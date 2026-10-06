@@ -1,0 +1,9 @@
+target/
+build/
+node_modules/
+.wrangler/
+.env*
+.dev.vars*
+.local/
+.DS_Store
+__pycache__/

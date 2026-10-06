@@ -1,0 +1,27 @@
+[package]
+name = "superci"
+description = "Your SuperCI dashboard, on your machine: puts a control plane in your own cloud and runs GitHub Actions jobs on your AWS or Cloudflare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "superci"
+path = "src/main.rs"
+
+[dependencies]
+superci-core = { path = "../core" }
+url.workspace = true
+ureq = { version = "3", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+open = "5"
+async-trait.workspace = true
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+sha2.workspace = true
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt"] }

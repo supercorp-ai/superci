@@ -1,0 +1,18 @@
+[package]
+name = "superci-runners-cloudflare"
+description = "A SuperCI runner agent on Cloudflare: one container per job, started when a control plane asks with a token it signed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+superci-core = { path = "../core" }
+worker = "0.8"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde_json.workspace = true
+getrandom.workspace = true

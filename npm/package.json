@@ -1,0 +1,29 @@
+{
+  "name": "@superci/cli",
+  "version": "0.0.0",
+  "description": "Your GitHub Actions and GitLab CI jobs on your own AWS, Cloudflare or Modal account",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/supercorp-ai/superci.git"
+  },
+  "homepage": "https://superci.dev",
+  "bugs": {
+    "url": "https://github.com/supercorp-ai/superci/issues"
+  },
+  "type": "module",
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "superci": "bin/superci.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {}
+}

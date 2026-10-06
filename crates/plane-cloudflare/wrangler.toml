@@ -1,0 +1,19 @@
+# A SuperCI control plane on Cloudflare (normally deployed by `superci init`; this file is for development).
+name = "superci"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "PLANE"
+class_name = "PlaneObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PlaneObject"]
+
+[vars]
+LABEL = "superci"

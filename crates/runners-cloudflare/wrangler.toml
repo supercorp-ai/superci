@@ -1,0 +1,16 @@
+# For local development only: the dashboard uploads this Worker (embedded in the SuperCI binary) through
+# Cloudflare's API with the bindings below, and creates its container application.
+name = "superci-runners"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "RUNNER"
+class_name = "Runner"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Runner"]

@@ -1,0 +1,8 @@
+{
+  "targets": [
+    { "rustTarget": "aarch64-apple-darwin", "package": "@superci/cli-darwin-arm64", "os": "darwin", "cpu": "arm64" },
+    { "rustTarget": "x86_64-apple-darwin", "package": "@superci/cli-darwin-x64", "os": "darwin", "cpu": "x64" },
+    { "rustTarget": "aarch64-unknown-linux-musl", "package": "@superci/cli-linux-arm64", "os": "linux", "cpu": "arm64" },
+    { "rustTarget": "x86_64-unknown-linux-musl", "package": "@superci/cli-linux-x64", "os": "linux", "cpu": "x64" }
+  ]
+}

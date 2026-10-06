@@ -1,0 +1,20 @@
+[package]
+name = "image-reader"
+description = "A big read-only image file, kept as small pieces at a public address, shown as one local file: pieces are fetched whole, in parallel, when first read, and kept on disk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "image-reader"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+
+# Showing an image is Linux only (it mounts with FUSE); elsewhere the program only packs one.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+libc = "0.2"

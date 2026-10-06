@@ -1,0 +1,68 @@
+name: Publish to npm
+
+# Builds SuperCI for every system it ships for, tries it, and publishes the npm packages: the program for each system
+# first, the launcher `@superci/cli` last. npm trusts this workflow (trusted publishing): there is no token to keep. Each
+# package names it on npmjs.com (Settings, Trusted publisher: supercorp-ai/superci, publish.yml).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release; must be the one this commit carries
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # A Mac builds all four: its own two, and Linux's two through zig.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require the requested version to be the one this commit carries
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          carried=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$carried" = "$RELEASE_VERSION" ] || { echo "This commit carries $carried, and $RELEASE_VERSION was asked for." >&2; exit 1; }
+          grep -q "^## $RELEASE_VERSION " CHANGELOG.md || { echo "CHANGELOG.md has no entry for $RELEASE_VERSION." >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,wasm32-unknown-unknown
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: The build's tools (zig, cargo-zigbuild, worker-build)
+        run: |
+          brew install zig
+          cargo install --locked cargo-zigbuild worker-build
+      - name: Build everything and pack the npm packages
+        run: ./scripts/npm-pack.sh
+      - name: The tests
+        run: cargo test --workspace
+      - name: Try what was packed, through npx
+        run: |
+          mkdir "$RUNNER_TEMP/try" && cd "$RUNNER_TEMP/try" && npm init -y > /dev/null
+          npm install "$GITHUB_WORKSPACE"/target/npm/superci-cli-darwin-arm64-*.tgz "$GITHUB_WORKSPACE"/target/npm/superci-cli-[0-9]*.tgz
+          [ "$(npx superci --version)" = "superci ${{ inputs.version }}" ]
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install -g npm@latest
+      - name: Publish (each program, then the launcher; what is on npm already is passed by)
+        run: ./scripts/npm-publish.sh
+      - name: Tag this commit and publish the release with its notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          tag="v$RELEASE_VERSION"
+          awk -v v="## $RELEASE_VERSION " 'index($0, v) == 1 { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          gh release view "$tag" > /dev/null 2>&1 || gh release create "$tag" --target "$GITHUB_SHA" --title "$RELEASE_VERSION" --notes-file "$RUNNER_TEMP/notes.md"

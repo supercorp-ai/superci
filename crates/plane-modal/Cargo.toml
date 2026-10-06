@@ -1,0 +1,18 @@
+[package]
+name = "superci-plane-modal"
+description = "A SuperCI control plane on Modal: a web endpoint whose state is a Modal Dict, starting runner sandboxes itself, in the user's own workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "superci-plane"
+path = "src/main.rs"
+
+[dependencies]
+superci-core = { path = "../core" }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+async-trait.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+futures = { version = "0.3", default-features = false, features = ["executor"] }
