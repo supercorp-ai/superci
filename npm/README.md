@@ -15,6 +15,6 @@ runs-on: superci
 - Documentation: https://superci.dev/docs
 - Source: https://github.com/supercorp-ai/superci
 
-This package is a small launcher (its command is `superci`). The program itself comes in a package for your system (macOS or Linux, arm64 or x64), installed with it.
+This package is a small launcher (its command is `superci`). The program itself comes in a package for your system (macOS, Linux or Windows; arm64 or x64), installed with it.
 
 MIT licensed.

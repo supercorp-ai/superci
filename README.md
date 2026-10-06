@@ -37,7 +37,7 @@ target/release/superci
 
 `build.sh` needs Rust, [worker-build](https://crates.io/crates/worker-build), zig with [cargo-zigbuild](https://crates.io/crates/cargo-zigbuild), and `zip`.
 
-The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS and Linux, arm64 and x64, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, publishes through npm's trusted publishing, and tags the release.
+The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release. Every push and pull request is built and tested by `.github/workflows/test.yml`.
 
 ## License
 

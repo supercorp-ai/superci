@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/plane-cloudflare", "crates/plane-aws", "crates/plane-modal", "crates/runners-cloudflare", "crates/cli", "crates/image-reader"]
 
 [workspace.package]
-version = "0.10.6"
+version = "0.10.7"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/supercorp-ai/superci"

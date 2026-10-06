@@ -10,18 +10,21 @@ on:
         description: The version to release; must be the one this commit carries
         required: true
         type: string
+      dry_run:
+        description: Build and try everything, publish nothing
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: publish
   cancel-in-progress: false
 
 jobs:
-  publish:
-    # A Mac builds all four: its own two, and Linux's two through zig.
+  build:
+    # A Mac builds them all: its own two, and Linux's and Windows' through zig.
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -35,11 +38,10 @@ jobs:
           grep -q "^## $RELEASE_VERSION " CHANGELOG.md || { echo "CHANGELOG.md has no entry for $RELEASE_VERSION." >&2; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,wasm32-unknown-unknown
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
       - name: The build's tools (zig, cargo-zigbuild, worker-build)
         run: |
@@ -50,10 +52,73 @@ jobs:
       - name: The tests
         run: cargo test --workspace
       - name: Try what was packed, through npx
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           mkdir "$RUNNER_TEMP/try" && cd "$RUNNER_TEMP/try" && npm init -y > /dev/null
           npm install "$GITHUB_WORKSPACE"/target/npm/superci-cli-darwin-arm64-*.tgz "$GITHUB_WORKSPACE"/target/npm/superci-cli-[0-9]*.tgz
-          [ "$(npx superci --version)" = "superci ${{ inputs.version }}" ]
+          [ "$(npx superci --version)" = "superci $RELEASE_VERSION" ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm
+          path: target/npm/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    # The package for Windows, on Windows: installed as npm would, asked its version, and its dashboard opened.
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm
+          path: npm
+      - name: Try what was packed, through npx
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          mkdir try && cd try && npm init -y > /dev/null
+          npm install ../npm/superci-cli-win32-x64-*.tgz ../npm/superci-cli-[0-9]*.tgz
+          [ "$(npx superci --version | tr -d '\r')" = "superci $RELEASE_VERSION" ]
+          npx superci --no-browser > out.txt 2>&1 &
+          for i in $(seq 1 30); do grep -q 'http://localhost' out.txt && break; sleep 1; done
+          cat out.txt
+          link=$(grep -o 'http://localhost[^ ]*' out.txt | head -1 | tr -d '\r')
+          [ -n "$link" ]
+          curl -sS --max-time 20 -o page.html -w '%{http_code}\n' -L -c jar -b jar "$link" | tee code.txt
+          [ "$(tail -1 code.txt | tr -d '\r')" = "200" ]
+          grep -q 'SuperCI' page.html
+
+  publish:
+    needs: [build, windows]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm
+          path: target/npm
       # Trusted publishing needs npm 11.5.1 or newer.
       - run: npm install -g npm@latest
       - name: Publish (each program, then the launcher; what is on npm already is passed by)

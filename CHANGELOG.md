@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.10.7 — 2026-10-06
+- `npx @superci/cli` works on Windows (x64, and arm64 through Windows' own x64 support). A release tries the package on both before it is published.
+- Every push and pull request to the repository is built and tested on GitHub.
+
 ## 0.10.6 — 2026-10-06
 - SuperCI is released by its repository on GitHub: one workflow builds the program for macOS and Linux (Apple silicon, Intel, arm64, x64), runs the tests, tries it through `npx`, and publishes `@superci/cli` to npm, which trusts that workflow (trusted publishing). No person's npm login or token is part of a release.
 - Nothing changes in the program or in a control plane.
