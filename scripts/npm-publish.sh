@@ -1,6 +1,9 @@
 #!/bin/sh
 # Publishes what ./scripts/npm-pack.sh packed: the programs first, the launcher last (it names them). A package whose
 # version is on npm already is passed by, so a publish that stopped halfway is finished by running this again.
+# Published is not yet downloadable: npm lists a new version at once and serves its file some minutes later (0.10.7:
+# nine minutes). So the launcher is published only once every program's file downloads; until then `npx @superci/cli`
+# goes on giving the version before.
 # From a computer: `npm login` as an owner of the npm organization `superci` (the @superci scope).
 # From GitHub (.github/workflows/publish.yml): no login, npm trusts the workflow (trusted publishing).
 #   ./scripts/npm-publish.sh            # publish
@@ -8,15 +11,53 @@
 set -e
 cd "$(dirname "$0")/.."
 ls target/npm/superci-cli-*-*-[0-9]*.tgz target/npm/superci-cli-[0-9]*.tgz >/dev/null 2>&1 || { echo "run ./scripts/npm-pack.sh first" >&2; exit 1; }
-for tgz in target/npm/superci-cli-*-*-[0-9]*.tgz target/npm/superci-cli-[0-9]*.tgz; do
-  spec=$(tar -xzOf "$tgz" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.name+"@"+p.version)})')
-  if [ -n "$(npm view "$spec" version 2>/dev/null)" ]; then echo "==> $spec is on npm already"; continue; fi
+
+named() { tar -xzOf "$1" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.name+"@"+p.version)})'; }
+
+publish() {
+  file=$1; shift
+  spec=$(named "$file")
+  if [ -n "$(npm view "$spec" version 2>/dev/null)" ]; then echo "==> $spec is on npm already"; return; fi
   echo "==> $spec"
   # npm runs attached to the terminal: it may ask for a one-time password. It may also not show a version it has
   # just taken; being told so (in its own log) is not a failure.
-  if ! npm publish "$tgz" --access public "$@"; then
+  if ! npm publish "$file" --access public "$@"; then
     log=$(ls -t "${npm_config_cache:-$HOME/.npm}"/_logs/*-debug-0.log 2>/dev/null | head -1)
     [ -n "$log" ] && grep -q "cannot publish over the previously published" "$log" || exit 1
     echo "==> $spec is on npm already"
   fi
+}
+
+# Waits until npm lists each version and its file downloads (15 minutes at most).
+downloadable() {
+  node - "$@" <<'NODE'
+const waiting = new Set(process.argv.slice(2)), started = Date.now();
+const seconds = () => Math.round((Date.now() - started) / 1000);
+async function there(spec) {
+  const at = spec.lastIndexOf("@"), name = spec.slice(0, at), version = spec.slice(at + 1);
+  const listed = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}?t=${Date.now()}`, { headers: { "cache-control": "no-cache" } });
+  const file = listed.ok && (await listed.json()).versions?.[version]?.dist?.tarball;
+  return Boolean(file) && (await fetch(file, { method: "HEAD" })).ok;
+}
+while (waiting.size) {
+  for (const spec of [...waiting]) {
+    if (await there(spec).catch(() => false)) { waiting.delete(spec); console.log(`==> ${spec} downloads, after ${seconds()} s`); }
+  }
+  if (!waiting.size) break;
+  if (seconds() > 900) { console.error(`still not downloadable after ${seconds()} s: ${[...waiting].join(", ")}`); process.exit(1); }
+  await new Promise((r) => setTimeout(r, 10000));
+}
+NODE
+}
+
+programs=""
+for tgz in target/npm/superci-cli-*-*-[0-9]*.tgz; do
+  publish "$tgz" "$@"
+  programs="$programs $(named "$tgz")"
 done
+launcher=$(ls target/npm/superci-cli-[0-9]*.tgz)
+if [ "${1:-}" = "--dry-run" ]; then publish "$launcher" "$@"; exit 0; fi
+# shellcheck disable=SC2086
+downloadable $programs
+publish "$launcher" "$@"
+downloadable "$(named "$launcher")"
