@@ -23,8 +23,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  trust:
+    # Before the long build: npm is asked whether it trusts this workflow for each package (the exchange a publish
+    # starts with). What it answers is said; the short-lived token it gives is thrown away.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ask npm about each package
+        run: |
+          id=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org" | jq -r .value)
+          echo "$id" | cut -d. -f2 | tr '_-' '/+' | awk '{ while (length($0) % 4) $0 = $0 "="; print }' | base64 -d | jq '{repository, repository_id, repository_owner, repository_owner_id, repository_visibility, workflow_ref, ref, event_name, runner_environment}'
+          failed=0
+          for package in $(jq -r '.targets[].package' npm/targets.json) $(jq -r .name npm/package.json); do
+            answer=$(curl -sS -o "$RUNNER_TEMP/answer.json" -w '%{http_code}' -X POST -H "Authorization: Bearer $id" "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/$(echo "$package" | sed 's|/|%2f|')")
+            if [ "$answer" = "201" ] || [ "$answer" = "200" ]; then echo "$package: trusted"; else echo "$package: $answer $(jq -c 'del(.token)' "$RUNNER_TEMP/answer.json" 2>/dev/null)"; failed=1; fi
+          done
+          [ "$failed" = 0 ] || { echo "npm does not trust this workflow for every package: set each one's Trusted publisher on npmjs.com (supercorp-ai/superci, publish.yml, Allow npm publish)." >&2; exit 1; }
+
   build:
     # A Mac builds them all: its own two, and Linux's and Windows' through zig.
+    needs: trust
     runs-on: macos-15
     timeout-minutes: 60
     steps:
