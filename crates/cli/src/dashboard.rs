@@ -20,7 +20,7 @@ use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
 use superci_core::plane::{Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU};
 use superci_core::spec::{Capacity, Spec};
-use superci_core::page::{document, esc, manifest_form, message, nearby_regions, region_name, REGIONS};
+use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, REGIONS};
 
 use crate::aws;
 use crate::aws_plane;
@@ -58,8 +58,14 @@ pub struct Dashboard {
     keep_failed: bool,
     /// A kept AWS sign-in turned out to have ended (AWS ends one after twelve hours at most).
     aws_ended: bool,
-    /// `superci login`: only the sign-in is wanted; once there is one, the page says so and the program ends.
-    login_only: bool,
+    /// The dashboard opened by a command for the one thing a person must do in a browser (see `Task`): once it is
+    /// done, the page says so and the program ends.
+    task: Option<Task>,
+    /// The control plane kept from the last run, listed before any cloud was asked (its id): looking in its own
+    /// cloud then says whether it is still there.
+    preloaded: Option<String>,
+    /// Said once at the top of the next page (signed out).
+    notice: Option<String>,
     cf_pending: Option<cloudflare::Pending>,
     cf_accounts: Vec<(String, String)>,
     aws: Option<aws::Session>,
@@ -119,6 +125,13 @@ pub struct Dashboard {
     last_good: HashMap<String, (PlaneView, u64)>,
 }
 
+
+/// What a command needs a person for, in the browser: a sign-in (with any cloud, or with one), or making a GitHub App
+/// for an account and choosing its repositories (GitHub offers that only on its own pages).
+pub enum Task {
+    Login(Option<&'static str>),
+    GitHub { login: String, host: String, started: bool, done: bool },
+}
 
 /// An update: of which control plane, its steps, the one it is at, and how it ended.
 struct Update { plane: String, steps: &'static [&'static str], at: usize, result: Option<Result<()>>, ended_ms: u64 }
@@ -190,6 +203,18 @@ fn side() -> &'static Mutex<String> { thread_local!(static SIDE: &'static Mutex<
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
 
+thread_local! {
+    /// The last page that said one thing (its status, heading and text): what a command, which asked in a browser's
+    /// place, says in turn (see `Dashboard::act`).
+    static SAID: std::cell::RefCell<Option<(u16, String, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A page that says one thing.
+fn message(status: u16, heading: &str, text: &str) -> Response {
+    SAID.with(|s| *s.borrow_mut() = Some((status, heading.to_string(), text.to_string())));
+    superci_core::page::message(status, heading, text)
+}
+
 /// A request; `last` is the connect screen's "Last used" cloud (a cookie of its own, only a cloud's name).
 struct Req { method: String, path: String, query: Vec<(String, String)>, cookie: Option<String>, last: Option<String>, body: Vec<u8>, host: String, origin: Option<String>, fetch_site: Option<String> }
 
@@ -240,6 +265,31 @@ fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
 }
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+
+/// What a command waits for after starting it (see `Dashboard::wait`).
+#[derive(Clone, Copy)]
+pub enum Background { Deploy, Update, Move }
+
+/// A control plane as commands say it.
+pub fn plane_json(v: &PlaneView) -> serde_json::Value {
+    serde_json::json!({ "id": v.plane.plane_id(), "cloud": v.plane.cloud(), "where": v.plane.place(), "url": v.plane.url(), "label": v.plane.label(),
+        "online": v.online, "version": v.version, "update_to": if v.outdated() { Some(DASHBOARD_VERSION) } else { None }, "ready": v.ready() })
+}
+
+/// A page's words without its markup: tags gone (a list's items one after another), entities as their characters.
+fn plain(html: &str) -> String {
+    let (mut out, mut tag) = (String::new(), None::<String>);
+    for c in html.chars() {
+        match (&mut tag, c) {
+            (None, '<') => tag = Some(String::new()),
+            (Some(t), '>') => { if t.starts_with("li") || t.starts_with("/p") || t.starts_with("/li") || t.starts_with("ul") { out.push(' ') } tag = None }
+            (Some(t), c) => t.push(c),
+            (None, c) => out.push(c),
+        }
+    }
+    let out = out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&#x27;", "'");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// What `superci status` says when SuperCI is signed in nowhere, and when its only sign-in was AWS's and has ended.
 pub const NOT_SIGNED_IN: &str = "SuperCI is not signed in on this computer. Run `superci login` (it opens your browser).";
@@ -490,7 +540,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, login_only: false, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, task: None, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -508,14 +558,145 @@ impl Dashboard {
             Some(k) => { d.status_key = k.value; d.status_secret = k.name; d.keyed = k.planes.into_iter().collect() }
             None => d.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()),
         }
+        // The control plane in use is listed at once: its pages are read with the kept key, whether or not its
+        // cloud's sign-in still stands (AWS ends one after twelve hours).
+        if let Some(p) = &kept.plane { d.planes.push(p.clone()); d.preloaded = Some(p.plane_id().to_string()) }
         d.kept_plane = kept.plane;
         d.store = Some(store);
         d.kept_as = serde_json::to_string(&d.kept()).unwrap_or_default();
         d
     }
 
-    /// `superci login`: a dashboard that only signs in.
-    pub fn for_login(mut self) -> Self { self.login_only = true; self }
+    /// A dashboard opened for one thing a person does in the browser.
+    pub fn for_task(mut self, task: Task) -> Self { self.task = Some(task); self }
+
+    fn signed_in_with(&self, cloud: &str) -> bool { match cloud { "aws" => self.aws.is_some(), "cloudflare" => self.cf.is_some(), _ => self.modal.is_some() } }
+
+    /// The task is done: what to say in the terminal.
+    fn task_done(&self) -> Option<String> {
+        let kept = || self.store.as_ref().map(|s| s.path().display().to_string()).unwrap_or_else(|| "nothing (no home folder)".into());
+        match self.task.as_ref()? {
+            Task::Login(cloud) if cloud.is_none_or(|c| self.signed_in_with(c)) => self.signed_in_as().map(|now| format!("Signed in: {now}. Kept in {}; `superci logout` removes it.", kept())),
+            Task::GitHub { login, done: true, .. } => Some(format!("GitHub is connected for {login}: its App is installed. Jobs with `runs-on: superci` in its repositories now come here.")),
+            _ => None,
+        }
+    }
+
+    /// What the task's tab shows at the dashboard's address, in the dashboard's place.
+    fn task_page(&mut self) -> Option<Response> {
+        if self.task_done().is_some() { return Some(message(200, "Done", "Back to your terminal: you can close this tab.")) }
+        match self.task.as_mut()? {
+            // A sign-in with one cloud goes straight to it; with any, the dashboard's own first screen asks which.
+            Task::Login(Some(cloud)) => Some(Response::redirect(&format!("/connect/{cloud}"))),
+            Task::Login(None) => None,
+            Task::GitHub { started: true, .. } => Some(message(200, "Finish on GitHub", "Create the App there and choose its repositories. This tab comes back here when it is done.")),
+            Task::GitHub { login, host, started, .. } => {
+                *started = true;
+                let fields = [("login", login.clone()), ("host", host.clone())];
+                let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields.iter().map(|(k, v)| (*k, v.as_str()))).finish().into_bytes();
+                let req = Req { method: "POST".into(), path: "/github/start".into(), query: vec![], cookie: None, last: None, body, host: String::new(), origin: None, fetch_site: None };
+                Some(self.handle(&req).unwrap_or_else(|e| message(500, "GitHub could not be started", &esc(&e))))
+            }
+        }
+    }
+
+    /// For a command that changes something: signed in, the clouds looked in, and the control plane in use chosen, as a
+    /// page's first load does.
+    pub fn ready(&mut self) -> Result<()> {
+        self.signed_in_as().ok_or(NOT_SIGNED_IN)?;
+        self.discover()?;
+        if self.signed_in_as().is_none() { return Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) }
+        let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
+        if !views.is_empty() {
+            let id = views[view::in_use(&views)].plane.plane_id().to_string();
+            if let Some(i) = self.planes.iter().position(|p| p.plane_id() == id) { self.selected = i }
+        }
+        self.keep();
+        Ok(())
+    }
+
+    /// Does what a form on the dashboard's pages does, with the same fields: the same code runs (`handle`), so a
+    /// command and the page can never differ. What it said: a page that says one thing, or the note a page shows once.
+    pub fn act(&mut self, path: &str, fields: &[(&str, String)]) -> Result<String> {
+        SAID.with(|s| s.borrow_mut().take());
+        let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields.iter().map(|(k, v)| (*k, v.as_str()))).finish().into_bytes();
+        let req = Req { method: "POST".into(), path: path.into(), query: vec![], cookie: None, last: None, body, host: String::new(), origin: None, fetch_site: None };
+        self.views = None;
+        let answer = self.handle(&req);
+        self.keep();
+        let answer = answer?;
+        let said = SAID.with(|s| s.borrow_mut().take()).map(|(_, heading, text)| { let text = plain(&text); if text.is_empty() { heading } else { format!("{}: {text}", heading.trim_end_matches('.')) } });
+        match (answer.status, said) {
+            (300..=399, _) => Ok(self.flash.take().unwrap_or_default()),
+            (status, Some(said)) if status >= 400 => Err(said),
+            (status, None) if status >= 400 => Err(format!("refused ({status})")),
+            (_, said) => Ok(said.unwrap_or_default()),
+        }
+    }
+
+    /// Waits for what a command started in the background (a deploy, an update, a move), saying each step as it
+    /// begins. A deploy's control plane joins the list, in use, with this machine's key.
+    pub fn wait(&mut self, what: Background, say: &mut dyn FnMut(&str)) -> Result<String> {
+        let mut said = 0;
+        loop {
+            let (steps, at, ended): (Vec<String>, usize, Option<Result<String>>) = match what {
+                Background::Deploy => { let g = lock(&self.deploying); let d = g.as_ref().ok_or("no deploy was started")?;
+                    (d.steps.iter().map(|s| s.to_string()).collect(), d.at, d.result.as_ref().map(|r| r.as_ref().map(|p| format!("The control plane is running: {} ({})", p.url(), p.place())).map_err(|e| e.clone()))) }
+                Background::Update => { let g = lock(&self.updating); let u = g.as_ref().ok_or("no update was started")?;
+                    (u.steps.iter().map(|s| s.to_string()).collect(), u.at, u.result.as_ref().map(|r| r.as_ref().map(|_| format!("Updated to {DASHBOARD_VERSION}.")).map_err(|e| e.clone()))) }
+                Background::Move => { let g = lock(&self.moving); let m = g.as_ref().ok_or("no move was started")?;
+                    (MOVE_STEPS.iter().map(|s| s.to_string()).collect(), m.at, m.result.as_ref().map(|r| r.as_ref().map(|left| if left.is_empty() { "Moved.".to_string() } else { format!("Moved. Did not come along: {}.", left.join("; ")) }).map_err(|e| e.clone()))) }
+            };
+            // Each step as it begins; all of them once it has ended well.
+            let upto = if ended.as_ref().is_some_and(|e| e.is_ok()) { steps.len() } else { (at + 1).min(steps.len()) };
+            while said < upto { say(&steps[said]); said += 1 }
+            if let Some(ended) = ended {
+                if matches!(what, Background::Deploy) && ended.is_ok() { self.adopt_deploy(); self.key_planes(); }
+                self.views = None;
+                self.keep();
+                return ended
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }
+
+    /// The control plane in use, read for a command: with the kept key when its control plane has it (no cloud is
+    /// asked), else after looking in the clouds signed in to. None: signed in, and no control plane found.
+    pub fn current(&mut self) -> Result<Option<PlaneView>> {
+        self.signed_in_as().ok_or(NOT_SIGNED_IN)?;
+        let kept = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id()));
+        if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some()) { return Ok(Some(v)) }
+        // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.
+        self.keyed.clear();
+        self.discover()?;
+        if self.planes.is_empty() { return if self.signed_in_as().is_none() { Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) } else { Ok(None) } }
+        let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
+        let p = views[view::in_use(&views)].plane.clone();
+        if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.selected = i }
+        let mut v = view::plane_view(&p, Some(&self.status_key));
+        if v.online && v.status.is_none() && self.keyed.contains(p.plane_id()) { v.status = status_soon(p.url(), &self.status_key) }
+        self.keep();
+        Ok(Some(v))
+    }
+
+    /// Every control plane found in the clouds signed in to, the one in use marked.
+    pub fn all(&mut self) -> Result<(Vec<PlaneView>, usize)> {
+        self.ready()?;
+        let key = self.status_key.clone();
+        let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, Some(&key))).collect();
+        let used = view::in_use(&views);
+        Ok((views, used))
+    }
+
+    #[cfg(test)]
+    fn read_only_of_test(&self) -> bool { self.signed_in_as().is_some() || !self.planes.is_empty() }
+
+    /// The key commands read the control plane with (after `current`).
+    pub fn key(&self) -> &str { &self.status_key }
+
+    /// The control plane in use (after `ready`), and the Cloudflare accounts the sign-in reaches.
+    pub fn plane_in_use(&self) -> Option<Plane> { self.plane().ok() }
+    pub fn cloudflare_accounts(&self) -> &[(String, String)] { &self.cf_accounts }
 
     /// Where SuperCI is signed in, in words (nothing: nowhere).
     pub fn signed_in_as(&self) -> Option<String> {
@@ -526,39 +707,21 @@ impl Dashboard {
         if at.is_empty() { None } else { Some(at.join(", ")) }
     }
 
-    /// The control plane in use and what it says of itself, for `superci status`: read with the kept key when its
-    /// control plane has it (no cloud is asked), else after looking in the clouds signed in to.
+    /// The control plane in use and what it says of itself, for `superci status`.
     pub fn status(&mut self) -> Result<serde_json::Value> {
-        let signed_in = self.signed_in_as().ok_or(NOT_SIGNED_IN)?;
-        let kept = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id()));
-        let read = |p: &Plane, key: &str| view::plane_view(p, Some(key));
-        let mut view = kept.as_ref().map(|p| read(p, &self.status_key)).filter(|v| v.status.is_some());
-        if view.is_none() {
-            // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.
-            self.keyed.clear();
-            self.discover()?;
-            if self.signed_in_as().is_none() { return Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) }
-            let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
-            if views.is_empty() { return Ok(serde_json::json!({ "signed_in": signed_in, "control_plane": null })) }
-            let p = views[view::in_use(&views)].plane.clone();
-            if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.selected = i }
-            let mut v = read(&p, &self.status_key);
-            if v.online && v.status.is_none() && self.keyed.contains(p.plane_id()) { v.status = status_soon(p.url(), &self.status_key) }
-            view = Some(v);
-            self.keep();
-        }
-        let v = view.expect("read above");
-        Ok(serde_json::json!({
-            "signed_in": signed_in,
-            "control_plane": { "id": v.plane.plane_id(), "cloud": v.plane.cloud(), "where": v.plane.place(), "url": v.plane.url(), "label": v.plane.label(),
-                "online": v.online, "version": v.version, "update_to": if v.outdated() { Some(DASHBOARD_VERSION) } else { None }, "ready": v.ready() },
-            "status": v.status,
-        }))
+        let view = self.current()?;
+        let signed_in = self.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into());
+        let Some(v) = view else { return Ok(serde_json::json!({ "signed_in": signed_in, "control_plane": null })) };
+        Ok(serde_json::json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }))
     }
 
     /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
     /// to (Cloudflare), and the control plane in use was asked to forget this machine's key. What was done, in words.
-    pub fn logout(mut self) -> Result<Vec<String>> {
+    pub fn logout(mut self) -> Result<Vec<String>> { self.sign_out() }
+
+    /// Signs SuperCI out on this machine (the dashboard's Sign out, and `superci logout`): see `logout`. Afterwards
+    /// this dashboard knows no cloud and no control plane, as on a first start.
+    fn sign_out(&mut self) -> Result<Vec<String>> {
         let Some(store) = self.store.clone() else { return Ok(vec!["Nothing is kept on this machine (it has no home folder).".into()]) };
         let mut said = vec![];
         if store.read().key.is_some() {
@@ -576,6 +739,17 @@ impl Dashboard {
         if self.modal.is_some() && !self.modal_given { said.push("SuperCI's Modal token is removed here; it stays listed in Modal (Settings → API tokens) until deleted there.".into()) }
         if self.aws.is_some() { said.push("SuperCI's AWS sign-in is removed here; AWS ends it by itself within twelve hours of when it was made.".into()) }
         said.push(if store.remove()? { format!("Removed {}.", store.path().display()) } else { "Nothing was kept on this machine.".into() });
+        // As on a first start: no sign-in (but one given by name for this run), no control plane, a new key.
+        if !self.cf_given { self.cf = None }
+        if !self.modal_given { self.modal = None }
+        self.aws = None;
+        (self.aws_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false);
+        (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
+        self.cf_accounts.clear();
+        self.keyed.clear();
+        self.status_key = random_token(24);
+        self.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase());
+        self.kept_as = serde_json::to_string(&self.kept()).unwrap_or_default();
         Ok(said)
     }
 
@@ -622,8 +796,8 @@ impl Dashboard {
         }
         if listening == 0 { return Err(format!("port {port} is in use (is another SuperCI or `wrangler login` running?)")) }
         let link = format!("{}/?k={}", self.base, self.key);
-        println!("{}: {link}", if self.login_only { "Sign in with your cloud here (on this machine only)" } else { "SuperCI dashboard (on this machine only)" });
-        if self.login_only {
+        println!("{}: {link}", match &self.task { Some(Task::Login(_)) => "Sign in with your cloud here (on this machine only)", Some(Task::GitHub { .. }) => "Create the GitHub App and choose its repositories here (on this machine only)", None => "SuperCI dashboard (on this machine only)" });
+        if self.task.is_some() {
             if open_browser { let _ = open::that(&link); }
         } else if open_browser {
             println!("It is opening in your browser. Ctrl-C stops it; your runners keep working without it.");
@@ -634,17 +808,17 @@ impl Dashboard {
         // One thread per connection, each with a read timeout: a browser's idle spare connection cannot hold up a page.
         // The page frame needs no shared state, so it is drawn at once; the live part holds it only briefly.
         let key = self.key.clone();
-        let login_only = self.login_only;
+        let for_task = self.task.is_some();
         let shared = Arc::new(Mutex::new(self));
-        if login_only {
-            // Signed in: kept, said, and (a moment later, so the tab gets its last page) ended.
+        if for_task {
+            // Done: kept, said, and (a moment later, so the tab gets its last page) ended.
             let shared = shared.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(300));
                 let mut d = lock(&shared);
-                if let Some(now) = d.signed_in_as() {
+                if let Some(done) = d.task_done() {
                     d.keep();
-                    println!("Signed in: {now}. Kept in {}; `superci logout` removes it.", d.store.as_ref().map(|s| s.path().display().to_string()).unwrap_or_else(|| "nothing (no home folder)".into()));
+                    println!("{done}");
                     drop(d);
                     std::thread::sleep(Duration::from_millis(2500));
                     std::process::exit(0)
@@ -733,8 +907,12 @@ impl Dashboard {
             let join = |h: std::thread::ScopedJoinHandle<'_, _>| h.join().unwrap_or_else(|_| Err::<_, String>("a cloud's search stopped".into()));
             (c.map(join), a.map(|h| h.join().unwrap_or_else(|_| Err("AWS's search stopped".into()))), m.map(|h| h.join().unwrap_or_else(|_| Err("Modal's search stopped".into()))))
         });
+        // Where the kept control plane was looked for, and what was found there.
+        let (mut looked, mut there): (Vec<String>, Vec<String>) = (vec![], vec![]);
         if let Some(found) = cf_found {
             let (accounts, planes) = found?;
+            looked.extend(accounts.iter().map(|(id, _)| format!("cloudflare:{id}")));
+            there.extend(planes.iter().map(|p| p.plane_id().to_string()));
             self.cf_accounts = accounts;
             for h in planes {
                 match self.planes.iter().position(|x| x.plane_id() == h.plane_id()) { Some(i) => self.planes[i] = h, None => self.planes.push(h) }
@@ -742,8 +920,10 @@ impl Dashboard {
             self.looked_cf = true;
         }
         if let (Some(found), Some((_, account_id))) = (aws_found, aws) {
+            looked.push(format!("aws:{account_id}"));
             for f in found? {
                 if !f.url.starts_with("https://") { continue }
+                if f.lambda.is_some() { there.push(f.plane_id.clone()) }
                 let found = match f.lambda {
                     Some((region, label)) => Plane::Aws { account_id: account_id.clone(), region, url: f.url, plane_id: f.plane_id, label },
                     None => Plane::Seen { url: f.url, plane_id: f.plane_id },
@@ -758,10 +938,30 @@ impl Dashboard {
             self.looked_aws = true;
         }
         if let Some(found) = modal_found {
+            if let Some(m) = &self.modal { looked.push(format!("modal:{}", m.workspace)) }
             for found in found? {
+                there.push(found.plane_id().to_string());
                 match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.planes.push(found) }
             }
             self.looked_modal = true;
+        }
+        // The control plane kept from the last run: looked for where it lives and not there any more, it is gone.
+        if let Some(i) = self.preloaded.as_ref().and_then(|id| self.planes.iter().position(|p| p.plane_id() == id)) {
+            let home = match &self.planes[i] {
+                Plane::Cloudflare { account_id, .. } => format!("cloudflare:{account_id}"),
+                Plane::Aws { account_id, .. } => format!("aws:{account_id}"),
+                Plane::Modal { workspace, .. } => format!("modal:{workspace}"),
+                Plane::Seen { .. } => String::new(),
+            };
+            if looked.contains(&home) {
+                if !there.iter().any(|id| id == self.planes[i].plane_id()) {
+                    self.planes.remove(i);
+                    self.kept_plane = None;
+                    self.selected = 0;
+                    self.views = None;
+                }
+                self.preloaded = None;
+            }
         }
         self.key_planes();
         Ok(())
@@ -1076,6 +1276,14 @@ impl Dashboard {
                 Ok(Response::redirect(&if field("fresh") == "on" { aws::signed_out_first(&link) } else { link }))
             }
 
+            // Sign out (the sidebar's More menu): SuperCI's sign-ins leave this machine, as with `superci logout`.
+            ("POST", "/signout") => {
+                self.sign_out()?;
+                lock(side()).clear();
+                self.notice = Some("Signed out. SuperCI's sign-ins are removed from this computer; your runners keep working.".into());
+                Ok(Response::redirect("/"))
+            }
+
             // Deploying happens only here, from a Deploy button: connecting to a cloud never deploys anything. It runs in the
             // background; the page shows each step, and the control plane joins the list when it answers.
             ("POST", "/plane/cloudflare") => {
@@ -1305,6 +1513,7 @@ impl Dashboard {
             }
             // Back from installing the App on GitHub: what was read before is from before it.
             ("GET", "/github/installed") => {
+                if let Some(Task::GitHub { done, .. }) = self.task.as_mut() { *done = true }
                 self.views = None;
                 self.github_expected.get_or_insert(now_ms() + 120_000);
                 Ok(back("Installed on GitHub", "Back to your dashboard…"))
@@ -1691,7 +1900,8 @@ load()})();</script>"#;
         if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
-        let html = format!("{}{}", d.aws_stuck(), d.render(section, &views, last));
+        let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
+        let html = format!("{said_once}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.render(section, &views, last));
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
         // A change's note is said once.
         if ["planes", "runners"].contains(&section_name(section)) { d.flash = None }
@@ -1707,6 +1917,13 @@ load()})();</script>"#;
         // AWS's own page offers the first way (sign in as usual in another tab, then use that session); signing out
         // clears the old one.
         r#"<div class="notice warn"><span>Your AWS sign-in is not finished. If AWS said “400 Bad Request”, an old AWS sign-in in this browser is in the way: <a href="https://console.aws.amazon.com/" target="_blank" rel="noopener">sign in to the AWS console</a> in another tab and try again, or</span><form method="post" action="/aws/signin"><input type="hidden" name="next"><input type="hidden" name="fresh" value="on"><button class="button secondary sm">Sign out of AWS and try again</button></form></div>"#.to_string()
+    }
+
+    /// A kept AWS sign-in that has ended: the pages still show what the control plane says (read with the kept key);
+    /// changing things in AWS needs the sign-in again.
+    fn aws_ended_notice(&self) -> String {
+        if !self.aws_ended || self.aws.is_some() || self.planes.is_empty() { return String::new() }
+        format!(r#"<div class="notice warn"><span>Your AWS sign-in has ended (AWS ends one after 12 hours). You can look around; sign in again to change things in AWS.</span>{}</div>"#, signin_button("aws", "Sign in with AWS", false))
     }
 
     fn render(&self, section: &str, views: &[PlaneView], last: Option<&str>) -> String {
@@ -1777,7 +1994,9 @@ load()})();</script>"#;
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
         // At the bottom: an update for the control plane, when it needs one (filled in by the page's live part), the
         // control plane itself, and what is new.
-        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("changes", "Changelog", ICON_NEWS));
+        // Last, More: what is about this computer and not the control plane (signing SuperCI out here).
+        let more = format!(r#"<details class="menu side-more"><summary>{ICON_MORE}<span>More</span></summary><div class="menu-pop"><form method="post" action="/signout"><button>Sign out</button></form></div></details>"#);
+        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{more}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("changes", "Changelog", ICON_NEWS));
         format!(r#"<aside class="side"><div class="brand">{MARK}<span>SuperCI</span>{THEME_TOGGLE}</div>{nav}{foot}</aside>"#)
     }
 
@@ -3574,9 +3793,9 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     if !req.cookie.as_deref().is_some_and(|c| safe_eq(c.as_bytes(), key.as_bytes())) && !["/github/callback", "/github/installed", "/oauth/callback", "/oauth/modal"].contains(&req.path.as_str()) {
         return message(403, "This tab is not connected to your dashboard", "Open the link SuperCI printed in your terminal when it started (it begins with http://localhost:8976/?k=). Nothing has changed.");
     }
-    // `superci login`, signed in: its tab's last page (the program ends a moment later).
-    if req.method == "GET" && req.path == "/" && { let d = lock(shared); d.login_only && d.signed_in_as().is_some() } {
-        return message(200, "Signed in", "SuperCI on this computer is signed in. You can close this tab.");
+    // A command's tab (a sign-in, a GitHub App): what it is for, in the dashboard's place.
+    if req.method == "GET" && req.path == "/" && q("fragment") != "1" {
+        if let Some(page) = lock(shared).task_page() { return page }
     }
     if req.method == "GET" && req.path == "/" {
         let new_here = match q("new") { "1" => Some(true), "0" => Some(false), _ => None };
@@ -4673,5 +4892,78 @@ mod tests {
         assert_eq!(day(0), "1970-01-01");
         assert_eq!(day(1_791_331_200), "2026-10-07");
         assert_eq!(day(1_709_164_800), "2024-02-29");
+    }
+
+    #[test]
+    fn a_command_does_what_the_page_does() {
+        // What a page would say is what the command says: a refusal as an error, with its text and no markup.
+        let mut d = Dashboard::new();
+        assert_eq!(d.act("/plane/leave", &[("confirm", "nope".into())]).unwrap_err(), "Type superci to confirm");
+        assert_eq!(d.act("/plane/delete", &[("plane", "abcdef123456".into())]).unwrap_err(), "That control plane is not known here");
+        assert_eq!(d.act("/routing", &[("action", "order".into())]).unwrap_err(), "no control plane yet");
+        assert_eq!(d.act("/nowhere", &[]).unwrap_err(), "Not found");
+        assert_eq!(d.ready().unwrap_err(), NOT_SIGNED_IN);
+        assert_eq!(plain(r#"Its control planes are deleted.</p><ul class="checks"><li>Delete the App <a href="https://github.com/x">superci-acme</a> on GitHub.</li><li>Change <code>runs-on: superci</code> back &amp; push.</li></ul><p>"#),
+            "Its control planes are deleted. Delete the App superci-acme on GitHub. Change runs-on: superci back & push.");
+        // What runs in the background is waited for, each step said as it begins.
+        let plane = Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "https://x.lambda-url.us-east-1.on.aws".into(), plane_id: "abcdef123456".into(), label: "superci".into() };
+        *lock(&d.deploying) = Some(Deploy { cloud: "aws", place: "account 123456789012 · us-east-1".into(), steps: &aws_plane::DEPLOY_STEPS, at: 6, form: vec![], result: Some(Ok(plane.clone())) });
+        let mut steps = vec![];
+        let said = d.wait(Background::Deploy, &mut |s: &str| steps.push(s.to_string())).unwrap();
+        assert!(said.starts_with("The control plane is running: https://x.lambda-url.us-east-1.on.aws") && steps.len() == aws_plane::DEPLOY_STEPS.len());
+        assert_eq!(d.plane_in_use().unwrap().plane_id(), "abcdef123456");
+        *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 2, result: Some(Err("AccessDenied: lambda:UpdateFunctionCode".into())), ended_ms: now_ms() });
+        let mut steps = vec![];
+        assert_eq!(d.wait(Background::Update, &mut |s: &str| steps.push(s.to_string())).unwrap_err(), "AccessDenied: lambda:UpdateFunctionCode");
+        assert_eq!(steps, UPDATE_AWS[..3], "a stop says the steps up to where it stopped");
+        assert_eq!(d.wait(Background::Move, &mut |_| {}).unwrap_err(), "no move was started");
+    }
+
+    #[test]
+    fn what_a_person_does_in_the_browser() {
+        // A sign-in with one cloud goes straight to it, and is done once that cloud is signed in to.
+        let mut d = Dashboard::new().for_task(Task::Login(Some("aws")));
+        assert_eq!(d.task_page().unwrap().headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str()), Some("/connect/aws"));
+        d.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
+        assert!(d.task_done().is_none(), "another cloud's sign-in is not this one");
+        d.aws = Some(aws::Session::for_test("123456789012"));
+        assert!(d.task_done().unwrap().starts_with("Signed in: AWS account 123456789012, Modal workspace acme."));
+        assert!(String::from_utf8(d.task_page().unwrap().body).unwrap().contains("Back to your terminal"));
+        // With any cloud: the dashboard's own first screen asks which.
+        let mut any = Dashboard::new().for_task(Task::Login(None));
+        assert!(any.task_page().is_none() && any.task_done().is_none());
+        // A GitHub App: done when GitHub comes back from choosing its repositories.
+        let mut g = Dashboard::new().for_task(Task::GitHub { login: "acme".into(), host: String::new(), started: true, done: false });
+        assert!(g.task_done().is_none() && String::from_utf8(g.task_page().unwrap().body).unwrap().contains("Finish on GitHub"));
+        let _ = g.handle(&Req { method: "GET".into(), path: "/github/installed".into(), query: vec![], cookie: None, last: None, body: vec![], host: String::new(), origin: None, fetch_site: None });
+        assert!(g.task_done().unwrap().starts_with("GitHub is connected for acme"));
+    }
+
+    #[test]
+    fn signing_out_and_a_sign_in_that_ended() {
+        let dir = std::env::temp_dir().join(format!("superci-out-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let store = Store::at(&dir);
+        let plane = Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "http://127.0.0.1:9".into(), plane_id: "abcdef123456".into(), label: "superci".into() };
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
+        d.planes.push(plane.clone());
+        d.keep();
+        // The sidebar's More menu signs out: nothing is left on this machine, and the page says so once.
+        assert!(Dashboard::sidebar("overview").contains(r#"<details class="menu side-more"><summary>"#) && Dashboard::sidebar("overview").contains(r#"<form method="post" action="/signout"><button>Sign out</button></form>"#));
+        // The control plane kept from the last run is listed at once, before any cloud was asked.
+        let mut next = Dashboard::signed_in(Some(store.clone()));
+        assert_eq!(next.planes, vec![plane.clone()]);
+        // Its AWS sign-in ended meanwhile: its pages still show, with a way to sign in again.
+        next.aws_ended = true;
+        let notice = next.aws_ended_notice();
+        preview("aws-ended", &format!("{notice}{}", next.render("overview", &[view::plane_view(&plane, None)], None)));
+        assert!(notice.contains("Your AWS sign-in has ended (AWS ends one after 12 hours)") && notice.contains(r#"action="/aws/signin""#));
+        next.aws = Some(aws::Session::for_test("123456789012"));
+        assert!(next.aws_ended_notice().is_empty());
+        assert_eq!(next.act("/signout", &[]).unwrap(), "");
+        assert!(!store.path().exists() && next.signed_in_as().is_none() && next.planes.is_empty());
+        assert!(next.notice.as_deref().is_some_and(|n| n.starts_with("Signed out.")));
+        assert!(!Dashboard::signed_in(Some(store.clone())).read_only_of_test());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
