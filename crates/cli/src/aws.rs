@@ -44,7 +44,7 @@ pub const ENDED: &str = "Your AWS sign-in has ended";
 /// A sign-in on its way: sent to AWS's page, waiting for its redirect back.
 pub struct Pending { verifier: String, pub state: String, key: SigningKeyStore, region: String, redirect: String }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub region: String,
     pub account_id: String,

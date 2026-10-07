@@ -1,7 +1,7 @@
-//! Where a control plane runs (the always-on part: GitHub's webhooks in, machines for jobs out). Nothing about it is
-//! kept on this machine: the dashboard finds it in your clouds after you sign in.
+//! Where a control plane runs (the always-on part: GitHub's webhooks in, machines for jobs out). The dashboard finds
+//! it in your clouds after you sign in; the one in use is kept with the sign-ins (store.rs), so commands reach it at once.
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Plane {
     Cloudflare { account_id: String, account_name: String, script: String, url: String, plane_id: String, label: String },
     /// A Lambda function with its URL, a DynamoDB table and a schedule (see aws_plane.rs).

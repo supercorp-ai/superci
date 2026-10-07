@@ -366,7 +366,11 @@ pub fn oauth_redirect() -> String { format!("http://localhost:{OAUTH_PORT}/oauth
 
 pub struct Pending { verifier: String, pub state: String }
 
-pub struct Session { access: String, refresh: Option<String>, expires_at: std::time::Instant }
+/// A sign-in with Cloudflare: its token, when that ends, and what renews it (kept with SuperCI's sign-ins: store.rs).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Session { access: String, refresh: Option<String>, expires_at_ms: u64 }
+
+fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
 pub fn authorize() -> (String, Pending) {
     // What it needs, asked once (`permissions::CLOUDFLARE`): read which accounts you have and their usage, change
@@ -390,7 +394,13 @@ fn token_call(fields: &[(&str, &str)]) -> Result<Session> {
     let v: Value = serde_json::from_str(&text).unwrap_or_default();
     let Some(access) = v["access_token"].as_str() else { return Err(format!("Cloudflare sign-in: {}", text.chars().take(200).collect::<String>())) };
     Ok(Session { access: access.into(), refresh: v["refresh_token"].as_str().map(str::to_string),
-        expires_at: std::time::Instant::now() + Duration::from_secs(v["expires_in"].as_u64().unwrap_or(3600)) })
+        expires_at_ms: now_ms() + v["expires_in"].as_u64().unwrap_or(3600) * 1000 })
+}
+
+/// Asks Cloudflare to end a sign-in (its token to renew with), as `wrangler logout` does. Whether Cloudflare said yes.
+pub fn end_sign_in(refresh: &str) -> bool {
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("client_id", OAUTH_CLIENT), ("token_type_hint", "refresh_token"), ("token", refresh)]).finish();
+    quick().post("https://dash.cloudflare.com/oauth2/revoke").header("content-type", "application/x-www-form-urlencoded").send(body).is_ok_and(|r| r.status().is_success())
 }
 
 pub fn exchange(p: Pending, code: &str) -> Result<Session> {
@@ -398,15 +408,22 @@ pub fn exchange(p: Pending, code: &str) -> Result<Session> {
 }
 
 impl Session {
-    /// An environment token (for automation) never expires here.
-    pub fn from_token(token: &str) -> Self { Session { access: token.trim().into(), refresh: None, expires_at: std::time::Instant::now() + Duration::from_secs(365 * 86400) } }
+    /// A token given to SuperCI by name (SUPERCI_CLOUDFLARE_TOKEN, for a machine with no browser) never expires here.
+    pub fn from_token(token: &str) -> Self { Session { access: token.trim().into(), refresh: None, expires_at_ms: now_ms() + 365 * 86_400_000 } }
+
+    /// What renews it, to ask Cloudflare to end it (`superci logout`).
+    pub fn refresh_token(&self) -> Option<&str> { self.refresh.as_deref() }
 
 
     /// A client whose token is good for a few more minutes, renewing it when needed.
     pub fn client(&mut self) -> Result<Cloudflare> {
-        if self.expires_at < std::time::Instant::now() + Duration::from_secs(300) {
+        if self.expires_at_ms < now_ms() + 300_000 {
             let refresh = self.refresh.clone().ok_or("the Cloudflare sign-in expired: sign in again")?;
-            *self = token_call(&[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", OAUTH_CLIENT)])?;
+            let renewed = token_call(&[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", OAUTH_CLIENT)])
+                // Cloudflare refusing what renews it: the sign-in is over. Cloudflare not answering leaves it as it is.
+                .map_err(|e| if e.contains("invalid_grant") || e.contains("invalid_token") { format!("the Cloudflare sign-in expired: sign in again ({e})") } else { e })?;
+            // Cloudflare may give a new one to renew with, or leave the one before in place.
+            *self = Session { refresh: renewed.refresh.or(Some(refresh)), ..renewed };
         }
         Ok(Cloudflare::new(&self.access))
     }
@@ -467,11 +484,11 @@ mod tests {
     use std::time::Instant;
 
     /// A Cloudflare runner agent (deployed for this check only, trusting a key made here) starts a runner with a
-    /// 3-minute bound; nobody stops it, and its container ends by itself (CLOUDFLARE_API_TOKEN, SUPERCI_LIVE_CF_ACCOUNT).
+    /// 3-minute bound; nobody stops it, and its container ends by itself (SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_LIVE_CF_ACCOUNT).
     #[test]
     #[ignore]
     fn live_cloudflare_runner_ends_at_its_time_bound() {
-        let cf = Cloudflare::new(&std::env::var("CLOUDFLARE_API_TOKEN").expect("CLOUDFLARE_API_TOKEN"));
+        let cf = Cloudflare::new(&std::env::var("SUPERCI_CLOUDFLARE_TOKEN").expect("SUPERCI_CLOUDFLARE_TOKEN"));
         let account = std::env::var("SUPERCI_LIVE_CF_ACCOUNT").expect("SUPERCI_LIVE_CF_ACCOUNT");
         let key = superci_core::crypto::SigningKeyStore::generate();
         // The "control plane": its keys served here, as the dashboard reads them when it sets an agent up.
@@ -519,12 +536,12 @@ mod tests {
 
 #[cfg(test)]
 mod metering {
-    /// Reads Cloudflare's metering for containers by id (CLOUDFLARE_API_TOKEN, SUPERCI_LIVE_CF_ACCOUNT, SUPERCI_LIVE_CF_IDS:
+    /// Reads Cloudflare's metering for containers by id (SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_LIVE_CF_ACCOUNT, SUPERCI_LIVE_CF_IDS:
     /// comma-separated Durable Object ids, SUPERCI_LIVE_CF_FROM / _TO: ms).
     #[test]
     #[ignore]
     fn live_cloudflare_container_costs() {
-        let cf = super::Cloudflare::new(&std::env::var("CLOUDFLARE_API_TOKEN").unwrap());
+        let cf = super::Cloudflare::new(&std::env::var("SUPERCI_CLOUDFLARE_TOKEN").unwrap());
         let ids: Vec<String> = std::env::var("SUPERCI_LIVE_CF_IDS").unwrap().split(',').map(str::to_string).collect();
         let n = |k: &str| std::env::var(k).unwrap().parse::<u64>().unwrap();
         let costs = cf.container_costs(&std::env::var("SUPERCI_LIVE_CF_ACCOUNT").unwrap(), &ids, n("SUPERCI_LIVE_CF_FROM"), n("SUPERCI_LIVE_CF_TO")).unwrap();

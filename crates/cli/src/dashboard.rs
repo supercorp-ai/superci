@@ -1,12 +1,13 @@
 //! The dashboard, served only on this machine and only while `superci` runs. You sign in with your clouds in the
 //! browser; it lists every control plane it finds there (or sets one up), each control plane's jobs, the machines running them, and the
 //! clouds they run on; it creates a control plane's GitHub App (GitHub redirects back here; the App's key goes straight into the
-//! control plane's secrets) and connects AWS. Nothing is kept on this machine; closing it changes nothing.
+//! control plane's secrets) and connects AWS. It keeps SuperCI's own sign-ins in SuperCI's folder on this machine (store.rs), so it
+//! opens signed in and commands run without it; closing it changes nothing.
 //!
 //! It listens on localhost:8976 (the one return address Cloudflare's browser sign-in allows). The page is opened with a
 //! random key in its URL, which becomes a same-site cookie: other websites and processes cannot drive it. It changes a
 //! control plane only through the cloud's own API with your sign-in, and reads a control plane's jobs with a key it writes into the
-//! control plane's secrets for this session.
+//! control plane's secrets (kept with the sign-ins, renewed every thirty days).
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -27,6 +28,7 @@ use crate::cloudflare::{self, Cloudflare, OAUTH_PORT};
 use crate::logos::{icon, logo};
 use crate::modal;
 use crate::plane::Plane;
+use crate::store::{Kept, Key, Store};
 use crate::view::{self, PlaneView, DASHBOARD_VERSION};
 use crate::Result;
 
@@ -45,6 +47,19 @@ pub struct Dashboard {
     status_secret: String,
     keyed: HashSet<String>,
     cf: Option<cloudflare::Session>,
+    /// A sign-in given by name for this run (SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID): used, never kept.
+    cf_given: bool,
+    modal_given: bool,
+    /// SuperCI's folder on this machine, where its sign-ins are kept (none: nothing is kept), what was last written
+    /// there, the control plane in use as kept (for commands, before any cloud was asked), and whether writing failed.
+    store: Option<Store>,
+    kept_as: String,
+    kept_plane: Option<Plane>,
+    keep_failed: bool,
+    /// A kept AWS sign-in turned out to have ended (AWS ends one after twelve hours at most).
+    aws_ended: bool,
+    /// `superci login`: only the sign-in is wanted; once there is one, the page says so and the program ends.
+    login_only: bool,
     cf_pending: Option<cloudflare::Pending>,
     cf_accounts: Vec<(String, String)>,
     aws: Option<aws::Session>,
@@ -225,6 +240,24 @@ fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
 }
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+
+/// What `superci status` says when SuperCI is signed in nowhere, and when its only sign-in was AWS's and has ended.
+pub const NOT_SIGNED_IN: &str = "SuperCI is not signed in on this computer. Run `superci login` (it opens your browser).";
+pub const AWS_ENDED: &str = "SuperCI's AWS sign-in has ended (AWS ends one after twelve hours at most). Run `superci login` to sign in again.";
+
+/// A day, as 2026-10-07 (UTC), from unix seconds.
+fn day(unix: u64) -> String {
+    let z = unix as i64 / 86_400 + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 })
+}
+
+/// When a key ends, from the name it is stored under in a control plane (`DASHBOARD_KEY_<unix seconds>_<random>`).
+fn key_until(name: &str) -> u64 { name.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()?.parse().ok()).unwrap_or(0) }
 
 fn ago(at_ms: u64) -> String {
     let s = now_ms().saturating_sub(at_ms) / 1000;
@@ -452,11 +485,125 @@ fn plain_reason(j: &serde_json::Value) -> String {
 
 impl Dashboard {
     pub fn new() -> Self {
-        // For automation only: a Cloudflare API token from the environment instead of signing in.
-        let cf = std::env::var("CLOUDFLARE_API_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
+        // For a machine with no browser: a Cloudflare API token given to SuperCI by name instead of signing in
+        // (Cloudflare's and Modal's own variables are not read).
+        let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
+        let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal: modal::Session::from_env(), modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, login_only: false, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+    }
+
+    /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
+    /// sign-in given by name for this run comes first.
+    pub fn signed_in(store: Option<Store>) -> Self {
+        let mut d = Dashboard::new();
+        let Some(store) = store else { return d };
+        let kept = store.read();
+        if d.cf.is_none() { d.cf = kept.cloudflare }
+        d.aws = kept.aws;
+        if d.modal.is_none() { d.modal = kept.modal }
+        // The key the control planes were handed, while it lasts another day; else a new one, good for thirty days.
+        match kept.key.filter(|k| key_until(&k.name) > now_ms() / 1000 + 86_400) {
+            Some(k) => { d.status_key = k.value; d.status_secret = k.name; d.keyed = k.planes.into_iter().collect() }
+            None => d.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()),
+        }
+        d.kept_plane = kept.plane;
+        d.store = Some(store);
+        d.kept_as = serde_json::to_string(&d.kept()).unwrap_or_default();
+        d
+    }
+
+    /// `superci login`: a dashboard that only signs in.
+    pub fn for_login(mut self) -> Self { self.login_only = true; self }
+
+    /// Where SuperCI is signed in, in words (nothing: nowhere).
+    pub fn signed_in_as(&self) -> Option<String> {
+        let mut at = vec![];
+        if let Some(a) = &self.aws { at.push(format!("AWS account {}", a.account_id)) }
+        if self.cf.is_some() { at.push(if self.cf_given { "Cloudflare (a token given for this run)".to_string() } else { "Cloudflare".to_string() }) }
+        if let Some(m) = &self.modal { at.push(format!("Modal workspace {}", m.workspace)) }
+        if at.is_empty() { None } else { Some(at.join(", ")) }
+    }
+
+    /// The control plane in use and what it says of itself, for `superci status`: read with the kept key when its
+    /// control plane has it (no cloud is asked), else after looking in the clouds signed in to.
+    pub fn status(&mut self) -> Result<serde_json::Value> {
+        let signed_in = self.signed_in_as().ok_or(NOT_SIGNED_IN)?;
+        let kept = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id()));
+        let read = |p: &Plane, key: &str| view::plane_view(p, Some(key));
+        let mut view = kept.as_ref().map(|p| read(p, &self.status_key)).filter(|v| v.status.is_some());
+        if view.is_none() {
+            // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.
+            self.keyed.clear();
+            self.discover()?;
+            if self.signed_in_as().is_none() { return Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) }
+            let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
+            if views.is_empty() { return Ok(serde_json::json!({ "signed_in": signed_in, "control_plane": null })) }
+            let p = views[view::in_use(&views)].plane.clone();
+            if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.selected = i }
+            let mut v = read(&p, &self.status_key);
+            if v.online && v.status.is_none() && self.keyed.contains(p.plane_id()) { v.status = status_soon(p.url(), &self.status_key) }
+            view = Some(v);
+            self.keep();
+        }
+        let v = view.expect("read above");
+        Ok(serde_json::json!({
+            "signed_in": signed_in,
+            "control_plane": { "id": v.plane.plane_id(), "cloud": v.plane.cloud(), "where": v.plane.place(), "url": v.plane.url(), "label": v.plane.label(),
+                "online": v.online, "version": v.version, "update_to": if v.outdated() { Some(DASHBOARD_VERSION) } else { None }, "ready": v.ready() },
+            "status": v.status,
+        }))
+    }
+
+    /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
+    /// to (Cloudflare), and the control plane in use was asked to forget this machine's key. What was done, in words.
+    pub fn logout(mut self) -> Result<Vec<String>> {
+        let Some(store) = self.store.clone() else { return Ok(vec!["Nothing is kept on this machine (it has no home folder).".into()]) };
+        let mut said = vec![];
+        if store.read().key.is_some() {
+            if let Some(p) = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id())) {
+                let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone() };
+                match writer.drop(&p, &self.status_secret) {
+                    Ok(()) => said.push(format!("The control plane ({}) no longer takes this machine's key.", p.place())),
+                    Err(_) => said.push(format!("The control plane ({}) still has this machine's key, which only reads; it ends by itself by {}.", p.place(), day(key_until(&self.status_secret)))),
+                }
+            }
+        }
+        if let Some(refresh) = self.cf.as_ref().filter(|_| !self.cf_given).and_then(|s| s.refresh_token()) {
+            said.push(if cloudflare::end_sign_in(refresh) { "Cloudflare ended SuperCI's sign-in.".into() } else { "Cloudflare did not confirm ending SuperCI's sign-in; it is removed here.".to_string() });
+        }
+        if self.modal.is_some() && !self.modal_given { said.push("SuperCI's Modal token is removed here; it stays listed in Modal (Settings → API tokens) until deleted there.".into()) }
+        if self.aws.is_some() { said.push("SuperCI's AWS sign-in is removed here; AWS ends it by itself within twelve hours of when it was made.".into()) }
+        said.push(if store.remove()? { format!("Removed {}.", store.path().display()) } else { "Nothing was kept on this machine.".into() });
+        Ok(said)
+    }
+
+    /// What is to be kept, as things are now.
+    fn kept(&self) -> Kept {
+        let mut planes: Vec<String> = self.keyed.iter().cloned().collect();
+        planes.sort();
+        Kept {
+            cloudflare: if self.cf_given { None } else { self.cf.clone() },
+            aws: self.aws.clone(),
+            modal: if self.modal_given { None } else { self.modal.clone() },
+            key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
+            plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
+        }
+    }
+
+    /// Keeps the sign-ins as they are now (a new one, a renewed one, one that ended), when they changed. Signed in
+    /// nowhere: nothing is kept.
+    fn keep(&mut self) {
+        let Some(store) = self.store.clone() else { return };
+        let kept = self.kept();
+        let text = serde_json::to_string(&kept).unwrap_or_default();
+        if text == self.kept_as { return }
+        let done = if kept.signed_in() { store.write(&kept) } else { store.remove().map(|_| ()) };
+        match done {
+            Ok(()) => self.kept_as = text,
+            Err(e) => if !self.keep_failed { println!("{e}"); self.keep_failed = true },
+        }
     }
 
     /// Serves the dashboard until you quit it (or Ctrl-C), opening it in the browser.
@@ -475,8 +622,10 @@ impl Dashboard {
         }
         if listening == 0 { return Err(format!("port {port} is in use (is another SuperCI or `wrangler login` running?)")) }
         let link = format!("{}/?k={}", self.base, self.key);
-        println!("SuperCI dashboard (on this machine only): {link}");
-        if open_browser {
+        println!("{}: {link}", if self.login_only { "Sign in with your cloud here (on this machine only)" } else { "SuperCI dashboard (on this machine only)" });
+        if self.login_only {
+            if open_browser { let _ = open::that(&link); }
+        } else if open_browser {
             println!("It is opening in your browser. Ctrl-C stops it; your runners keep working without it.");
             let _ = open::that(&link);
         } else {
@@ -485,7 +634,23 @@ impl Dashboard {
         // One thread per connection, each with a read timeout: a browser's idle spare connection cannot hold up a page.
         // The page frame needs no shared state, so it is drawn at once; the live part holds it only briefly.
         let key = self.key.clone();
+        let login_only = self.login_only;
         let shared = Arc::new(Mutex::new(self));
+        if login_only {
+            // Signed in: kept, said, and (a moment later, so the tab gets its last page) ended.
+            let shared = shared.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(300));
+                let mut d = lock(&shared);
+                if let Some(now) = d.signed_in_as() {
+                    d.keep();
+                    println!("Signed in: {now}. Kept in {}; `superci logout` removes it.", d.store.as_ref().map(|s| s.path().display().to_string()).unwrap_or_else(|| "nothing (no home folder)".into()));
+                    drop(d);
+                    std::thread::sleep(Duration::from_millis(2500));
+                    std::process::exit(0)
+                }
+            });
+        }
         for stream in rx {
             let (shared, key) = (shared.clone(), key.clone());
             std::thread::spawn(move || {
@@ -537,7 +702,15 @@ impl Dashboard {
     fn discover(&mut self) -> Result<()> {
         // Every cloud signed in to and not looked in yet, at once.
         let cf = if self.cf.is_some() && !self.looked_cf { Some(self.cloudflare()?) } else { None };
-        let aws = match (self.aws.as_mut(), self.looked_aws) { (Some(s), false) => Some((s.credentials()?, s.account_id.clone())), _ => None };
+        let asked = if self.looked_aws { None } else { self.aws.as_mut().map(|s| (s.credentials(), s.account_id.clone())) };
+        let aws = match asked {
+            Some((Ok(creds), account)) => Some((creds, account)),
+            // Over on AWS's side (a sign-in lasts twelve hours at most, and one kept from yesterday has ended):
+            // forgotten, so the pages ask for it again.
+            Some((Err(e), _)) if e.starts_with(aws::ENDED) => { self.aws = None; self.aws_ended = true; None }
+            Some((Err(e), _)) => return Err(e),
+            None => None,
+        };
         let modal = if self.looked_modal { None } else { self.modal.clone() };
         let accounts = self.cf_accounts.clone();
         let (cf_found, aws_found, modal_found) = std::thread::scope(|s| {
@@ -877,6 +1050,7 @@ impl Dashboard {
                 let pending = self.aws_pending.take().unwrap();
                 if !q("error").is_empty() { return Ok(message(400, "AWS sign-in was not completed", &esc(q("error")))) }
                 self.aws = Some(aws::exchange(pending, q("code"))?);
+                self.aws_ended = false;
                 println!("Signed in to AWS.");
                 self.looked_aws = false;
                 Ok(back_to("Signed in with AWS", "Looking for SuperCI in your account…", &format!("{}/{}", self.base, self.return_to)))
@@ -1107,7 +1281,7 @@ impl Dashboard {
                 if !fresh { return Ok(message(400, "This App creation has expired", "Start again from the dashboard.")) }
                 let host = self.manifest_state.as_ref().and_then(|(_, _, h)| h.clone());
                 let app = convert_manifest_code(&github::api_base(host.as_deref()), host.as_deref(), q("code"))?;
-                // The App's key goes straight into the control plane's encrypted secrets; this machine keeps nothing.
+                // The App's key goes straight into the control plane's encrypted secrets; this machine does not keep it.
                 let plane = self.plane()?;
                 // A further organization (the control plane has an App of another account already): beside the first,
                 // as a secret of its own.
@@ -1438,7 +1612,7 @@ load()})();</script>"#;
                     d.cf = None;
                     d.looked_cf = false;
                     return format!(r#"<div class="bar"><h1 class="page-title">Sign in again</h1></div><div class="cards"><section class="card">{}</section></div>"#,
-                        empty_state(&logo("cloudflare", 40), "Your Cloudflare sign-in has ended", "Sign-ins last an hour and are kept only while this dashboard runs. Your runners keep working meanwhile.", &signin_button("cloudflare", "Sign in with Cloudflare", true)));
+                        empty_state(&logo("cloudflare", 40), "Your Cloudflare sign-in has ended", "Cloudflare ended it, or it was ended there. Your runners keep working meanwhile.", &signin_button("cloudflare", "Sign in with Cloudflare", true)));
                 }
                 return format!(r#"<div class="bar"><h1 class="page-title">Could not reach your cloud</h1></div><div class="cards"><section class="card">{}</section></div>"#, empty_state(&icon("lock"), "Your cloud did not answer", &e, r#"<a class="button" href="">Try again</a>"#))
             }
@@ -1521,6 +1695,7 @@ load()})();</script>"#;
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
         // A change's note is said once.
         if ["planes", "runners"].contains(&section_name(section)) { d.flash = None }
+        d.keep();
         html
     }
 
@@ -1536,7 +1711,7 @@ load()})();</script>"#;
 
     fn render(&self, section: &str, views: &[PlaneView], last: Option<&str>) -> String {
         let section = section_name(section);
-        // Nothing is kept here: until a cloud is connected, whether (and where) SuperCI runs is not known yet.
+        // No cloud signed in to: whether (and where) SuperCI runs is not known yet.
         if self.cf.is_none() && self.aws.is_none() && self.modal.is_none() && views.is_empty() {
             lock(side()).clear();
             // Back from Modal's sign-in: the page looks again until it is approved.
@@ -3399,6 +3574,10 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     if !req.cookie.as_deref().is_some_and(|c| safe_eq(c.as_bytes(), key.as_bytes())) && !["/github/callback", "/github/installed", "/oauth/callback", "/oauth/modal"].contains(&req.path.as_str()) {
         return message(403, "This tab is not connected to your dashboard", "Open the link SuperCI printed in your terminal when it started (it begins with http://localhost:8976/?k=). Nothing has changed.");
     }
+    // `superci login`, signed in: its tab's last page (the program ends a moment later).
+    if req.method == "GET" && req.path == "/" && { let d = lock(shared); d.login_only && d.signed_in_as().is_some() } {
+        return message(200, "Signed in", "SuperCI on this computer is signed in. You can close this tab.");
+    }
     if req.method == "GET" && req.path == "/" {
         let new_here = match q("new") { "1" => Some(true), "0" => Some(false), _ => None };
         if q("fragment") == "1" {
@@ -3411,6 +3590,7 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     d.views = None;
     // Actions and sign-ins are told in the terminal too (never their codes or tokens).
     let r = d.handle(req);
+    d.keep();
     match &r {
         Ok(ok) => println!("{} {} → {}", req.method, req.path, ok.status),
         Err(e) => println!("{} {} → failed: {e}", req.method, req.path),
@@ -4447,5 +4627,51 @@ mod tests {
         *lock(&d.deployed) = true;
         assert!(d.render("plane", &[], None).contains(r#"<div data-go="/"></div>"#));
         assert!(d.render("plane", &[], None).contains("Set up a control plane"));
+    }
+
+    #[test]
+    fn sign_ins_are_kept_in_supercis_own_folder() {
+        let dir = std::env::temp_dir().join(format!("superci-kept-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let store = Store::at(&dir);
+        // Signed in nowhere: nothing is kept, and a command says what a person must do first.
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.keep();
+        assert!(d.signed_in_as().is_none() && !store.path().exists());
+        assert_eq!(d.status().unwrap_err(), NOT_SIGNED_IN);
+        // A sign-in made in the dashboard is kept; the next start has it, with the same key for its control planes.
+        d.aws = Some(aws::Session::for_test("123456789012"));
+        d.modal = Some(modal::Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acme".into() });
+        d.keyed.insert("abcdef123456".into());
+        d.planes.push(Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "https://x.lambda-url.us-east-1.on.aws".into(), plane_id: "abcdef123456".into(), label: "superci".into() });
+        d.keep();
+        assert!(key_until(&d.status_secret) > now_ms() / 1000 + 29 * 86_400, "a kept key lasts thirty days");
+        let again = Dashboard::signed_in(Some(store.clone()));
+        assert_eq!(again.signed_in_as().unwrap(), "AWS account 123456789012, Modal workspace acme");
+        assert!(again.status_key == d.status_key && again.status_secret == d.status_secret && again.keyed.contains("abcdef123456"));
+        assert_eq!(again.kept_plane.as_ref().map(|p| p.plane_id()), Some("abcdef123456"));
+        // A sign-in given by name for one run is used, and not kept.
+        let mut given = Dashboard::signed_in(Some(store.clone()));
+        given.cf = Some(cloudflare::Session::from_token("t"));
+        given.cf_given = true;
+        given.keep();
+        assert!(given.signed_in_as().unwrap().contains("Cloudflare (a token given for this run)") && store.read().cloudflare.is_none());
+        // A key about to end is not taken up again.
+        let mut kept = store.read();
+        kept.key.as_mut().unwrap().name = format!("DASHBOARD_KEY_{}_ABCDEF", now_ms() / 1000 + 3600);
+        store.write(&kept).unwrap();
+        assert!(Dashboard::signed_in(Some(store.clone())).status_key != d.status_key);
+        // Signed in nowhere any more (a sign-in that ended): nothing is left on this machine.
+        d.aws = None;
+        d.modal = None;
+        d.keep();
+        assert!(!store.path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn days_are_said_as_dates() {
+        assert_eq!(day(0), "1970-01-01");
+        assert_eq!(day(1_791_331_200), "2026-10-07");
+        assert_eq!(day(1_709_164_800), "2024-02-29");
     }
 }

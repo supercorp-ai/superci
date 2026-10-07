@@ -96,12 +96,14 @@ pub fn github_missing(have: &Value, org: bool) -> Vec<Need> {
     github(org).into_iter().filter(|(name, level, _)| rank(have[*name].as_str().unwrap_or("")) < rank(level)).map(|(_, _, n)| n).collect()
 }
 
-/// What the dashboard asks Cloudflare for at each sign-in (OAuth scopes). Nothing is kept in the account: a newer
+/// What the dashboard asks Cloudflare for at a sign-in (OAuth scopes). Nothing is kept in the account: a newer
 /// dashboard asks for its own at the next sign-in, and the control plane and runner agent hold no Cloudflare credentials.
+/// `offline_access` is what lets the sign-in be renewed (without it, it ends after an hour).
 pub const CLOUDFLARE: &[Need] = &[
     Need { id: "account:read", what: "Read your accounts and their usage", why: "To find control planes, and read what containers cost (usage analytics).", since: "0.1.0", writes: false },
     Need { id: "workers_scripts:write", what: "Deploy Workers and set their secrets", why: "The control plane and the runner agent are Workers, updated from here.", since: "0.1.0", writes: true },
     Need { id: "containers:write", what: "Manage container applications and images", why: "Jobs run in containers started from GitHub's runner image.", since: "0.1.0", writes: true },
+    Need { id: "offline_access", what: "Stay signed in", why: "So SuperCI on this computer can go on without asking you to sign in every hour. It is kept in SuperCI's own folder; `superci logout` ends it.", since: "0.11.0", writes: false },
 ];
 
 /// The scopes the dashboard asks Cloudflare for, as OAuth writes them.

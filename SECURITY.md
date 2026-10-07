@@ -10,9 +10,19 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
 
 ## How SuperCI is built, and where the trust lines are
 
-- **The dashboard** runs on your computer (`localhost:8976`) and stores nothing. It opens with a random key in its URL,
-  which becomes a cookie. It answers only on this computer's own address, and makes changes only on requests from its
-  own pages.
+- **The dashboard** runs on your computer (`localhost:8976`). It opens with a random key in its URL, which becomes a
+  cookie. It answers only on this computer's own address, and makes changes only on requests from its own pages.
+- **SuperCI's sign-ins** are its own, kept on your computer in `~/.superci/sign-ins.json` (readable by you alone), so
+  the dashboard opens signed in and commands such as `superci status` run without a browser. It reads no other
+  tool's credentials: no AWS profile, no wrangler or Modal login, none of their environment variables. What is kept:
+  - AWS: the browser sign-in. It can do what you can in that account, and AWS ends it after twelve hours at most.
+  - Cloudflare: the browser sign-in, renewed by SuperCI until you end it. It reaches Workers and containers in the
+    accounts you can reach; Cloudflare has nothing narrower.
+  - Modal: a token for your workspace, until you delete it in Modal.
+  - A key to read your control plane's status, renewed every thirty days.
+  Anyone who can read that file can act as SuperCI does in those clouds. `superci logout` removes it, asks Cloudflare
+  to end its sign-in, and asks your control plane to forget the key. Nothing of this is in your control plane or
+  anywhere outside your computer.
 - **The control plane** runs in your cloud account (a Cloudflare Worker, an AWS Lambda, or a Modal app). It is open
   to the internet, because GitHub and GitLab send it webhooks. Anything else needs one of these:
   - a GitHub signature (HMAC, compared in constant time);

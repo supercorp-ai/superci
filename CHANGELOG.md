@@ -2,6 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.11.0 — unreleased
+- SuperCI stays signed in. Its sign-ins to your clouds are kept in its own folder on your computer (`~/.superci`, readable by you alone), so the dashboard opens where you left it. An AWS sign-in still ends after twelve hours at most, as AWS has it; Cloudflare's no longer ends after an hour.
+- Commands beside the dashboard, on the same sign-ins: `superci login` (signs in, in the browser, and ends), `superci status` (the control plane in use and what it says; `--json` for programs and coding agents) and `superci logout` (removes the sign-ins from this computer, asks Cloudflare to end its one, and has the control plane forget this computer's key).
+- SuperCI reads no other tool's credentials. `CLOUDFLARE_API_TOKEN`, `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are no longer picked up; on a machine with no browser a sign-in is given by name: `SUPERCI_CLOUDFLARE_TOKEN`, `SUPERCI_MODAL_TOKEN_ID`, `SUPERCI_MODAL_TOKEN_SECRET`.
+- The key the dashboard reads a control plane with lasts thirty days and is reused between runs (before: a new one, twelve hours, at every start).
+
 ## 0.10.7 — 2026-10-06
 - `npx @superci/cli` works on Windows (x64, and arm64 through Windows' own x64 support). A release tries the package on both before it is published.
 - Every push and pull request to the repository is built and tested on GitHub.

@@ -87,15 +87,16 @@ pub fn month(session: &Session) -> Result<Month> {
     Ok(Month { metered: n(&summary.metered_cost), billed: n(&summary.billed_cost), superci })
 }
 
-/// A signed-in Modal workspace (held in memory only).
-#[derive(Clone)]
+/// A signed-in Modal workspace (SuperCI's own token there, kept with its sign-ins: store.rs).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Session { pub token_id: String, pub token_secret: String, pub workspace: String }
 
 impl Session {
-    /// For automation only: a token from the environment (MODAL_TOKEN_ID, MODAL_TOKEN_SECRET) instead of signing in.
+    /// For a machine with no browser: a token given to SuperCI by name (SUPERCI_MODAL_TOKEN_ID,
+    /// SUPERCI_MODAL_TOKEN_SECRET) instead of signing in. Modal's own variables are not read.
     pub fn from_env() -> Option<Session> {
         let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
-        let (token_id, token_secret) = (var("MODAL_TOKEN_ID")?, var("MODAL_TOKEN_SECRET")?);
+        let (token_id, token_secret) = (var("SUPERCI_MODAL_TOKEN_ID")?, var("SUPERCI_MODAL_TOKEN_SECRET")?);
         let mut c = Client::new(Some(Session { token_id: token_id.clone(), token_secret: token_secret.clone(), workspace: String::new() })).ok()?;
         let w: pb::WorkspaceNameLookupResponse = c.unary("WorkspaceNameLookup", pb::Empty {}).ok()?;
         Some(Session { token_id, token_secret, workspace: w.username })
@@ -350,12 +351,12 @@ mod tests {
     }
 
     /// A runner sandbox with a 3-minute bound, as the control plane starts one, ends by itself; and a job's sandbox,
-    /// holding no token, cannot read this workspace's stored settings (MODAL_TOKEN_ID/SECRET, plus live.rs's settings).
+    /// holding no token, cannot read this workspace's stored settings (SUPERCI_MODAL_TOKEN_ID/SECRET, plus live.rs's settings).
     #[test]
     #[ignore]
     fn live_modal_sandbox_ends_at_its_time_bound_and_cannot_read_settings() {
         use super::{pb, Client, Session};
-        let session = Session::from_env().expect("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET");
+        let session = Session::from_env().expect("SUPERCI_MODAL_TOKEN_ID and SUPERCI_MODAL_TOKEN_SECRET");
         let idle = crate::live::Idle::new(&format!("superci-leaktest-modal-{}", superci_core::crypto::random_id(6)));
         let script = r#"
 import modal, os, sys, time
@@ -476,11 +477,11 @@ except Exception as e:
     }
 
     /// What Modal says about this workspace's costs: its rates, this month's summary (metered, billed, credits), and
-    /// the last hours by object (MODAL_TOKEN_ID/SECRET).
+    /// the last hours by object (SUPERCI_MODAL_TOKEN_ID/SECRET).
     #[test]
     #[ignore]
     fn live_modal_billing() {
-        let session = super::Session::from_env().expect("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET");
+        let session = super::Session::from_env().expect("SUPERCI_MODAL_TOKEN_ID and SUPERCI_MODAL_TOKEN_SECRET");
         let out = run_script(&session, r#"
 import modal, datetime
 w = modal.Workspace.from_context()
@@ -495,11 +496,11 @@ for name, call in [("rates", lambda: w.billing.rates()), ("summary", lambda: w.b
         assert!(out.contains("BILLING rates"));
     }
 
-    /// This month as Modal bills it, read directly (MODAL_TOKEN_ID/SECRET).
+    /// This month as Modal bills it, read directly (SUPERCI_MODAL_TOKEN_ID/SECRET).
     #[test]
     #[ignore]
     fn live_modal_month() {
-        let m = super::month(&super::Session::from_env().expect("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET")).unwrap();
+        let m = super::month(&super::Session::from_env().expect("SUPERCI_MODAL_TOKEN_ID and SUPERCI_MODAL_TOKEN_SECRET")).unwrap();
         eprintln!("{m:?}");
         assert!(m.metered >= m.superci && m.metered >= m.billed);
     }
