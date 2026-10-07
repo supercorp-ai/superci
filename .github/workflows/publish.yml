@@ -113,7 +113,7 @@ jobs:
           mkdir try && cd try && npm init -y > /dev/null
           npm install ../npm/superci-cli-win32-x64-*.tgz ../npm/superci-cli-[0-9]*.tgz
           [ "$(npx superci --version | tr -d '\r')" = "superci $RELEASE_VERSION" ]
-          npx superci --no-browser > out.txt 2>&1 &
+          npx superci dashboard --no-browser > out.txt 2>&1 &
           for i in $(seq 1 30); do grep -q 'http://localhost' out.txt && break; sleep 1; done
           cat out.txt
           link=$(grep -o 'http://localhost[^ ]*' out.txt | head -1 | tr -d '\r')

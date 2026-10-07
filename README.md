@@ -3,7 +3,7 @@
 Your GitHub Actions and GitLab CI jobs, on fresh machines in your own AWS, Cloudflare or Modal account.
 
 ```sh
-npx @superci/cli
+npx @superci/cli dashboard
 ```
 
 That opens your dashboard, on your own computer. Sign in with your cloud, put a control plane there with one click, connect a repository, and change one line in a workflow:
@@ -20,7 +20,7 @@ Documentation: [superci.dev/docs](https://superci.dev/docs).
 
 ## How it is put together
 
-- **The dashboard** (`crates/cli`) runs on your computer. It deploys and updates everything else with SuperCI's own sign-ins to your clouds, kept in `~/.superci` (it reads no other tool's credentials); everything it does is also a command on the same sign-ins, for scripts and coding agents (`superci status --json`, `superci plane update`, `superci runners order …`; see `superci --help`), and `superci logout` removes them.
+- **The dashboard** (`crates/cli`) runs on your computer. It deploys and updates everything else with SuperCI's own sign-ins to your clouds, kept in `~/.superci` (it reads no other tool's credentials); everything it does is also a command on the same sign-ins, for scripts and coding agents (`superci status --json`, `superci plane update`, `superci runners order …`; `superci` alone lists them), and `superci logout` removes them.
 - **The control plane** (`crates/core`, with a thin runtime for each place it can live: `crates/plane-cloudflare`, `crates/plane-aws`, `crates/plane-modal`) runs in your cloud account. GitHub and GitLab tell it when a job is waiting, and it starts a machine for it at the first of your providers that can run it.
 - **Runner agents** (`crates/runners-cloudflare`, and a Modal app in `crates/cli/src/modal_agent.py`) start containers for a control plane that lives in another cloud.
 - **The image reader** (`crates/image-reader`) lets a Cloudflare container run jobs inside GitHub's full runner image without holding it on its disk.

@@ -1,4 +1,4 @@
-//! The dashboard, served only on this machine and only while `superci` runs. You sign in with your clouds in the
+//! The dashboard, served only on this machine and only while `superci dashboard` runs. You sign in with your clouds in the
 //! browser; it lists every control plane it finds there (or sets one up), each control plane's jobs, the machines running them, and the
 //! clouds they run on; it creates a control plane's GitHub App (GitHub redirects back here; the App's key goes straight into the
 //! control plane's secrets) and connects AWS. It keeps SuperCI's own sign-ins in SuperCI's folder on this machine (store.rs), so it
@@ -269,6 +269,15 @@ fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 /// What a command waits for after starting it (see `Dashboard::wait`).
 #[derive(Clone, Copy)]
 pub enum Background { Deploy, Update, Move }
+
+/// A job as commands say it: how it stands, what it is (its name, repository and workflow), the runner it got, how
+/// long it ran, what it cost, and why (when it failed or waits): the words the Jobs page has.
+pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
+    let state = match j["state"].as_str().unwrap_or_default() { "done" => "done", "failed" | "orphan" | "swept" => "failed", "cancelled" => "cancelled", "running" => "running", "waiting" => "waiting", _ => "starting" };
+    let (title, sub) = job_names(j);
+    let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { String::new() };
+    serde_json::json!({ "state": state, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
+}
 
 /// A control plane as commands say it.
 pub fn plane_json(v: &PlaneView) -> serde_json::Value {
@@ -585,6 +594,16 @@ impl Dashboard {
     /// What the task's tab shows at the dashboard's address, in the dashboard's place.
     fn task_page(&mut self) -> Option<Response> {
         if self.task_done().is_some() { return Some(message(200, "Done", "Back to your terminal: you can close this tab.")) }
+        // Modal's page does not come back with the sign-in: it is asked for here until it is approved there.
+        if matches!(self.task, Some(Task::Login(Some("modal")))) {
+            if let Some(pending) = self.modal_pending.clone() {
+                if let Ok(Some(session)) = modal::wait(&pending, 1.0) {
+                    (self.modal, self.modal_pending, self.looked_modal) = (Some(session), None, false);
+                    return Some(message(200, "Done", "Back to your terminal: you can close this tab."))
+                }
+                return Some(back_to("Approve it in Modal's tab", "This tab goes on by itself once you have.", &format!("{}/", self.base)))
+            }
+        }
         match self.task.as_mut()? {
             // A sign-in with one cloud goes straight to it; with any, the dashboard's own first screen asks which.
             Task::Login(Some(cloud)) => Some(Response::redirect(&format!("/connect/{cloud}"))),
@@ -820,7 +839,8 @@ impl Dashboard {
                     d.keep();
                     println!("{done}");
                     drop(d);
-                    std::thread::sleep(Duration::from_millis(2500));
+                    // A page that looks again by itself (every three seconds) gets its last word too.
+                    std::thread::sleep(Duration::from_millis(4000));
                     std::process::exit(0)
                 }
             });
@@ -1795,7 +1815,7 @@ function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='';
 function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}document.body.classList.remove('busy');clearTimeout(timer);var ld=h.match(/data-loading="([^"]+)"/),cur=main.querySelector('[data-loading]'),again=h.match(/data-refresh="(\d+)"/);if(h===shown||(ld&&cur&&cur.getAttribute('data-loading')===ld[1])){if(again)timer=setTimeout(load,again[1]*1000);return}shown=h;main.innerHTML=h;main.querySelectorAll('form.picker').forEach(superciPick);if(location.hash){var hd=document.getElementById(location.hash.slice(1));if(hd){if(hd.tagName==='DETAILS')hd.open=true;hd.scrollIntoView({block:'center'})}}document.body.classList.toggle('gated',!!main.querySelector('[data-gated]'));var u=main.querySelector('[data-side]'),su=document.getElementById('side-update'),nx=u?u.innerHTML:'';if(u)u.remove();if(su.innerHTML!==nx)su.innerHTML=nx;document.querySelectorAll('input[name=next]').forEach(function(i){i.value=location.search+(i.dataset.open&&location.search?'&open='+i.dataset.open:'')});var op=new URLSearchParams(location.search).get('open');if(op){var od=document.getElementById(op);if(od&&od.showModal)od.showModal();if(od||!main.querySelector('[data-refresh]')){var ou=new URL(location.href);ou.searchParams.delete('open');history.replaceState(null,'',ou.pathname+ou.search+ou.hash)}}clearTimeout(timer);var t=main.querySelector('[data-refresh]');if(t)timer=setTimeout(load,t.getAttribute('data-refresh')*1000)}
-function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci again.</div>'})}
+function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci dashboard again.</div>'})}
 function go(url){var u=new URL(url,location.href);history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
 document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||a.target||e.defaultPrevented||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname!=='/'||u.searchParams.has('k')||(u.search===location.search&&u.hash))return;e.preventDefault();go(u.href)});
 document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/'||/signin$|^\/github\/start/.test(act))return;e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}fetch(act,{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
@@ -3791,11 +3811,14 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     }
     // Redirects back from GitHub, Cloudflare, AWS and Modal come from their sites: no cookie; the state they carry guards them.
     if !req.cookie.as_deref().is_some_and(|c| safe_eq(c.as_bytes(), key.as_bytes())) && !["/github/callback", "/github/installed", "/oauth/callback", "/oauth/modal"].contains(&req.path.as_str()) {
-        return message(403, "This tab is not connected to your dashboard", "Open the link SuperCI printed in your terminal when it started (it begins with http://localhost:8976/?k=). Nothing has changed.");
+        return message(403, "This tab is not connected to your dashboard", "Open the link `superci dashboard` printed in your terminal when it started (it begins with http://localhost:8976/?k=). Nothing has changed.");
     }
-    // A command's tab (a sign-in, a GitHub App): what it is for, in the dashboard's place.
-    if req.method == "GET" && req.path == "/" && q("fragment") != "1" {
-        if let Some(page) = lock(shared).task_page() { return page }
+    // A command's tab (a sign-in, a GitHub App): what it is for, in the dashboard's place. A page that looks again by
+    // itself is told when it is done.
+    if req.method == "GET" && req.path == "/" {
+        let mut d = lock(shared);
+        if q("fragment") != "1" { if let Some(page) = d.task_page() { return page } }
+        else if d.task_done().is_some() { return Response::new(200, "text/html; charset=utf-8", r#"<div class="empty">Done. Back to your terminal: you can close this tab.</div>"#.to_string()) }
     }
     if req.method == "GET" && req.path == "/" {
         let new_here = match q("new") { "1" => Some(true), "0" => Some(false), _ => None };

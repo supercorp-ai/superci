@@ -3,7 +3,7 @@
 Your GitHub Actions and GitLab CI jobs, on fresh machines in your own AWS, Cloudflare or Modal account.
 
 ```sh
-npx @superci/cli
+npx @superci/cli dashboard
 ```
 
 That opens your dashboard, on your own computer. Sign in with your cloud, put a control plane there with one click, connect a repository, and change one line in a workflow:
