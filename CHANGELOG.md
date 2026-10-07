@@ -10,6 +10,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - After an AWS sign-in has ended, the dashboard still opens on your control plane and shows its jobs and settings (read with this computer's key), with a line saying the sign-in ended and a button to sign in again. Before, it would have shown the first screen as if nothing were known.
 - SuperCI reads no other tool's credentials. `CLOUDFLARE_API_TOKEN`, `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are no longer picked up; on a machine with no browser a sign-in is given by name: `SUPERCI_CLOUDFLARE_TOKEN`, `SUPERCI_MODAL_TOKEN_ID`, `SUPERCI_MODAL_TOKEN_SECRET`.
 - The key the dashboard reads a control plane with lasts thirty days and is reused between runs (before: a new one, twelve hours, at every start).
+- The dashboard has a new mark: four petals, as on superci.dev, in place of the two arrows.
 
 ## 0.10.7 — 2026-10-06
 - `npx @superci/cli` works on Windows (x64, and arm64 through Windows' own x64 support). A release tries the package on both before it is published.
