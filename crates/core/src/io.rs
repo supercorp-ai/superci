@@ -10,6 +10,10 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Asked of one request only (a job's log): a redirect is given back as it is, not followed, so the caller goes
+    /// on to another site without this request's credentials. A runtime whose client already drops credentials on
+    /// the way to another site may follow anyway; the caller takes either answer.
+    pub no_follow: bool,
 }
 
 impl Request {
@@ -25,6 +29,10 @@ impl Request {
     }
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
+        self
+    }
+    pub fn without_following(mut self) -> Self {
+        self.no_follow = true;
         self
     }
 }

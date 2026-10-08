@@ -171,7 +171,7 @@ pub async fn installation_token(http: &dyn Http, app: &App, installation_id: u64
 pub async fn job_log(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<Vec<u8>> {
     let ask = Request::new("GET", &format!("{api}/repos/{repo}/actions/jobs/{job_id}/logs"))
         .with_header("accept", "application/vnd.github+json").with_header("user-agent", "superci-plane").with_header("x-github-api-version", "2022-11-28")
-        .with_header("authorization", &format!("Bearer {token}"));
+        .with_header("authorization", &format!("Bearer {token}")).without_following();
     let mut r = http.send(ask).await?;
     if matches!(r.status, 301 | 302 | 303 | 307 | 308) {
         let at = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone()).ok_or("GitHub did not say where the log is")?;

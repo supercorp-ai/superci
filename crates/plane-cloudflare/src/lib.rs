@@ -164,28 +164,16 @@ impl Store for DoStore<'_> {
 #[async_trait(?Send)]
 impl Http for FetchHttp {
     async fn send(&self, r: io::Request) -> io::Result<io::Response> {
-        // A redirect is followed here, not by the runtime: to another site the request goes without its
-        // credentials (GitHub answers a job's log with a signed link elsewhere, which refuses a token it does not know).
-        let (mut url, mut method, mut body, mut headers_in) = (r.url.clone(), r.method.clone(), r.body.clone(), r.headers.clone());
-        let mut hops = 0;
-        let mut resp = loop {
-            let headers = Headers::new();
-            for (k, v) in &headers_in { headers.append(k, v).map_err(|e| e.to_string())?; }
-            let mut init = RequestInit::new();
-            init.with_method(Method::from(method.clone())).with_headers(headers).with_redirect(RequestRedirect::Manual);
-            if !body.is_empty() { init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into())); }
-            let req = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
-            let resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
-            let status = resp.status_code();
-            let to = resp.headers().get("location").ok().flatten().filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308) && hops < 5);
-            let Some(to) = to.and_then(|to| url::Url::parse(&url).ok()?.join(&to).ok()) else { break resp };
-            let same_site = url::Url::parse(&url).is_ok_and(|from| from.origin() == to.origin());
-            if !same_site { headers_in.retain(|(k, _)| !["authorization", "private-token", "cookie"].contains(&k.to_ascii_lowercase().as_str())) }
-            // As browsers do: what was posted is fetched after a 301, 302 or 303.
-            if matches!(status, 301 | 302 | 303) && method != "GET" && method != "HEAD" { method = "GET".into(); body.clear(); headers_in.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type")) }
-            url = to.to_string();
-            hops += 1;
-        };
+        let headers = Headers::new();
+        for (k, v) in &r.headers { headers.append(k, v).map_err(|e| e.to_string())?; }
+        let mut init = RequestInit::new();
+        init.with_method(Method::from(r.method.clone())).with_headers(headers);
+        // One request asks for its redirect back (a job's log: GitHub answers with a signed link on another site,
+        // to be fetched without the token); every other is followed by the runtime, as before.
+        if r.no_follow { init.with_redirect(RequestRedirect::Manual); }
+        if !r.body.is_empty() { init.with_body(Some(js_sys::Uint8Array::from(r.body.as_slice()).into())); }
+        let req = Request::new_with_init(&r.url, &init).map_err(|e| e.to_string())?;
+        let mut resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
         let status = resp.status_code();
         let headers = resp.headers().entries().collect();
         let body = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -256,7 +244,7 @@ impl DurableObject for PlaneObject {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let body = if req.method() == Method::Get || req.method() == Method::Head { vec![] } else { req.bytes().await.unwrap_or_default() };
-        let request = io::Request { method: req.method().to_string(), url: req.url()?.to_string(), headers: req.headers().entries().collect(), body };
+        let request = io::Request { method: req.method().to_string(), url: req.url()?.to_string(), headers: req.headers().entries().collect(), body, no_follow: false };
         let mut all = String::new();
         for i in 0.. { match req.headers().get(&format!("{SETTINGS}-{i}"))? { Some(piece) => all.push_str(&piece), None => break } }
         let fresh = serde_json::from_str::<serde_json::Value>(&all).ok();
