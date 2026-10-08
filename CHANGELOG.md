@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.11.0 — unreleased
+## 0.11.0 — 2026-10-08
 - SuperCI stays signed in. Its sign-ins to your clouds are kept in its own folder on your computer (`~/.superci`, readable by you alone), so the dashboard opens where you left it. An AWS sign-in still ends after twelve hours at most, as AWS has it; Cloudflare's no longer ends after an hour.
 - Everything the dashboard does is also a command, for scripts and coding agents, in the shape of Stripe's CLI: `superci <resource> <operation> [id] [--param=value]`, with `list`, `retrieve`, `create`, `update` and `delete` wherever they fit. The resources: `jobs`, `planes` (also `move` and `allow`), `runners` (also `order`), `machine`, `limits`, `public_repos`, `github`, `gitlab`, `gitlab_projects` and `keys`; beside them `superci status`, `login`, `logout`, `dashboard` and `leave`. A command runs the same code as its page. `--json` prints one object; `--dry-run` checks a change and says what it would do; nothing is ever asked in the terminal; what would delete something needs `--confirm`; when a person is needed first (a sign-in), the answer names the command for it and the status is 3.
 - The dashboard opens with `superci dashboard` (`npx @superci/cli dashboard`). `superci` alone lists the commands, and `superci help RESOURCE` (or `superci RESOURCE --help`) says more about one.
