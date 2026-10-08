@@ -42,7 +42,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "connect   Opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your own name)\n          and chooses its repositories. GitHub offers that nowhere else. It ends when the App is installed.\n          --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\nremove    A further organization: its App is uninstalled and forgotten. The first one goes with `superci leave`."),
     ("gitlab", "  superci gitlab connect --url https://gitlab.com [--gitlab ID|new]\n  superci gitlab projects [--gitlab ID]\n  superci gitlab enable PROJECT_ID | --all [--gitlab ID]\n  superci gitlab disable PROJECT_ID [--gitlab ID]\n  superci gitlab disconnect [ID] --yes",
         "connect   The token is read from SUPERCI_GITLAB_TOKEN (--token-env NAME for another variable): a project, group or\n          personal access token with the scopes api, create_runner and manage_runner. It goes to your control plane\n          and is not kept on this machine. --gitlab new: a further connection beside the first.\nprojects  The projects the token reaches, with their ids and whether their jobs come here.\nenable    A project's jobs with `tags: [superci]` run here from then on."),
-    ("limits", "  superci limits --max-cpu N    The largest machine a label may ask for.", ""),
+    ("limits", "  superci limits [--max-cpu N] [--max-hours N]    The largest machine a label may ask for; the longest a job may run.",
+        "Without flags it says what they are. --max-cpu: a label asking for more is refused (32 unless set). --max-hours: a\njob's machine is ended after this (6 unless set, as on GitHub's own runners; 120 at most). Whatever is set, a machine\non Cloudflare lives 6 hours at most and one on Modal 24. A workflow's timeout-minutes ends a job sooner."),
     ("public", "  superci public add|remove OWNER/REPO    Public repositories allowed to run here.",
         "Jobs from public repositories are refused unless the repository is allowed. Even then, a fork's pull request and\n`pull_request_target` runs are refused."),
 ];
@@ -106,7 +107,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 13] = ["json", "yes", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "on", "off", "on-demand", "spot", "help", "version"];
-const VALUES: [&str; 21] = ["days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 22] = ["max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -422,11 +423,16 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             Ok(Done { said: vec![format!("`runs-on: superci` gets: {}.", machine_words(&serde_json::to_value(&machine).unwrap_or_default()))], data: json!({ "ok": true, "machine": machine }) })
         }
         ("limits", "") => {
-            let Some(max) = args.get("max-cpu") else { return usage("Say the limit: `superci limits --max-cpu 32`.") };
-            let mut d = ready_to_set()?;
-            in_use(&d)?;
-            apply!(d, args, format!("let a label ask for up to {max} CPUs"), "/routing", &[field("action", "max_cpu"), field("max_cpu", max)]);
-            Ok(Done::said(format!("A label may ask for up to {max} CPUs.")))
+            let mut d = signed_in();
+            if args.has("max-cpu") || args.has("max-hours") {
+                to_set(&mut d)?;
+                in_use(&d)?;
+                if let Some(max) = args.get("max-cpu") { apply!(d, args, format!("let a label ask for up to {max} CPUs"), "/routing", &[field("action", "max_cpu"), field("max_cpu", max)]); }
+                if let Some(hours) = args.get("max-hours") { apply!(d, args, format!("let a job run for up to {hours} hours"), "/routing", &[field("action", "max_hours"), field("max_hours", hours)]); }
+            }
+            let routing = view(&mut d)?.routing();
+            let (cpu, hours) = (routing.max_cpu.unwrap_or(superci_core::plane::MAX_CPU), routing.max_minutes.unwrap_or(superci_core::plane::MAX_JOB_MINUTES) / 60);
+            Ok(Done { said: vec![format!("A label may ask for up to {cpu} CPUs."), format!("A job may run for up to {hours} hours (6 at most on Cloudflare, 24 on Modal).")], data: json!({ "ok": true, "max_cpu": cpu, "max_hours": hours }) })
         }
         ("public", action @ ("add" | "remove")) => {
             if w(2).is_empty() { return usage(format!("Say which: `superci public {action} OWNER/REPO`.")) }
@@ -581,7 +587,7 @@ fn repos() -> Result<Done> {
     if said.is_empty() { said.push("No repositories yet: `superci github connect OWNER`, or `superci gitlab connect`.".into()) }
     let routing = view.routing();
     if !routing.public_repos.is_empty() { said.push(format!("Public repositories allowed: {}", routing.public_repos.join(", "))) }
-    Ok(Done { said, data: json!({ "github": st["apps"], "installations": st["installations"], "gitlab": st["gitlabs"], "public_repos": routing.public_repos, "max_cpu": routing.max_cpu }) })
+    Ok(Done { said, data: json!({ "github": st["apps"], "installations": st["installations"], "gitlab": st["gitlabs"], "public_repos": routing.public_repos, "max_cpu": routing.max_cpu.unwrap_or(superci_core::plane::MAX_CPU), "max_hours": routing.max_minutes.unwrap_or(superci_core::plane::MAX_JOB_MINUTES) / 60 }) })
 }
 
 fn planes() -> Result<Done> {
@@ -649,7 +655,7 @@ mod tests {
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
         for line in ["status", "jobs", "job 7", "keys", "keys create agent", "keys revoke agent", "runners", "repos", "planes", "machine", "machine --cpu 8", "plane update", "plane deploy modal", "plane deploy aws --region us-east-1", "runners add aws", "runners order aws", "runners set aws --max-jobs 3",
-            "limits --max-cpu 8", "public add acme/site", "gitlab projects", "gitlab enable 7", "gitlab enable --all", "plane allow", "plane move abcdef123456", "plane update --dry-run", "runners add cloudflare --dry-run"] {
+            "limits", "limits --max-cpu 8", "limits --max-hours 12", "public add acme/site", "gitlab projects", "gitlab enable 7", "gitlab enable --all", "plane allow", "plane move abcdef123456", "plane update --dry-run", "runners add cloudflare --dry-run"] {
             assert_eq!(run(line), signed_out, "{line}");
         }
         for line in ["plane delete abcdef123456", "leave", "runners remove aws", "github remove acme", "gitlab disconnect"] {
@@ -658,7 +664,7 @@ mod tests {
             assert_eq!(run(&format!("{line} --dry-run")), signed_out, "{line}: a dry run checks the sign-in too");
         }
         for (line, says) in [("runners add gcp", "Say which: `superci runners add aws`"), ("plane deploy", "Say where: `superci plane deploy aws"), ("plane deploy aws", "Say where: --region"), ("plane move", "Say where to:"), ("plane delete", "Say which:"),
-            ("runners order", "Say the order:"), ("limits", "Say the limit:"), ("public add", "Say which:"), ("gitlab connect", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("gitlab connect --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
+            ("runners order", "Say the order:"), ("public add", "Say which:"), ("gitlab connect", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("gitlab connect --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
             ("job", "Say which: `superci job ID`"), ("job seven", "Say which: `superci job ID`"), ("keys create", "Give it a name:"), ("keys revoke", "Say which:"), ("keys create agent --days soon", "--days is a number"),
             ("plane", "That is not a whole command of `superci plane`."), ("runners frob", "That is not a whole command of `superci runners`."), ("frobnicate", "`frobnicate` is not a command of superci.")] {
             assert!(matches!(run(line), Fail::Usage(e) if e.starts_with(says)), "{line}");

@@ -18,7 +18,7 @@ use superci_core::crypto::{random_token, safe_eq};
 use superci_core::github::{self, app_manifest, manifest_target, Owner};
 use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
-use superci_core::plane::{Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU};
+use superci_core::plane::{Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
 use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, REGIONS};
 
@@ -1751,6 +1751,12 @@ impl Dashboard {
                     "remove" => { let repo = field("repo"); routing.rules.retain(|r| r.repo != repo) }
                     // Limits: the largest machine a label may ask for; public repositories allowed to run here.
                     "max_cpu" => routing.max_cpu = field("max_cpu").parse().ok().filter(|n: &u32| *n >= 1 && *n <= 192 && *n != MAX_CPU),
+                    // The longest a job may run, in hours: up to five days (what AWS's machines may live; Modal's
+                    // and Cloudflare's end sooner whatever is set).
+                    "max_hours" => {
+                        let Some(hours) = field("max_hours").parse::<u32>().ok().filter(|h| (1..=120).contains(h)) else { return Ok(message(400, "From 1 to 120 hours", "Five days is the longest GitHub lets a job run on a runner of your own.")) };
+                        routing.max_minutes = Some(hours * 60).filter(|m| *m != MAX_JOB_MINUTES);
+                    }
                     "public_add" => {
                         let repo = field("repo").trim().to_string();
                         let ok = { let mut p = repo.split('/'); matches!((p.next(), p.next(), p.next()), (Some(o), Some(r), None) if github::valid_login(o) && !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.*".contains(&b))) };
@@ -1863,7 +1869,7 @@ impl Dashboard {
                 let want = serde_json::to_value(&routing).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "ROUTING", &want.to_string())?;
                 wait_for(plane.url(), &self.status_key, |s| s["routing"] == want);
-                Ok(Response::redirect(if field("action").starts_with("public") || field("action") == "max_cpu" { "/?p=workflows" } else { "/?p=runners" }))
+                Ok(Response::redirect(if field("action").starts_with("public") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=workflows" } else { "/?p=runners" }))
             }
 
             _ => Ok(message(404, "Not found", "")),
@@ -3539,6 +3545,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
 fn limits_card(v: &PlaneView, public: Option<Vec<String>>) -> String {
     let routing = v.routing();
     let max = routing.max_cpu.unwrap_or(MAX_CPU);
+    let hours = routing.max_minutes.unwrap_or(MAX_JOB_MINUTES) / 60;
     // Public repositories: a line saying which are allowed, and a dialog to choose them (search, a box each). Not
     // known (a control plane from before it could say): typed in.
     let allowed = &routing.public_repos;
@@ -3571,6 +3578,7 @@ fn limits_card(v: &PlaneView, public: Option<Vec<String>>) -> String {
     let public_row = if v.github { format!(r#"<div class="limit"><span class="limit-text"><strong>Public repositories</strong><small>Their jobs run only when allowed. Pull requests from forks never run.</small></span><span class="limit-do">{control}</span></div>"#) } else { String::new() };
     format!(r#"<section class="card"><div class="card-head"><h2>Limits</h2></div><div class="limits">
 <form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="max_cpu"><span class="limit-text"><strong>Largest machine</strong><small>A label asking for more is refused.</small></span><span class="limit-do"><input type="number" name="max_cpu" min="1" max="192" value="{max}" aria-label="Most CPUs"><span class="note">CPUs</span><button class="button secondary sm">Save</button></span></form>
+<form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="max_hours"><span class="limit-text"><strong>Longest job</strong><small>Its machine is ended after this. Cloudflare allows 6 hours, Modal 24.</small></span><span class="limit-do"><input type="number" name="max_hours" min="1" max="120" value="{hours}" aria-label="Most hours"><span class="note">hours</span><button class="button secondary sm">Save</button></span></form>
 {public_row}
 </div></section>{dialog}"#)
 }
@@ -4783,6 +4791,7 @@ mod tests {
         let workflows = d.render("workflows", &[view], None);
         preview("workflows-both", &workflows);
         // Limits: the largest machine, and public repositories allowed (none yet).
+        assert!(workflows.contains("<strong>Longest job</strong>") && workflows.contains(r#"name="max_hours" min="1" max="120" value="6""#), "a job's machine lives six hours unless set");
         assert!(workflows.contains("<h2>Limits</h2>") && workflows.contains(r#"name="max_cpu" min="1" max="192" value="32""#) && workflows.contains(r#"value="public_add""#) && !workflows.contains("tag-chips"));
         assert!(workflows.contains(r#"<input type="radio" name="host" id="use-gh" checked>"#) && workflows.contains("Turn the project on in") && workflows.contains("tags: [superci]"));
     }

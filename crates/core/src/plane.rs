@@ -20,11 +20,13 @@ use crate::io::{Containers, get_json, put_json, Clock, Http, Request, Response, 
 use crate::spec::{aws_instance_types, Capacity, Size, Spec};
 
 pub const AUDIENCE: &str = "superci";
-/// How long a machine may live, in minutes: as long as its cloud lets one. AWS sets no limit, so there it is the
-/// longest GitHub lets a job run on a runner of your own (five days); Cloudflare keeps a container six hours at most;
-/// a Modal sandbox lives a day at most. Not a limit on jobs as such: GitHub and GitLab end a job at its own time limit
-/// (`timeout-minutes`, six hours unless the workflow says otherwise), and its machine ends with it. This is what ends
-/// a machine nothing else would (its control plane gone, its runner stuck).
+/// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
+/// never more than that cloud lets a machine live.
+pub fn job_minutes(set: Option<u32>, cloud: &str) -> u32 { set.unwrap_or(MAX_JOB_MINUTES).clamp(1, max_minutes(cloud)) }
+
+/// The longest a cloud lets a machine live, in minutes. AWS sets no limit, so there it is the longest GitHub lets a
+/// job run on a runner of your own (five days); Cloudflare keeps a container six hours at most; a Modal sandbox
+/// lives a day at most. The longest a job may run (`Routing::max_minutes`, six hours unless set) is never more.
 pub fn max_minutes(cloud: &str) -> u32 {
     match cloud { "cloudflare" => 6 * 60, "modal" => 24 * 60, _ => 5 * 24 * 60 }
 }
@@ -359,8 +361,14 @@ pub struct Routing {
     /// The most CPUs a label may ask for (default `MAX_CPU`); memory at most 8 GB per CPU of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cpu: Option<u32>,
+    /// The longest a job may run, in minutes (default `MAX_JOB_MINUTES`): its machine is ended after it. Never
+    /// longer than its cloud lets a machine live (`max_minutes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes: Option<u32>,
 }
 
+/// The longest a job may run unless the dashboard sets another: six hours, as on GitHub's own runners.
+pub const MAX_JOB_MINUTES: u32 = 360;
 /// The largest machine a label may ask for unless the dashboard sets another: 32 CPUs.
 pub const MAX_CPU: u32 = 32;
 /// Jobs at once in a cloud unless the dashboard sets another.
@@ -777,6 +785,11 @@ impl<'a> ControlPlane<'a> {
         let now = self.clock.now_ms();
         self.config.dashboard_keys.iter().any(|(until, key)| *until > now && key.len() >= 16 && safe_eq(given.as_bytes(), key.as_bytes()))
     }
+
+    /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
+    /// and never more than that cloud lets a machine live. Enforced by the machine itself or its cloud, so it holds
+    /// with the control plane gone; a job's own time limit (`timeout-minutes`) ends it sooner.
+    fn machine_minutes(&self, cloud: &str) -> u32 { job_minutes(self.config.routing.max_minutes, cloud) }
 
     /// Whether a request may read: a dashboard session's key, or a key that only reads and has not expired.
     fn reader(&self, req: &Request) -> bool {
@@ -1539,7 +1552,7 @@ impl<'a> ControlPlane<'a> {
                         // A spot machine says when AWS takes it back, with a link only it has.
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
-                        let user_data = aws::runner_user_data_for(&work, max_minutes("aws"), spec.os(), notice.as_deref())?;
+                        let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref())?;
                         let mut launched = None;
                         // The regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         for region in &self.aws_regions(&a) {
@@ -1587,14 +1600,14 @@ impl<'a> ControlPlane<'a> {
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) } else { cloudflare_usd_per_hour(size) });
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, max_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
+                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, self.machine_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
                     }.await,
                     Runner::Agent(a) => async {
                         let size = if a.cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }.fit(&spec)?;
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = match a.cloud.as_str() { "cloudflare" => Some(cloudflare_usd_per_hour(size)), "modal" => Some(modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu)), _ => None };
                         if a.cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": max_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
+                        let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
                         for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
@@ -2022,7 +2035,7 @@ impl<'a> ControlPlane<'a> {
             }
             // Its machine's age (a job may have waited long for room before it got one).
             let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
-            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || age > (max_minutes(&j.cloud) as u64 + 5) * 60_000;
+            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || age > (self.machine_minutes(&j.cloud) as u64 + 5) * 60_000;
             if !stale { active += 1; continue; }
             self.stop_machine(&plane_url, &j).await;
             self.withdraw_runner(&j).await;

@@ -566,7 +566,14 @@ fn gpus_and_windows_get_their_own_images_types_and_prices() {
     let l = &launches(&clouds.clouds)[1];
     assert_eq!((field(l, "ImageId").as_str(), field(l, "BlockDeviceMapping.1.Ebs.VolumeSize").as_str()), ("ami-windows", "100"));
     let user_data = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(field(l, "UserData")).unwrap()).unwrap();
-    assert!(user_data.starts_with("<powershell>") && user_data.contains(r".\run.cmd --jitconfig JITCONFIG+/=") && user_data.contains("shutdown.exe /s /f /t 432000"), "{user_data}");
+    assert!(user_data.starts_with("<powershell>") && user_data.contains(r".\run.cmd --jitconfig JITCONFIG+/=") && user_data.contains("shutdown.exe /s /f /t 21600"), "{user_data}");
+    // Six hours unless set; as set, up to what each cloud lets a machine live (AWS: five days; Modal: a day;
+    // Cloudflare: six hours).
+    use superci_core::plane::job_minutes;
+    assert_eq!((job_minutes(None, "aws"), job_minutes(None, "cloudflare"), job_minutes(None, "modal")), (360, 360, 360));
+    assert_eq!((job_minutes(Some(60), "aws"), job_minutes(Some(60), "cloudflare")), (60, 60));
+    assert_eq!((job_minutes(Some(48 * 60), "aws"), job_minutes(Some(48 * 60), "modal"), job_minutes(Some(48 * 60), "cloudflare")), (2880, 1440, 360));
+    assert_eq!(job_minutes(Some(30 * 24 * 60), "aws"), 7200);
     let jit = clouds.clouds.calls.borrow().iter().filter(|c| c.1.ends_with("/generate-jitconfig")).last().cloned().unwrap();
     assert_eq!(serde_json::from_str::<serde_json::Value>(&jit.2).unwrap()["work_folder"], "_work");
     assert!(clouds.clouds.calls.borrow().iter().any(|c| c.2.contains("Action=DescribeSpotPriceHistory") && c.2.contains("ProductDescription.1=Windows")));
