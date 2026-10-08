@@ -20,11 +20,14 @@ use crate::io::{Containers, get_json, put_json, Clock, Http, Request, Response, 
 use crate::spec::{aws_instance_types, Capacity, Size, Spec};
 
 pub const AUDIENCE: &str = "superci";
-/// How long a machine may live: as long as GitHub lets a job run unless its workflow says otherwise (six hours,
-/// `timeout-minutes`' default, and what GitHub's own runners allow at most). Not a limit on jobs as such: GitHub and
-/// GitLab end a job at its own time limit, and its machine ends with it. This is what ends a machine nothing else
-/// would (its control plane gone, its runner stuck): AWS itself never ends one.
-const MAX_JOB_MINUTES: u32 = 360;
+/// How long a machine may live, in minutes: as long as its cloud lets one. AWS sets no limit, so there it is the
+/// longest GitHub lets a job run on a runner of your own (five days); Cloudflare keeps a container six hours at most;
+/// a Modal sandbox lives a day at most. Not a limit on jobs as such: GitHub and GitLab end a job at its own time limit
+/// (`timeout-minutes`, six hours unless the workflow says otherwise), and its machine ends with it. This is what ends
+/// a machine nothing else would (its control plane gone, its runner stuck).
+pub fn max_minutes(cloud: &str) -> u32 {
+    match cloud { "cloudflare" => 6 * 60, "modal" => 24 * 60, _ => 5 * 24 * 60 }
+}
 
 /// What the runtime gives a control plane: its id and label, and (once set up on the user's machine) the App and AWS connect
 /// token from its secrets.
@@ -1150,7 +1153,7 @@ impl<'a> ControlPlane<'a> {
         if self.config.gitlabs().next().is_none() { return Ok(()) }
         for (key, v) in self.store.list("glrunner:").await? {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&v) else { continue };
-            if v["at_ms"].as_u64().is_some_and(|at| now.saturating_sub(at) < (MAX_JOB_MINUTES as u64 + 10) * 60_000) { continue }
+            if v["at_ms"].as_u64().is_some_and(|at| now.saturating_sub(at) < (max_minutes("aws") as u64 + 10) * 60_000) { continue }
             // Removed at the connection it was made through; one whose connection is gone is only forgotten here.
             if let (Some(id), Some(gl)) = (v["id"].as_u64(), self.gitlab_by(v["gitlab"].as_str().unwrap_or_default())) { if gitlab::delete_runner(self.http, gl, id).await.is_err() { continue } }
             self.store.delete(&key).await?;
@@ -1536,7 +1539,7 @@ impl<'a> ControlPlane<'a> {
                         // A spot machine says when AWS takes it back, with a link only it has.
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
-                        let user_data = aws::runner_user_data_for(&work, MAX_JOB_MINUTES, spec.os(), notice.as_deref())?;
+                        let user_data = aws::runner_user_data_for(&work, max_minutes("aws"), spec.os(), notice.as_deref())?;
                         let mut launched = None;
                         // The regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         for region in &self.aws_regions(&a) {
@@ -1584,14 +1587,14 @@ impl<'a> ControlPlane<'a> {
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) } else { cloudflare_usd_per_hour(size) });
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, MAX_JOB_MINUTES, size).await?, machine_name(size)))
+                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, max_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
                     }.await,
                     Runner::Agent(a) => async {
                         let size = if a.cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }.fit(&spec)?;
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = match a.cloud.as_str() { "cloudflare" => Some(cloudflare_usd_per_hour(size)), "modal" => Some(modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu)), _ => None };
                         if a.cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": MAX_JOB_MINUTES, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
+                        let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": max_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
                         for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
@@ -2019,7 +2022,7 @@ impl<'a> ControlPlane<'a> {
             }
             // Its machine's age (a job may have waited long for room before it got one).
             let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
-            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || age > (MAX_JOB_MINUTES as u64 + 5) * 60_000;
+            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || age > (max_minutes(&j.cloud) as u64 + 5) * 60_000;
             if !stale { active += 1; continue; }
             self.stop_machine(&plane_url, &j).await;
             self.withdraw_runner(&j).await;
