@@ -28,12 +28,12 @@ fn main() {
     // A failure: said (as JSON too, with the command a person runs first when that is what it needs), and its status:
     // 1 failed, 2 not a command or not a whole one (its help follows), 3 a person is needed first.
     let fail = |e: commands::Fail, topic: &str| -> ! {
-        let (said, half) = (e.said().to_string(), matches!(e, commands::Fail::Usage(_)));
+        let (said, half, unconfirmed) = (e.said().to_string(), matches!(e, commands::Fail::Usage(_)), matches!(e, commands::Fail::Unconfirmed(_)));
         let needs = commands::needs(&said);
         if json { println!("{}", serde_json::json!({ "ok": false, "error": said, "needs": needs })) }
         else if half { eprintln!("superci: {said}\n\n{}", commands::help(topic)) }
         else { eprintln!("superci: {said}") }
-        std::process::exit(if needs.is_some() { 3 } else if half { 2 } else { 1 })
+        std::process::exit(if needs.is_some() { 3 } else if half || unconfirmed { 2 } else { 1 })
     };
     let args = match commands::Args::parse(&raw) { Ok(a) => a, Err(e) => fail(e, "") };
     if args.has("version") { println!("superci {}", env!("CARGO_PKG_VERSION")); return }

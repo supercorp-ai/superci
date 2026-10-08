@@ -61,6 +61,9 @@ pub struct Dashboard {
     /// The dashboard opened by a command for the one thing a person must do in a browser (see `Task`): once it is
     /// done, the page says so and the program ends.
     task: Option<Task>,
+    /// A command is acting, in a page's place (`act`): what a page's action would say in the dashboard's terminal is
+    /// left to the command.
+    commanding: bool,
     /// The control plane kept from the last run, listed before any cloud was asked (its id): looking in its own
     /// cloud then says whether it is still there.
     preloaded: Option<String>,
@@ -310,7 +313,7 @@ fn plain(html: &str) -> String {
 
 /// What `superci status` says when SuperCI is signed in nowhere, and when its only sign-in was AWS's and has ended.
 pub const NOT_SIGNED_IN: &str = "SuperCI is not signed in on this computer. Run `superci login` (it opens your browser).";
-pub const AWS_ENDED: &str = "SuperCI's AWS sign-in has ended (AWS ends one after twelve hours at most). Run `superci login` to sign in again.";
+pub const AWS_ENDED: &str = "SuperCI's AWS sign-in has ended (AWS ends one after twelve hours at most). Run `superci login aws` to sign in again.";
 
 /// A day, as 2026-10-07 (UTC), from unix seconds.
 fn day(unix: u64) -> String {
@@ -557,7 +560,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, task: None, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -570,6 +573,7 @@ impl Dashboard {
         if d.cf.is_none() { d.cf = kept.cloudflare }
         d.aws = kept.aws;
         if d.modal.is_none() { d.modal = kept.modal }
+        d.aws_ended = kept.aws_ended && d.aws.is_none();
         // The key the control planes were handed, while it lasts another day; else a new one, good for thirty days.
         match kept.key.filter(|k| key_until(&k.name) > now_ms() / 1000 + 86_400) {
             Some(k) => { d.status_key = k.value; d.status_secret = k.name; d.keyed = k.planes.into_iter().collect() }
@@ -647,7 +651,7 @@ impl Dashboard {
     /// For a command that changes something: signed in, the clouds looked in, and the control plane in use chosen, as a
     /// page's first load does.
     pub fn ready(&mut self) -> Result<()> {
-        self.signed_in_as().ok_or(NOT_SIGNED_IN)?;
+        self.signed_in_as().ok_or(if self.aws_ended { AWS_ENDED } else { NOT_SIGNED_IN })?;
         self.discover()?;
         if self.signed_in_as().is_none() { return Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
@@ -673,16 +677,19 @@ impl Dashboard {
     /// command and the page can never differ. What it said: a page that says one thing, or the note a page shows once.
     pub fn act(&mut self, path: &str, fields: &[(&str, String)]) -> Result<String> {
         SAID.with(|s| s.borrow_mut().take());
+        self.commanding = true;
         let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields.iter().map(|(k, v)| (*k, v.as_str()))).finish().into_bytes();
         let req = Req { method: "POST".into(), path: path.into(), query: vec![], cookie: None, last: None, body, host: String::new(), origin: None, fetch_site: None };
         self.views = None;
         let answer = self.handle(&req);
         self.keep();
-        let answer = answer?;
+        // A change that needs AWS, after AWS ended the sign-in kept here: said as that.
+        let ended = |e: String| if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else { e };
+        let answer = answer.map_err(ended)?;
         let said = SAID.with(|s| s.borrow_mut().take()).map(|(_, heading, text)| { let text = plain(&text); if text.is_empty() { heading } else { format!("{}: {text}", heading.trim_end_matches('.')) } });
         match (answer.status, said) {
             (300..=399, _) => Ok(self.flash.take().unwrap_or_default()),
-            (status, Some(said)) if status >= 400 => Err(said),
+            (status, Some(said)) if status >= 400 => Err(ended(said)),
             (status, None) if status >= 400 => Err(format!("refused ({status})")),
             (_, said) => Ok(said.unwrap_or_default()),
         }
@@ -705,7 +712,14 @@ impl Dashboard {
             let upto = if ended.as_ref().is_some_and(|e| e.is_ok()) { steps.len() } else { (at + 1).min(steps.len()) };
             while said < upto { say(&steps[said]); said += 1 }
             if let Some(ended) = ended {
-                if matches!(what, Background::Deploy) && ended.is_ok() { self.adopt_deploy(); self.key_planes(); }
+                if matches!(what, Background::Deploy) && ended.is_ok() {
+                    self.adopt_deploy();
+                    self.key_planes();
+                    // The new one joins the list; the one in use stays the one in use (and the one kept), unless
+                    // this is the first.
+                    let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
+                    if let Some(i) = views.get(view::in_use(&views)).and_then(|v| self.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { self.selected = i }
+                }
                 self.views = None;
                 self.keep();
                 return ended
@@ -717,9 +731,13 @@ impl Dashboard {
     /// The control plane in use, read for a command: with the kept key when its control plane has it (no cloud is
     /// asked), else after looking in the clouds signed in to. None: signed in, and no control plane found.
     pub fn current(&mut self) -> Result<Option<PlaneView>> {
-        self.signed_in_as().ok_or(NOT_SIGNED_IN)?;
+        // Signed in nowhere: only what is left of a sign-in AWS ended can still be read (with the kept key).
+        let only_reading = self.signed_in_as().is_none();
+        if only_reading && !(self.aws_ended && self.kept_plane.is_some()) { return Err(NOT_SIGNED_IN.into()) }
         let kept = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id()));
         if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some()) { return Ok(Some(v)) }
+        // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
+        if only_reading { return match self.kept_plane.clone() { Some(p) => Ok(Some(view::plane_view(&p, Some(&self.status_key)))), None => Err(AWS_ENDED.into()) } }
         // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.
         self.keyed.clear();
         self.discover()?;
@@ -841,6 +859,7 @@ impl Dashboard {
             modal: if self.modal_given { None } else { self.modal.clone() },
             key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
             plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
+            aws_ended: self.aws_ended && self.aws.is_none(),
         }
     }
 
@@ -851,7 +870,7 @@ impl Dashboard {
         let kept = self.kept();
         let text = serde_json::to_string(&kept).unwrap_or_default();
         if text == self.kept_as { return }
-        let done = if kept.signed_in() { store.write(&kept) } else { store.remove().map(|_| ()) };
+        let done = if kept.worth_keeping() { store.write(&kept) } else { store.remove().map(|_| ()) };
         match done {
             Ok(()) => self.kept_as = text,
             Err(e) => if !self.keep_failed { eprintln!("{e}"); self.keep_failed = true },
@@ -1103,11 +1122,13 @@ impl Dashboard {
         work: impl FnOnce(&dyn Fn(usize)) -> Result<Plane> + Send + 'static) {
         let state = self.deploying.clone();
         *lock(&state) = Some(Deploy { cloud, place, steps, at: 0, form, result: None });
-        eprintln!("Deploying a control plane to {}…", provider_name(cloud));
+        let quiet = self.commanding;
+        if !quiet { eprintln!("Deploying a control plane to {}…", provider_name(cloud)); }
         std::thread::spawn(move || {
             let step = |i: usize| if let Some(d) = lock(&state).as_mut() { d.at = i };
             let result = work(&step);
-            match &result { Ok(p) => eprintln!("The control plane is running: {}", p.url()), Err(e) => eprintln!("The deploy stopped: {e}") }
+            // Said in the dashboard's terminal; a command says how it ended itself.
+            if !quiet { match &result { Ok(p) => eprintln!("The control plane is running: {}", p.url()), Err(e) => eprintln!("The deploy stopped: {e}") } }
             // A stop keeps the step it stopped at; a finish marks them all done.
             if let Some(d) = lock(&state).as_mut() { if result.is_ok() { d.at = d.steps.len() } d.result = Some(result) }
         });
@@ -5013,6 +5034,11 @@ mod tests {
         let said = d.wait(Background::Deploy, &mut |s: &str| steps.push(s.to_string())).unwrap();
         assert!(said.starts_with("The control plane is running: https://x.lambda-url.us-east-1.on.aws") && steps.len() == aws_plane::DEPLOY_STEPS.len());
         assert_eq!(d.plane_in_use().unwrap().plane_id(), "abcdef123456");
+        // A second one joins the list; the one in use stays the one in use (and so the one kept).
+        let second = Plane::Modal { workspace: "acme".into(), url: "http://127.0.0.1:9".into(), plane_id: "second123456".into(), label: "superci".into() };
+        *lock(&d.deploying) = Some(Deploy { cloud: "modal", place: "workspace acme".into(), steps: &modal::DEPLOY_STEPS, at: 3, form: vec![], result: Some(Ok(second)) });
+        d.wait(Background::Deploy, &mut |_| {}).unwrap();
+        assert_eq!((d.planes.len(), d.plane_in_use().unwrap().plane_id().to_string()), (2, "abcdef123456".to_string()));
         *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 2, result: Some(Err("AccessDenied: lambda:UpdateFunctionCode".into())), ended_ms: now_ms() });
         let mut steps = vec![];
         assert_eq!(d.wait(Background::Update, &mut |s: &str| steps.push(s.to_string())).unwrap_err(), "AccessDenied: lambda:UpdateFunctionCode");
@@ -5070,6 +5096,26 @@ mod tests {
         assert!(!store.path().exists() && next.signed_in_as().is_none() && next.planes.is_empty());
         assert!(next.notice.as_deref().is_some_and(|n| n.starts_with("Signed out.")));
         assert!(!Dashboard::signed_in(Some(store.clone())).read_only_of_test());
+        // AWS alone was signed in to and AWS ended it: the control plane and its key stay kept, so the next start
+        // still reads; a change says the sign-in ended.
+        let mut only = Dashboard::signed_in(Some(store.clone()));
+        only.planes.push(plane.clone());
+        only.keyed.insert("abcdef123456".into());
+        only.aws_ended = true;
+        only.keep();
+        assert!(store.path().exists() && store.read().aws_ended && store.read().plane.is_some() && !store.read().signed_in());
+        let mut next = Dashboard::signed_in(Some(store.clone()));
+        assert!(next.aws_ended && next.signed_in_as().is_none() && next.planes == vec![plane.clone()]);
+        assert_eq!(next.current().unwrap().unwrap().plane, plane, "read with the kept key, without a sign-in");
+        assert_eq!(next.ready().unwrap_err(), AWS_ENDED);
+        assert_eq!(next.act("/runners/aws-own", &[]).unwrap_err(), AWS_ENDED);
+        // Signed in to AWS again: nothing says it ended any more.
+        next.aws = Some(aws::Session::for_test("123456789012"));
+        next.aws_ended = false;
+        next.keep();
+        assert!(!store.read().aws_ended && store.read().signed_in());
+        next.sign_out().unwrap();
+        assert!(!store.path().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

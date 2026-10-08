@@ -25,6 +25,10 @@ pub struct Kept {
     pub key: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plane: Option<Plane>,
+    /// The AWS sign-in kept here was ended by AWS (it ends one after twelve hours at most) and has not been made
+    /// again: said where it matters, and the key and the control plane stay, so looking goes on working.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub aws_ended: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -32,6 +36,8 @@ pub struct Key { pub name: String, pub value: String, pub planes: Vec<String> }
 
 impl Kept {
     pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || self.modal.is_some() }
+    /// Worth keeping: a sign-in, or what is left of one AWS ended (the control plane and the key it is read with).
+    pub fn worth_keeping(&self) -> bool { self.signed_in() || (self.aws_ended && self.key.is_some() && self.plane.is_some()) }
 }
 
 #[derive(Clone)]
@@ -124,7 +130,7 @@ mod tests {
         }
         // A file this version cannot read is nothing kept, not an error.
         std::fs::write(store.path(), b"{ not json").unwrap();
-        assert!(!store.read().signed_in());
+        assert!(!store.read().signed_in() && !store.read().worth_keeping());
         assert!(store.remove().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }

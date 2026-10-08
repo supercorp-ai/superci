@@ -94,15 +94,16 @@ SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"])
     }
 }
 
-/// How a command did not do its thing: it was not a whole command (its group's help follows), or it failed.
+/// How a command did not do its thing: it was not a whole command (its resource's help follows), it would delete
+/// something and was not told to, or it failed.
 #[derive(Debug, PartialEq)]
-pub enum Fail { Usage(String), Failed(String) }
+pub enum Fail { Usage(String), Unconfirmed(String), Failed(String) }
 
 impl From<String> for Fail { fn from(e: String) -> Self { Fail::Failed(e) } }
 impl From<&str> for Fail { fn from(e: &str) -> Self { Fail::Failed(e.to_string()) } }
 
 impl Fail {
-    pub fn said(&self) -> &str { match self { Fail::Usage(e) | Fail::Failed(e) => e } }
+    pub fn said(&self) -> &str { match self { Fail::Usage(e) | Fail::Unconfirmed(e) | Fail::Failed(e) => e } }
 }
 
 type Result<T> = std::result::Result<T, Fail>;
@@ -184,7 +185,6 @@ fn ready_to_set() -> Result<Dashboard> { let mut d = signed_in(); to_set(&mut d)
 /// The same, of a dashboard that has read already. A key that only reads is no sign-in, and is said to be none.
 fn to_set(d: &mut Dashboard) -> Result<()> {
     if d.signed_in_as().is_none() && given_key().is_some() { return Err(ONLY_READS.into()) }
-    d.signed_in_as().ok_or(NOT_SIGNED_IN)?;
     Ok(d.ready_for_settings()?)
 }
 
@@ -209,7 +209,7 @@ fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
 fn view(d: &mut Dashboard) -> Result<PlaneView> { Ok(look(d)?.0) }
 
 /// What deletes something needs --confirm (said with what it would do); --dry-run needs none.
-fn confirmed(args: &Args, what: &str) -> Result<()> { if args.has("confirm") || args.has("dry-run") { Ok(()) } else { usage(format!("This would {what}. Add --confirm to do it, or --dry-run to check it first.")) } }
+fn confirmed(args: &Args, what: &str) -> Result<()> { if args.has("confirm") || args.has("dry-run") { Ok(()) } else { Err(Fail::Unconfirmed(format!("This would {what}. Add --confirm to do it, or --dry-run to check it first."))) } }
 
 /// A flag that is true or false (`--enabled=true`). None: not given.
 fn truth(args: &Args, flag: &str) -> Result<Option<bool>> {
@@ -692,7 +692,7 @@ mod tests {
             assert_eq!(run(line), signed_out, "{line}");
         }
         for line in ["planes delete abcdef123456", "leave", "runners delete aws", "github delete acme", "gitlab delete"] {
-            assert!(matches!(run(line), Fail::Usage(e) if e.starts_with("This would ") && e.ends_with("Add --confirm to do it, or --dry-run to check it first.")), "{line}");
+            assert!(matches!(run(line), Fail::Unconfirmed(e) if e.starts_with("This would ") && e.ends_with("Add --confirm to do it, or --dry-run to check it first.")), "{line}");
             assert_eq!(run(&format!("{line} --confirm")), signed_out, "{line}");
             assert_eq!(run(&format!("{line} --dry-run")), signed_out, "{line}: a dry run checks the sign-in too");
         }
