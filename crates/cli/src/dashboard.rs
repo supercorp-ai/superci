@@ -771,13 +771,13 @@ impl Dashboard {
         if name.is_empty() || name.len() > 24 || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) { return Err("A key's name is letters and digits, 24 at most (agent, ci2).".into()) }
         if !(1..=366).contains(&days) { return Err("A key lasts from 1 to 366 days.".into()) }
         let seen = view::plane_view(&plane, Some(&self.status_key));
-        if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: keys that only read need control plane 0.11.0 or newer (`superci plane update`).".into()) }
+        if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: keys that only read need control plane 0.11.0 or newer (`superci planes update`).".into()) }
         let status = seen.status.or_else(|| status_soon(plane.url(), &self.status_key)).ok_or("The control plane did not answer: try again in a few seconds")?;
-        if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys revoke {}` first.", name.to_lowercase(), name.to_lowercase())) }
+        if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys delete {}` first.", name.to_lowercase(), name.to_lowercase())) }
         let (key, until) = (format!("superci_read_{}", random_token(32)), now_ms() / 1000 + days * 86_400);
         self.put_secret(&plane, &format!("READ_KEY_{until}_{name}"), &superci_core::crypto::sha256_hex(key.as_bytes()))?;
         let n = name.clone();
-        if !wait_for(plane.url(), &self.status_key, move |s| read_keys(s).iter().any(|(k, _)| *k == n)) { return Err("The control plane has not taken the key yet. It is written; look with `superci keys` in a moment, and make it again if it is not there (the key itself was not shown).".into()) }
+        if !wait_for(plane.url(), &self.status_key, move |s| read_keys(s).iter().any(|(k, _)| *k == n)) { return Err("The control plane has not taken the key yet. It is written; look with `superci keys list` in a moment, and make it again if it is not there (the key itself was not shown).".into()) }
         Ok((key, until))
     }
 

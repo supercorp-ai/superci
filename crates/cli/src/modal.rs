@@ -172,11 +172,13 @@ impl Pending {
     pub fn for_test() -> Pending { Pending { web_url: "https://modal.com/token-flow/tf-test".into(), flow_id: "tf-test".into(), wait_secret: String::new() } }
 }
 
-pub fn authorize(next_url: &str) -> Result<Pending> {
+/// `_back`: where the dashboard would have Modal return. Modal's page says it will and never does (it stays on
+/// "API token created"), so it is not asked to: SuperCI asks Modal whether the sign-in was approved (`wait`).
+pub fn authorize(_back: &str) -> Result<Pending> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let mut client = Client::new(None)?;
-    let r: pb::TokenFlowCreateResponse = client.unary("TokenFlowCreate", pb::TokenFlowCreateRequest { utm_source: "superci".into(), localhost_port: port as i32, next_url: next_url.into() })?;
+    let r: pb::TokenFlowCreateResponse = client.unary("TokenFlowCreate", pb::TokenFlowCreateRequest { utm_source: "superci".into(), localhost_port: port as i32, next_url: String::new() })?;
     let flow_id = r.token_flow_id.clone();
     std::thread::spawn(move || {
         let _ = listener.set_nonblocking(false);
