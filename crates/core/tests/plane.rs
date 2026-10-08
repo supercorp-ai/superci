@@ -1787,3 +1787,58 @@ fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
     assert_eq!(ask("GET", "/job/log?id=1", "superci_read_one-that-ended").status, 404);
     assert_eq!(block_on(plane.handle(get("/job/log?id=1"))).status, 404);
 }
+
+/// The fake clouds, with what GitHub lists as waiting in acme/app: a run that waits (its jobs: one for here that
+/// GitHub never told of, one for GitHub's own runners, one for here made ten seconds ago, one known here), and a run
+/// under way with another job for here that waits.
+struct Untold(FakeClouds);
+#[async_trait(?Send)]
+impl Http for Untold {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let job = |id: u64, label: &str, at: &str| serde_json::json!({ "id": id, "run_id": 90, "status": "queued", "name": format!("job {id}"), "workflow_name": "ci", "labels": [label], "created_at": at });
+        let ok = |v: serde_json::Value| Ok(Response::new(200, "application/json", v.to_string()));
+        match r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/runs") {
+            Some("?status=queued&per_page=10") => { self.0.calls.borrow_mut().push(("GET".into(), r.url.clone(), String::new())); ok(serde_json::json!({ "workflow_runs": [{ "id": 90, "repository": { "private": true } }] })) }
+            Some("?status=in_progress&per_page=10") => { self.0.calls.borrow_mut().push(("GET".into(), r.url.clone(), String::new())); ok(serde_json::json!({ "workflow_runs": [{ "id": 91, "repository": { "private": true } }] })) }
+            Some("/90/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(9, "superci", "2026-09-21T14:11:20Z"), job(10, "ubuntu-latest", "2026-09-21T14:11:20Z"), job(11, "superci", "2026-09-21T14:13:10Z"), job(7, "superci", "2026-09-21T13:00:00Z"),
+                { "id": 12, "run_id": 90, "status": "in_progress", "labels": ["superci"], "created_at": "2026-09-21T14:11:20Z" }] })),
+            Some("/91/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(13, "superci-2cpu", "2026-09-21T14:11:20Z")] })),
+            _ => self.0.send(r).await,
+        }
+    }
+}
+
+#[test]
+fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
+    let (store, clouds, wakes, cache) = (Mem::default(), Untold(FakeClouds::default()), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // A repository that had a job here an hour ago, and one whose last was two days ago (not asked about).
+    for (id, repo, ago_ms) in [(7u64, "acme/app", 3_600_000u64), (3, "acme/old", 2 * 86_400_000)] {
+        store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": repo, "state": "done", "at_ms": 1_790_000_000_000u64 - ago_ms, "ended_ms": 1_790_000_000_000u64 - ago_ms + 60_000,
+            "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    }
+    let asked = |what: &str| clouds.0.calls.borrow().iter().filter(|c| c.1.contains(what)).count();
+    block_on(plane.alarm()).unwrap();
+    // The one for here that waits and was never told of gets a machine; one for other runners, one made a moment
+    // ago (its event may be on its way), one known, and one that runs do not.
+    assert_eq!(job(&store, 9)["label"], "superci");
+    assert_eq!(launches(&clouds.0).len(), 1);
+    for id in [10, 11, 12, 13] { assert!(!store.0.borrow().contains_key(&format!("job:{id}")), "{id}") }
+    assert_eq!((asked("acme/app/actions/runs?status=queued"), asked("acme/app/actions/runs?status=in_progress"), asked("acme/old")), (1, 0, 0));
+    // Not asked again within five minutes; asked again after.
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(asked("acme/app/actions/runs?status=queued"), 1);
+    store.0.borrow_mut().insert("untold_at".into(), (1_790_000_000_000u64 - 6 * 60_000).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((asked("acme/app/actions/runs?status=queued"), launches(&clouds.0).len()), (2, 1), "asked again; the job found before is known now");
+    // Just after a move here: asked at every sweep, also about runs of which a job has started, and the sweep
+    // comes every minute.
+    store.0.borrow_mut().insert("claimed_at".into(), (1_790_000_000_000u64 - 60_000).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((asked("acme/app/actions/runs?status=queued"), asked("acme/app/actions/runs?status=in_progress")), (3, 1));
+    assert_eq!(job(&store, 13)["label"], "superci-2cpu");
+    assert_eq!(wakes.0.borrow().last(), Some(&60_000));
+}

@@ -203,6 +203,41 @@ pub async fn failed_deliveries(http: &dyn Http, app: &App, since_ms: u64, now_ms
     }).filter_map(|d| Some((d["id"].as_u64()?, d["guid"].as_str()?.to_string()))).collect())
 }
 
+/// A repository's jobs that wait for a runner, as GitHub lists them now (not as it told of them): each job as its
+/// event would have carried it, and whether the repository is private. `started_too`: also the waiting jobs of runs
+/// of which another job has started.
+pub async fn waiting_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, started_too: bool) -> Result<Vec<(serde_json::Value, bool)>> {
+    let mut out = vec![];
+    for status in if started_too { &["queued", "in_progress"][..] } else { &["queued"][..] } {
+        let runs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs?status={status}&per_page=10"), Some(token), None).await?;
+        for run in runs["workflow_runs"].as_array().into_iter().flatten() {
+            let Some(id) = run["id"].as_u64() else { continue };
+            let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?per_page=50"), Some(token), None).await?;
+            for job in jobs["jobs"].as_array().into_iter().flatten().filter(|j| j["status"] == "queued") { out.push((job.clone(), run["repository"]["private"] == true)) }
+        }
+    }
+    Ok(out)
+}
+
+/// What GitHub says of the events it sent this App lately (the newest hundred): for each, what it was, when, where
+/// it answered from (the status), and whether it was a second sending. With `id`: one of them whole, with the address
+/// it was sent to and what was answered.
+pub async fn deliveries(http: &dyn Http, app: &App, id: Option<u64>, now_ms: u64) -> Result<serde_json::Value> {
+    let jwt = app_jwt(app, now_ms)?;
+    match id {
+        Some(id) => {
+            let d = gh(http, &app.api(), "GET", &format!("/app/hook/deliveries/{id}"), Some(&jwt), None).await?;
+            let job = &d["request"]["payload"]["workflow_job"];
+            Ok(serde_json::json!({ "id": d["id"], "event": d["event"], "action": d["action"], "delivered_at": d["delivered_at"], "status": d["status"], "status_code": d["status_code"], "redelivery": d["redelivery"], "duration": d["duration"],
+                "url": d["url"], "job": job["id"], "job_name": job["name"], "labels": job["labels"], "answer": d["response"]["payload"].as_str().map(|p| p.chars().take(600).collect::<String>()) }))
+        }
+        None => {
+            let list = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", Some(&jwt), None).await?;
+            Ok(serde_json::Value::Array(list.as_array().into_iter().flatten().map(|d| serde_json::json!({ "id": d["id"], "event": d["event"], "action": d["action"], "delivered_at": d["delivered_at"], "status": d["status"], "status_code": d["status_code"], "redelivery": d["redelivery"], "duration": d["duration"] })).collect()))
+        }
+    }
+}
+
 /// Points the App's webhook at a control plane (moving to another one keeps the App and its installations).
 pub async fn set_webhook_url(http: &dyn Http, app: &App, url: &str, now_ms: u64) -> Result<()> {
     gh(http, &app.api(), "PATCH", "/app/hook/config", Some(&app_jwt(app, now_ms)?), Some(serde_json::json!({ "url": url, "content_type": "json" }))).await.map(|_| ())

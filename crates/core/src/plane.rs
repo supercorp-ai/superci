@@ -559,6 +559,14 @@ impl<'a> ControlPlane<'a> {
             // GitLab's projects, for the dashboard: which send their jobs here; switching one on or off; after the
             // connection changes, every webhook here gets the new secret.
             ("GET", "/job/log") if self.reader(&req) => self.job_log(&url).await,
+            // What GitHub says of the events it sent here lately, for whoever may read: whether each arrived, and (one
+            // by its id) where it was sent and what was answered. To see why a job never got a machine.
+            ("GET", "/github/deliveries") if self.reader(&req) => {
+                let id = url.query_pairs().find(|(k, _)| k == "id").and_then(|(_, v)| v.parse::<u64>().ok());
+                let mut out = vec![];
+                for app in self.config.apps() { out.push(serde_json::json!({ "app": app.slug, "deliveries": github::deliveries(self.http, app, id, self.clock.now_ms()).await.unwrap_or_else(|e| serde_json::json!({ "error": e })) })) }
+                Ok(Response::json(&serde_json::Value::Array(out)))
+            }
             ("GET", "/gitlab/projects") if self.reader(&req) => {
                 // Of one connection (`g`: its name; nothing: the first).
                 let which = url.query_pairs().find(|(k, _)| k == "g").map(|(_, v)| v.into_owned()).unwrap_or_default();
@@ -775,6 +783,9 @@ impl<'a> ControlPlane<'a> {
         // In use (again, when moving back to a control plane moved away from before).
         self.store.delete("moved_to").await?;
         self.store.delete("standby").await?;
+        // GitHub can lose an event made in the seconds its App's address changes (seen: a job queued four seconds
+        // after, never sent anywhere): for a while, jobs it did not tell of are looked for more often (`untold`).
+        put_json(self.store, "claimed_at", &now).await?;
         self.timer.wake_in(60_000).await?;
         Ok(Response::json(&serde_json::json!({ "github": self.config.app.is_some(), "github_apps": self.config.apps().count(), "github_failed": failed, "gitlab_projects": projects })))
     }
@@ -2051,9 +2062,42 @@ impl<'a> ControlPlane<'a> {
             for (k, v) in self.store.list(prefix).await? { if v.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > keep) { self.store.delete(&k).await? } }
         }
         self.redeliver_failed().await;
-        // Every 20 seconds while jobs wait for room; every minute while machines are up; every five otherwise (redeliveries).
-        self.timer.wake_in(if waiting > 0 { 20_000 } else if active > 0 { 60_000 } else { 300_000 }).await?;
+        let moved_lately = self.untold(&plane_url, now).await;
+        // Every 20 seconds while jobs wait for room; every minute while machines are up, or just after a move here;
+        // every five otherwise (redeliveries, jobs not told of).
+        self.timer.wake_in(if waiting > 0 { 20_000 } else if active > 0 || moved_lately { 60_000 } else { 300_000 }).await?;
         Ok(())
+    }
+
+    /// Jobs that wait for a runner of this control plane and that GitHub never told it of: found by asking, and given
+    /// a machine as if the event had come. GitHub sends each event once; one it loses (seen when its App's address
+    /// changes in a move) is in no list of failed deliveries, so nothing else would ever start that job. Asked for
+    /// the repositories that had a job here in the last day (ten at most), every five minutes; in the quarter of an
+    /// hour after a move here, at every sweep, and also for runs of which another job has started. Whether a move
+    /// was that lately.
+    async fn untold(&self, plane_url: &str, now: u64) -> bool {
+        let moved_lately = get_json::<u64>(self.store, "claimed_at").await.ok().flatten().is_some_and(|at| now.saturating_sub(at) < 15 * 60_000);
+        if self.config.app.is_none() { return moved_lately }
+        if !moved_lately && get_json::<u64>(self.store, "untold_at").await.ok().flatten().is_some_and(|at| now.saturating_sub(at) < 5 * 60_000 - 5_000) { return false }
+        let _ = put_json(self.store, "untold_at", &now).await;
+        let Ok(kept) = self.store.list("job:").await else { return moved_lately };
+        let mut jobs: Vec<Job> = kept.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.provider.is_empty() && now.saturating_sub(j.at_ms) < 86_400_000).collect();
+        jobs.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        let mut repos: Vec<&Job> = vec![];
+        for j in &jobs { if repos.len() < 10 && !repos.iter().any(|r| r.repo == j.repo) { repos.push(j) } }
+        for known in repos {
+            let (Some(app), Some(token)) = (self.app_of(known), self.installation_token_for(known).await) else { continue };
+            let Ok(waiting) = github::waiting_jobs(self.http, &app.api(), &token, &known.repo, moved_lately).await else { continue };
+            for (job, private) in waiting {
+                // Told of already, or made a moment ago (its event may still be on its way).
+                let Some(id) = job["id"].as_u64() else { continue };
+                if matches!(self.store.get(&format!("job:{id}")).await, Ok(Some(_)) | Err(_)) { continue }
+                if job["created_at"].as_str().and_then(aws::parse_iso_ms).is_none_or(|at| now.saturating_sub(at) < 45_000) { continue }
+                let event = serde_json::json!({ "action": "queued", "workflow_job": job, "repository": { "full_name": known.repo, "private": private }, "installation": { "id": known.installation_id } });
+                if let Some(ev) = github::our_job(&event, &self.config.label, &app.owner) { let _ = self.launch(plane_url, &ev, app).await; }
+            }
+        }
+        moved_lately
     }
 
     /// A webhook that failed while the runtime restarted (a secret changed, a new version) would leave its job waiting

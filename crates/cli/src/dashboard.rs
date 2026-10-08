@@ -712,11 +712,10 @@ impl Dashboard {
             let upto = if ended.as_ref().is_some_and(|e| e.is_ok()) { steps.len() } else { (at + 1).min(steps.len()) };
             while said < upto { say(&steps[said]); said += 1 }
             if let Some(ended) = ended {
-                if matches!(what, Background::Deploy) && ended.is_ok() {
-                    self.adopt_deploy();
-                    self.key_planes();
-                    // The new one joins the list; the one in use stays the one in use (and the one kept), unless
-                    // this is the first.
+                if matches!(what, Background::Deploy) && ended.is_ok() { self.adopt_deploy(); self.key_planes(); }
+                // The one in use is the one kept: after a deploy still the one before (unless this is the first),
+                // after a move the one moved to.
+                if !matches!(what, Background::Update) && ended.is_ok() {
                     let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
                     if let Some(i) = views.get(view::in_use(&views)).and_then(|v| self.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { self.selected = i }
                 }
@@ -735,7 +734,8 @@ impl Dashboard {
         let only_reading = self.signed_in_as().is_none();
         if only_reading && !(self.aws_ended && self.kept_plane.is_some()) { return Err(NOT_SIGNED_IN.into()) }
         let kept = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id()));
-        if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some()) { return Ok(Some(v)) }
+        // (One that says it moved away is no longer the one in use: found again below.)
+        if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some() && (v.moved_to.is_none() || only_reading)) { return Ok(Some(v)) }
         // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
         if only_reading { return match self.kept_plane.clone() { Some(p) => Ok(Some(view::plane_view(&p, Some(&self.status_key)))), None => Err(AWS_ENDED.into()) } }
         // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.

@@ -37,6 +37,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "Public repositories allowed to run here. Jobs from public repositories are refused unless the repository is allowed.\nEven then, a fork's pull request and `pull_request_target` runs are refused."),
     ("github", "  superci github list\n  superci github create OWNER [--host=https://github.example.com]\n  superci github delete OWNER --confirm",
         "list      The GitHub accounts connected, and where each one's App is installed.\ncreate    Opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your own name)\n          and chooses its repositories. GitHub offers that nowhere else. It ends when the App is installed.\n          --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\ndelete    A further organization: its App is uninstalled and forgotten. The first one goes with `superci leave`."),
+    ("github_deliveries", "  superci github_deliveries list\n  superci github_deliveries retrieve ID",
+        "What GitHub says of the events it sent your control plane lately: for a job that never got a machine.\n\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
     ("gitlab", "  superci gitlab list\n  superci gitlab create --url=https://gitlab.com [--gitlab=ID|new]\n  superci gitlab delete [ID] --confirm",
         "create    The token is read from SUPERCI_GITLAB_TOKEN (--token-env=NAME for another variable): a project, group or\n          personal access token with the scopes api, create_runner and manage_runner. It goes to your control plane\n          and is not kept on this machine. --gitlab=new: a further connection beside the first.\ndelete    Its projects stop sending jobs here, and its token is forgotten."),
     ("gitlab_projects", "  superci gitlab_projects list [--gitlab=ID]\n  superci gitlab_projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci gitlab_projects update --all --enabled=true [--gitlab=ID]",
@@ -89,7 +91,7 @@ Coding agents and scripts:
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere) and reads no other tool's. On a
 machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
 SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "machine", "limits"]),
-                group(&["github", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["leave"]))
+                group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["leave"]))
         }
     }
 }
@@ -296,6 +298,31 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("runners", "list") => runners_of(&mut signed_in()),
         ("github", "list") => github(),
+        ("github_deliveries", operation @ ("list" | "retrieve")) => {
+            let id = w(2);
+            if operation == "retrieve" && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit())) { return usage("Say which: `superci github_deliveries retrieve ID` (ids are in `superci github_deliveries list`).") }
+            let mut d = signed_in();
+            let (v, key) = look(&mut d)?;
+            let got = crate::cloudflare::plane_get(v.plane.url(), &key, &if operation == "retrieve" { format!("/github/deliveries?id={id}") } else { "/github/deliveries".to_string() })
+                .map_err(|e| if e.contains("404") { "This needs control plane 0.11.2 or newer: `superci planes update`.".to_string() } else { e })?;
+            let s = |x: &Value| x.as_str().unwrap_or_default().to_string();
+            let mut said = vec![];
+            for app in got.as_array().into_iter().flatten() {
+                let list = &app["deliveries"];
+                if let Some(e) = list["error"].as_str() { said.push(format!("{}: GitHub would not say ({e})", s(&app["app"]))); continue }
+                if operation == "retrieve" {
+                    said.push(format!("{} {} {} · answered {} {} · job {} {} {}", s(&list["delivered_at"]), s(&list["event"]), s(&list["action"]), list["status_code"], s(&list["status"]), list["job"], s(&list["job_name"]), list["labels"]));
+                    said.push(format!("sent to {}", s(&list["url"])));
+                    if let Some(a) = list["answer"].as_str().filter(|a| !a.is_empty()) { said.push(format!("answer: {a}")) }
+                } else {
+                    for x in list.as_array().into_iter().flatten() {
+                        said.push(format!("{}  {:<13} {:<12} {} {}{}  {}", s(&x["delivered_at"]).replace('T', " ").chars().take(19).collect::<String>(), s(&x["event"]), s(&x["action"]), x["status_code"], s(&x["status"]).chars().take(60).collect::<String>(), if x["redelivery"] == true { "  (sent again)" } else { "" }, x["id"]));
+                    }
+                }
+            }
+            if said.is_empty() { said.push("GitHub is not connected, or it has sent nothing lately.".into()) }
+            Ok(Done { said, data: got })
+        }
         ("gitlab", "list") => gitlab(),
         ("planes", "list") => planes(),
         ("logout", "") => { let said = signed_in().logout()?; Ok(Done { data: json!({ "ok": true, "done": said }), said }) }
@@ -660,7 +687,7 @@ mod tests {
         for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs list", "superci jobs retrieve ID", "superci keys list", "superci keys create NAME", "superci keys delete NAME",
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci github list", "superci github create OWNER", "superci github delete OWNER",
-            "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab_projects list", "superci gitlab_projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete"] {
+            "superci github_deliveries list", "superci github_deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab_projects list", "superci gitlab_projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete"] {
             assert!(all.contains(command), "{command}");
         }
     }
@@ -685,7 +712,7 @@ mod tests {
         for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs list", "jobs retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
+        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "gitlab_projects list", "gitlab_projects update 7 --enabled=true", "gitlab_projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
             "planes update --dry-run", "runners create cloudflare --dry-run"] {

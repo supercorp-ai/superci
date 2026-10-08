@@ -2,6 +2,11 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.11.2 — 2026-10-09
+- A job that GitHub never told your control plane of now gets its machine all the same. GitHub sends each event once, and can lose one (seen: a job queued four seconds after a move changed the App's address was never sent anywhere, so it waited until cancelled). The control plane now asks GitHub which jobs wait for its runners: every five minutes for the repositories that had a job in the last day, and every sweep in the quarter of an hour after a move.
+- After `superci planes move`, commands read the control plane moved to at once (before: the one moved away from, until `superci planes list` or the dashboard had looked again).
+- `superci github_deliveries list` and `retrieve ID` show what GitHub says of the events it sent your control plane: when, what, how each was answered, and for one, which job, which address and what was answered. For a job that never got a machine.
+
 ## 0.11.1 — 2026-10-08
 - `superci planes create`, with a control plane in use already: the new one no longer takes its place in what SuperCI keeps on your computer. In 0.11.0, commands run afterwards went to the new, empty control plane until the dashboard was opened again.
 - After AWS has ended a sign-in that was SuperCI's only one, the dashboard and the commands that look go on working at the next start too (in 0.11.0 only until the program ended), and a change says that the sign-in has ended and to run `superci login aws`.
