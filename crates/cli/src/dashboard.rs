@@ -599,15 +599,31 @@ impl Dashboard {
         }
     }
 
+    /// The task's last page: what was done (its cloud's or GitHub's mark, checked), in a line, and nothing to press.
+    fn done_page(&self) -> Response {
+        let (mark, heading, text) = match &self.task {
+            Some(Task::GitHub { login, .. }) => ("github", "GitHub is connected".to_string(), format!("Jobs with runs-on: superci in {login}'s repositories now run on your runners.")),
+            Some(Task::Login(cloud)) => {
+                // The cloud asked for; with any: the one signed in to (several: none named).
+                let signed: Vec<&str> = ["aws", "cloudflare", "modal"].into_iter().filter(|c| self.signed_in_with(c)).collect();
+                let one = cloud.or(match signed.as_slice() { [only] => Some(*only), _ => None });
+                (one.unwrap_or("superci"), one.map(|c| format!("Signed in with {}", provider_name(c))).unwrap_or_else(|| "Signed in".into()), "SuperCI stays signed in on this computer until you sign out.".to_string())
+            }
+            None => ("superci", "Done".to_string(), String::new()),
+        };
+        let mark = if mark == "superci" { MARK.to_string() } else { logo(mark, 44) };
+        document(200, "SuperCI", &format!(r#"<div class="done"><div><span class="done-mark">{mark}<span class="done-check"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"/></svg></span></span><h1>{}</h1><p>{}</p><p class="done-foot">You can close this tab.</p></div></div>"#, esc(&heading), esc(&text)), None)
+    }
+
     /// What the task's tab shows at the dashboard's address, in the dashboard's place.
     fn task_page(&mut self) -> Option<Response> {
-        if self.task_done().is_some() { return Some(message(200, "Done", "Back to your terminal: you can close this tab.")) }
+        if self.task_done().is_some() { return Some(self.done_page()) }
         // Modal's page does not come back with the sign-in: it is asked for here until it is approved there.
         if matches!(self.task, Some(Task::Login(Some("modal")))) {
             if let Some(pending) = self.modal_pending.clone() {
                 if let Ok(Some(session)) = modal::wait(&pending, 1.0) {
                     (self.modal, self.modal_pending, self.looked_modal) = (Some(session), None, false);
-                    return Some(message(200, "Done", "Back to your terminal: you can close this tab."))
+                    return Some(self.done_page())
                 }
                 return Some(back_to("Approve it in Modal's tab", "This tab goes on by itself once you have.", &format!("{}/", self.base)))
             }
@@ -616,7 +632,8 @@ impl Dashboard {
             // A sign-in with one cloud goes straight to it; with any, the dashboard's own first screen asks which.
             Task::Login(Some(cloud)) => Some(Response::redirect(&format!("/connect/{cloud}"))),
             Task::Login(None) => None,
-            Task::GitHub { started: true, .. } => Some(message(200, "Finish on GitHub", "Create the App there and choose its repositories. This tab comes back here when it is done.")),
+            // Back here before GitHub was finished: the page waits, and looks again by itself.
+            Task::GitHub { started: true, .. } => Some(document(200, "SuperCI", &format!(r#"<div class="wait"><div>{MARK}<h1>Finish on GitHub</h1><p>Create the App there and choose its repositories.</p><div class="spinner"></div></div></div>"#), Some(3))),
             Task::GitHub { login, host, started, .. } => {
                 *started = true;
                 let fields = [("login", login.clone()), ("host", host.clone())];
@@ -4982,7 +4999,9 @@ mod tests {
         assert!(d.task_done().is_none(), "another cloud's sign-in is not this one");
         d.aws = Some(aws::Session::for_test("123456789012"));
         assert!(d.task_done().unwrap().starts_with("Signed in: AWS account 123456789012, Modal workspace acme."));
-        assert!(String::from_utf8(d.task_page().unwrap().body).unwrap().contains("Back to your terminal"));
+        let done = String::from_utf8(d.task_page().unwrap().body).unwrap();
+        if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { std::fs::write(format!("{dir}/done-login.html"), &done).unwrap() }
+        assert!(done.contains("<h1>Signed in with AWS</h1>") && done.contains("SuperCI stays signed in on this computer until you sign out.") && done.contains("You can close this tab.") && !done.contains(">Back<"), "what was done, and nothing to press");
         // With any cloud: the dashboard's own first screen asks which.
         let mut any = Dashboard::new().for_task(Task::Login(None));
         assert!(any.task_page().is_none() && any.task_done().is_none());
@@ -4991,6 +5010,9 @@ mod tests {
         assert!(g.task_done().is_none() && String::from_utf8(g.task_page().unwrap().body).unwrap().contains("Finish on GitHub"));
         let _ = g.handle(&Req { method: "GET".into(), path: "/github/installed".into(), query: vec![], cookie: None, last: None, body: vec![], host: String::new(), origin: None, fetch_site: None });
         assert!(g.task_done().unwrap().starts_with("GitHub is connected for acme"));
+        let done = String::from_utf8(g.task_page().unwrap().body).unwrap();
+        if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { std::fs::write(format!("{dir}/done-github.html"), &done).unwrap() }
+        assert!(done.contains("<h1>GitHub is connected</h1>") && done.contains("acme&#39;s repositories") && !done.contains(">Back<"));
     }
 
     #[test]

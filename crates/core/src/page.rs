@@ -70,6 +70,15 @@ a.item:hover{color:var(--ink);background:var(--card)}.item[aria-current=true]{co
 .note{color:var(--muted);font-size:12.5px}.empty{padding:28px 12px;text-align:center;color:var(--muted)}
 .plain{max-width:640px;margin:0 auto;padding:64px 24px}.plain h1{font-size:26px;margin-bottom:12px}
 .wait{display:grid;place-items:center;min-height:100vh;text-align:center;padding:24px}.wait .mark{width:34px;height:34px;margin:0 auto 18px}.wait h1{font-size:22px;margin-bottom:8px}.wait p{color:var(--muted)}
+/* A command's last page in the browser: what was done, its mark with a check drawn on, nothing to press. */
+.done{display:grid;place-items:center;min-height:100vh;padding:24px;text-align:center}.done>div{display:grid;justify-items:center;max-width:420px}
+.done-mark{position:relative;display:grid;place-items:center;width:84px;height:84px;margin-bottom:26px;border-radius:24px;background:var(--card);border:1px solid var(--rule);box-shadow:var(--shadow);animation:done-in .5s cubic-bezier(.2,.9,.3,1.2) both}
+.done-mark>.logo{border-radius:12px}.done-mark>.mark{width:40px;height:40px}
+.done-check{position:absolute;right:-9px;bottom:-9px;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--good-fill);color:#fff;border:3px solid var(--bg);animation:done-in .4s .25s cubic-bezier(.2,.9,.3,1.4) both}
+.done-check svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:22;stroke-dashoffset:22;animation:done-draw .35s .45s ease-out forwards}
+.done h1{font-size:28px;letter-spacing:-.035em;margin-bottom:10px}.done p{max-width:32ch;color:var(--muted);font-size:15.5px;line-height:1.5}.done .done-foot{margin-top:30px;color:var(--faint);font:500 12px/1.4 var(--mono)}
+@keyframes done-in{from{opacity:0;transform:scale(.8)}}@keyframes done-draw{to{stroke-dashoffset:0}}
+@media (prefers-reduced-motion:reduce){.done-mark,.done-check{animation:none}.done-check svg{animation:none;stroke-dashoffset:0}}
 .spinner{width:26px;height:26px;margin:22px auto 0;border:3px solid var(--rule);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}
 .sk{height:14px;margin:10px 0;border-radius:7px;background:var(--sk) linear-gradient(90deg,transparent 30%,var(--sk-hi) 50%,transparent 70%) no-repeat;background-size:200% 100%;background-position:150% 0;animation:shimmer 1.8s ease-in-out infinite}.sk.w30{width:30%}.sk.w40{width:40%;height:18px}.sk.w70{width:70%}
 @keyframes shimmer{from{background-position:150% 0}to{background-position:-50% 0}}@media (prefers-reduced-motion:reduce){.sk{animation:none}}
