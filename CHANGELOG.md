@@ -2,10 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.11.1 — unreleased
+## 0.11.1 — 2026-10-08
 - `superci planes create`, with a control plane in use already: the new one no longer takes its place in what SuperCI keeps on your computer. In 0.11.0, commands run afterwards went to the new, empty control plane until the dashboard was opened again.
 - After AWS has ended a sign-in that was SuperCI's only one, the dashboard and the commands that look go on working at the next start too (in 0.11.0 only until the program ended), and a change says that the sign-in has ended and to run `superci login aws`.
+- A move to another control plane waits until the new one says every runner provider it was given is there, before GitHub and GitLab are switched over. Before, a job that arrived in the first minute could fail saying a provider was not added (seen with Cloudflare's containers).
 - A command that would delete something and was not given `--confirm` says only that, without its resource's help after it.
+- `superci login` says what it is waiting for and that it is done, without a line for each request of the browser.
 
 ## 0.11.0 — 2026-10-08
 - SuperCI stays signed in. Its sign-ins to your clouds are kept in its own folder on your computer (`~/.superci`, readable by you alone), so the dashboard opens where you left it. An AWS sign-in still ends after twelve hours at most, as AWS has it; Cloudflare's no longer ends after an hour.

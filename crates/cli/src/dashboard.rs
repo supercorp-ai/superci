@@ -3931,9 +3931,12 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     // Actions and sign-ins are told in the terminal too (never their codes or tokens).
     let r = d.handle(req);
     d.keep();
-    match &r {
-        Ok(ok) => println!("{} {} → {}", req.method, req.path, ok.status),
-        Err(e) => println!("{} {} → failed: {e}", req.method, req.path),
+    // The dashboard's terminal says each action; a command that only opened the browser for one thing says that thing.
+    if d.task.is_none() {
+        match &r {
+            Ok(ok) => println!("{} {} → {}", req.method, req.path, ok.status),
+            Err(e) => println!("{} {} → failed: {e}", req.method, req.path),
+        }
     }
     r.unwrap_or_else(|e| message(500, "Something went wrong", &esc(&e)))
 }
@@ -4071,6 +4074,16 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     if agents.len() != agents_before || plan.iter().any(|c| matches!(c, Carry::Comes("cloudflare") | Carry::Comes("modal"))) {
         w.put(to, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
     }
+    // The new one says each provider it was given is there, before any job is sent to it: a control plane given its
+    // containers a moment ago starts again with them, and until it has, a job for them would find none.
+    let brought: Vec<&str> = plan.iter().filter_map(|c| match c { Carry::Comes(cloud) => Some(*cloud), _ => None }).collect();
+    let mut ready = brought.is_empty();
+    for _ in 0..60 {
+        if ready { break }
+        std::thread::sleep(Duration::from_secs(2));
+        ready = cloudflare::status_light(to.url(), key).is_some_and(|s| brought.iter().all(|c| provider_connected(&s, c)));
+    }
+    if !ready { left.push("The new control plane had not started with every runner provider yet: a job in the next minutes may find one missing.".into()) }
 
     // 3. The switch: the old one passes on what still reaches it, then the new one takes GitHub and GitLab over.
     step(2);
