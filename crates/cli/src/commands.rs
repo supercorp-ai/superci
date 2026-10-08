@@ -168,6 +168,17 @@ fn ready() -> Result<Dashboard> {
 
 fn in_use(d: &Dashboard) -> Result<Plane> { Ok(d.plane_in_use().ok_or(NO_PLANE)?) }
 
+/// A dashboard ready to change a setting of the control plane in use (its limits, its order, its keys): as `ready`,
+/// without looking through the clouds again when that control plane is known.
+fn ready_to_set() -> Result<Dashboard> { let mut d = signed_in(); to_set(&mut d)?; Ok(d) }
+
+/// The same, of a dashboard that has read already. A key that only reads is no sign-in, and is said to be none.
+fn to_set(d: &mut Dashboard) -> Result<()> {
+    if d.signed_in_as().is_none() && given_key().is_some() { return Err(ONLY_READS.into()) }
+    d.signed_in_as().ok_or(NOT_SIGNED_IN)?;
+    Ok(d.ready_for_settings()?)
+}
+
 /// A key that only reads, given by name with its control plane's address (SUPERCI_PLANE, SUPERCI_KEY): what a coding
 /// agent or a script is handed in place of the sign-ins.
 fn given_key() -> Option<(String, String)> {
@@ -252,7 +263,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("keys", "create") => {
             if w(2).is_empty() { return usage("Give it a name: `superci keys create agent`.") }
             let Ok(days) = args.get("days").unwrap_or("30").parse::<u64>() else { return usage("--days is a number of days (30 unless given).") };
-            let mut d = ready()?;
+            let mut d = ready_to_set()?;
             let plane = in_use(&d)?;
             if let Some(done) = dry(args, &format!("make a key named {} that only reads, good for {days} days", w(2)), "keys", &[]) { return Ok(done) }
             let (key, until) = d.create_key(w(2), days)?;
@@ -262,7 +273,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("keys", "revoke") => {
             if w(2).is_empty() { return usage("Say which: `superci keys revoke NAME` (names are in `superci keys`).") }
-            let mut d = ready()?;
+            let mut d = ready_to_set()?;
             in_use(&d)?;
             if let Some(done) = dry(args, &format!("end the key named {}", w(2)), "keys", &[]) { return Ok(done) }
             d.revoke_key(w(2))?;
@@ -368,7 +379,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let names: Vec<String> = (0..order.len()).map(|i| format!("cloud_{i}")).collect();
             let mut fields: Vec<(&str, String)> = vec![field("action", "order")];
             for (name, cloud) in names.iter().zip(&order) { fields.push((name, cloud.clone())) }
-            d.ready()?;
+            to_set(&mut d)?;
             apply!(d, args, format!("set the order to {}", order.join(", ")), "/routing", &fields);
             Ok(Done { said: vec![format!("Order: {}.", order.join(", "))], data: json!({ "ok": true, "order": order }) })
         }
@@ -390,7 +401,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if let Some(image) = args.get("image") { fields.push(field("image", if image == "none" { "" } else { image })) }
             let given: Vec<String> = ["max-jobs", "monthly-usd", "on", "off", "regions", "networks", "location", "image"].iter().filter(|f| args.has(f)).map(|f| match args.get(f) { Some(v) => format!("--{f} {v}"), None => format!("--{f}") }).collect();
             if given.is_empty() { return usage(format!("Say what to set: `superci runners set {cloud} --max-jobs 20` (see `superci help runners`).")) }
-            d.ready()?;
+            to_set(&mut d)?;
             apply!(d, args, format!("set {cloud}: {}", given.join(" ")), "/routing", &fields);
             runners_of(&mut d)
         }
@@ -403,7 +414,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                     field("arch", args.get("arch").map(str::to_string).or(now.arch.clone()).unwrap_or_else(|| "x64".into())),
                     field("os", args.get("os").map(str::to_string).or(now.os.clone()).unwrap_or_else(|| "linux".into()))];
                 if args.has("on-demand") || (!args.has("spot") && now.on_demand) { fields.push(field("ondemand", "on")) }
-                d.ready()?;
+                to_set(&mut d)?;
                 let would = fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
                 apply!(d, args, format!("give `runs-on: superci` this machine: {would}"), "/machine", &fields);
             }
@@ -412,14 +423,14 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("limits", "") => {
             let Some(max) = args.get("max-cpu") else { return usage("Say the limit: `superci limits --max-cpu 32`.") };
-            let mut d = ready()?;
+            let mut d = ready_to_set()?;
             in_use(&d)?;
             apply!(d, args, format!("let a label ask for up to {max} CPUs"), "/routing", &[field("action", "max_cpu"), field("max_cpu", max)]);
             Ok(Done::said(format!("A label may ask for up to {max} CPUs.")))
         }
         ("public", action @ ("add" | "remove")) => {
             if w(2).is_empty() { return usage(format!("Say which: `superci public {action} OWNER/REPO`.")) }
-            let mut d = ready()?;
+            let mut d = ready_to_set()?;
             in_use(&d)?;
             apply!(d, args, if action == "add" { format!("let the public repository {} run here", w(2)) } else { format!("stop the public repository {} from running here", w(2)) }, "/routing", &[field("action", format!("public_{action}")), field("repo", w(2))]);
             Ok(Done::said(if action == "add" { format!("{} may run here (never a fork's pull request).", w(2)) } else { format!("{} no longer runs here.", w(2)) }))
@@ -459,7 +470,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 (_, _, "") => return usage(format!("Say which: `superci gitlab {action} PROJECT_ID` (ids are in `superci gitlab projects`).")),
                 (_, _, id) => { fields.push(field("id", id)); fields.push(field("enabled", if action == "enable" { "true" } else { "false" })); format!("{} project {id}'s jobs here", if action == "enable" { "send" } else { "stop sending" }) }
             };
-            let mut d = ready()?;
+            let mut d = ready_to_set()?;
             in_use(&d)?;
             apply!(d, args, would, "/gitlab/project", &fields);
             Ok(Done::said(if action == "enable" { "Its jobs come here now (tags: superci)." } else { "Its jobs no longer come here." }))

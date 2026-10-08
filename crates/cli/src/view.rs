@@ -117,17 +117,20 @@ pub fn older(a: Option<&str>, b: &str) -> bool {
 }
 
 pub fn plane_view(plane: &Plane, key: Option<&str>) -> PlaneView {
+    // Its public yes/no and (with a key) what it says of itself, asked at once.
     let t = std::time::Instant::now();
-    let h = health(plane.url());
-    let health_ms = t.elapsed().as_millis();
+    let (h, health_ms, said) = std::thread::scope(|scope| {
+        let said = key.map(|k| scope.spawn(move || { let t = std::time::Instant::now(); (cloudflare::status(plane.url(), k), t.elapsed().as_millis()) }));
+        let h = health(plane.url());
+        let health_ms = t.elapsed().as_millis();
+        (h, health_ms, said.and_then(|s| s.join().ok()))
+    });
     let flag = |k: &str| h.as_ref().is_some_and(|h| h[k] == true);
     PlaneView { plane: plane.clone(), online: h.is_some(), github: flag("github"), installed: flag("installed"), aws: flag("aws"), runners: flag("runners"), gitlab: flag("gitlab"),
         moved_to: h.as_ref().and_then(|h| h["moved_to"].as_str().map(str::to_string)), standby: flag("standby"),
         version: h.as_ref().map(|h| h["version"].as_str().unwrap_or("0.1.0").to_string()),
-        status: key.and_then(|k| {
-            let t = std::time::Instant::now();
-            let s = cloudflare::status(plane.url(), k);
-            if std::env::var_os("SUPERCI_TIMING").is_some() { println!("  {:>6} ms  {}: health · {:>6} ms status{}", health_ms, plane.place(), t.elapsed().as_millis(), if s.is_some() { "" } else { " (not read)" }) }
+        status: said.and_then(|(s, status_ms)| {
+            if std::env::var_os("SUPERCI_TIMING").is_some() { println!("  {:>6} ms  {}: health · {:>6} ms status{}", health_ms, plane.place(), status_ms, if s.is_some() { "" } else { " (not read)" }) }
             s
         }) }
 }

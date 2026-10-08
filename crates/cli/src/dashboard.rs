@@ -659,6 +659,16 @@ impl Dashboard {
         Ok(())
     }
 
+    /// For a command that changes a setting of the control plane in use: when that one is known from the last run and
+    /// its cloud is signed in to, nothing more is looked for (finding control planes asks a cloud in every region);
+    /// else as `ready`.
+    pub fn ready_for_settings(&mut self) -> Result<()> {
+        match self.planes.get(self.selected).map(|p| p.cloud()) {
+            Some(cloud) if self.preloaded.is_some() && self.signed_in_with(cloud) => Ok(()),
+            _ => self.ready(),
+        }
+    }
+
     /// Does what a form on the dashboard's pages does, with the same fields: the same code runs (`handle`), so a
     /// command and the page can never differ. What it said: a page that says one thing, or the note a page shows once.
     pub fn act(&mut self, path: &str, fields: &[(&str, String)]) -> Result<String> {
@@ -718,7 +728,8 @@ impl Dashboard {
         let p = views[view::in_use(&views)].plane.clone();
         if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.selected = i }
         let mut v = view::plane_view(&p, Some(&self.status_key));
-        if v.online && v.status.is_none() && self.keyed.contains(p.plane_id()) { v.status = status_soon(p.url(), &self.status_key) }
+        // Just handed the key: its whole status, once it takes it (a few tries).
+        for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } std::thread::sleep(Duration::from_millis(1500)); v.status = cloudflare::status(p.url(), &self.status_key) }
         self.keep();
         Ok(Some(v))
     }
@@ -3894,7 +3905,7 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
 /// dashboard started), so asked again for a few seconds before giving up.
 fn status_soon(plane_url: &str, key: &str) -> Option<serde_json::Value> {
     for i in 0..8 {
-        if let Some(s) = cloudflare::status(plane_url, key) { return Some(s) }
+        if let Some(s) = cloudflare::status_light(plane_url, key) { return Some(s) }
         if i < 7 { std::thread::sleep(Duration::from_millis(1500)) }
     }
     None
@@ -3902,9 +3913,9 @@ fn status_soon(plane_url: &str, key: &str) -> Option<serde_json::Value> {
 
 /// Whether it did.
 fn wait_for(plane_url: &str, key: &str, done: impl Fn(&serde_json::Value) -> bool) -> bool {
-    for _ in 0..20 {
-        if cloudflare::status(plane_url, key).is_some_and(|s| done(&s)) { return true }
-        std::thread::sleep(Duration::from_secs(1));
+    for _ in 0..40 {
+        if cloudflare::status_light(plane_url, key).is_some_and(|s| done(&s)) { return true }
+        std::thread::sleep(Duration::from_millis(500));
     }
     false
 }

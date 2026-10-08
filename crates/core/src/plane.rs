@@ -805,8 +805,10 @@ impl<'a> ControlPlane<'a> {
     /// the App and where it is installed, the AWS connection, and recent jobs. Without a key it is like any unknown path.
     async fn status(&self, req: &Request) -> Result<Response> {
         if !self.reader(req) { return Ok(nothing_here()); }
+        // `light`: asked only to see a setting take (after each change): without what GitHub has to be asked for.
+        let light = url::Url::parse(&req.url).is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "light" && v == "1"));
         let mut installations = vec![];
-        for app in self.config.apps() {
+        for app in self.config.apps().filter(|_| !light) {
             installations.extend(github::installations(self.http, app, self.clock.now_ms()).await.unwrap_or_default()
                 .into_iter().map(|i| serde_json::json!({ "account": i.account, "repositories": i.selection, "id": i.id, "permissions": i.permissions, "app": app.id })));
         }

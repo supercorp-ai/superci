@@ -470,8 +470,13 @@ pub fn plane_move_call(plane_url: &str, key: &str, token: &str, path: &str, body
 }
 
 /// The control plane's view for the dashboard (jobs, the App, the AWS connection), read with this session's key.
-pub fn status(plane_url: &str, key: &str) -> Option<Value> {
-    let mut r = quick().get(&format!("{plane_url}/status")).header("authorization", &format!("Bearer {key}")).call().ok()?;
+pub fn status(plane_url: &str, key: &str) -> Option<Value> { status_of(plane_url, key, "") }
+
+/// The same, to see a setting take: without where the App is installed (which GitHub is asked for each time).
+pub fn status_light(plane_url: &str, key: &str) -> Option<Value> { status_of(plane_url, key, "?light=1") }
+
+fn status_of(plane_url: &str, key: &str, query: &str) -> Option<Value> {
+    let mut r = quick().get(&format!("{plane_url}/status{query}")).header("authorization", &format!("Bearer {key}")).call().ok()?;
     if r.status().as_u16() != 200 { return None }
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
 }
