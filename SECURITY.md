@@ -38,7 +38,8 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
   caller picks.
 - **Runner agents** (Cloudflare, Modal) accept only tokens signed by the one control plane they were set up for. The
   token must be for the agent's own address and must not have expired.
-- **Machines** run one job each and end when it ends. A machine also has its own time limit: 70 minutes, enforced by
+- **Machines** run one job each and end when it ends. A machine also has its own time limit: six hours (GitHub's
+  default limit for a job), enforced by
   the machine itself (AWS: a timer plus a scheduled shutdown, and the machine terminates on power-off) or by the cloud
   (Cloudflare: the runner's alarm; Modal: the sandbox timeout). This works even if the control plane is gone. The
   control plane also sweeps up machines whose job never came (after 10 minutes) and machines past the limit.

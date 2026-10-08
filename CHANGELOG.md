@@ -13,6 +13,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - Keys that only read, for a coding agent or a script that should look and not change: `superci keys create agent` shows one once; with `SUPERCI_PLANE` and `SUPERCI_KEY` set, `superci status`, `jobs`, `job`, `runners` and `repos` work with no sign-in on that machine, and nothing can be changed. Your control plane keeps only the key's SHA-256; a key ends by itself (30 days unless said otherwise) or with `superci keys revoke`.
 - `superci job ID` shows one job with the end of its log: GitHub's, read by your control plane with your App's token, or GitLab's. So why a job failed can be read without opening the code host.
 - A change is seen at once on a control plane in AWS (before: up to fifteen seconds later, while it went on with the settings it had read). The dashboard and commands no longer wait there after each change, and a change made right after another starts from it.
+- A job may run for six hours, GitHub's default limit for a job (before: 70 minutes, whatever the workflow said). `timeout-minutes` in a workflow ends one sooner, as on GitHub's runners. The six hours are what ends a machine that nothing else would.
 - A release becomes what `npx @superci/cli` gives only once every one of its files downloads from npm, the launcher's too (npm lists a version minutes before it serves its file; for those minutes a new install failed).
 - The dashboard has a new mark: four petals, as on superci.dev, in place of the two arrows.
 

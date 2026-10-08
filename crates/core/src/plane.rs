@@ -20,7 +20,11 @@ use crate::io::{Containers, get_json, put_json, Clock, Http, Request, Response, 
 use crate::spec::{aws_instance_types, Capacity, Size, Spec};
 
 pub const AUDIENCE: &str = "superci";
-const MAX_JOB_MINUTES: u32 = 70;
+/// How long a machine may live: as long as GitHub lets a job run unless its workflow says otherwise (six hours,
+/// `timeout-minutes`' default, and what GitHub's own runners allow at most). Not a limit on jobs as such: GitHub and
+/// GitLab end a job at its own time limit, and its machine ends with it. This is what ends a machine nothing else
+/// would (its control plane gone, its runner stuck): AWS itself never ends one.
+const MAX_JOB_MINUTES: u32 = 360;
 
 /// What the runtime gives a control plane: its id and label, and (once set up on the user's machine) the App and AWS connect
 /// token from its secrets.
