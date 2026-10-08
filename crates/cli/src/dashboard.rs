@@ -260,7 +260,7 @@ fn write_response(stream: &mut TcpStream, r: &Response) {
 fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
     let start = std::time::Instant::now();
     let out = f();
-    if std::env::var_os("SUPERCI_TIMING").is_some() { println!("  {:>6} ms  {what}", start.elapsed().as_millis()) }
+    if std::env::var_os("SUPERCI_TIMING").is_some() { eprintln!("  {:>6} ms  {what}", start.elapsed().as_millis()) }
     out
 }
 
@@ -854,7 +854,7 @@ impl Dashboard {
         let done = if kept.signed_in() { store.write(&kept) } else { store.remove().map(|_| ()) };
         match done {
             Ok(()) => self.kept_as = text,
-            Err(e) => if !self.keep_failed { println!("{e}"); self.keep_failed = true },
+            Err(e) => if !self.keep_failed { eprintln!("{e}"); self.keep_failed = true },
         }
     }
 
@@ -893,6 +893,15 @@ impl Dashboard {
             let shared = shared.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(300));
+                // Modal's page does not come back here once the sign-in is approved (it stays on "API token
+                // created"): Modal is asked from here until it is, whatever the tab does.
+                let asked = { let d = lock(&shared); if matches!(d.task, Some(Task::Login(_))) { d.modal_pending.clone() } else { None } };
+                if let Some(pending) = asked {
+                    if let Ok(Some(session)) = modal::wait(&pending, 2.0) {
+                        let mut d = lock(&shared);
+                        (d.modal, d.modal_pending, d.looked_modal) = (Some(session), None, false);
+                    }
+                }
                 let mut d = lock(&shared);
                 if let Some(done) = d.task_done() {
                     d.keep();
@@ -1094,11 +1103,11 @@ impl Dashboard {
         work: impl FnOnce(&dyn Fn(usize)) -> Result<Plane> + Send + 'static) {
         let state = self.deploying.clone();
         *lock(&state) = Some(Deploy { cloud, place, steps, at: 0, form, result: None });
-        println!("Deploying a control plane to {}…", provider_name(cloud));
+        eprintln!("Deploying a control plane to {}…", provider_name(cloud));
         std::thread::spawn(move || {
             let step = |i: usize| if let Some(d) = lock(&state).as_mut() { d.at = i };
             let result = work(&step);
-            match &result { Ok(p) => println!("The control plane is running: {}", p.url()), Err(e) => println!("The deploy stopped: {e}") }
+            match &result { Ok(p) => eprintln!("The control plane is running: {}", p.url()), Err(e) => eprintln!("The deploy stopped: {e}") }
             // A stop keeps the step it stopped at; a finish marks them all done.
             if let Some(d) = lock(&state).as_mut() { if result.is_ok() { d.at = d.steps.len() } d.result = Some(result) }
         });
@@ -1130,6 +1139,7 @@ impl Dashboard {
                 Ok(leave(&link, "AWS").with_header("set-cookie", &last_used_cookie("aws")))
             }
             ("GET", "/connect/modal") => {
+                if self.task.is_some() { println!("Approve it in Modal's tab. Modal's page stays where it is afterwards: this ends by itself, and the tab can be closed.") }
                 let pending = modal::authorize(&format!("{}/oauth/modal", self.base))?;
                 let link = pending.web_url.clone();
                 self.modal_pending = Some(pending);
@@ -1288,7 +1298,7 @@ impl Dashboard {
                 wait_for(plane.url(), &self.status_key, move |s| if w.is_empty() { s["gitlab"]["url"] == u.as_str() } else { s["gitlabs"].as_array().is_some_and(|l| l.iter().any(|g| g["id"] == w.as_str() && g["url"] == u.as_str())) });
                 // Connected again: its webhooks get the new secret.
                 if before { let _ = cloudflare::plane_post(plane.url(), &self.status_key, "/gitlab/projects", &serde_json::json!({ "refresh": true, "gitlab": which })); }
-                println!("GitLab connected as {me}");
+                eprintln!("GitLab connected as {me}");
                 self.views = None;
                 Ok(Response::redirect(&format!("/?p=gitlab&g={which}")))
             }
@@ -1653,7 +1663,7 @@ impl Dashboard {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
                 let keys: serde_json::Value = ureq::get(&format!("{}/.well-known/jwks.json", plane.url())).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
-                println!("Deploying the Modal runner agent (the first time builds a small image in your workspace)…");
+                eprintln!("Deploying the Modal runner agent (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 // Its first answer can take a few seconds (a cold start).
                 for _ in 0..20 { if ureq::get(&format!("{url}/health")).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(std::time::Duration::from_secs(3)) }

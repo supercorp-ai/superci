@@ -219,7 +219,7 @@ impl Cloudflare {
             match v["status"].as_str() {
                 Some("ready") => return Ok(image),
                 Some("error") => return Err(format!("Cloudflare could not prepare the runner image: {}", v["reason"].as_str().unwrap_or("no reason given"))),
-                _ => { if attempt % 6 == 0 { println!("Cloudflare is preparing the runner image for its machines…") } std::thread::sleep(Duration::from_secs(5)) }
+                _ => { if attempt % 6 == 0 { eprintln!("Cloudflare is preparing the runner image for its machines…") } std::thread::sleep(Duration::from_secs(5)) }
             }
         }
         Err("Cloudflare took over 10 minutes to prepare the runner image; try again later".into())

@@ -96,16 +96,16 @@ pub fn copy_runner_image(cf: &Cloudflare, account_id: &str) -> Result<String> {
     let blobs: Vec<(String, u64)> = std::iter::once(&m["config"]).chain(m["layers"].as_array().into_iter().flatten())
         .filter_map(|b| Some((b["digest"].as_str()?.to_string(), b["size"].as_u64().unwrap_or(0)))).collect();
     let total: u64 = blobs.iter().map(|b| b.1).sum();
-    println!("Copying GitHub's runner image into your Cloudflare registry ({} MB, once)…", total / 1_000_000);
+    eprintln!("Copying GitHub's runner image into your Cloudflare registry ({} MB, once)…", total / 1_000_000);
     for (digest, size) in &blobs {
         let head = cloudflare.send("HEAD", &format!("/v2/{repo}/blobs/{digest}"), &[], None)?.status;
-        println!("  {digest} ({} MB): {}", size / 1_000_000, if head == 200 { "already there" } else { "copying" });
+        eprintln!("  {digest} ({} MB): {}", size / 1_000_000, if head == 200 { "already there" } else { "copying" });
         if head == 200 { continue }
         copy_blob(&mut github, &mut cloudflare, &repo, digest, *size)?;
     }
     let put = cloudflare.send("PUT", &format!("/v2/{repo}/manifests/{tag}"), &[("content-type", &media_type)], Some(&manifest))?;
     if put.status >= 300 { return Err(format!("Cloudflare's registry refused the image manifest: {} {}", put.status, String::from_utf8_lossy(&put.body))) }
-    println!("Runner image ready: {image}");
+    eprintln!("Runner image ready: {image}");
     Ok(image)
 }
 
@@ -135,7 +135,7 @@ fn copy_blob(github: &mut Registry, cloudflare: &mut Registry, repo: &str, diges
         if r.status >= 300 { return Err(format!("Cloudflare's registry refused a layer chunk: {} {}", r.status, String::from_utf8_lossy(&r.body))) }
         location = r.location.unwrap_or(location);
         offset += filled as u64;
-        println!("  {digest}: {} of {} MB", offset / 1_000_000, size / 1_000_000);
+        eprintln!("  {digest}: {} of {} MB", offset / 1_000_000, size / 1_000_000);
     }
     let separator = if location.contains('?') { '&' } else { '?' };
     let done = cloudflare.send("PUT", &format!("{location}{separator}digest={digest}"), &[("content-length", "0")], Some(&[]))?;

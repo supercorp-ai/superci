@@ -130,7 +130,7 @@ pub fn plane_view(plane: &Plane, key: Option<&str>) -> PlaneView {
         moved_to: h.as_ref().and_then(|h| h["moved_to"].as_str().map(str::to_string)), standby: flag("standby"),
         version: h.as_ref().map(|h| h["version"].as_str().unwrap_or("0.1.0").to_string()),
         status: said.and_then(|(s, status_ms)| {
-            if std::env::var_os("SUPERCI_TIMING").is_some() { println!("  {:>6} ms  {}: health · {:>6} ms status{}", health_ms, plane.place(), status_ms, if s.is_some() { "" } else { " (not read)" }) }
+            if std::env::var_os("SUPERCI_TIMING").is_some() { eprintln!("  {:>6} ms  {}: health · {:>6} ms status{}", health_ms, plane.place(), status_ms, if s.is_some() { "" } else { " (not read)" }) }
             s
         }) }
 }
