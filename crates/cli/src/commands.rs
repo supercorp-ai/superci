@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::dashboard::{job_words, plane_json, Background, Dashboard, Task, AWS_ENDED, NOT_SIGNED_IN};
+use crate::dashboard::{day_of, job_words, plane_json, read_keys, Background, Dashboard, Task, AWS_ENDED, NOT_SIGNED_IN};
 use crate::plane::Plane;
 use crate::view::{PlaneView, DASHBOARD_VERSION};
 use crate::store;
@@ -20,9 +20,13 @@ const HELP: &[(&str, &str, &str)] = &[
         "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci) and commands use it from then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again.\n\n  --no-browser    Prints the link without opening it."),
     ("logout", "  superci logout                Removes SuperCI's sign-ins from this machine.",
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
+    ("keys", "  superci keys                  Keys that only read, for a coding agent or a script.\n  superci keys create NAME [--days 30]\n  superci keys revoke NAME",
+        "create    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci status   (jobs, job, runners, repos)\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\nrevoke    Ends one at once."),
     ("status", "  superci status                The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
-    ("jobs", "  superci jobs                  The latest jobs: how each ended, where it ran, how long, and why it failed.", ""),
+    ("jobs", "  superci jobs                  The latest jobs: how each ended, where it ran, how long, and why it failed.", "Each line starts with the job's id, for `superci job ID`."),
+    ("job", "  superci job ID [--bytes N]    One job, with the end of its log.",
+        "The log is GitHub's (read with your App's token) or GitLab's, as far back as --bytes says (200000 unless given, a\nmillion at most). GitHub keeps a job's log once the job has ended."),
     ("planes", "  superci planes                Every control plane found in the clouds signed in to.",
         "One is in use at a time; another is somewhere to move to (`superci plane move ID`)."),
     ("plane", "  superci plane deploy aws --region us-east-1 | cloudflare [--account ID] | modal\n  superci plane update [--plane ID]\n  superci plane move ID\n  superci plane allow [--plane ID]\n  superci plane delete ID --yes",
@@ -76,7 +80,7 @@ Repositories:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere) and reads no other tool's. On a
 machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout"]), group(&["status", "jobs", "repos", "planes"]), group(&["plane", "leave"]), group(&["runners", "machine"]), group(&["github", "gitlab", "limits", "public"]))
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "keys"]), group(&["status", "jobs", "job", "repos", "planes"]), group(&["plane", "leave"]), group(&["runners", "machine"]), group(&["github", "gitlab", "limits", "public"]))
         }
     }
 }
@@ -102,7 +106,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 13] = ["json", "yes", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "on", "off", "on-demand", "spot", "help", "version"];
-const VALUES: [&str; 19] = ["region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 21] = ["days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -143,21 +147,46 @@ pub fn needs(error: &str) -> Option<&'static str> {
     if error == AWS_ENDED || has(&["Sign in with AWS", "Your AWS sign-in has ended"]) { return Some("superci login aws") }
     if has(&["Sign in with Cloudflare", "Cloudflare sign-in expired"]) { return Some("superci login cloudflare") }
     if has(&["Sign in with Modal"]) { return Some("superci login modal") }
-    if has(&["Sign in where this control plane runs", "sign in where it runs"]) { return Some("superci login") }
+    if has(&["Sign in where this control plane runs", "sign in where it runs", "needs SuperCI's own sign-in"]) { return Some("superci login") }
     None
 }
 
 const CLOUDS: [&str; 3] = ["aws", "cloudflare", "modal"];
 const NO_PLANE: &str = "There is no control plane yet. Set one up: `superci plane deploy aws --region us-east-1` (or cloudflare, or modal).";
 
+const ONLY_READS: &str = "SUPERCI_KEY only reads. A change needs SuperCI's own sign-in on this machine: `superci login`.";
+
 fn signed_in() -> Dashboard { Dashboard::signed_in(store::Store::new()) }
 
 /// A dashboard ready for a change: signed in, its clouds looked in, the control plane in use chosen.
-fn ready() -> Result<Dashboard> { let mut d = signed_in(); d.ready()?; Ok(d) }
+fn ready() -> Result<Dashboard> {
+    let mut d = signed_in();
+    if d.signed_in_as().is_none() && given_key().is_some() { return Err(ONLY_READS.into()) }
+    d.ready()?;
+    Ok(d)
+}
 
 fn in_use(d: &Dashboard) -> Result<Plane> { Ok(d.plane_in_use().ok_or(NO_PLANE)?) }
 
-fn view(d: &mut Dashboard) -> Result<PlaneView> { Ok(d.current()?.ok_or(NO_PLANE)?) }
+/// A key that only reads, given by name with its control plane's address (SUPERCI_PLANE, SUPERCI_KEY): what a coding
+/// agent or a script is handed in place of the sign-ins.
+fn given_key() -> Option<(String, String)> {
+    let var = |n: &str| std::env::var(n).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    Some((var("SUPERCI_PLANE")?.trim_end_matches('/').to_string(), var("SUPERCI_KEY")?))
+}
+
+/// What a command that looks reads: the control plane, and the key it is read with. With a key given by name: that
+/// control plane, with no sign-in. Else the one in use, with this machine's key.
+fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
+    let Some((url, key)) = given_key() else { let v = d.current()?.ok_or(NO_PLANE)?; return Ok((v, d.key().to_string())) };
+    if !url.starts_with("https://") { return usage("SUPERCI_PLANE is the control plane's address, starting with https:// (`superci status` says it).") }
+    let health = crate::cloudflare::health(&url).ok_or("The control plane at SUPERCI_PLANE did not answer.")?;
+    let v = crate::view::plane_view(&Plane::Seen { url, plane_id: health["plane"].as_str().unwrap_or_default().to_string() }, Some(&key));
+    if v.status.is_none() { return Err("The control plane did not take SUPERCI_KEY: it has ended, was revoked, or is another control plane's (keys that only read need control plane 0.11.0 or newer).".into()) }
+    Ok((v, key))
+}
+
+fn view(d: &mut Dashboard) -> Result<PlaneView> { Ok(look(d)?.0) }
 
 /// What deletes something needs --yes (said with what it would do); --dry-run needs none.
 fn confirmed(args: &Args, what: &str) -> Result<()> { if args.has("yes") || args.has("dry-run") { Ok(()) } else { usage(format!("This would {what}. Add --yes to do it, or --dry-run to check it first.")) } }
@@ -185,8 +214,60 @@ macro_rules! apply {
 pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
     let w = |i: usize| args.word(i);
     match (w(0), w(1)) {
-        ("status", "") => { let v = signed_in().status()?; Ok(Done { said: status_lines(&v), data: v }) }
+        ("status", "") => {
+            let mut d = signed_in();
+            let (signed_in, view) = match given_key() {
+                Some(_) => ("with a key that only reads (SUPERCI_KEY)".to_string(), Some(look(&mut d)?.0)),
+                None => { let v = d.current()?; (d.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into()), v) }
+            };
+            let v = match view { Some(v) => json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }), None => json!({ "signed_in": signed_in, "control_plane": null }) };
+            Ok(Done { said: status_lines(&v), data: v })
+        }
         ("jobs", "") => jobs(),
+        ("job", id) => {
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return usage("Say which: `superci job ID` (ids are in `superci jobs`).") }
+            let mut d = signed_in();
+            let (v, key) = look(&mut d)?;
+            let j = v.jobs().into_iter().find(|j| j["job_id"].as_u64().is_some_and(|n| n.to_string() == id)).ok_or("That job is not among the latest this control plane keeps (ids are in `superci jobs`).")?;
+            let words = job_words(&j);
+            let mut path = format!("/job/log?id={id}&bytes={}", args.get("bytes").unwrap_or("200000"));
+            if j["provider"] == "gitlab" { path += &format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) }
+            let got = crate::cloudflare::plane_get(v.plane.url(), &key, &path)
+                .map_err(|e| if e.contains("404") { "Reading a job's log needs control plane 0.11.0 or newer: `superci plane update`.".to_string() } else { e })?;
+            let mut said = vec![job_line(&words), words["link"].as_str().unwrap_or_default().to_string()];
+            match got["log"].as_str() {
+                Some(log) => { said.push(if got["truncated"] == true { format!("The end of its log ({} bytes in all):", got["bytes"]) } else { "Its log:".to_string() }); said.push(log.trim_end().to_string()) }
+                None => said.push(format!("No log: {}.", got["error"].as_str().unwrap_or("the control plane gave none").trim_end_matches('.'))),
+            }
+            Ok(Done { said, data: json!({ "job": words, "log": got["log"], "truncated": got["truncated"], "log_error": got["error"] }) })
+        }
+        ("keys", "") => {
+            let mut d = signed_in();
+            let v = d.current()?.ok_or(NO_PLANE)?;
+            let keys: Vec<Value> = read_keys(&v.status.clone().unwrap_or_default()).into_iter().map(|(name, until)| json!({ "name": name.to_lowercase(), "until": day_of(until / 1000) })).collect();
+            let said = if keys.is_empty() { vec!["No keys that only read. Make one for a coding agent or a script: `superci keys create agent`.".to_string()] }
+                else { keys.iter().map(|k| format!("{:<24} reads until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default())).collect() };
+            Ok(Done { said, data: json!({ "keys": keys }) })
+        }
+        ("keys", "create") => {
+            if w(2).is_empty() { return usage("Give it a name: `superci keys create agent`.") }
+            let Ok(days) = args.get("days").unwrap_or("30").parse::<u64>() else { return usage("--days is a number of days (30 unless given).") };
+            let mut d = ready()?;
+            let plane = in_use(&d)?;
+            if let Some(done) = dry(args, &format!("make a key named {} that only reads, good for {days} days", w(2)), "keys", &[]) { return Ok(done) }
+            let (key, until) = d.create_key(w(2), days)?;
+            Ok(Done { said: vec![format!("A key that only reads, until {}. It is shown this once:", day_of(until)), String::new(), format!("  SUPERCI_PLANE={} SUPERCI_KEY={key}", plane.url()), String::new(),
+                "With these two set, `superci status`, `jobs`, `job`, `runners` and `repos` work with no sign-in, and nothing can be changed.".to_string()],
+                data: json!({ "ok": true, "name": w(2).to_lowercase(), "until": day_of(until), "env": { "SUPERCI_PLANE": plane.url(), "SUPERCI_KEY": key } }) })
+        }
+        ("keys", "revoke") => {
+            if w(2).is_empty() { return usage("Say which: `superci keys revoke NAME` (names are in `superci keys`).") }
+            let mut d = ready()?;
+            in_use(&d)?;
+            if let Some(done) = dry(args, &format!("end the key named {}", w(2)), "keys", &[]) { return Ok(done) }
+            d.revoke_key(w(2))?;
+            Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
+        }
         ("runners", "") => runners_of(&mut signed_in()),
         ("repos", "") => repos(),
         ("planes", "") => planes(),
@@ -366,8 +447,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("gitlab", "projects") => {
             let mut d = signed_in();
-            let view = view(&mut d)?;
-            let v = crate::cloudflare::plane_get(view.plane.url(), d.key(), &format!("/gitlab/projects?g={}", args.get("gitlab").unwrap_or_default()))?;
+            let (view, key) = look(&mut d)?;
+            let v = crate::cloudflare::plane_get(view.plane.url(), &key, &format!("/gitlab/projects?g={}", args.get("gitlab").unwrap_or_default()))?;
             let said = v["projects"].as_array().into_iter().flatten().map(|p| format!("{:>10}  {}  {}", p["id"].as_u64().unwrap_or_default(), if p["enabled"] == true { "on " } else { "off" }, p["path"].as_str().unwrap_or_default())).collect::<Vec<_>>();
             Ok(Done { said: if said.is_empty() { vec!["No projects this token can reach.".into()] } else { said }, data: v })
         }
@@ -446,12 +527,15 @@ fn status_lines(v: &Value) -> Vec<String> {
 fn jobs() -> Result<Done> {
     let mut d = signed_in();
     let jobs: Vec<Value> = view(&mut d)?.jobs().iter().map(job_words).collect();
-    let s = |j: &Value, k: &str| j[k].as_str().unwrap_or_default().to_string();
-    let said = jobs.iter().take(40).map(|j| {
-        let tail: Vec<String> = [s(j, "runner"), s(j, "took"), j["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s(j, "why")].into_iter().filter(|t| !t.is_empty()).collect();
-        format!("{:<9} {} · {}{}", s(j, "state"), s(j, "job"), s(j, "in"), if tail.is_empty() { String::new() } else { format!("  ({})", tail.join(" · ")) })
-    }).collect::<Vec<_>>();
+    let said = jobs.iter().take(40).map(job_line).collect::<Vec<_>>();
     Ok(Done { said: if said.is_empty() { vec!["No jobs yet.".into()] } else { said }, data: json!({ "jobs": jobs }) })
+}
+
+/// A job in a line: its id, how it stands, what it is, and (its runner, how long, its cost, why it failed or waits).
+fn job_line(j: &Value) -> String {
+    let s = |k: &str| j[k].as_str().unwrap_or_default().to_string();
+    let tail: Vec<String> = [s("runner"), s("took"), j["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s("why")].into_iter().filter(|t| !t.is_empty()).collect();
+    format!("{:<12} {:<9} {} · {}{}", j["id"].as_u64().unwrap_or_default(), s("state"), s("job"), s("in"), if tail.is_empty() { String::new() } else { format!("  ({})", tail.join(" · ")) })
 }
 
 fn machine_words(m: &Value) -> String {
@@ -526,7 +610,7 @@ mod tests {
         assert!(all.starts_with("SuperCI —") && all.contains("superci help COMMAND") && all.contains("SUPERCI_HOME"));
         assert!(help("runners").contains("aws-on-demand") && help("gitlab").contains("SUPERCI_GITLAB_TOKEN") && help("github").contains("GitHub offers that nowhere else"));
         // Every command `run` and `in_browser` know is in some group's lines.
-        for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs", "superci runners add", "superci runners remove", "superci runners order", "superci runners set", "superci machine",
+        for command in ["superci dashboard", "superci login", "superci logout", "superci keys create", "superci keys revoke", "superci job ID", "superci status", "superci jobs", "superci runners add", "superci runners remove", "superci runners order", "superci runners set", "superci machine",
             "superci repos", "superci planes", "superci plane deploy", "superci plane update", "superci plane move", "superci plane allow", "superci plane delete", "superci leave", "superci github connect", "superci github remove",
             "superci gitlab connect", "superci gitlab projects", "superci gitlab enable", "superci gitlab disable", "superci gitlab disconnect", "superci limits", "superci public add|remove"] {
             assert!(all.contains(command), "{command}");
@@ -550,10 +634,10 @@ mod tests {
     fn nothing_runs_unasked_or_signed_out() {
         let dir = std::env::temp_dir().join(format!("superci-commands-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
         std::env::set_var("SUPERCI_HOME", &dir);
-        std::env::remove_var("SUPERCI_GITLAB_TOKEN");
+        for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs", "runners", "repos", "planes", "machine", "machine --cpu 8", "plane update", "plane deploy modal", "plane deploy aws --region us-east-1", "runners add aws", "runners order aws", "runners set aws --max-jobs 3",
+        for line in ["status", "jobs", "job 7", "keys", "keys create agent", "keys revoke agent", "runners", "repos", "planes", "machine", "machine --cpu 8", "plane update", "plane deploy modal", "plane deploy aws --region us-east-1", "runners add aws", "runners order aws", "runners set aws --max-jobs 3",
             "limits --max-cpu 8", "public add acme/site", "gitlab projects", "gitlab enable 7", "gitlab enable --all", "plane allow", "plane move abcdef123456", "plane update --dry-run", "runners add cloudflare --dry-run"] {
             assert_eq!(run(line), signed_out, "{line}");
         }
@@ -564,6 +648,7 @@ mod tests {
         }
         for (line, says) in [("runners add gcp", "Say which: `superci runners add aws`"), ("plane deploy", "Say where: `superci plane deploy aws"), ("plane deploy aws", "Say where: --region"), ("plane move", "Say where to:"), ("plane delete", "Say which:"),
             ("runners order", "Say the order:"), ("limits", "Say the limit:"), ("public add", "Say which:"), ("gitlab connect", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("gitlab connect --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
+            ("job", "Say which: `superci job ID`"), ("job seven", "Say which: `superci job ID`"), ("keys create", "Give it a name:"), ("keys revoke", "Say which:"), ("keys create agent --days soon", "--days is a number"),
             ("plane", "That is not a whole command of `superci plane`."), ("runners frob", "That is not a whole command of `superci runners`."), ("frobnicate", "`frobnicate` is not a command of superci.")] {
             assert!(matches!(run(line), Fail::Usage(e) if e.starts_with(says)), "{line}");
         }
@@ -572,6 +657,14 @@ mod tests {
         assert!(matches!(in_browser(&args("login gcp")), Some(Err(Fail::Usage(_)))) && matches!(in_browser(&args("github connect")), Some(Err(Fail::Usage(_)))));
         assert_eq!(in_browser(&args("github connect acme")).unwrap().unwrap_err(), signed_out);
         assert!(in_browser(&args("status")).is_none());
+        // A key that only reads, given by name, is no sign-in: a change says so, and names what is needed.
+        std::env::set_var("SUPERCI_PLANE", "https://plane.example");
+        std::env::set_var("SUPERCI_KEY", "superci_read_x");
+        assert_eq!(run("runners add aws"), Fail::Failed(ONLY_READS.into()));
+        assert_eq!(needs(ONLY_READS), Some("superci login"));
+        std::env::set_var("SUPERCI_PLANE", "plane.example");
+        assert!(matches!(run("status"), Fail::Usage(e) if e.starts_with("SUPERCI_PLANE is the control plane's address")));
+        for name in ["SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

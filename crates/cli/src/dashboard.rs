@@ -266,6 +266,14 @@ fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
+/// The keys that only read, as a control plane's status lists them: each one's name and when it ends (ms).
+pub fn read_keys(status: &serde_json::Value) -> Vec<(String, u64)> {
+    status["read_keys"].as_array().into_iter().flatten().filter_map(|k| Some((k["name"].as_str()?.to_string(), k["until_ms"].as_u64()?))).collect()
+}
+
+/// A day, as 2026-10-07 (UTC), from unix seconds: when a key ends, as commands say it.
+pub fn day_of(unix: u64) -> String { day(unix) }
+
 /// What a command waits for after starting it (see `Dashboard::wait`).
 #[derive(Clone, Copy)]
 pub enum Background { Deploy, Update, Move }
@@ -276,7 +284,7 @@ pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     let state = match j["state"].as_str().unwrap_or_default() { "done" => "done", "failed" | "orphan" | "swept" => "failed", "cancelled" => "cancelled", "running" => "running", "waiting" => "waiting", _ => "starting" };
     let (title, sub) = job_names(j);
     let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { String::new() };
-    serde_json::json!({ "state": state, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
+    serde_json::json!({ "id": j["job_id"], "state": state, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
 /// A control plane as commands say it.
@@ -726,12 +734,35 @@ impl Dashboard {
         if at.is_empty() { None } else { Some(at.join(", ")) }
     }
 
-    /// The control plane in use and what it says of itself, for `superci status`.
-    pub fn status(&mut self) -> Result<serde_json::Value> {
-        let view = self.current()?;
-        let signed_in = self.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into());
-        let Some(v) = view else { return Ok(serde_json::json!({ "signed_in": signed_in, "control_plane": null })) };
-        Ok(serde_json::json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }))
+    /// A key that only reads, for a coding agent or a script that should look and not change: made here, its SHA-256
+    /// written into the control plane's secrets (through the cloud's API, like every setting), and shown once. The
+    /// key, and when it ends (unix seconds).
+    pub fn create_key(&mut self, name: &str, days: u64) -> Result<(String, u64)> {
+        let plane = self.plane()?;
+        let name = name.to_ascii_uppercase();
+        if name.is_empty() || name.len() > 24 || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) { return Err("A key's name is letters and digits, 24 at most (agent, ci2).".into()) }
+        if !(1..=366).contains(&days) { return Err("A key lasts from 1 to 366 days.".into()) }
+        let seen = view::plane_view(&plane, Some(&self.status_key));
+        if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: keys that only read need control plane 0.11.0 or newer (`superci plane update`).".into()) }
+        let status = seen.status.or_else(|| status_soon(plane.url(), &self.status_key)).ok_or("The control plane did not answer: try again in a few seconds")?;
+        if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys revoke {}` first.", name.to_lowercase(), name.to_lowercase())) }
+        let (key, until) = (format!("superci_read_{}", random_token(32)), now_ms() / 1000 + days * 86_400);
+        self.put_secret(&plane, &format!("READ_KEY_{until}_{name}"), &superci_core::crypto::sha256_hex(key.as_bytes()))?;
+        let n = name.clone();
+        if !wait_for(plane.url(), &self.status_key, move |s| read_keys(s).iter().any(|(k, _)| *k == n)) { return Err("The control plane has not taken the key yet. It is written; look with `superci keys` in a moment, and make it again if it is not there (the key itself was not shown).".into()) }
+        Ok((key, until))
+    }
+
+    /// Ends a key that only reads: its entry leaves the control plane's secrets.
+    pub fn revoke_key(&mut self, name: &str) -> Result<()> {
+        let plane = self.plane()?;
+        let name = name.to_ascii_uppercase();
+        let status = status_soon(plane.url(), &self.status_key).ok_or("The control plane did not answer: try again in a few seconds")?;
+        let (_, until_ms) = read_keys(&status).into_iter().find(|(n, _)| *n == name).ok_or_else(|| format!("There is no key named {}.", name.to_lowercase()))?;
+        self.drop_secret(&plane, &format!("READ_KEY_{}_{name}", until_ms / 1000))?;
+        let n = name.clone();
+        wait_for(plane.url(), &self.status_key, move |s| !read_keys(s).iter().any(|(k, _)| *k == n));
+        Ok(())
     }
 
     /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
@@ -4879,7 +4910,7 @@ mod tests {
         let mut d = Dashboard::signed_in(Some(store.clone()));
         d.keep();
         assert!(d.signed_in_as().is_none() && !store.path().exists());
-        assert_eq!(d.status().unwrap_err(), NOT_SIGNED_IN);
+        assert_eq!(d.current().err().unwrap(), NOT_SIGNED_IN);
         // A sign-in made in the dashboard is kept; the next start has it, with the same key for its control planes.
         d.aws = Some(aws::Session::for_test("123456789012"));
         d.modal = Some(modal::Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acme".into() });

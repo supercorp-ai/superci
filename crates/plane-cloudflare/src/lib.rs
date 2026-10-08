@@ -79,6 +79,12 @@ fn dashboard_keys(env: &Env) -> Vec<(u64, String)> {
     }).collect()
 }
 
+/// Keys that only read: one secret each, READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
+fn read_keys(env: &Env) -> Vec<(u64, String, String)> {
+    let names = js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>());
+    names.iter().filter_map(|n| n.as_string()).filter(|n| n.starts_with("READ_KEY_")).filter_map(|n| superci_core::plane::read_key(&n, &env.secret(&n).ok()?.to_string())).collect()
+}
+
 #[durable_object]
 pub struct PlaneObject {
     state: State,
@@ -158,13 +164,28 @@ impl Store for DoStore<'_> {
 #[async_trait(?Send)]
 impl Http for FetchHttp {
     async fn send(&self, r: io::Request) -> io::Result<io::Response> {
-        let headers = Headers::new();
-        for (k, v) in &r.headers { headers.append(k, v).map_err(|e| e.to_string())?; }
-        let mut init = RequestInit::new();
-        init.with_method(Method::from(r.method.clone())).with_headers(headers);
-        if !r.body.is_empty() { init.with_body(Some(js_sys::Uint8Array::from(r.body.as_slice()).into())); }
-        let req = Request::new_with_init(&r.url, &init).map_err(|e| e.to_string())?;
-        let mut resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+        // A redirect is followed here, not by the runtime: to another site the request goes without its
+        // credentials (GitHub answers a job's log with a signed link elsewhere, which refuses a token it does not know).
+        let (mut url, mut method, mut body, mut headers_in) = (r.url.clone(), r.method.clone(), r.body.clone(), r.headers.clone());
+        let mut hops = 0;
+        let mut resp = loop {
+            let headers = Headers::new();
+            for (k, v) in &headers_in { headers.append(k, v).map_err(|e| e.to_string())?; }
+            let mut init = RequestInit::new();
+            init.with_method(Method::from(method.clone())).with_headers(headers).with_redirect(RequestRedirect::Manual);
+            if !body.is_empty() { init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into())); }
+            let req = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
+            let resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+            let status = resp.status_code();
+            let to = resp.headers().get("location").ok().flatten().filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308) && hops < 5);
+            let Some(to) = to.and_then(|to| url::Url::parse(&url).ok()?.join(&to).ok()) else { break resp };
+            let same_site = url::Url::parse(&url).is_ok_and(|from| from.origin() == to.origin());
+            if !same_site { headers_in.retain(|(k, _)| !["authorization", "private-token", "cookie"].contains(&k.to_ascii_lowercase().as_str())) }
+            // As browsers do: what was posted is fetched after a 301, 302 or 303.
+            if matches!(status, 301 | 302 | 303) && method != "GET" && method != "HEAD" { method = "GET".into(); body.clear(); headers_in.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type")) }
+            url = to.to_string();
+            hops += 1;
+        };
         let status = resp.status_code();
         let headers = resp.headers().entries().collect();
         let body = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -200,6 +221,7 @@ impl PlaneObject {
         if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase(); }
         if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
         c.dashboard_keys = dashboard_keys(&self.env);
+        c.read_keys = read_keys(&self.env);
         c.agents = secret("AGENTS").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
         c.routing = secret("ROUTING").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
         c.gitlab = secret("GITLAB").and_then(|v| serde_json::from_str(&v).ok());

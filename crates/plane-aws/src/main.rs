@@ -135,6 +135,8 @@ fn config(secrets: &Secrets, account_id: &str) -> Config {
     c.machine = secrets.get("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
     // One parameter per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
     c.dashboard_keys = secrets.values.iter().filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
+    // One parameter per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
+    c.read_keys = secrets.values.iter().filter_map(|(n, v)| superci_core::plane::read_key(n, v)).collect();
     c.move_token = secrets.get("MOVE_TOKEN").map(str::to_string);
     if let Some(l) = secrets.get("CF_LOCATION") { c.cloudflare_location = l.to_string() }
     c.cloudflare_image = secrets.get("CF_IMAGE").and_then(superci_core::plane::image_address);
@@ -177,9 +179,11 @@ fn main() {
         let account_id = next.headers().get("lambda-runtime-invoked-function-arn").and_then(|v| v.to_str().ok()).and_then(|a| a.split(':').nth(4)).unwrap_or_default().to_string();
         let event: Value = next.body_mut().read_json().unwrap_or_default();
         let outcome: io::Result<Value> = (|| {
-            // A bearer key not among the dashboard keys known: a new session's, set a moment ago.
+            // Whoever comes with a key (the dashboard, a command) gets the settings as they are now, not as they
+            // were up to fifteen seconds ago: a change is seen at once, and the next one starts from it. A key not
+            // known yet is a new session's, set a moment ago. Webhooks and the sweep carry none, and use what was read.
             let bearer = event["headers"]["authorization"].as_str().and_then(|a| a.strip_prefix("Bearer ")).unwrap_or_default();
-            let unknown = bearer.len() >= 16 && !secrets.values.iter().any(|(n, v)| n.starts_with("DASHBOARD_KEY_") && v == bearer);
+            let unknown = bearer.len() >= 16;
             // A move's steps need what the dashboard wrote a moment ago (the App, GitLab): read fresh for them too.
             let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
             secrets.refresh(&http, &region, &plane_id, unknown || moving)?;

@@ -2,8 +2,10 @@
 # Publishes what ./scripts/npm-pack.sh packed: the programs first, the launcher last (it names them). A package whose
 # version is on npm already is passed by, so a publish that stopped halfway is finished by running this again.
 # Published is not yet downloadable: npm lists a new version at once and serves its file some minutes later (0.10.7:
-# nine minutes). So the launcher is published only once every program's file downloads; until then `npx @superci/cli`
-# goes on giving the version before.
+# nine minutes), the launcher's own too. So nothing is `latest` before it downloads: the launcher is published only
+# once every program's file downloads, and under the tag `next`; once its own file downloads, `latest` is moved to
+# it. Until that last step `npx @superci/cli` goes on giving the version before, and a release that stops anywhere
+# leaves it so. Moving the tag from GitHub needs "Allow npm dist-tag" on @superci/cli's trusted publisher.
 # From a computer: `npm login` as an owner of the npm organization `superci` (the @superci scope).
 # From GitHub (.github/workflows/publish.yml): no login, npm trusts the workflow (trusted publishing).
 #   ./scripts/npm-publish.sh            # publish
@@ -59,5 +61,14 @@ launcher=$(ls target/npm/superci-cli-[0-9]*.tgz)
 if [ "${1:-}" = "--dry-run" ]; then publish "$launcher" "$@"; exit 0; fi
 # shellcheck disable=SC2086
 downloadable $programs
-publish "$launcher" "$@"
-downloadable "$(named "$launcher")"
+publish "$launcher" --tag next "$@"
+released=$(named "$launcher")
+downloadable "$released"
+if [ "$(npm view "${released%@*}" dist-tags.latest 2>/dev/null)" = "${released##*@}" ]; then echo "==> $released is latest already"; exit 0; fi
+if ! npm dist-tag add "$released" latest; then
+  echo "==> $released is published as \`next\`, and \`latest\` could not be moved to it. Nothing is broken: \`npx @superci/cli\` still gives the version before." >&2
+  echo "    From GitHub: on npmjs.com, @superci/cli → Settings → Trusted publisher, tick \"Allow npm dist-tag\", then run this again." >&2
+  echo "    From a computer: npm dist-tag add $released latest" >&2
+  exit 1
+fi
+echo "==> $released is latest"

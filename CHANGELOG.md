@@ -10,6 +10,10 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - After an AWS sign-in has ended, the dashboard still opens on your control plane and shows its jobs and settings (read with this computer's key), with a line saying the sign-in ended and a button to sign in again. Before, it would have shown the first screen as if nothing were known.
 - SuperCI reads no other tool's credentials. `CLOUDFLARE_API_TOKEN`, `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are no longer picked up; on a machine with no browser a sign-in is given by name: `SUPERCI_CLOUDFLARE_TOKEN`, `SUPERCI_MODAL_TOKEN_ID`, `SUPERCI_MODAL_TOKEN_SECRET`.
 - The key the dashboard reads a control plane with lasts thirty days and is reused between runs (before: a new one, twelve hours, at every start).
+- Keys that only read, for a coding agent or a script that should look and not change: `superci keys create agent` shows one once; with `SUPERCI_PLANE` and `SUPERCI_KEY` set, `superci status`, `jobs`, `job`, `runners` and `repos` work with no sign-in on that machine, and nothing can be changed. Your control plane keeps only the key's SHA-256; a key ends by itself (30 days unless said otherwise) or with `superci keys revoke`.
+- `superci job ID` shows one job with the end of its log: GitHub's, read by your control plane with your App's token, or GitLab's. So why a job failed can be read without opening the code host.
+- A change is seen at once on a control plane in AWS (before: up to fifteen seconds later, while it went on with the settings it had read). The dashboard and commands no longer wait there after each change, and a change made right after another starts from it.
+- A release becomes what `npx @superci/cli` gives only once every one of its files downloads from npm, the launcher's too (npm lists a version minutes before it serves its file; for those minutes a new install failed).
 - The dashboard has a new mark: four petals, as on superci.dev, in place of the two arrows.
 
 ## 0.10.7 — 2026-10-06

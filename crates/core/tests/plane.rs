@@ -1705,3 +1705,78 @@ fn no_gpu_allowance_is_said_at_once_even_when_spot_refuses_for_another_reason() 
     // The allowance to raise is the on-demand one: spot did not refuse for its allowance.
     assert!(e.starts_with("AWS lets this account run no GPU machines yet") && e.contains("L-DB2E81BA") && !e.contains("L-3819A6DF"), "{e}");
 }
+
+/// The fake clouds, with two jobs' logs: GitHub answers the first with where it is (to be fetched without the
+/// token), and has none for the second; GitLab gives a job's trace.
+struct Logs(FakeClouds);
+#[async_trait(?Send)]
+impl Http for Logs {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        match r.url.as_str() {
+            "https://api.github.com/repos/acme/app/actions/jobs/1/logs" => {
+                assert_eq!(r.header("authorization"), Some("Bearer ghs_test"), "asked with the App's token for the job's repository");
+                let mut at = Response::new(302, "text/plain", "");
+                at.headers.push(("Location".into(), "https://logs.example/blob?sig=abc".into()));
+                Ok(at)
+            }
+            "https://logs.example/blob?sig=abc" => {
+                assert!(r.header("authorization").is_none(), "the signed link is fetched without the token");
+                Ok(Response::new(200, "text/plain", format!("{}Error: 3 tests failed\n", "a line of the build, forty characters\n".repeat(80))))
+            }
+            "https://api.github.com/repos/acme/app/actions/jobs/2/logs" => Ok(Response::new(404, "application/json", "{}")),
+            "https://gitlab.example/api/v4/projects/380/jobs/1977/trace" => {
+                assert_eq!(r.header("private-token"), Some("glpat-test"));
+                Ok(Response::new(200, "text/plain", "$ make test\nok\n"))
+            }
+            _ => self.0.send(r).await,
+        }
+    }
+}
+
+#[test]
+fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
+    let (store, clouds, wakes, cache) = (Mem::default(), Logs(FakeClouds::default()), Wakes::default(), Cache::default());
+    let hash = |key: &str| superci_core::crypto::sha256_hex(key.as_bytes());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    config.dashboard_keys = vec![(1_800_000_000_000, "dashboard-session-key-1".into())];
+    // As the runtimes read them from where they are stored: a name that says when it ends, the key's SHA-256.
+    config.read_keys = [("READ_KEY_1800000000_AGENT", hash("superci_read_the-agents-key")), ("READ_KEY_1700000000_OLD", hash("superci_read_one-that-ended"))].iter()
+        .filter_map(|(n, v)| superci_core::plane::read_key(n, v)).collect();
+    assert_eq!(config.read_keys.len(), 2);
+    assert!(superci_core::plane::read_key("READ_KEY_1800000000_AGENT", "").is_none() && superci_core::plane::read_key("READ_KEY_soon_AGENT", &hash("x")).is_none() && superci_core::plane::read_key("DASHBOARD_KEY_1800000000_AB", &hash("x")).is_none());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    for (id, state) in [(1u64, "failed"), (2, "running")] {
+        store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "at_ms": 1_789_999_000_000u64, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    }
+    store.0.borrow_mut().insert("job:gl1977".into(), serde_json::json!({ "job_id": 1977, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": 1_789_999_000_000u64, "installation_id": 0, "cloud": "aws", "seen_in_progress": true, "provider": "gitlab", "project_id": 380 }).to_string());
+    let ask = |method: &str, path: &str, key: &str| block_on(plane.handle(Request::new(method, &format!("{PLANE_URL}{path}")).with_header("authorization", &format!("Bearer {key}"))));
+    let (dashboard, agent) = ("dashboard-session-key-1", "superci_read_the-agents-key");
+
+    // It reads what the dashboard reads; one that ended, or is not known, reads nothing.
+    let seen = ask("GET", "/status", agent);
+    assert_eq!((seen.status, json(&seen)["jobs"].as_array().map(Vec::len)), (200, Some(3)));
+    assert!(json(&seen)["read_keys"].is_null(), "which keys there are is the dashboard's to see");
+    assert_eq!(json(&ask("GET", "/status", dashboard))["read_keys"], serde_json::json!([{ "name": "AGENT", "until_ms": 1_800_000_000_000u64 }, { "name": "OLD", "until_ms": 1_700_000_000_000u64 }]));
+    for key in ["superci_read_one-that-ended", "superci_read_never-made-here", ""] { assert_eq!(ask("GET", "/status", key).status, 404, "{key}") }
+    // It changes nothing: what the dashboard's key may do is like any unknown path to it.
+    for path in ["/costs", "/gitlab/projects", "/leave", "/aws/forget", "/move/export", "/github/uninstall", "/permissions/given"] {
+        assert_eq!(ask("POST", path, agent).status, 404, "{path}");
+    }
+    assert_ne!(ask("POST", "/permissions/given", dashboard).status, 404);
+
+    // A job's log: its end, from a line's start, and how much there is in all.
+    let log = json(&ask("GET", "/job/log?id=1&bytes=1000", agent));
+    let text = log["log"].as_str().unwrap();
+    assert!(text.ends_with("Error: 3 tests failed\n") && text.starts_with("a line of the build") && text.len() <= 1000 && text.len() > 900);
+    assert_eq!((log["truncated"].as_bool(), log["bytes"].as_u64()), (Some(true), Some(80 * 38 + 22)));
+    let whole = json(&ask("GET", "/job/log?id=1", dashboard));
+    assert_eq!((whole["truncated"].as_bool(), whole["log"].as_str().map(str::len)), (Some(false), Some(80 * 38 + 22)));
+    // No log yet (the job still runs), no such job, and GitLab's trace.
+    assert!(json(&ask("GET", "/job/log?id=2", agent))["error"].as_str().unwrap().starts_with("GitHub has no log for it yet"));
+    assert!(json(&ask("GET", "/job/log?id=99", agent))["error"].as_str().unwrap().starts_with("This control plane has no such job"));
+    assert_eq!(json(&ask("GET", "/job/log?id=1977&gl=", agent))["log"], "$ make test\nok\n");
+    assert_eq!(ask("GET", "/job/log?id=1", "superci_read_one-that-ended").status, 404);
+    assert_eq!(block_on(plane.handle(get("/job/log?id=1"))).status, 404);
+}

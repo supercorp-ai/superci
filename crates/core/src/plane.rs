@@ -52,6 +52,10 @@ pub struct Config {
     /// Set by each dashboard session on your machine (through the cloud's API): keys to read `/status`, each with
     /// the time it expires (ms).
     pub dashboard_keys: Vec<(u64, String)>,
+    /// Keys that only read (`superci keys create`, for a coding agent or a script that should look and not change):
+    /// each with the time it expires (ms), its name, and the SHA-256 of the key (the key itself is not kept here).
+    /// Set through the cloud's API like the dashboard's, as READ_KEY_<expires, unix seconds>_<NAME>.
+    pub read_keys: Vec<(u64, String, String)>,
     /// A one-time token for moving to another control plane, set by the dashboard through the cloud's API (so only
     /// someone who controls this cloud account can ask): the old one hands over its settings with it, the new one
     /// takes its history and GitLab's project runners with it.
@@ -97,6 +101,7 @@ impl Config {
             cloudflare_location: "enam".into(),
             cloudflare_image: None,
             dashboard_keys: Vec::new(),
+            read_keys: Vec::new(),
             move_token: None,
             agents: Vec::new(),
             routing: Routing::default(),
@@ -452,6 +457,14 @@ pub struct ControlPlane<'a> {
     pub containers: Option<&'a dyn Containers>,
 }
 
+/// A key that only reads, from the name and value it is stored under (`READ_KEY_<expires, unix seconds>_<NAME>`, the
+/// key's SHA-256): when it expires (ms), its name, the hash. A removed one (emptied, where a store keeps names) is none.
+pub fn read_key(name: &str, value: &str) -> Option<(u64, String, String)> {
+    let (until, key_name) = name.strip_prefix("READ_KEY_")?.split_once('_')?;
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) { return None }
+    Some((until.parse::<u64>().ok()? * 1000, key_name.to_string(), value.to_ascii_lowercase()))
+}
+
 fn nothing_here() -> Response {
     Response::text(404, "SuperCI plane: nothing here (set up and changed from the SuperCI dashboard on your machine)")
 }
@@ -530,7 +543,8 @@ impl<'a> ControlPlane<'a> {
             }
             // GitLab's projects, for the dashboard: which send their jobs here; switching one on or off; after the
             // connection changes, every webhook here gets the new secret.
-            ("GET", "/gitlab/projects") if self.dashboard(&req) => {
+            ("GET", "/job/log") if self.reader(&req) => self.job_log(&url).await,
+            ("GET", "/gitlab/projects") if self.reader(&req) => {
                 // Of one connection (`g`: its name; nothing: the first).
                 let which = url.query_pairs().find(|(k, _)| k == "g").map(|(_, v)| v.into_owned()).unwrap_or_default();
                 let gl = self.gitlab_by(&which).ok_or("GitLab is not connected")?;
@@ -757,10 +771,40 @@ impl<'a> ControlPlane<'a> {
         self.config.dashboard_keys.iter().any(|(until, key)| *until > now && key.len() >= 16 && safe_eq(given.as_bytes(), key.as_bytes()))
     }
 
-    /// What the dashboard shows, for a key a dashboard session set and that has not expired: the App and where it is installed, the AWS
-    /// connection, and recent jobs. Without that key it is like any unknown path.
+    /// Whether a request may read: a dashboard session's key, or a key that only reads and has not expired.
+    fn reader(&self, req: &Request) -> bool {
+        if self.dashboard(req) { return true }
+        let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+        if given.len() < 16 { return false }
+        let (hash, now) = (sha256_hex(given.as_bytes()), self.clock.now_ms());
+        self.config.read_keys.iter().any(|(until, _, kept)| *until > now && safe_eq(hash.as_bytes(), kept.as_bytes()))
+    }
+
+    /// A job's log, for whoever may read: GitHub's for the job (with the App's token for its repository), or GitLab's
+    /// trace. Its end (`bytes`: how much, a megabyte at most), since the end says why a job failed.
+    async fn job_log(&self, url: &url::Url) -> Result<Response> {
+        let q = |n: &str| url.query_pairs().find(|(k, _)| k == n).map(|(_, v)| v.into_owned());
+        let id = q("id").filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())).ok_or("which job?")?;
+        // A GitLab job is kept under its connection's name and its id (`gl`: the name; nothing for the first).
+        let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Err("which GitLab?".into()), None => format!("job:{id}") };
+        let Some(j) = get_json::<Job>(self.store, &key).await? else { return Ok(Response::json(&serde_json::json!({ "error": "This control plane has no such job (it keeps the latest ones)." }))) };
+        let fetched = if j.provider == "gitlab" {
+            match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
+        } else {
+            match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) }
+        };
+        let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e }))) };
+        let want = q("bytes").and_then(|b| b.parse::<usize>().ok()).unwrap_or(200_000).clamp(1_000, 1_000_000);
+        // From a line's start, when the cut falls inside one.
+        let from = log.len().saturating_sub(want);
+        let from = if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) };
+        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0 })))
+    }
+
+    /// What the dashboard shows, for a key a dashboard session set and that has not expired (or one that only reads):
+    /// the App and where it is installed, the AWS connection, and recent jobs. Without a key it is like any unknown path.
     async fn status(&self, req: &Request) -> Result<Response> {
-        if !self.dashboard(req) { return Ok(nothing_here()); }
+        if !self.reader(req) { return Ok(nothing_here()); }
         let mut installations = vec![];
         for app in self.config.apps() {
             installations.extend(github::installations(self.http, app, self.clock.now_ms()).await.unwrap_or_default()
@@ -793,6 +837,7 @@ impl<'a> ControlPlane<'a> {
             // Every GitLab connection (the first, then each further one, by its name), with its token's scopes.
             "gitlabs": gitlabs,
             "routing": self.config.routing,
+            "read_keys": if self.dashboard(req) { serde_json::json!(self.config.read_keys.iter().map(|(until, name, _)| serde_json::json!({ "name": name, "until_ms": until })).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
             "spend": self.month_spend(&jobs_all).await,
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).

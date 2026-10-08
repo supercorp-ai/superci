@@ -56,6 +56,14 @@ async fn api(http: &dyn Http, gl: &GitLab, method: &str, path: &str, form: Optio
     serde_json::from_slice(&resp.body).map_err(|e| format!("GitLab {path}: {e}"))
 }
 
+/// A job's log so far (GitLab's trace).
+pub async fn job_trace(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u64) -> Result<Vec<u8>> {
+    let r = Request::new("GET", &format!("{}/api/v4/projects/{project_id}/jobs/{job_id}/trace", gl.url.trim_end_matches('/'))).with_header("private-token", &gl.token).with_header("user-agent", "superci");
+    let resp = http.send(r).await?;
+    if resp.status >= 300 { return Err(format!("GitLab would not give its log: {} {}", resp.status, resp.body_text().chars().take(200).collect::<String>())) }
+    Ok(resp.body)
+}
+
 /// A job's tags and status (the webhook does not carry its tags).
 pub async fn job(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u64) -> Result<(Vec<String>, String)> {
     let v = api(http, gl, "GET", &format!("/projects/{project_id}/jobs/{job_id}"), None).await?;

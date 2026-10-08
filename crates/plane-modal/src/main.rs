@@ -120,6 +120,8 @@ fn config(secrets: &Value) -> Config {
     // One entry per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
     c.dashboard_keys = secrets.as_object().into_iter().flatten()
         .filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.as_str()?.to_string()))).collect();
+    // One entry per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
+    c.read_keys = secrets.as_object().into_iter().flatten().filter_map(|(n, v)| superci_core::plane::read_key(n, v.as_str()?)).collect();
     c
 }
 

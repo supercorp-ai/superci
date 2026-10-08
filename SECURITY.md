@@ -28,7 +28,12 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
   - a GitHub signature (HMAC, compared in constant time);
   - the GitLab webhook secret;
   - a dashboard key (random, expiring, kept in the control plane's own secrets);
+  - a key that only reads (`superci keys create`): it sees what the dashboard sees and a job's log, and changes
+    nothing. The control plane keeps its SHA-256, not the key, and it expires;
   - a one-time move token.
+  A job's log is fetched by the control plane when a key holder asks, with your GitHub App's token for that job's
+  repository (or your GitLab token), and passed on. GitHub masks secrets in logs; what a job printed is otherwise
+  what a key holder reads.
   It signs short-lived tokens (ES256), but only for its own runner agents and for AWS. It never signs claims a
   caller picks.
 - **Runner agents** (Cloudflare, Modal) accept only tokens signed by the one control plane they were set up for. The
