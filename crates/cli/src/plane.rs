@@ -15,6 +15,8 @@ pub enum Plane {
 impl Plane {
     pub fn url(&self) -> &str { match self { Plane::Cloudflare { url, .. } | Plane::Aws { url, .. } | Plane::Modal { url, .. } | Plane::Seen { url, .. } => url } }
     pub fn plane_id(&self) -> &str { match self { Plane::Cloudflare { plane_id, .. } | Plane::Aws { plane_id, .. } | Plane::Modal { plane_id, .. } | Plane::Seen { plane_id, .. } => plane_id } }
+    /// Its label, as just changed in the dashboard (a control plane known only by its address keeps none here).
+    pub fn set_label(&mut self, to: &str) { if let Plane::Cloudflare { label, .. } | Plane::Aws { label, .. } | Plane::Modal { label, .. } = self { *label = to.to_string() } }
     pub fn label(&self) -> &str { match self { Plane::Cloudflare { label, .. } | Plane::Aws { label, .. } | Plane::Modal { label, .. } => label, Plane::Seen { .. } => "superci" } }
     pub fn place(&self) -> String {
         match self {

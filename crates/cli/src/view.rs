@@ -43,6 +43,15 @@ impl PlaneView {
             None => self.gitlab_url().map(|u| vec![(String::new(), u, scopes(&st["permissions"]["gitlab_scopes"]))]).unwrap_or_default(),
         }
     }
+    /// Every label it answers to, the one workflows are shown first (a control plane from before it could have several: its one).
+    pub fn labels(&self) -> Vec<String> {
+        let said: Vec<String> = self.status.as_ref().and_then(|s| s["labels"].as_array().cloned()).unwrap_or_default().iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
+        if said.is_empty() { vec![self.plane.label().to_string()] } else { said }
+    }
+    /// The label shown in examples: the first of them.
+    pub fn label(&self) -> String { self.labels().into_iter().next().unwrap_or_else(|| "superci".into()) }
+    /// What it is called (SuperCI, unless named; one from before it could be named: SuperCI).
+    pub fn name(&self) -> String { self.status.as_ref().and_then(|s| s["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or("SuperCI").to_string() }
     pub fn jobs(&self) -> Vec<Value> { self.status.as_ref().and_then(|s| s["jobs"].as_array().cloned()).unwrap_or_default() }
     pub fn app_slug(&self) -> Option<String> { self.status.as_ref().and_then(|s| s["app"]["slug"].as_str().map(str::to_string)) }
     /// Where the first App's GitHub is, when not github.com.

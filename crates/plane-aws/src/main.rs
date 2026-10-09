@@ -121,6 +121,8 @@ fn config(secrets: &Secrets, account_id: &str) -> Config {
     let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
     let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
     if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase() }
+    if let Some(v) = secrets.get("LABELS") { c.set_labels(v) }
+    if let Some(v) = secrets.get("NAME") { c.set_name(v) }
     if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() }
     c.app = secrets.get("GITHUB_APP").and_then(|v| serde_json::from_str(v).ok());
     // One parameter for each further organization's GitHub App: GITHUB_APP_<its id>.

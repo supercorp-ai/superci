@@ -65,10 +65,13 @@ pub fn valid_login(login: &str) -> bool {
 }
 
 /// The App a control plane asks GitHub to create: private, webhook to the control plane, only the permissions runners need.
-pub fn app_manifest(plane_url: &str, owner: &Owner, label: &str, plane_id: &str) -> serde_json::Value {
+/// The App's name starts with what the control plane is called (SuperCI, or its own name: SoroCI acme …); the person
+/// can change it on GitHub's page before it is made.
+pub fn app_manifest(plane_url: &str, owner: &Owner, called: &str, label: &str, plane_id: &str) -> serde_json::Value {
+    let brand = if called.is_empty() { "SuperCI" } else { called };
     // A long login is cut, with a mark of the whole of it (two organizations may begin alike).
     let login = if owner.login.len() > 15 { format!("{}-{}", owner.login.chars().take(10).collect::<String>(), &crate::crypto::sha256_hex(owner.login.to_ascii_lowercase().as_bytes())[..4]) } else { owner.login.clone() };
-    let mut name: String = format!("SuperCI {login}").chars().take(27).collect();
+    let mut name: String = format!("{brand} {login}").chars().take(27).collect();
     name.push(' ');
     name.extend(plane_id.chars().take(6)); // names are unique across GitHub, at most 34 characters
     let permissions = if owner.org {
@@ -305,13 +308,16 @@ pub struct JobEvent {
 /// A `workflow_job` event this control plane should act on: in a repository of the App's owner, labelled with the control
 /// plane's label or a machine of it (`superci-8cpu-arm64`; see spec.rs), plus only GitHub's own self-hosted, system and
 /// architecture labels, which a job may also list.
-pub fn our_job(payload: &serde_json::Value, base: &str, owner_login: &str) -> Option<JobEvent> {
+pub fn our_job(payload: &serde_json::Value, base: &str, owner_login: &str) -> Option<JobEvent> { our_job_among(payload, &[base.to_string()], owner_login) }
+
+/// The same, for a control plane that answers to several labels (its own, and ones it keeps answering to).
+pub fn our_job_among(payload: &serde_json::Value, bases: &[String], owner_login: &str) -> Option<JobEvent> {
     let job = payload.get("workflow_job")?;
     let repo = payload["repository"]["full_name"].as_str()?;
     let installation_id = payload["installation"]["id"].as_u64()?;
     if !repo.split('/').next()?.eq_ignore_ascii_case(owner_login) { return None; }
     let labels: Vec<&str> = job["labels"].as_array()?.iter().filter_map(|l| l.as_str()).collect();
-    let mut ours = labels.iter().filter_map(|l| Spec::parse(l, base).map(|s| (l.to_string(), s)));
+    let mut ours = labels.iter().filter_map(|l| Spec::parse_among(l, bases).map(|s| (l.to_string(), s)));
     let (label, spec) = ours.next()?;
     if ours.next().is_some() { return None; }
     let github_own = ["self-hosted", "linux", "macos", "x64", "arm64"];
@@ -349,12 +355,12 @@ mod tests {
 
     #[test]
     fn manifest_for_org_and_user() {
-        let org = app_manifest("https://h.example.workers.dev", &Owner { org: true, login: "acme-corp".into() }, "superci", "abc123xyz");
+        let org = app_manifest("https://h.example.workers.dev", &Owner { org: true, login: "acme-corp".into() }, "SuperCI", "superci", "abc123xyz");
         assert_eq!(org["default_permissions"], serde_json::json!({ "organization_self_hosted_runners": "write", "actions": "write", "metadata": "read" }));
         assert_eq!(org["hook_attributes"]["url"], "https://h.example.workers.dev/webhook");
         assert_eq!(org["public"], false);
         assert!(org["name"].as_str().unwrap().len() <= 34 && org["name"].as_str().unwrap().ends_with(" abc123"));
-        let user = app_manifest("https://h", &Owner { org: false, login: "a-very-long-user-name-that-goes-on-and-on".into() }, "x", "abc123");
+        let user = app_manifest("https://h", &Owner { org: false, login: "a-very-long-user-name-that-goes-on-and-on".into() }, "Acme CI", "acme", "abc123");
         assert_eq!(user["default_permissions"]["administration"], "write");
         assert!(user["name"].as_str().unwrap().chars().count() <= 34);
         assert_eq!(manifest_target(None, &Owner { org: true, login: "o".into() }, "s1"), "https://github.com/organizations/o/settings/apps/new?state=s1");

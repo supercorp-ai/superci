@@ -18,7 +18,7 @@ const VOUCHED: &str = "x-superci-key-until";
 /// Durable Object keeps the ones it started with until it restarts, which can take half a minute after a change).
 /// One from outside is dropped: only the Worker sets it.
 const SETTINGS: &str = "x-superci-settings";
-const SETTING_NAMES: [&str; 13] = ["GITHUB_APP", "GITLAB", "AGENTS", "ROUTING", "MACHINE", "CONTAINERS", "AWS_CONNECT", "AWS_REGIONS", "AWS_NETWORKS", "CF_LOCATION", "CF_IMAGE", "MOVE_TOKEN", "INSTANCE_TYPES"];
+const SETTING_NAMES: [&str; 15] = ["LABELS", "NAME", "GITHUB_APP", "GITLAB", "AGENTS", "ROUTING", "MACHINE", "CONTAINERS", "AWS_CONNECT", "AWS_REGIONS", "AWS_NETWORKS", "CF_LOCATION", "CF_IMAGE", "MOVE_TOKEN", "INSTANCE_TYPES"];
 
 /// JSON with every character outside ASCII escaped, so it can travel in a header.
 fn ascii_json(v: &serde_json::Value) -> String {
@@ -207,6 +207,8 @@ impl PlaneObject {
         }.filter(|v| !v.is_empty());
         let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
         if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase(); }
+        if let Some(v) = secret("LABELS") { c.set_labels(&v) }
+        if let Some(v) = secret("NAME") { c.set_name(&v) }
         if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
         c.dashboard_keys = dashboard_keys(&self.env);
         c.read_keys = read_keys(&self.env);

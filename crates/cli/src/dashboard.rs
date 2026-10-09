@@ -204,6 +204,14 @@ fn side() -> &'static Mutex<String> { static SIDE: Mutex<String> = Mutex::new(St
 #[cfg(test)]
 fn side() -> &'static Mutex<String> { thread_local!(static SIDE: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); SIDE.with(|s| *s) }
 
+/// What the control plane in use is called, as last seen: the page's frame is drawn before it is asked, and says
+/// this until the page's live part says otherwise.
+#[cfg(not(test))]
+fn called() -> &'static Mutex<String> { static CALLED: Mutex<String> = Mutex::new(String::new()); &CALLED }
+#[cfg(test)]
+fn called() -> &'static Mutex<String> { thread_local!(static CALLED: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); CALLED.with(|s| *s) }
+fn called_now() -> String { let c = lock(called()); if c.is_empty() { "SuperCI".to_string() } else { c.clone() } }
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
 
 thread_local! {
@@ -292,7 +300,7 @@ pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
 
 /// A control plane as commands say it.
 pub fn plane_json(v: &PlaneView) -> serde_json::Value {
-    serde_json::json!({ "id": v.plane.plane_id(), "cloud": v.plane.cloud(), "where": v.plane.place(), "url": v.plane.url(), "label": v.plane.label(),
+    serde_json::json!({ "id": v.plane.plane_id(), "cloud": v.plane.cloud(), "where": v.plane.place(), "url": v.plane.url(), "label": v.label(),
         "online": v.online, "version": v.version, "update_to": if v.outdated() { Some(DASHBOARD_VERSION) } else { None }, "ready": v.ready() })
 }
 
@@ -1586,7 +1594,7 @@ impl Dashboard {
                     return Ok(message(409, "Update the control plane first", "Adding another organization needs control plane 0.9.31 or newer (Control plane → Update)."))
                 }
                 let state = random_token(18);
-                let mut manifest = app_manifest(plane.url(), &owner, plane.label(), plane.plane_id());
+                let mut manifest = app_manifest(plane.url(), &owner, &seen.name(), &seen.label(), plane.plane_id());
                 // GitHub comes back to this machine, not to the control plane: the code is exchanged here.
                 manifest["redirect_url"] = format!("{}/github/callback", self.base).into();
                 manifest["setup_url"] = format!("{}/github/installed", self.base).into();
@@ -1727,6 +1735,46 @@ impl Dashboard {
                     }
                 }
                 Ok(Response::redirect("/?p=runners"))
+            }
+            // The labels workflows name: a list, each answered to until removed (so no workflow has to change the day
+            // one is added). One added goes first: the one shown in examples.
+            ("POST", "/labels") => {
+                let plane = self.plane()?;
+                let seen = view::plane_view(&plane, Some(&self.status_key));
+                if view::older(seen.version.as_deref(), "0.12.0") { return Ok(message(409, "Update the control plane first", "Labels can be added from control plane 0.12.0 on (Control plane → Update).")) }
+                let Some(status) = seen.status.clone().or_else(|| status_soon(plane.url(), &self.status_key)) else {
+                    return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
+                };
+                let mut labels: Vec<String> = status["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
+                if labels.is_empty() { labels.push(plane.label().to_string()) }
+                let label = field("label").to_ascii_lowercase();
+                if field("action") == "remove" {
+                    if !labels.contains(&label) { return Ok(message(400, "It does not answer to that label", "")) }
+                    if labels.len() == 1 { return Ok(message(409, "This is its only label", "Add another first: a control plane answers to at least one.")) }
+                    labels.retain(|l| *l != label);
+                } else {
+                    if label != "superci" { if let Err(e) = superci_core::spec::valid_label(&label) { return Ok(message(400, "That cannot be a label", &esc(&e))) } }
+                    labels.retain(|l| *l != label);
+                    labels.insert(0, label);
+                }
+                let want = serde_json::to_value(&labels).map_err(|e| e.to_string())?;
+                self.put_secret(&plane, "LABELS", &want.to_string())?;
+                wait_for(plane.url(), &self.status_key, |s| s["labels"] == want);
+                if let Some(p) = self.planes.get_mut(self.selected) { p.set_label(&labels[0]) }
+                self.views = None;
+                Ok(Response::redirect("/?p=workflows"))
+            }
+            // What it is called where people read it: the dashboard's header, the App's name for further
+            // organizations, what it says on a job it could not run. SuperCI again by naming it that.
+            ("POST", "/name") => {
+                let plane = self.plane()?;
+                if view::older(view::plane_view(&plane, Some(&self.status_key)).version.as_deref(), "0.12.0") { return Ok(message(409, "Update the control plane first", "It can be named from control plane 0.12.0 on (Control plane → Update).")) }
+                let name = field("name").trim().to_string();
+                if let Err(e) = superci_core::spec::valid_name(&name) { return Ok(message(400, "That cannot be its name", &esc(&e))) }
+                self.put_secret(&plane, "NAME", &name)?;
+                wait_for(plane.url(), &self.status_key, |s| s["name"] == name.as_str());
+                self.views = None;
+                Ok(Response::redirect("/?p=workflows"))
             }
             // The default machine: what `runs-on: superci` alone gets.
             ("POST", "/machine") => {
@@ -1910,7 +1958,7 @@ var sections={plane:'planes',settings:'planes','add-runners':'runners',gitlab:'r
 function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1')}
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='';
-function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}document.body.classList.remove('busy');clearTimeout(timer);var ld=h.match(/data-loading="([^"]+)"/),cur=main.querySelector('[data-loading]'),again=h.match(/data-refresh="(\d+)"/);if(h===shown||(ld&&cur&&cur.getAttribute('data-loading')===ld[1])){if(again)timer=setTimeout(load,again[1]*1000);return}shown=h;main.innerHTML=h;main.querySelectorAll('form.picker').forEach(superciPick);if(location.hash){var hd=document.getElementById(location.hash.slice(1));if(hd){if(hd.tagName==='DETAILS')hd.open=true;hd.scrollIntoView({block:'center'})}}document.body.classList.toggle('gated',!!main.querySelector('[data-gated]'));var u=main.querySelector('[data-side]'),su=document.getElementById('side-update'),nx=u?u.innerHTML:'';if(u)u.remove();if(su.innerHTML!==nx)su.innerHTML=nx;document.querySelectorAll('input[name=next]').forEach(function(i){i.value=location.search+(i.dataset.open&&location.search?'&open='+i.dataset.open:'')});var op=new URLSearchParams(location.search).get('open');if(op){var od=document.getElementById(op);if(od&&od.showModal)od.showModal();if(od||!main.querySelector('[data-refresh]')){var ou=new URL(location.href);ou.searchParams.delete('open');history.replaceState(null,'',ou.pathname+ou.search+ou.hash)}}clearTimeout(timer);var t=main.querySelector('[data-refresh]');if(t)timer=setTimeout(load,t.getAttribute('data-refresh')*1000)}
+function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}document.body.classList.remove('busy');clearTimeout(timer);var ld=h.match(/data-loading="([^"]+)"/),cur=main.querySelector('[data-loading]'),again=h.match(/data-refresh="(\d+)"/);if(h===shown||(ld&&cur&&cur.getAttribute('data-loading')===ld[1])){if(again)timer=setTimeout(load,again[1]*1000);return}shown=h;main.innerHTML=h;main.querySelectorAll('form.picker').forEach(superciPick);if(location.hash){var hd=document.getElementById(location.hash.slice(1));if(hd){if(hd.tagName==='DETAILS')hd.open=true;hd.scrollIntoView({block:'center'})}}document.body.classList.toggle('gated',!!main.querySelector('[data-gated]'));var cl=main.querySelector('[data-called]');if(cl){var cn=cl.getAttribute('data-called'),cb=document.querySelector('.brand span');if(cb.textContent!==cn)cb.textContent=cn;if(document.title!==cn)document.title=cn}var u=main.querySelector('[data-side]'),su=document.getElementById('side-update'),nx=u?u.innerHTML:'';if(u)u.remove();if(su.innerHTML!==nx)su.innerHTML=nx;document.querySelectorAll('input[name=next]').forEach(function(i){i.value=location.search+(i.dataset.open&&location.search?'&open='+i.dataset.open:'')});var op=new URLSearchParams(location.search).get('open');if(op){var od=document.getElementById(op);if(od&&od.showModal)od.showModal();if(od||!main.querySelector('[data-refresh]')){var ou=new URL(location.href);ou.searchParams.delete('open');history.replaceState(null,'',ou.pathname+ou.search+ou.hash)}}clearTimeout(timer);var t=main.querySelector('[data-refresh]');if(t)timer=setTimeout(load,t.getAttribute('data-refresh')*1000)}
 function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci dashboard again.</div>'})}
 function go(url){var u=new URL(url,location.href);history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
 document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||a.target||e.defaultPrevented||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname!=='/'||u.searchParams.has('k')||(u.search===location.search&&u.hash))return;e.preventDefault();go(u.href)});
@@ -1918,7 +1966,7 @@ document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute
 window.addEventListener('popstate',function(){current();document.body.classList.add('busy');load()});
 window.addEventListener('pageshow',function(e){if(e.persisted)load()});
 load()})();</script>"#;
-        document(200, "SuperCI", &format!(r#"<div class="layout">{}<main class="main" id="live">{skeleton}</main></div>{PAGE_JS}{script}"#, Self::sidebar(section)), None)
+        document(200, &called_now(), &format!(r#"<div class="layout">{}<main class="main" id="live">{skeleton}</main></div>{PAGE_JS}{script}"#, Self::sidebar(section)), None)
     }
 
     /// The live part of a page: control planes (and a pending Modal sign-in) asked now, in parallel, without holding
@@ -2099,6 +2147,9 @@ load()})();</script>"#;
         let waiting = waiting || updating.as_ref().is_some_and(|u| u.result.is_none()) || self.modal_pending.is_some() || self.github_expected.is_some_and(|until| now_ms() < until);
         drop(updating);
         *lock(side()) = card.clone();
+        let name = current.map(|v| v.name()).unwrap_or_else(|| "SuperCI".to_string());
+        *lock(called()) = name.clone();
+        let html = format!(r#"{html}<div data-called="{}" hidden></div>"#, esc(&name));
         let html = if card.is_empty() { html } else { format!(r#"{html}<div data-side hidden>{card}</div>"#) };
         if waiting || settling { format!(r#"<div data-refresh="{}"></div>{html}"#, if settling { 2 } else { 5 }) } else { html }
     }
@@ -2113,7 +2164,7 @@ load()})();</script>"#;
         // Last, More: what is about this computer and not the control plane (signing SuperCI out here).
         let more = format!(r#"<details class="menu side-more"><summary>{ICON_MORE}<span>More</span></summary><div class="menu-pop"><form method="post" action="/signout"><button>Sign out</button></form></div></details>"#);
         let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{more}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("changes", "Changelog", ICON_NEWS));
-        format!(r#"<aside class="side"><div class="brand">{MARK}<span>SuperCI</span>{THEME_TOGGLE}</div>{nav}{foot}</aside>"#)
+        format!(r#"<aside class="side"><div class="brand">{MARK}<span>{}</span>{THEME_TOGGLE}</div>{nav}{foot}</aside>"#, esc(&called_now()))
     }
 
     /// Where a control plane runs: reachable from Settings to add another. The connect screen's list: a row per cloud with
@@ -2305,7 +2356,7 @@ load()})();</script>"#;
             step(3, "locked", format!("<h3>Add runners {logos}</h3>"), format!("<p>Where jobs run: containers in Cloudflare, spot machines in AWS, sandboxes in Modal.</p>{}", locked("the control plane")))
         };
         // 4. The one line a workflow needs, on Workflows.
-        let label = esc(v.plane.label());
+        let label = esc(&v.label());
         let ready_before = v.online && ((v.github && v.installed) || v.gitlab) && v.runners;
         let workflow = if ready_before {
             step(4, "", "<h3>Use it in a workflow</h3>".into(), format!(r#"<p>Set <code>runs-on: {label}</code> in a workflow; nothing else changes.</p><div class="do"><a class="button primary" href="/?p=workflows">Open Workflows</a></div>"#))
@@ -2446,7 +2497,7 @@ load()})();</script>"#;
         let Some(v) = v else {
             return format!(r#"{bar}<div class="cards"><section class="card">{}</section></div>"#, empty_state(&icon("lock"), "Set up a control plane first", "Workflows use your runners through its label.", r#"<a class="button primary" href="/?p=plane">Set up a control plane</a>"#))
         };
-        let label = esc(v.plane.label());
+        let label = esc(&v.label());
         let gh_on = v.github;
         let gl_on = v.gitlab_url().is_some();
         let (default_card, picker) = machines_card(v);
@@ -2989,7 +3040,7 @@ fn agent_button(label: &str, accessible: &str, onclick: &str) -> String {
 
 /// The prompts for switching workflows to SuperCI, each as (choice, what it does, for GitHub Actions, for GitLab CI).
 fn switch_prompts(v: &PlaneView) -> Vec<(&'static str, &'static str, String, String)> {
-    let l = v.plane.label();
+    let l = &v.label();
     let gh = |task: &str| format!("Move this repository's GitHub Actions jobs to SuperCI runners (`runs-on: {l}`, a fresh self-hosted machine per job). {task}
 
 - Linux jobs: `{l}`, keeping their size (`{l}-8cpu`, `{l}-16cpu-64gb`, `{l}-arm64`). Windows: `{l}-windows`. GPU: `{l}-gpu`.
@@ -3554,7 +3605,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
     };
     // Rules by repository from before (a workflow now picks a provider in its label): shown, so nothing steers jobs unseen.
     let rules = v.routing().rules.iter().map(|r| format!(r#"<form method="post" action="/routing" class="rule"><input type="hidden" name="action" value="remove"><input type="hidden" name="repo" value="{}"><span class="note"><code>{}</code> only uses {} (a rule from before; a workflow can say <code>runs-on: {}-{}</code> instead)</span><button class="chip">Remove</button></form>"#,
-        esc(&r.repo), esc(&r.repo), esc(cloud_name(&r.cloud)), esc(v.plane.label()), esc(&r.cloud))).collect::<String>();
+        esc(&r.repo), esc(&r.repo), esc(cloud_name(&r.cloud)), esc(&v.label()), esc(&r.cloud))).collect::<String>();
     format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{rules}{dialogs}</section>"#, esc(&current))
 }
 
@@ -3607,7 +3658,7 @@ fn limits_card(v: &PlaneView, public: Option<Vec<String>>) -> String {
 /// the label picker, a dialog of its own: it names only what differs from the default.
 fn machines_card(v: &PlaneView) -> (String, String) {
     let m = v.machine();
-    let base = esc(v.plane.label());
+    let base = esc(&v.label());
     let select = |name: &str, label: &str, first: &str, choices: &[(u32, &str)], current: Option<u32>| {
         let opts = choices.iter().map(|(n, text)| format!(r#"<option value="{n}"{}>{text}</option>"#, if current == Some(*n) { " selected" } else { "" })).collect::<String>();
         format!(r#"<label class="field"><span>{label}</span><select name="{name}"><option value="">{first}</option>{opts}</select></label>"#)
@@ -3642,9 +3693,25 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         select("cpu", "CPU", "Default", &CPUS, None), select("ram", "Memory", "Default", &RAMS, None), select("disk", "Disk", "Default", &DISKS, None),
         choice("arch", "Architecture", "Default", &[("x64", "x64"), ("arm64", "arm64")], None), choice("os", "System", "Default", &[("linux", "Linux"), ("windows", "Windows")], None),
         choice("gpu", "GPU", "None", &[("gpu", "Any (least costly)"), ("t4", "T4"), ("l4", "L4"), ("a10g", "A10G"), ("l40s", "L40S"), ("a100", "A100"), ("h100", "H100"), ("h200", "H200"), ("b200", "B200")], None), pools());
-    (format!(r#"<section class="card dm-card">{default_row}{dialog}</section>"#), picker)
+    // The labels: the list of them, and its dialog (add one; each stays until removed, the last one always).
+    let labels = v.labels();
+    let close = r#"<button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>"#;
+    let logo = |icon: &str| format!(r#"<span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{icon}</span>"#);
+    let kept = labels.iter().enumerate().map(|(i, l)| format!(r#"<form method="post" action="/labels" class="kept-label"><input type="hidden" name="action" value="remove"><input type="hidden" name="label" value="{l}"><span><code>{l}</code>{}</span>{}</form>"#,
+        if i == 0 && labels.len() > 1 { r#" <small class="faint">shown in examples</small>"# } else { "" },
+        if labels.len() > 1 { r#"<button class="button secondary sm">Remove</button>"# } else { "" }, l = esc(l))).collect::<String>();
+    let label_dialog = format!(r#"<dialog class="dlg" id="labels" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Labels</strong><small>A workflow may name any of them in <code>runs-on</code>.</small></span>{close}</div><div class="kept-labels">{kept}</div><form method="post" action="/labels" class="limit-do"><input name="label" placeholder="soroci" aria-label="A label to add" pattern="[a-z][a-z0-9]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Add</button></form></div></dialog>"#, logo(ICON_TAG));
+    let label_row = format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Labels</strong><small>What workflows name in <code>runs-on</code>.</small></span><span class="dm-spec">{}</span><button type="button" class="button secondary sm" onclick="document.getElementById('labels').showModal()">Change</button></div>"#,
+        logo(ICON_TAG), labels.iter().map(|l| format!(r#"<span class="lim">{}</span>"#, esc(l))).collect::<String>());
+    // Its name: what it is called in the dashboard and on GitHub.
+    let name = esc(&v.name());
+    let name_dialog = format!(r#"<dialog class="dlg" id="name" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Name</strong><small>Shown in the dashboard and on GitHub.</small></span>{close}</div><form method="post" action="/name" class="limit-do"><input name="name" value="{name}" aria-label="Name" pattern="[A-Za-z][A-Za-z0-9 \-]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_NAME));
+    let name_row = format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Name</strong><small>What your CI is called.</small></span><span class="dm-spec"><span class="lim">{name}</span></span><button type="button" class="button secondary sm" onclick="document.getElementById('name').showModal()">Change</button></div>"#, logo(ICON_NAME));
+    (format!(r#"<section class="card dm-card">{name_row}{label_row}{default_row}{dialog}{label_dialog}{name_dialog}</section>"#), picker)
 }
 
+const ICON_NAME: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7V5.5h14V7M12 5.5v13M9.5 18.5h5"/></svg>"#;
+const ICON_TAG: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 11.6V5a1.5 1.5 0 0 1 1.5-1.5h6.6a1.5 1.5 0 0 1 1.06.44l7.4 7.4a1.5 1.5 0 0 1 0 2.12l-6.1 6.1a1.5 1.5 0 0 1-2.12 0l-7.4-7.4a1.5 1.5 0 0 1-.44-1.06Z"/><circle cx="8" cy="8" r="1.4"/></svg>"#;
 const ICON_CHIP: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>"#;
 
 fn signin_button(cloud: &str, label: &str, primary: bool) -> String {
@@ -3728,7 +3795,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value]) -> String {
     let spend_kpi = kpi(usd(spent), if settled { "spent" } else { "spent, estimated" }, spend_spark, versus);
 
     // No jobs at all yet: the page as it will be, with nothing in it.
-    if jobs.is_empty() { return overview_empty_cards(v.plane.label()) }
+    if jobs.is_empty() { return overview_empty_cards(&v.label()) }
     let latest = job_table(&jobs[..jobs.len().min(5)]);
     // Where they ran.
     let mut by: Vec<(String, String, usize, u64, f64)> = vec![];
@@ -3787,7 +3854,7 @@ fn jobs_card(v: Option<&PlaneView>, limit: usize) -> String {
     let listed: Vec<serde_json::Value> = jobs.iter().take(limit).map(|j| match v { Some(v) => with_hosts(v, j), None => j.clone() }).collect();
     let rows = match v { Some(_) if !listed.is_empty() => job_table(&listed), _ => String::new() };
     let more = if jobs.len() > limit { r#"<div style="text-align:right"><a class="chip" href="/?p=jobs">All jobs ›</a></div>"#.to_string() } else { String::new() };
-    let label = esc(v.map(|v| v.plane.label()).unwrap_or("superci"));
+    let label = esc(&v.map(|v| v.label()).unwrap_or_else(|| "superci".into()));
     let snippet = format!(r#"<pre class="snippet" style="text-align:left;padding:12px 16px;border-radius:10px;background:var(--card-2)">jobs:
   test:
     <span class="hl">runs-on: {label}</span></pre>"#);
@@ -4014,6 +4081,9 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     // Networks of the account's own for AWS's machines, and GitHub's full image for Cloudflare's containers.
     if old["aws_networks"].as_object().is_some_and(|n| !n.is_empty()) { w.put(to, "AWS_NETWORKS", &old["aws_networks"].to_string())? }
     if let Some(i) = old["cloudflare_image"].as_str() { w.put(to, "CF_IMAGE", i)? }
+    // The labels workflows name, when set to other than the one every control plane starts with.
+    if old["labels"].as_array().is_some_and(|l| l.len() > 1 || l.first().is_some_and(|f| f != "superci")) { w.put(to, "LABELS", &old["labels"].to_string())? }
+    if let Some(n) = old["name"].as_str().filter(|n| *n != "SuperCI") { w.put(to, "NAME", n)? }
     // Where Cloudflare's containers start, when set to other than the default.
     if let Some(l) = old["cloudflare_location"].as_str().filter(|l| *l != "enam") { w.put(to, "CF_LOCATION", l)? }
     call(to, &in_token, "/move/import", serde_json::json!({ "state": out["state"] }))?;
@@ -4184,7 +4254,7 @@ mod tests {
         let (a, b) = page.split_once(r#"data-static>"#).unwrap();
         let rest = &b[b.find("</main>").unwrap()..];
         let gated = if fragment.contains("data-gated") { r#"<script>document.body.classList.add('gated')</script>"# } else { "" };
-        let gated = format!(r#"{gated}<script>var u=document.querySelector('[data-side]');if(u){{document.getElementById('side-update').innerHTML=u.innerHTML;u.remove()}}document.querySelectorAll('form.picker').forEach(superciPick)</script>"#);
+        let gated = format!(r#"{gated}<script>var c=document.querySelector('[data-called]');if(c){{document.querySelector('.brand span').textContent=document.title=c.getAttribute('data-called')}}var u=document.querySelector('[data-side]');if(u){{document.getElementById('side-update').innerHTML=u.innerHTML;u.remove()}}document.querySelectorAll('form.picker').forEach(superciPick)</script>"#);
         std::fs::write(format!("{dir}/{name}.html"), format!(r#"{a}data-static>{fragment}{rest}{gated}"#)).unwrap();
     }
 
@@ -4563,8 +4633,20 @@ mod tests {
         assert!(html.contains("us-east-1 · closest to GitHub</small>"));
         // Cloudflare: where GitHub's full image is published, if anywhere (empty: the small image).
         assert!(html.contains(r#"name="image" value="""#) && html.contains("GitHub&#39;s full image") || html.contains("GitHub's full image"));
-        let html = d.render("workflows", &[view], None);
+        let html = d.render("workflows", &[view.clone()], None);
         preview("workflows", &html);
+        // Its name and its labels: a row each, changed in its dialog. The only label has no Remove.
+        assert!(html.contains("<strong>Name</strong>") && html.contains(r#"<span class="lim">SuperCI</span>"#) && html.contains(r#"data-called="SuperCI""#));
+        assert!(html.contains("<strong>Labels</strong>") && html.contains(r#"<form method="post" action="/labels" class="kept-label">"#) && !html.contains(r#"<button class="button secondary sm">Remove</button>"#));
+        // Named, with a label added: the page's frame says the name, and each label can go.
+        let mut named = view;
+        named.status.as_mut().unwrap()["name"] = "SoroCI".into();
+        named.status.as_mut().unwrap()["labels"] = serde_json::json!(["soroci", "superci"]);
+        let soro = d.render("workflows", &[named], None);
+        preview("workflows-named", &soro);
+        assert!(soro.contains(r#"data-called="SoroCI""#) && soro.contains(r#"name="name" value="SoroCI""#) && soro.matches(r#"<button class="button secondary sm">Remove</button>"#).count() == 2);
+        assert!(soro.contains(r#"<code>soroci</code> <small class="faint">shown in examples</small>"#) && Dashboard::sidebar("workflows").contains("<span>SoroCI</span>"));
+        *lock(called()) = String::new();
         // The default machine, in words, changed in its own dialog (which starts at it).
         assert!(html.contains(r#"<span class="lim">4 CPU</span><span class="lim">100 GB disk</span><span class="lim">x64</span><span class="lim">Linux</span><span class="lim">spot</span>"#));
         assert!(html.contains(r#"<dialog class="dlg" id="default-machine""#) && html.contains(r#"<option value="4" selected>4</option>"#) && html.contains(r#"<option value="100" selected>100 GB</option>"#));

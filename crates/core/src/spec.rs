@@ -28,7 +28,35 @@ pub const CLOUDS: [&str; 3] = ["aws", "cloudflare", "modal"];
 /// The GPUs a label may name, least costly first.
 pub const GPUS: [&str; 8] = ["t4", "l4", "a10g", "l40s", "a100", "h100", "h200", "b200"];
 
+/// Whether a word can be a control plane's label (what workflows name in `runs-on`, before any part): two to twenty-four
+/// lowercase letters and digits, a letter first, and not a word GitHub or a label's parts use (`ubuntu`, `gpu`…): a
+/// label is told from its parts by the dashes between them.
+pub fn valid_label(label: &str) -> Result<(), String> {
+    let ok = (2..=24).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) && label.as_bytes()[0].is_ascii_lowercase();
+    if !ok { return Err("A label is 2 to 24 lowercase letters and digits, starting with a letter (soroci, ci2).".into()) }
+    const TAKEN: [&str; 22] = ["ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest"];
+    if TAKEN.contains(&label) || GPUS.contains(&label) { return Err(format!("{label} means something else in a label already: choose another word.")) }
+    Ok(())
+}
+
+/// Whether a control plane can be called this where people read it (SoroCI, Acme CI): two to twenty-four letters,
+/// digits, spaces and dashes, a letter first and no space last. Nothing else, since it goes into an App's name and
+/// into what a job's page says, where other marks mean something.
+pub fn valid_name(name: &str) -> Result<(), String> {
+    let ok = (2..=24).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'-')
+        && name.as_bytes()[0].is_ascii_alphabetic() && !name.ends_with([' ', '-']) && !name.contains("  ");
+    if ok { Ok(()) } else { Err("A name is 2 to 24 letters, digits, spaces and dashes, starting with a letter (SoroCI, Acme CI).".into()) }
+}
+
 impl Spec {
+    /// What a label asks for among several bases a control plane answers to: the longest that fits (so `ci` does not
+    /// take `cibig-8cpu`).
+    pub fn parse_among(label: &str, bases: &[String]) -> Option<Result<Spec, String>> {
+        let mut bases: Vec<&String> = bases.iter().collect();
+        bases.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        bases.into_iter().find_map(|b| Spec::parse(label, b))
+    }
+
     /// What a label asks for: `base` alone is the default machine; `base-part-part…` names one. `None`: not ours;
     /// `Some(Err)`: ours, but a part is not understood (the job is told why instead of waiting forever).
     pub fn parse(label: &str, base: &str) -> Option<Result<Spec, String>> {

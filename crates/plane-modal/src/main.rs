@@ -100,6 +100,8 @@ fn config(secrets: &Value) -> Config {
     let secret = |n: &str| secrets[n].as_str();
     let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
     if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase() }
+    if let Some(v) = secret("LABELS") { c.set_labels(v) }
+    if let Some(v) = secret("NAME") { c.set_name(v) }
     c.own_cloud = "modal".into();
     c.containers = secret("CONTAINERS") == Some("on");
     c.app = secret("GITHUB_APP").and_then(|v| serde_json::from_str(v).ok());

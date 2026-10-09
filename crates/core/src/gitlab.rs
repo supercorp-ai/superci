@@ -72,9 +72,9 @@ pub async fn job(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u64) -> 
 
 /// A project runner for one job's tags (locked to the project, no untagged jobs); its id and token. GitLab has no
 /// runner for exactly one job, so each job gets its own, paused once it takes a job and removed after.
-pub async fn create_runner(http: &dyn Http, gl: &GitLab, project_id: u64, tags: &[String], plane_id: &str, job_id: u64) -> Result<(u64, String)> {
+pub async fn create_runner(http: &dyn Http, gl: &GitLab, project_id: u64, tags: &[String], called: &str, plane_id: &str, job_id: u64) -> Result<(u64, String)> {
     let tags = tags.join(",");
-    let description = format!("SuperCI {plane_id}: job {job_id} ({tags})");
+    let description = format!("{called} {plane_id}: job {job_id} ({tags})");
     let project = project_id.to_string();
     let v = api(http, gl, "POST", "/user/runners", Some(&[("runner_type", "project_type"), ("project_id", &project), ("tag_list", &tags), ("run_untagged", "false"),
         ("locked", "true"), ("description", &description)])).await?;

@@ -29,6 +29,10 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
     ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
         "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's limits: jobs at once, dollars a month (`none` lifts one). --enabled: aws-on-demand only.\n          --regions and --networks are AWS's (a network of your own per region; give --networks once per region),\n          --location and --image Cloudflare's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal. A job goes to the first that can run it and is\n          within its limits; when one cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
+    ("labels", "  superci labels list\n  superci labels create NAME\n  superci labels delete NAME --confirm",
+        "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: soroci`, `soroci-8cpu`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
+    ("name", "  superci name retrieve\n  superci name update NAME",
+        "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"SoroCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
     ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--arch=x64|arm64] [--os=linux|windows] [--on-demand=true|false]",
         "The machine `runs-on: superci` alone gets. A job's label can ask for another (`superci-8cpu-arm64`)."),
     ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N]",
@@ -90,7 +94,7 @@ Coding agents and scripts:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere) and reads no other tool's. On a
 machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "labels", "name", "machine", "limits"]),
                 group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["leave"]))
         }
     }
@@ -448,6 +452,32 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             apply!(d, args, format!("update {cloud}: {}", given.join(" ")), "/routing", &fields);
             runners_of(&mut d)
         }
+        ("labels", "list") => {
+            let labels = view(&mut signed_in())?.labels();
+            Ok(Done { said: labels.iter().enumerate().map(|(i, l)| if i == 0 && labels.len() > 1 { format!("{l}  (shown in examples)") } else { l.clone() }).collect(), data: json!({ "labels": labels }) })
+        }
+        ("labels", operation @ ("create" | "delete")) => {
+            if w(2).is_empty() { return usage(format!("Say which: `superci labels {operation} NAME`.")) }
+            let would = if operation == "create" { format!("add {} to the labels workflows may name; the ones before keep working", w(2)) } else { format!("stop answering to the label {}: jobs that still name it would wait for a runner that never comes", w(2)) };
+            if operation == "delete" { confirmed(args, &would)? }
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            apply!(d, args, would, "/labels", &[field("action", if operation == "create" { "add" } else { "remove" }), field("label", w(2))]);
+            let labels = view(&mut d)?.labels();
+            Ok(Done { said: vec![format!("It answers to: {}.", labels.join(", ")), format!("In a workflow: `runs-on: {}`.", labels.first().cloned().unwrap_or_default())], data: json!({ "ok": true, "labels": labels }) })
+        }
+        ("name", "retrieve") => {
+            let name = view(&mut signed_in())?.name();
+            Ok(Done { said: vec![name.clone()], data: json!({ "name": name }) })
+        }
+        ("name", "update") => {
+            if w(2).is_empty() { return usage("Say what to call it: `superci name update SoroCI`.") }
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            apply!(d, args, format!("call it {}", w(2)), "/name", &[field("name", w(2))]);
+            let name = view(&mut d)?.name();
+            Ok(Done { said: vec![format!("It is called {name}.")], data: json!({ "ok": true, "name": name }) })
+        }
         ("machine", operation @ ("retrieve" | "update")) => {
             let mut d = signed_in();
             let now = view(&mut d)?.machine();
@@ -685,7 +715,7 @@ mod tests {
         assert!(help("runners").contains("aws-on-demand") && help("gitlab").contains("SUPERCI_GITLAB_TOKEN") && help("github").contains("GitHub offers that nowhere else"));
         // Every command `run` and `in_browser` know is in some resource's lines.
         for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs list", "superci jobs retrieve ID", "superci keys list", "superci keys create NAME", "superci keys delete NAME",
-            "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
+            "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci github list", "superci github create OWNER", "superci github delete OWNER",
             "superci github_deliveries list", "superci github_deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab_projects list", "superci gitlab_projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete"] {
             assert!(all.contains(command), "{command}");
@@ -712,20 +742,20 @@ mod tests {
         for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
+        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create soroci", "name retrieve", "name update SoroCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "gitlab_projects list", "gitlab_projects update 7 --enabled=true", "gitlab_projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
             "planes update --dry-run", "runners create cloudflare --dry-run"] {
             assert_eq!(run(line), signed_out, "{line}");
         }
-        for line in ["planes delete abcdef123456", "leave", "runners delete aws", "github delete acme", "gitlab delete"] {
+        for line in ["planes delete abcdef123456", "leave", "runners delete aws", "labels delete superci", "github delete acme", "gitlab delete"] {
             assert!(matches!(run(line), Fail::Unconfirmed(e) if e.starts_with("This would ") && e.ends_with("Add --confirm to do it, or --dry-run to check it first.")), "{line}");
             assert_eq!(run(&format!("{line} --confirm")), signed_out, "{line}");
             assert_eq!(run(&format!("{line} --dry-run")), signed_out, "{line}: a dry run checks the sign-in too");
         }
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
             ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("gitlab create", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("gitlab create --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
-            ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("keys create agent --days soon", "--days is a number"),
+            ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
             ("gitlab_projects update 7", "Say which way:"), ("gitlab_projects update --all --enabled=false", "Projects are switched off one at a time"),
             ("planes", "`superci planes` takes an operation."), ("limits", "`superci limits` takes an operation."), ("runners frob", "`frob` is not an operation of `superci runners`."), ("limits set", "`set` is not an operation of `superci limits`."),
             ("frobnicate", "`frobnicate` is not a command of superci.")] {

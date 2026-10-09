@@ -1842,3 +1842,69 @@ fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
     assert_eq!(job(&store, 13)["label"], "superci-2cpu");
     assert_eq!(wakes.0.borrow().last(), Some(&60_000));
 }
+
+#[test]
+fn a_control_plane_answers_to_the_labels_set_for_it_the_new_one_and_the_ones_before() {
+    use superci_core::spec::{valid_label, Spec};
+    for ok in ["soroci", "ci2", "acme"] { assert!(valid_label(ok).is_ok(), "{ok}") }
+    for no in ["", "a", "2ci", "my-ci", "CI", "ubuntu", "gpu", "aws", "t4", "averyveryverylongnameforalabel"] { assert!(valid_label(no).is_err(), "{no}") }
+    let mut config = Config::new(PLANE_ID.into());
+    assert_eq!(config.labels(), ["superci"]);
+    // As the dashboard sets them: the new one first, the one before kept.
+    config.set_labels(r#"["soroci","superci"]"#);
+    assert_eq!((config.label.as_str(), config.labels()), ("soroci", vec!["soroci".to_string(), "superci".to_string()]));
+    assert_eq!(config.parse("soroci-8cpu-arm64").unwrap().unwrap().cpu, Some(8));
+    assert!(config.parse("superci").is_some() && config.parse("SuperCI-arm64").is_some() && config.parse("sorociplus").is_none() && config.parse("ubuntu-latest").is_none());
+    // The longest label that fits is the one meant; what cannot be a label is left out; nothing usable leaves it as it was.
+    assert!(Spec::parse_among("cibig-2cpu", &["ci".into(), "cibig".into()]).unwrap().is_ok());
+    config.set_labels(r#"["my-ci","gpu"]"#);
+    assert_eq!(config.labels(), ["soroci", "superci"]);
+    config.set_labels(r#"["superci"]"#);
+    assert_eq!(config.labels(), ["superci"]);
+
+    // A job naming either label gets a machine, registered under the label it named; the status says both.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.set_labels(r#"["soroci","superci"]"#);
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    assert_eq!(json(&run(get("/health")))["label"], "soroci");
+    run(labelled("queued", 21, "acme/app", None, "soroci-2cpu"));
+    run(labelled("queued", 22, "acme/app", None, "superci"));
+    run(labelled("queued", 23, "acme/app", None, "otherci"));
+    assert_eq!((job(&store, 21)["label"].as_str(), job(&store, 22)["label"].as_str(), launches(&clouds).len()), (Some("soroci-2cpu"), Some("superci"), 2));
+    assert!(!store.0.borrow().contains_key("job:23"));
+    let status = json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!((status["label"].as_str(), status["labels"].clone()), (Some("soroci"), serde_json::json!(["soroci", "superci"])));
+}
+
+#[test]
+fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
+    use superci_core::spec::valid_name;
+    for ok in ["SoroCI", "Acme CI", "ci-2", "Io"] { assert!(valid_name(ok).is_ok(), "{ok}") }
+    for no in ["", "A", "2CI", "Acme CI ", "Acme  CI", "Acme: CI", "Acme,CI", "A name far too long to be one"] { assert!(valid_name(no).is_err(), "{no}") }
+    let mut config = Config::new(PLANE_ID.into());
+    assert_eq!(config.name(), "SuperCI");
+    config.set_name("Acme: CI");
+    assert_eq!(config.name(), "SuperCI", "what cannot be a name leaves it as it was");
+    config.set_name(" SoroCI ");
+    assert_eq!(config.name(), "SoroCI");
+
+    // The status says it; a job nothing can run says so under that name; the App for an organization starts with it.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    config.app = Some(app());
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    assert_eq!(json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")))["name"], "SoroCI");
+    run(labelled("queued", 31, "acme/app", None, "superci"));
+    let why = job(&store, 31)["error"].as_str().unwrap_or_default().to_string();
+    assert!(why.contains("the SoroCI dashboard") && !why.contains("SuperCI"), "{why}");
+    let named = |called: &str| superci_core::github::app_manifest(PLANE_URL, &superci_core::github::Owner { org: true, login: "acme".into() }, called, "superci", PLANE_ID)["name"].as_str().unwrap().to_string();
+    assert!(named("SoroCI").starts_with("SoroCI acme ") && named("SuperCI").starts_with("SuperCI acme ") && named("").starts_with("SuperCI acme "));
+    config.set_name("SuperCI");
+    assert!(config.name.is_none());
+}

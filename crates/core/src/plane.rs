@@ -35,7 +35,13 @@ pub fn max_minutes(cloud: &str) -> u32 {
 /// token from its secrets.
 pub struct Config {
     pub plane_id: String,
+    /// The label workflows name (`runs-on: superci`), and the ones it also answers to: a label changed in the
+    /// dashboard keeps the one before working until that is removed, so no workflow has to change the same day.
     pub label: String,
+    pub more_labels: Vec<String>,
+    /// What it is called where people read it (the dashboard's header, the App's name, what it says on a job it
+    /// could not run), when that is not SuperCI: a team's own name for its CI (SoroCI).
+    pub name: Option<String>,
     pub app: Option<App>,
     /// GitHub Apps for further organizations (a private App belongs to one account, so each has its own); `app` is
     /// the first one made.
@@ -94,10 +100,35 @@ pub struct Config {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl Config {
+    /// Every label it answers to, its own first.
+    pub fn labels(&self) -> Vec<String> { std::iter::once(self.label.clone()).chain(self.more_labels.iter().filter(|l| **l != self.label).cloned()).collect() }
+
+    /// The labels as set in the dashboard (a JSON list, the one workflows are shown first): taken when it holds at
+    /// least one that can be a label.
+    pub fn set_labels(&mut self, json: &str) {
+        let mut set: Vec<String> = serde_json::from_str::<Vec<String>>(json).unwrap_or_default().into_iter().map(|l| l.to_ascii_lowercase()).filter(|l| crate::spec::valid_label(l).is_ok() || l == "superci").collect();
+        set.dedup();
+        if let Some(first) = set.first().cloned() { self.label = first; self.more_labels = set.split_off(1); }
+    }
+
+    /// What it is called: SuperCI, unless given a name of its own.
+    pub fn name(&self) -> &str { self.name.as_deref().unwrap_or("SuperCI") }
+
+    /// The name as set in the dashboard: taken when it can be one (see `spec::valid_name`).
+    pub fn set_name(&mut self, name: &str) {
+        let name = name.trim();
+        self.name = (name != "SuperCI" && crate::spec::valid_name(name).is_ok()).then(|| name.to_string());
+    }
+
+    /// What a label asks for, by any of its labels.
+    pub fn parse(&self, label: &str) -> Option<std::result::Result<Spec, String>> { Spec::parse_among(label, &self.labels()) }
+
     pub fn new(plane_id: String) -> Self {
         Config {
             plane_id,
             label: "superci".into(),
+            more_labels: Vec::new(),
+            name: None,
             own_cloud: "cloudflare".into(),
             app: None,
             gitlab: None,
@@ -854,7 +885,7 @@ impl<'a> ControlPlane<'a> {
         jobs_all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
         let jobs: Vec<Job> = jobs_all.iter().take(50).cloned().collect();
         Ok(Response::json(&serde_json::json!({
-            "plane": self.config.plane_id, "label": self.config.label,
+            "plane": self.config.plane_id, "label": self.config.label, "labels": self.config.labels(), "name": self.config.name(),
             "app": self.config.app.as_ref().map(|a| serde_json::json!({ "id": a.id, "slug": a.slug, "owner": a.owner, "org": a.owner_is_org, "host": a.host })),
             "apps": apps,
             "installations": installations,
@@ -1038,7 +1069,7 @@ impl<'a> ControlPlane<'a> {
         let payload: serde_json::Value = serde_json::from_slice(&req.body).map_err(|e| e.to_string())?;
         // The sweep keeps running after the first webhook (it asks for failed deliveries again).
         self.timer.wake_in(300_000).await?;
-        let Some(ev) = github::our_job(&payload, &self.config.label, &app.owner) else { return Ok(Response::text(202, "not ours")) };
+        let Some(ev) = github::our_job_among(&payload, &self.config.labels(), &app.owner) else { return Ok(Response::text(202, "not ours")) };
         match ev.action.as_str() {
             "queued" => self.launch(plane_url, &ev, app).await?,
             "in_progress" => self.started(plane_url, ev.job_id, ev.runner_name.as_deref()).await?,
@@ -1065,7 +1096,7 @@ impl<'a> ControlPlane<'a> {
                 if self.store.get(&key).await?.is_some() { return Ok(Response::text(200, "known")) }
                 let (tags, status) = gitlab::job(self.http, gl, ev.project_id, ev.job_id).await?;
                 if status != "pending" { return Ok(Response::text(200, "not pending")) }
-                let ours: Vec<&String> = tags.iter().filter(|t| Spec::parse(t, &self.config.label).is_some()).collect();
+                let ours: Vec<&String> = tags.iter().filter(|t| self.config.parse(t).is_some()).collect();
                 let [label] = ours.as_slice() else { return Ok(Response::text(200, "not ours")) };
                 let mut job = Job { job_id: ev.job_id, run_id: ev.pipeline_id, repo: ev.project.clone(), state: "launching".into(), at_ms: self.clock.now_ms(), label: label.to_string(),
                     provider: "gitlab".into(), gitlab: gl.id.clone(), project_id: Some(ev.project_id), tags: tags.clone(), name: ev.name.clone(), workflow: ev.stage.clone(), ..Default::default() };
@@ -1155,7 +1186,7 @@ impl<'a> ControlPlane<'a> {
     async fn gitlab_runner(&self, gl: &GitLab, job: &mut Job) -> Result<String> {
         let mut tags = job.tags.clone();
         tags.sort();
-        let (id, token) = gitlab::create_runner(self.http, gl, job.project_id.ok_or("a GitLab job without its project")?, &tags, &self.config.plane_id, job.job_id).await?;
+        let (id, token) = gitlab::create_runner(self.http, gl, job.project_id.ok_or("a GitLab job without its project")?, &tags, self.config.name(), &self.config.plane_id, job.job_id).await?;
         put_json(self.store, &format!("glrunner:{}", gitlab::local(&gl.id, id)), &serde_json::json!({ "id": id, "job": job.job_id, "gitlab": gl.id, "at_ms": self.clock.now_ms() })).await?;
         job.runner_id = Some(id);
         Ok(token)
@@ -1262,7 +1293,7 @@ impl<'a> ControlPlane<'a> {
     /// Whether other jobs' GPU machines are up in AWS now (then a quota refusal means it is full, not that it is 0).
     async fn gpu_machines_up(&self, job_id: u64) -> bool {
         let jobs: Vec<Job> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
-        jobs.iter().any(|j| j.job_id != job_id && j.cloud == "aws" && active(j) && Spec::parse(&j.label, &self.config.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
+        jobs.iter().any(|j| j.job_id != job_id && j.cloud == "aws" && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
     }
 
     /// Its own network in an AWS region (made by the dashboard), looked up at most every ten minutes; without one
@@ -1314,7 +1345,7 @@ impl<'a> ControlPlane<'a> {
             else if !routing.order.is_empty() { order.clone() }
             else if let Some(d) = &routing.default { let v = named(d); if v.is_empty() { vec![d.clone()] } else { v } }
             else { connected };
-        if candidates.is_empty() { return Ok(Placement::Fail("no cloud connected for jobs: connect one in the SuperCI dashboard".into())) }
+        if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
         let jobs: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
         let spend = self.month_spend(&jobs).await;
         let (mut later, mut never, mut places) = (vec![], vec![], vec![]);
@@ -1381,7 +1412,7 @@ impl<'a> ControlPlane<'a> {
         let Ok(creds) = self.aws_creds(plane_url, &a).await else { return };
         let (from, now) = (j.launched_ms.unwrap_or(j.at_ms), self.clock.now_ms());
         let hours = end.saturating_sub(from).max(60_000) as f64 / 3_600_000.0;
-        let spec = Spec::parse(&j.label, &self.config.label).and_then(|s| s.ok()).map(|s| s.or(&self.config.machine)).unwrap_or_default();
+        let spec = self.config.parse(&j.label).and_then(|s| s.ok()).map(|s| s.or(&self.config.machine)).unwrap_or_default();
         let machine = match j.zone.as_deref() {
             Some(zone) if !(spec.on_demand || j.on_demand) => aws::spot_cost(self.http, &region, zone, &creds, &kind, spec.os(), from, end, now).await,
             _ => { let p = aws::on_demand_price(self.http, &creds, &region, &kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.map(|p| p * hours) }
@@ -1481,7 +1512,7 @@ impl<'a> ControlPlane<'a> {
         let key = job_key(job);
         let gitlab = job.provider == "gitlab";
         let label = if job.label.is_empty() { self.config.label.clone() } else { job.label.clone() };
-        let spec = match Spec::parse(&label, &self.config.label) {
+        let spec = match self.config.parse(&label) {
             Some(Ok(s)) => Ok(s.or(&self.config.machine)),
             Some(Err(e)) => Err(e),
             None => Err(format!("{label} is not this control plane's label")),
@@ -1745,9 +1776,10 @@ impl<'a> ControlPlane<'a> {
         // Known by its name, as a job's runner is: it may take another job with the label (see `failed_by_runner`).
         let _ = put_json(self.store, &format!("runner:{name}"), &job.job_id).await;
         // macOS (no provider here runs it yet): what to do, in so many words.
-        let mac = Spec::parse(&label, &self.config.label).and_then(|s| s.ok()).is_some_and(|s| s.os() == "macos") && why.starts_with("nowhere to run");
-        let line = if mac { "::error title=SuperCI could not run this job::SuperCI runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.".to_string() }
-            else { format!("::error title=SuperCI could not run this job::{}. Change its runs-on, or add a place that can run it in the SuperCI dashboard.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) };
+        let mac = self.config.parse(&label).and_then(|s| s.ok()).is_some_and(|s| s.os() == "macos") && why.starts_with("nowhere to run");
+        let called = self.config.name();
+        let line = if mac { format!("::error title={called} could not run this job::{called} runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.") }
+            else { format!("::error title={called} could not run this job::{}. Change its runs-on, or add a place that can run it in the {called} dashboard.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) };
         let work = Work::Fail { jit, why: crate::crypto::b64(line.as_bytes()) };
         let size = Size { cpu: 1, ram_gb: 4, disk_gb: 8, gpu: None };
         // The first place that starts it (a container that would not start, a cloud's hiccup: the next).
@@ -2094,7 +2126,7 @@ impl<'a> ControlPlane<'a> {
                 if matches!(self.store.get(&format!("job:{id}")).await, Ok(Some(_)) | Err(_)) { continue }
                 if job["created_at"].as_str().and_then(aws::parse_iso_ms).is_none_or(|at| now.saturating_sub(at) < 45_000) { continue }
                 let event = serde_json::json!({ "action": "queued", "workflow_job": job, "repository": { "full_name": known.repo, "private": private }, "installation": { "id": known.installation_id } });
-                if let Some(ev) = github::our_job(&event, &self.config.label, &app.owner) { let _ = self.launch(plane_url, &ev, app).await; }
+                if let Some(ev) = github::our_job_among(&event, &self.config.labels(), &app.owner) { let _ = self.launch(plane_url, &ev, app).await; }
             }
         }
         moved_lately
