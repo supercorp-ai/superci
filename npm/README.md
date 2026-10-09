@@ -19,4 +19,6 @@ runs-on: superci
 
 This package is a small launcher (its command is `superci`). The program itself comes in a package for your system (macOS, Linux or Windows; arm64 or x64), installed with it.
 
+Without Node: `brew install supercorp-ai/tap/superci`, `curl -fsSL https://superci.dev/install.sh | sh`, or `cargo install superci`.
+
 MIT licensed.

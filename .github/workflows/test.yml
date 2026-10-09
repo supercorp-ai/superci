@@ -34,3 +34,9 @@ jobs:
         run: cargo test --workspace
       - name: The program for Windows builds
         run: cargo zigbuild --release --target x86_64-pc-windows-gnu -p superci
+      - name: The crates pack and build as crates.io would get them
+        run: ./scripts/crates-publish.sh --dry-run
+      - name: The installer installs the latest release
+        run: |
+          SUPERCI_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          "$RUNNER_TEMP/bin/superci" --version

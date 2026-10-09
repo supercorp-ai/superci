@@ -211,7 +211,7 @@ pub fn deploy_runners(session: &Session, plane_url: &str, plane_id: &str, keys: 
 }
 
 /// The control plane program a Modal control plane runs (Linux x86_64), handed to `modal deploy` with plane.py.
-const PLANE_BINARY: &[u8] = include_bytes!("../../plane-modal/build/superci-plane");
+const PLANE_BINARY: &[u8] = include_bytes!(env!("SUPERCI_PLANE_MODAL"));
 
 /// What deploying a control plane to Modal does, in order, as the dashboard shows it.
 pub const DEPLOY_STEPS: [&str; 3] = ["Building its images in your workspace", "Deploying it, with its check for waiting jobs and leftover machines every minute", "Waiting for it to answer"];

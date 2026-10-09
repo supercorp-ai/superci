@@ -4,13 +4,21 @@ description = "Your SuperCI dashboard, on your machine: puts a control plane in 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage = "https://superci.dev"
+readme = "../../README.md"
+keywords = ["ci", "github-actions", "gitlab", "runners", "aws"]
+categories = ["command-line-utilities", "development-tools"]
+build = "build.rs"
+# The crate on crates.io carries what `./build.sh` built (embedded/, filled by scripts/crates-publish.sh).
+include = ["src/**", "embedded/**", "build.rs", "Cargo.toml"]
 
 [[bin]]
 name = "superci"
 path = "src/main.rs"
 
 [dependencies]
-superci-core = { path = "../core" }
+superci-core = { path = "../core", version = "=0.12.0" }
 url.workspace = true
 ureq = { version = "3", features = ["json"] }
 serde.workspace = true

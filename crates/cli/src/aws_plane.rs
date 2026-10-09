@@ -14,7 +14,7 @@ use superci_core::aws::{self, Credentials};
 use crate::aws::Blocking;
 use crate::Result;
 
-const BOOTSTRAP_ZIP: &[u8] = include_bytes!("../../plane-aws/build/bootstrap.zip");
+const BOOTSTRAP_ZIP: &[u8] = include_bytes!(env!("SUPERCI_PLANE_AWS"));
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 

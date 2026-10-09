@@ -18,6 +18,16 @@ jobs:
 
 Each job gets a machine of its own, of the size its label asks for (`superci-16cpu`, `superci-arm64`, `superci-gpu`, `superci-windows`), and the machine is gone when the job ends. You pay your cloud's prices; there is no service of ours in between.
 
+Without Node, the same program installs as `superci`:
+
+```sh
+brew install supercorp-ai/tap/superci           # Homebrew
+curl -fsSL https://superci.dev/install.sh | sh  # macOS and Linux, into ~/.local/bin
+cargo install superci                           # built from source by Rust
+```
+
+Then `superci dashboard`.
+
 Documentation: [superci.dev/docs](https://superci.dev/docs).
 
 ## How it is put together
@@ -39,7 +49,7 @@ target/release/superci
 
 `build.sh` needs Rust, [worker-build](https://crates.io/crates/worker-build), zig with [cargo-zigbuild](https://crates.io/crates/cargo-zigbuild), and `zip`.
 
-The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release. Every push and pull request is built and tested by `.github/workflows/test.yml`.
+The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release; then it publishes the crates (`scripts/crates-publish.sh`), writes the Homebrew formula into the tap (`scripts/brew-formula.sh`), and tries `install.sh`, all three from npm's files or the same source. Every push and pull request is built and tested by `.github/workflows/test.yml`.
 
 ## License
 

@@ -4,6 +4,10 @@ description = "The runtime-neutral core of a SuperCI plane: GitHub App, AWS over
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage = "https://superci.dev"
+readme = "README.md"
+keywords = ["ci", "github-actions", "gitlab", "runners"]
 
 [dependencies]
 serde.workspace = true

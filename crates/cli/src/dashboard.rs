@@ -3413,7 +3413,7 @@ fn update_progress(u: &Update) -> String {
 }
 
 /// The changelog (CHANGELOG.md, in this program): each version with its date and changes.
-const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
+const CHANGELOG: &str = include_str!(env!("SUPERCI_CHANGELOG"));
 
 fn changelog() -> Vec<(String, String, Vec<String>)> {
     let mut out: Vec<(String, String, Vec<String>)> = vec![];

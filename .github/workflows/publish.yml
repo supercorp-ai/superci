@@ -86,6 +86,14 @@ jobs:
           path: target/npm/*.tgz
           if-no-files-found: error
           retention-days: 7
+      - name: The crates pack and build as crates.io would get them
+        run: ./scripts/crates-publish.sh --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: embedded
+          path: crates/cli/embedded/
+          if-no-files-found: error
+          retention-days: 7
 
   windows:
     # The package for Windows, on Windows: installed as npm would, asked its version, and its dashboard opened.
@@ -153,3 +161,82 @@ jobs:
           tag="v$RELEASE_VERSION"
           awk -v v="## $RELEASE_VERSION " 'index($0, v) == 1 { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           gh release view "$tag" > /dev/null 2>&1 || gh release create "$tag" --target "$GITHUB_SHA" --title "$RELEASE_VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+
+  crates:
+    # `cargo install superci`: the same source, with what the build job built inside it. crates.io trusts this
+    # workflow (trusted publishing, set on each crate's page: Settings, Trusted Publishing, supercorp-ai/superci,
+    # publish.yml), so there is no token to keep. After npm: a failure here leaves npm's release whole, and running
+    # the failed job again finishes it.
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: embedded
+          path: crates/cli/embedded
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - run: ./scripts/crates-publish.sh --embedded
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  homebrew:
+    # `brew install supercorp-ai/tap/superci`: the tap's formula names npm's files for one version, each with its
+    # checksum, so it is written again at each release. Needs the secret HOMEBREW_TAP_TOKEN (a token that may write
+    # to supercorp-ai/homebrew-tap; this workflow's own token reaches only this repository). Without it this job
+    # fails and says so: a tap left a release behind would install the old program without a word.
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Point the tap at this release
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          [ -n "${TAP_TOKEN:-}" ] || { echo "HOMEBREW_TAP_TOKEN is not set: the tap still installs the release before. Add the secret and run this job again." >&2; exit 1; }
+          git clone -q --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/supercorp-ai/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          ./scripts/brew-formula.sh "$RELEASE_VERSION" > tap/Formula/superci.rb
+          cd tap
+          if git diff --quiet -- Formula/superci.rb && git ls-files --error-unmatch Formula/superci.rb > /dev/null 2>&1; then echo "The tap already installs $RELEASE_VERSION."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/superci.rb
+          git commit -q -m "superci $RELEASE_VERSION"
+          git push -q
+      - name: Install from the tap and ask its version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap supercorp-ai/tap
+          brew install supercorp-ai/tap/superci
+          [ "$(superci --version)" = "superci $RELEASE_VERSION" ]
+
+  installer:
+    # `curl -fsSL https://superci.dev/install.sh | sh`: the installer as this commit has it installs this release.
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          SUPERCI_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
+          [ "$("$RUNNER_TEMP/bin/superci" --version)" = "superci $RELEASE_VERSION" ]
