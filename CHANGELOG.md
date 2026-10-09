@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.12.0 — unreleased
+## 0.12.0 — 2026-10-09
 - Labels of your own. Your control plane answers to a list of labels, `superci` alone to begin with: add one on Workflows → Labels, or with `superci labels create soroci`, and workflows can name it in `runs-on` (`runs-on: soroci`, `soroci-8cpu-arm64`). Every label in the list works at once, so workflows change one at a time and nothing waits the day you add one; remove a label when nothing names it any more. The one added last is the one shown in examples. Two to twenty-four lowercase letters and digits.
 - A name of your own. Workflows → Name, or `superci name update SoroCI`: the dashboard's header and tab say it, a GitHub App made for a further organization starts with it (SoroCI acme …), GitLab's runners are described with it, and a job that could not be run says "SoroCI could not run this job". `SuperCI` puts it back. The command stays `superci`.
 - A move to another control plane takes the labels and the name along.
