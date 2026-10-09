@@ -1,3 +1,5 @@
+![Your CI jobs, on your own cloud](https://raw.githubusercontent.com/supercorp-ai/superci/main/superci.jpg)
+
 # SuperCI
 
 Your GitHub Actions and GitLab CI jobs, on fresh machines in your own AWS, Cloudflare or Modal account.
