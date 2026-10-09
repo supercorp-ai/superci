@@ -42,6 +42,10 @@ pub struct Config {
     /// What it is called where people read it (the dashboard's header, the App's name, what it says on a job it
     /// could not run), when that is not SuperCI: a team's own name for its CI (SoroCI).
     pub name: Option<String>,
+    /// What is switched on beside running jobs (see `Plugins`), and where a job's files are kept when it keeps any:
+    /// the bucket and its region, of a control plane in AWS.
+    pub plugins: Plugins,
+    pub bucket: Option<(String, String)>,
     pub app: Option<App>,
     /// GitHub Apps for further organizations (a private App belongs to one account, so each has its own); `app` is
     /// the first one made.
@@ -99,6 +103,33 @@ pub struct Config {
 /// This control plane's version (SuperCI's): the dashboard offers an update when it is older than the dashboard.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// What a control plane does beside running jobs. Each is off until switched on in the dashboard, and none needs a
+/// line in a workflow: a job's file stays what it would be on GitHub's own runners.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Plugins {
+    /// Keeps what a job's tests leave on its machine (reports, traces, videos, results) in the control plane's bucket.
+    #[serde(default)] pub output: bool,
+}
+
+/// What one machine sent of its job's files: where from, each file's path and size, and whether it said it was done.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Kept {
+    pub at_ms: u64,
+    pub files: Vec<(String, u64)>,
+    #[serde(default)] pub done: bool,
+}
+
+/// The most files a job's machine may send, the largest one, and all of them together.
+pub const KEPT_FILES: usize = 5_000;
+pub const KEPT_FILE_BYTES: u64 = 500 << 20;
+pub const KEPT_BYTES: u64 = 2 << 30;
+
+/// Whether a path a machine named may be a file's name in the bucket: relative, with no way out of its folder.
+pub fn kept_path(path: &str) -> bool {
+    !path.is_empty() && path.len() <= 512 && !path.starts_with('/') && !path.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'\\')
+        && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 impl Config {
     /// Every label it answers to, its own first.
     pub fn labels(&self) -> Vec<String> { std::iter::once(self.label.clone()).chain(self.more_labels.iter().filter(|l| **l != self.label).cloned()).collect() }
@@ -129,6 +160,8 @@ impl Config {
             label: "superci".into(),
             more_labels: Vec::new(),
             name: None,
+            plugins: Plugins::default(),
+            bucket: None,
             own_cloud: "cloudflare".into(),
             app: None,
             gitlab: None,
@@ -590,6 +623,11 @@ impl<'a> ControlPlane<'a> {
             // GitLab's projects, for the dashboard: which send their jobs here; switching one on or off; after the
             // connection changes, every webhook here gets the new secret.
             ("GET", "/job/log") if self.reader(&req) => self.job_log(&url).await,
+            // What a job's machine kept of its files (see `Plugins::output`): the machine says which, and is told
+            // where to send each; whoever may read lists them and is sent to one.
+            ("POST", "/kept") => self.kept(&req, &url).await,
+            ("GET", "/job/files") if self.reader(&req) => self.job_files(&url).await,
+            ("GET", "/job/file") if self.reader(&req) => self.job_file(&url).await,
             // What GitHub says of the events it sent here lately, for whoever may read: whether each arrived, and (one
             // by its id) where it was sent and what was answered. To see why a job never got a machine.
             ("GET", "/github/deliveries") if self.reader(&req) => {
@@ -842,6 +880,79 @@ impl<'a> ControlPlane<'a> {
         self.config.read_keys.iter().any(|(until, _, kept)| *until > now && safe_eq(hash.as_bytes(), kept.as_bytes()))
     }
 
+    /// Where files are kept, when they are: the bucket, its region and the credentials to sign links with.
+    fn keeps(&self) -> Option<(&str, &str, &Credentials)> {
+        if !self.config.plugins.output { return None }
+        let (bucket, region) = self.config.bucket.as_ref()?;
+        Some((bucket.as_str(), region.as_str(), self.config.aws_own_creds.as_ref()?))
+    }
+
+    /// The link a job's machine is given to say what it kept (only it has it), when files are kept.
+    async fn keep_link(&self, plane_url: &str, runner: &str) -> Result<Option<String>> {
+        if self.keeps().is_none() { return Ok(None) }
+        let token = crate::crypto::random_token(18);
+        put_json(self.store, &format!("keep:{runner}"), &token).await?;
+        Ok(Some(format!("{plane_url}/kept?runner={runner}&t={token}")))
+    }
+
+    /// A machine saying what it kept: lines of `size<TAB>path`, answered with a link to send each to, in the same
+    /// order (a line with no link: that file is not taken). With `done`, that all were sent.
+    async fn kept(&self, req: &Request, url: &url::Url) -> Result<Response> {
+        let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        let Some(runner) = q.get("runner").filter(|r| !r.is_empty() && r.len() <= 128 && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) else { return Ok(nothing_here()) };
+        let Some(token) = get_json::<String>(self.store, &format!("keep:{runner}")).await? else { return Ok(nothing_here()) };
+        if token.len() < 16 || !q.get("t").is_some_and(|t| safe_eq(t.as_bytes(), token.as_bytes())) { return Ok(nothing_here()) }
+        let Some((bucket, region, creds)) = self.keeps() else { return Ok(nothing_here()) };
+        let key = format!("kept:{runner}");
+        if q.contains_key("done") {
+            if let Some(mut k) = get_json::<Kept>(self.store, &key).await? { k.done = true; put_json(self.store, &key, &k).await?; }
+            return Ok(Response::text(200, "ok"));
+        }
+        // Said once: what a machine named first is what its links are for.
+        if get_json::<Kept>(self.store, &key).await?.is_some() { return Ok(Response::text(409, "already said")) }
+        let (now, mut kept, mut links, mut bytes) = (self.clock.now_ms(), Kept::default(), String::new(), 0u64);
+        for line in String::from_utf8_lossy(&req.body).lines() {
+            let taken = line.split_once('\t').and_then(|(size, path)| Some((size.parse::<u64>().ok()?, path)))
+                .filter(|(size, path)| kept_path(path) && *size <= KEPT_FILE_BYTES && bytes + size <= KEPT_BYTES && kept.files.len() < KEPT_FILES && !kept.files.iter().any(|(p, _)| p == path));
+            if let Some((size, path)) = taken {
+                bytes += size;
+                kept.files.push((path.to_string(), size));
+                links.push_str(&aws::s3_link("PUT", bucket, region, &format!("jobs/{runner}/{path}"), creds, 900, now));
+            }
+            links.push('\n');
+        }
+        kept.at_ms = now;
+        put_json(self.store, &key, &kept).await?;
+        Ok(Response::text(200, &links))
+    }
+
+    /// The machine a job ran on, by the job's id: as GitHub said when it completed, or as it was started.
+    async fn ran_on(&self, url: &url::Url) -> Result<Option<String>> {
+        let id = url.query_pairs().find(|(k, _)| k == "id").map(|(_, v)| v.into_owned()).filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())).ok_or("which job?")?;
+        if let Some(runner) = get_json::<String>(self.store, &format!("ran:{id}")).await? { return Ok(Some(runner)) }
+        Ok(get_json::<Job>(self.store, &format!("job:{id}")).await?.and_then(|j| j.runner))
+    }
+
+    /// What was kept of a job's files, for whoever may read.
+    async fn job_files(&self, url: &url::Url) -> Result<Response> {
+        let kept = match self.ran_on(url).await? { Some(runner) => get_json::<Kept>(self.store, &format!("kept:{runner}")).await?, None => None };
+        let Some(kept) = kept else { return Ok(Response::json(&serde_json::json!({ "files": [], "kept": false }))) };
+        Ok(Response::json(&serde_json::json!({ "kept": true, "at_ms": kept.at_ms, "done": kept.done,
+            "files": kept.files.iter().map(|(path, size)| serde_json::json!({ "path": path, "size": size })).collect::<Vec<_>>() })))
+    }
+
+    /// One kept file: whoever may read is sent to it (a link good for five minutes).
+    async fn job_file(&self, url: &url::Url) -> Result<Response> {
+        let path = url.query_pairs().find(|(k, _)| k == "path").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let Some(runner) = self.ran_on(url).await? else { return Ok(nothing_here()) };
+        let Some(kept) = get_json::<Kept>(self.store, &format!("kept:{runner}")).await? else { return Ok(nothing_here()) };
+        if !kept.files.iter().any(|(p, _)| *p == path) { return Ok(nothing_here()) }
+        let (bucket, region) = self.config.bucket.as_ref().ok_or("this control plane keeps no files")?;
+        let creds = self.config.aws_own_creds.as_ref().ok_or("no AWS credentials in this runtime")?;
+        let link = aws::s3_link("GET", bucket, region, &format!("jobs/{runner}/{path}"), creds, 300, self.clock.now_ms());
+        Ok(Response::json(&serde_json::json!({ "url": link })))
+    }
+
     /// A job's log, for whoever may read: GitHub's for the job (with the App's token for its repository), or GitLab's
     /// trace. Its end (`bytes`: how much, a megabyte at most), since the end says why a job failed.
     async fn job_log(&self, url: &url::Url) -> Result<Response> {
@@ -885,7 +996,7 @@ impl<'a> ControlPlane<'a> {
         jobs_all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
         let jobs: Vec<Job> = jobs_all.iter().take(50).cloned().collect();
         Ok(Response::json(&serde_json::json!({
-            "plane": self.config.plane_id, "label": self.config.label, "labels": self.config.labels(), "name": self.config.name(),
+            "plane": self.config.plane_id, "label": self.config.label, "labels": self.config.labels(), "name": self.config.name(), "plugins": self.config.plugins, "bucket": self.config.bucket.is_some(),
             "app": self.config.app.as_ref().map(|a| serde_json::json!({ "id": a.id, "slug": a.slug, "owner": a.owner, "org": a.owner_is_org, "host": a.host })),
             "apps": apps,
             "installations": installations,
@@ -1594,7 +1705,9 @@ impl<'a> ControlPlane<'a> {
                         // A spot machine says when AWS takes it back, with a link only it has.
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
-                        let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref())?;
+                        // What its tests leave is kept, when that is switched on (GitHub jobs on Linux so far).
+                        let keep = if gitlab || spec.os() == "windows" { None } else { self.keep_link(plane_url, &name).await? };
+                        let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref(), keep.as_deref())?;
                         let mut launched = None;
                         // The regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         for region in &self.aws_regions(&a) {
@@ -1935,6 +2048,8 @@ impl<'a> ControlPlane<'a> {
     async fn completed(&self, plane_url: &str, ev: &github::JobEvent) -> Result<()> {
         let (job_id, runner) = (ev.job_id, ev.runner_name.as_deref());
         if let Some(name) = runner.filter(|r| failing_runner(r)) { return self.failed_by_runner(name, job_id).await }
+        // The machine it ran on (a runner may take another job than the one it was started for): where its files are.
+        if let Some(name) = runner.filter(|_| self.keeps().is_some()) { put_json(self.store, &format!("ran:{job_id}"), &name).await?; }
         let mut on_anothers = None;
         if let Some(mut j) = self.by_runner(runner).await? {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }

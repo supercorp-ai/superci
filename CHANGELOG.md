@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.13.0 — unreleased
+- Plugins: what your control plane does beside running jobs. Each is off until you switch it on, and none needs a line in a workflow, so a job's file stays what it would be on GitHub's own runners. `superci plugins list`, `superci plugins update NAME --enabled=true`.
+- The first plugin, `output`: what each job's tests leave on its machine is kept. Once the job's last step has ended, the machine sends Playwright's report, traces, videos and `error-context.md` files, Cypress's videos and screenshots, pytest's list of what failed, coverage files and any JUnit XML written during the job to a private bucket in your AWS account, where they stay 30 days. `superci files list --job=ID` names them and `superci files retrieve --job=ID` downloads them, with a key that only reads too, so a coding agent can fetch a failed test's context. Nothing here can fail a job. Needs a control plane in AWS; GitHub jobs on Linux machines in AWS so far.
+
 ## 0.12.0 — 2026-10-09
 - Labels of your own. Your control plane answers to a list of labels, `superci` alone to begin with: add one on Workflows → Labels, or with `superci labels create soroci`, and workflows can name it in `runs-on` (`runs-on: soroci`, `soroci-8cpu-arm64`). Every label in the list works at once, so workflows change one at a time and nothing waits the day you add one; remove a label when nothing names it any more. The one added last is the one shown in examples. Two to twenty-four lowercase letters and digits.
 - A name of your own. Workflows → Name, or `superci name update SoroCI`: the dashboard's header and tab say it, a GitHub App made for a further organization starts with it (SoroCI acme …), GitLab's runners are described with it, and a job that could not be run says "SoroCI could not run this job". `SuperCI` puts it back. The command stays `superci`.

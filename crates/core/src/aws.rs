@@ -152,6 +152,81 @@ pub async fn json_call(http: &dyn Http, method: &str, url: &str, region: &str, s
     Ok(v)
 }
 
+/// The bucket a control plane in AWS keeps jobs' files in: named after the control plane, like its table and function.
+pub fn bucket(plane_id: &str) -> String { format!("superci-plane-{plane_id}") }
+
+fn s3_host(bucket: &str, region: &str) -> String { format!("{bucket}.s3.{region}.amazonaws.com") }
+
+/// A link that lets its holder send (`PUT`) or fetch (`GET`) one object for `secs` seconds and do nothing else (S3's
+/// presigned URL): a job's machine sends a file with it, and a browser or the CLI fetches one, without AWS
+/// credentials of their own and without the file passing through the control plane.
+pub fn s3_link(method: &str, bucket: &str, region: &str, key: &str, creds: &Credentials, secs: u32, now_ms: u64) -> String {
+    presigned(method, &s3_host(bucket, region), region, key, creds, secs, &amz_date(now_ms))
+}
+
+fn presigned(method: &str, host: &str, region: &str, key: &str, creds: &Credentials, secs: u32, amz_date: &str) -> String {
+    let path = format!("/{}", key.split('/').map(rfc3986).collect::<Vec<_>>().join("/"));
+    let scope = format!("{}/{region}/s3/aws4_request", &amz_date[..8]);
+    let mut query = vec![("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()), ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key_id)),
+        ("X-Amz-Date".into(), amz_date.to_string()), ("X-Amz-Expires".into(), secs.to_string()), ("X-Amz-SignedHeaders".into(), "host".into())];
+    if let Some(t) = &creds.session_token { query.push(("X-Amz-Security-Token".into(), t.clone())) }
+    let mut query: Vec<String> = query.iter().map(|(k, v)| format!("{}={}", rfc3986(k), rfc3986(v))).collect();
+    query.sort();
+    let query = query.join("&");
+    let canonical = format!("{method}\n{path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+    let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
+    let mut signing = hmac_sha256(format!("AWS4{}", creds.secret_access_key).as_bytes(), amz_date[..8].as_bytes());
+    for part in [region, "s3", "aws4_request"] { signing = hmac_sha256(&signing, part.as_bytes()); }
+    format!("https://{host}{path}?{query}&X-Amz-Signature={}", hex(&hmac_sha256(&signing, to_sign.as_bytes())))
+}
+
+/// One signed S3 call on a bucket (`path_and_query` starts with `/`): the answer's status and text.
+pub async fn s3(http: &dyn Http, method: &str, bucket: &str, region: &str, path_and_query: &str, body: &[u8], creds: &Credentials, now_ms: u64) -> Result<(u16, String)> {
+    let url = format!("https://{}{path_and_query}", s3_host(bucket, region));
+    let mut headers = vec![("x-amz-content-sha256".to_string(), sha256_hex(body))];
+    // S3 asks for a checksum of what sets a bucket's rules.
+    if !body.is_empty() {
+        headers.push(("x-amz-sdk-checksum-algorithm".into(), "SHA256".into()));
+        headers.push(("x-amz-checksum-sha256".into(), b64(&crate::crypto::sha256(body))));
+    }
+    let signed = sigv4(method, &url, &headers, body, creds, region, "s3", &amz_date(now_ms))?;
+    let mut req = Request::new(method, &url).with_body(body.to_vec());
+    req.headers = signed;
+    let r = http.send(req).await?;
+    Ok((r.status, r.body_text()))
+}
+
+/// Makes the bucket (private, as every new bucket is) when it is not there, and has what is in it removed after `days`.
+pub async fn make_bucket(http: &dyn Http, bucket: &str, region: &str, days: u32, creds: &Credentials, now_ms: u64) -> Result<()> {
+    let place = if region == "us-east-1" { String::new() } else { format!("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>") };
+    let (status, text) = s3(http, "PUT", bucket, region, "/", place.as_bytes(), creds, now_ms).await?;
+    if status >= 300 && xml_tag(&text, "Code") != Some("BucketAlreadyOwnedByYou") { return Err(aws_error(&text, status)) }
+    let rule = format!("<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>superci</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{days}</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>");
+    let (status, text) = s3(http, "PUT", bucket, region, "/?lifecycle=", rule.as_bytes(), creds, now_ms).await?;
+    if status >= 300 { return Err(aws_error(&text, status)) }
+    Ok(())
+}
+
+/// Removes the bucket and everything in it. A bucket that is not there is no error.
+pub async fn delete_bucket(http: &dyn Http, bucket: &str, region: &str, creds: &Credentials, now: &dyn Fn() -> u64) -> Result<()> {
+    loop {
+        let (status, text) = s3(http, "GET", bucket, region, "/?list-type=2&max-keys=1000", b"", creds, now()).await?;
+        if status == 404 { return Ok(()) }
+        if status >= 300 { return Err(aws_error(&text, status)) }
+        let keys: Vec<&str> = text.split("<Key>").skip(1).filter_map(|k| k.split("</Key>").next()).collect();
+        if keys.is_empty() { break }
+        for key in keys {
+            let key = key.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'");
+            let path = format!("/{}", key.split('/').map(rfc3986).collect::<Vec<_>>().join("/"));
+            let (status, text) = s3(http, "DELETE", bucket, region, &path, b"", creds, now()).await?;
+            if status >= 300 && status != 404 { return Err(aws_error(&text, status)) }
+        }
+    }
+    let (status, text) = s3(http, "DELETE", bucket, region, "/", b"", creds, now()).await?;
+    if status >= 300 && status != 404 { return Err(aws_error(&text, status)) }
+    Ok(())
+}
+
 /// One signed EC2 Query API call.
 pub async fn ec2(http: &dyn Http, region: &str, creds: &Credentials, action: &str, params: serde_json::Value, now_ms: u64) -> Result<String> {
     query(http, &format!("https://ec2.{region}.amazonaws.com/"), region, "ec2", "2016-11-15", creds, action, params, now_ms).await
@@ -620,12 +695,55 @@ const SPOT_WATCH_WINDOWS: &str = r#"Start-Job -ScriptBlock {
 } | Out-Null
 "#;
 
+/// What a machine does once its job's last step has ended, when files are kept (see `plane::Plugins::output`): it
+/// finds what the job's tests left by their own names (Playwright's and Cypress's folders, pytest's list of what
+/// failed, coverage in the usual places, JUnit XML written during the job), tells the control plane, and sends each
+/// file where it is told. GitHub's runner runs it as a job-completed hook, so it is bounded in time and always says
+/// it went well: nothing here can fail a job. `KEEP_LINK` is the machine's own link to the control plane.
+const KEEP: &str = r#"link='KEEP_LINK'
+cd "${GITHUB_WORKSPACE:-/nonexistent}" 2>/dev/null || exit 0
+t=$(mktemp -d) || exit 0
+skip='( -name node_modules -o -name .git -o -name vendor -o -name .venv -o -name venv )'
+{
+  find . -maxdepth 6 $skip -prune -o -type d \( -name playwright-report -o -name blob-report -o -name test-results -o -path '*/cypress/videos' -o -path '*/cypress/screenshots' \) -print 2>/dev/null | while IFS= read -r d; do
+    case "$d" in */test-results) [ -e "$d/.last-run.json" ] || continue ;; esac
+    find "$d" -type f 2>/dev/null
+  done
+  find . -maxdepth 6 $skip -prune -o -type f \( -path '*/.pytest_cache/v/cache/lastfailed' -o -path '*/coverage/lcov.info' -o -name cobertura-coverage.xml -o -name coverage.xml \) -print 2>/dev/null
+  find . -maxdepth 6 $skip -prune -o -type f -name '*.xml' -size -30M -newer /opt/superci/started -print 2>/dev/null | while IFS= read -r f; do head -c 4096 "$f" | grep -q '<testsuite' && printf '%s\n' "$f"; done
+} | sed 's|^\./||' | awk '!seen[$0]++' | head -n 5000 > "$t/files"
+[ -s "$t/files" ] || exit 0
+while IFS= read -r f; do printf '%s\t%s\n' "$(stat -c %s "$f" 2>/dev/null || echo 0)" "$f"; done < "$t/files" > "$t/said"
+curl -sS -f -m 30 --retry 2 -X POST --data-binary "@$t/said" "$link" -o "$t/links" 2>/dev/null || exit 0
+n=0; sent=0
+while IFS= read -r to <&3 && IFS= read -r f <&4; do
+  [ -n "$to" ] || continue
+  curl -sS -f -m 200 -T "$f" "$to" > /dev/null 2>&1 &
+  sent=$((sent + 1)); n=$((n + 1)); [ $((n % 8)) -eq 0 ] && wait
+done 3< "$t/links" 4< "$t/files"
+wait
+curl -sS -f -m 20 -X POST "$link&done=1" > /dev/null 2>&1
+echo "SuperCI kept $sent files this job's tests left."
+"#;
+
+/// The start-up script's part that puts `KEEP` on the machine, with the hook GitHub's runner is given.
+fn keep_files(link: &str) -> String {
+    format!("mkdir -p /opt/superci && cat > /opt/superci/keep.sh <<'SUPERCI_KEEP'\n{}SUPERCI_KEEP\nprintf '#!/bin/bash\\ntimeout 240 bash /opt/superci/keep.sh\\nexit 0\\n' > /opt/superci/kept.sh\nchmod 755 /opt/superci/kept.sh && touch /opt/superci/started\n", KEEP.replace("KEEP_LINK", link))
+}
+
 /// A machine's start-up script for an operating system ("linux" or "windows"; see `runner_user_data`). `notice`: for
 /// a spot machine running a GitHub job, where it says that AWS is taking it back.
-pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, notice: Option<&str>) -> Result<String> {
-    if notice.is_some_and(|url| !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b))) { return Err("invalid notice link".into()) }
+pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, notice: Option<&str>, keep: Option<&str>) -> Result<String> {
+    let link = |url: &str| url.starts_with("https://") && url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b));
+    if notice.is_some_and(|url| !link(url)) { return Err("invalid notice link".into()) }
+    if keep.is_some_and(|url| !link(url)) { return Err("invalid link for kept files".into()) }
     if os != "windows" {
-        let script = runner_user_data(work, max_minutes)?;
+        let mut script = runner_user_data(work, max_minutes)?;
+        // What the job's tests leave is kept: GitHub's runner runs this once the job's last step has ended.
+        if let (Some(url), crate::io::Work::GitHub { .. }) = (keep, work) {
+            let (before, after) = script.split_once("cd /home/runner && sudo -u runner -H ./run.sh").ok_or("no runner in the start-up script")?;
+            script = format!("{before}{}cd /home/runner && sudo -u runner -H env ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/superci/kept.sh ./run.sh{after}", keep_files(url));
+        }
         // Before the runner starts. GitHub's runner stops its job on an interrupt; GitLab's on being ended (the job
         // fails at once either way, not when the machine is gone).
         let (at, stop) = match work {
@@ -698,6 +816,38 @@ poweroff
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_keeps_its_jobs_files_only_when_told_to() {
+        let gh = crate::io::Work::GitHub { jit: "abc".into() };
+        let link = "https://plane.example/kept?runner=superci-p1-7&t=abcdefghijklmnopqrstuvwx";
+        let plain = runner_user_data_for(&gh, 70, "linux", None, None).unwrap();
+        assert!(!plain.contains("ACTIONS_RUNNER_HOOK_JOB_COMPLETED") && !plain.contains("/opt/superci"));
+        let keeps = runner_user_data_for(&gh, 70, "linux", None, Some(link)).unwrap();
+        // The script is on the machine before the runner starts, which is given it as its job-completed hook; the
+        // hook is bounded and always says it went well.
+        assert!(keeps.find("cat > /opt/superci/keep.sh <<'SUPERCI_KEEP'").unwrap() < keeps.find("sudo -u runner -H env ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/superci/kept.sh ./run.sh --jitconfig abc").unwrap());
+        assert!(keeps.contains(&format!("link='{link}'")) && keeps.contains(r"timeout 240 bash /opt/superci/keep.sh\nexit 0\n") && !keeps.contains("KEEP_LINK"));
+        assert!(keeps.len() < 16_000, "EC2 takes 16 KB of start-up script: {}", keeps.len());
+        // Not a failing runner, not GitLab's, not Windows (so far); and no link that is more than a link.
+        assert!(!runner_user_data_for(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10, "linux", None, Some(link)).unwrap().contains("/opt/superci"));
+        assert!(!runner_user_data_for(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-a".into() }, 70, "linux", None, Some(link)).unwrap().contains("/opt/superci"));
+        assert!(!runner_user_data_for(&gh, 70, "windows", None, Some(link)).unwrap().contains("superci\\keep"));
+        assert!(runner_user_data_for(&gh, 70, "linux", None, Some("https://x/'; reboot; '")).is_err());
+        if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { std::fs::write(format!("{dir}/keep.sh"), KEEP).unwrap(); }
+    }
+
+    #[test]
+    fn a_presigned_link_is_signed_as_aws_documents() {
+        // AWS's own example (Signature Version 4, query string authentication).
+        let creds = Credentials { access_key_id: "AKIAIOSFODNN7EXAMPLE".into(), secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(), session_token: None, expires_at_ms: 0 };
+        let link = presigned("GET", "examplebucket.s3.amazonaws.com", "us-east-1", "test.txt", &creds, 86400, "20130524T000000Z");
+        assert_eq!(link, "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404");
+        // A key's parts are escaped one by one; a session's token is part of what is signed.
+        let session = Credentials { session_token: Some("tok/en+".into()), ..creds };
+        let link = s3_link("PUT", &bucket("abc123"), "eu-west-1", "jobs/7/a b/c.xml", &session, 900, 1_700_000_000_000);
+        assert!(link.starts_with("https://superci-plane-abc123.s3.eu-west-1.amazonaws.com/jobs/7/a%20b/c.xml?") && link.contains("X-Amz-Security-Token=tok%2Fen%2B") && link.contains("X-Amz-Expires=900"));
+    }
 
     /// EC2 holding one account's networks, answering the calls `make_network` and `find_network` make.
     #[derive(Default)]
@@ -802,22 +952,22 @@ mod tests {
         let link = "https://plane.example/interrupted?runner=r-1&t=tok";
         // Windows: a background job of the start-up script; the job's process is ended, then the runner; and the
         // machine powers off whatever shutdown was scheduled before.
-        let win = runner_user_data_for(&gh, 70, "windows", Some(link)).unwrap();
+        let win = runner_user_data_for(&gh, 70, "windows", Some(link), None).unwrap();
         assert!(win.contains("Start-Job") && win.contains(&format!("-Method Post '{link}'")) && win.contains("Stop-Process -Name Runner.Worker -Force"));
         assert!(win.find("spot/instance-action").unwrap() < win.find(".\\run.cmd --jitconfig abc").unwrap());
         assert!(win.ends_with("shutdown.exe /a\nshutdown.exe /s /f /t 0\n</powershell>\n"));
-        assert!(!runner_user_data_for(&gh, 70, "windows", None).unwrap().contains("Start-Job"), "on-demand: nothing to watch");
+        assert!(!runner_user_data_for(&gh, 70, "windows", None, None).unwrap().contains("Start-Job"), "on-demand: nothing to watch");
         // Docker is the job's to use on a Linux machine, as on GitHub's runners: its user is let in before the runner starts.
-        let linux = runner_user_data_for(&gh, 70, "linux", None).unwrap();
+        let linux = runner_user_data_for(&gh, 70, "linux", None, None).unwrap();
         assert!(linux.find("usermod -aG docker runner").unwrap() < linux.find("sudo -u runner").unwrap() && linux.contains("systemctl start docker"));
         // Linux: GitHub's runner is interrupted, GitLab's ended; a failing runner watches nothing.
-        let linux = runner_user_data_for(&gh, 70, "linux", Some(link)).unwrap();
+        let linux = runner_user_data_for(&gh, 70, "linux", Some(link), None).unwrap();
         assert!(linux.contains(&format!("-X POST '{link}'")) && linux.contains("--retry 4") && linux.contains("pkill -INT -f Runner.Listener"));
-        let gl = runner_user_data_for(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-a".into() }, 70, "linux", Some(link)).unwrap();
+        let gl = runner_user_data_for(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-a".into() }, 70, "linux", Some(link), None).unwrap();
         assert!(gl.contains("pkill -TERM -f /tmp/gitlab-runner") && !gl.contains("STOP_RUNNER") && !gl.contains("NOTICE_URL"));
-        assert!(!runner_user_data_for(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10, "linux", Some(link)).unwrap().contains("instance-action"));
+        assert!(!runner_user_data_for(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10, "linux", Some(link), None).unwrap().contains("instance-action"));
         // A link is only ever what a shell reads as one word.
-        assert!(runner_user_data_for(&gh, 70, "linux", Some("https://x/'; reboot; '")).is_err() && runner_user_data_for(&gh, 70, "windows", Some("http://x/y")).is_err());
+        assert!(runner_user_data_for(&gh, 70, "linux", Some("https://x/'; reboot; '"), None).is_err() && runner_user_data_for(&gh, 70, "windows", Some("http://x/y"), None).is_err());
     }
 
     #[test]

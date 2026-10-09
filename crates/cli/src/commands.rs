@@ -35,6 +35,10 @@ const HELP: &[(&str, &str, &str)] = &[
         "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"SoroCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
     ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--arch=x64|arm64] [--os=linux|windows] [--on-demand=true|false]",
         "The machine `runs-on: superci` alone gets. A job's label can ask for another (`superci-8cpu-arm64`)."),
+    ("plugins", "  superci plugins list\n  superci plugins update NAME --enabled=true|false",
+        "What your control plane does beside running jobs. Each is off until you switch it on, and none needs a line in\na workflow: a job's file stays what it would be on GitHub's own runners.\n\noutput    Keeps what each job's tests leave on its machine: Playwright's report, traces and videos, JUnit XML,\n          pytest's list of what failed, coverage files. Switching it on makes a private bucket in your AWS\n          account (files go after 30 days). Needs a control plane in AWS; GitHub jobs on Linux so far."),
+    ("files", "  superci files list --job=ID\n  superci files retrieve --job=ID [--path=PATH] [--output=DIR]",
+        "What a job's tests left, kept by the `output` plugin (`superci plugins`). Job ids are in `superci jobs list`.\n\nlist      The files, with their sizes.\nretrieve  Downloads them into DIR (the current folder unless given), each under its own path; --path: only\n          that file, or the files under that folder."),
     ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N]",
         "--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
     ("public_repos", "  superci public_repos list\n  superci public_repos create OWNER/REPO\n  superci public_repos delete OWNER/REPO",
@@ -94,7 +98,7 @@ Coding agents and scripts:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere) and reads no other tool's. On a
 machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "labels", "name", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "files"]), group(&["planes"]), group(&["runners", "labels", "name", "machine", "limits", "plugins"]),
                 group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["leave"]))
         }
     }
@@ -122,7 +126,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 9] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version"];
-const VALUES: [&str; 24] = ["enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 27] = ["job", "path", "output", "enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -213,6 +217,11 @@ fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
 }
 
 fn view(d: &mut Dashboard) -> Result<PlaneView> { Ok(look(d)?.0) }
+
+/// A size as people read it.
+fn bytes_words(n: u64) -> String {
+    match n { 0..=999 => format!("{n} B"), 1_000..=999_999 => format!("{:.1} kB", n as f64 / 1e3), 1_000_000..=999_999_999 => format!("{:.1} MB", n as f64 / 1e6), _ => format!("{:.2} GB", n as f64 / 1e9) }
+}
 
 /// What deletes something needs --confirm (said with what it would do); --dry-run needs none.
 fn confirmed(args: &Args, what: &str) -> Result<()> { if args.has("confirm") || args.has("dry-run") { Ok(()) } else { Err(Fail::Unconfirmed(format!("This would {what}. Add --confirm to do it, or --dry-run to check it first."))) } }
@@ -465,6 +474,54 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             apply!(d, args, would, "/labels", &[field("action", if operation == "create" { "add" } else { "remove" }), field("label", w(2))]);
             let labels = view(&mut d)?.labels();
             Ok(Done { said: vec![format!("It answers to: {}.", labels.join(", ")), format!("In a workflow: `runs-on: {}`.", labels.first().cloned().unwrap_or_default())], data: json!({ "ok": true, "labels": labels }) })
+        }
+        ("plugins", "list") => {
+            let v = view(&mut signed_in())?;
+            let on = v.plugin("output");
+            Ok(Done { said: vec![format!("output  {}  Keeps what each job's tests leave (reports, traces, videos, results).", if on { "on " } else { "off" })], data: json!({ "plugins": [{ "name": "output", "enabled": on }] }) })
+        }
+        ("plugins", "update") => {
+            if w(2) != "output" { return usage("Say which: `superci plugins update output --enabled=true` (`superci plugins list` names them).") }
+            let Some(on) = truth(args, "enabled")? else { return usage("Say which way: --enabled=true or --enabled=false.") };
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            let would = if on { "keep what each job's tests leave, in a private bucket made in your AWS account" } else { "stop keeping what jobs' tests leave (what is kept already stays until its 30 days are over)" };
+            apply!(d, args, would, "/plugins", &[field("plugin", "output"), field("on", on.to_string())]);
+            let on = view(&mut d)?.plugin("output");
+            Ok(Done { said: vec![format!("output is {}.", if on { "on: the next jobs' files are kept (`superci files list --job=ID`)" } else { "off" })], data: json!({ "ok": true, "name": "output", "enabled": on }) })
+        }
+        ("files", operation @ ("list" | "retrieve")) => {
+            let id = args.get("job").unwrap_or_default();
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return usage(format!("Say which job: `superci files {operation} --job=ID` (ids are in `superci jobs list`).")) }
+            let mut d = signed_in();
+            let (v, key) = look(&mut d)?;
+            let got = crate::cloudflare::plane_get(v.plane.url(), &key, &format!("/job/files?id={id}"))
+                .map_err(|e| if e.contains("404") { "Kept files need control plane 0.13.0 or newer: `superci planes update`.".to_string() } else { e })?;
+            let under = args.get("path").unwrap_or_default().trim_end_matches('/');
+            let files: Vec<(String, u64)> = got["files"].as_array().into_iter().flatten().filter_map(|f| Some((f["path"].as_str()?.to_string(), f["size"].as_u64().unwrap_or(0))))
+                .filter(|(p, _)| under.is_empty() || p == under || p.starts_with(&format!("{under}/"))).collect();
+            if got["kept"] != true {
+                return Ok(Done { said: vec![if v.plugin("output") { "Nothing was kept of that job: its tests left none of the files looked for, or it did not run on a machine that keeps them.".to_string() }
+                    else { "Nothing is kept: the output plugin is off (`superci plugins update output --enabled=true`).".to_string() }], data: json!({ "files": [] }) })
+            }
+            let listed: Vec<Value> = files.iter().map(|(p, n)| json!({ "path": p, "size": n })).collect();
+            if operation == "list" {
+                let mut said: Vec<String> = files.iter().map(|(p, n)| format!("{:>9}  {p}", bytes_words(*n))).collect();
+                if said.is_empty() { said.push("No file there.".into()) }
+                if got["done"] != true { said.push("Its machine did not say it had sent them all: some may be missing.".into()) }
+                return Ok(Done { said, data: json!({ "files": listed, "complete": got["done"] }) })
+            }
+            if files.is_empty() { return Err("No file there (`superci files list --job=ID` says what was kept).".into()) }
+            let dir = std::path::PathBuf::from(args.get("output").unwrap_or("."));
+            for (path, _) in &files {
+                // A name is taken as the control plane checked it: under the folder asked for, nowhere else.
+                if !superci_core::plane::kept_path(path) { return Err(format!("the control plane named a file that cannot be one: {path}").into()) }
+                steps(&format!("Fetching {path}"));
+                let to = dir.join(path);
+                let at = crate::cloudflare::plane_get(v.plane.url(), &key, &format!("/job/file?id={id}&path={}", superci_core::aws::rfc3986(path)))?;
+                crate::cloudflare::download(at["url"].as_str().ok_or("the control plane gave no link to it")?, &to)?;
+            }
+            Ok(Done { said: vec![format!("{} {} in {}.", files.len(), if files.len() == 1 { "file" } else { "files" }, dir.display())], data: json!({ "files": listed, "output": dir.display().to_string() }) })
         }
         ("name", "retrieve") => {
             let name = view(&mut signed_in())?.name();
@@ -742,7 +799,7 @@ mod tests {
         for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create soroci", "name retrieve", "name update SoroCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
+        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create soroci", "plugins list", "plugins update output --enabled=true", "files list --job=7", "files retrieve --job=7", "name retrieve", "name update SoroCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "gitlab_projects list", "gitlab_projects update 7 --enabled=true", "gitlab_projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
             "planes update --dry-run", "runners create cloudflare --dry-run"] {
@@ -755,7 +812,7 @@ mod tests {
         }
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
             ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("gitlab create", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("gitlab create --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
-            ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
+            ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("plugins update", "Say which:"), ("plugins update output", "Say which way:"), ("files list", "Say which job:"), ("files retrieve --job=x", "Say which job:"), ("keys create agent --days soon", "--days is a number"),
             ("gitlab_projects update 7", "Say which way:"), ("gitlab_projects update --all --enabled=false", "Projects are switched off one at a time"),
             ("planes", "`superci planes` takes an operation."), ("limits", "`superci limits` takes an operation."), ("runners frob", "`frob` is not an operation of `superci runners`."), ("limits set", "`set` is not an operation of `superci limits`."),
             ("frobnicate", "`frobnicate` is not a command of superci.")] {

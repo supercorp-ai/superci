@@ -450,6 +450,18 @@ pub fn plane_get(plane_url: &str, key: &str, path: &str) -> Result<Value> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+/// Fetches what a link names into a file (its folders made as needed), written beside it first and moved over.
+pub fn download(url: &str, to: &std::path::Path) -> Result<()> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(600))).build().into();
+    let mut r = agent.get(url).call().map_err(|e| e.to_string())?;
+    if r.status().as_u16() != 200 { return Err(format!("the file's store answered {}", r.status())) }
+    if let Some(dir) = to.parent() { std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?; }
+    let part = to.with_file_name(format!(".{}.part", to.file_name().and_then(|n| n.to_str()).unwrap_or("file")));
+    let mut file = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    std::io::copy(&mut r.body_mut().as_reader(), &mut file).map_err(|e| format!("{}: {e}", to.display()))?;
+    std::fs::rename(&part, to).map_err(|e| format!("{}: {e}", to.display()))
+}
+
 /// A change the control plane makes itself (no restart), asked with this session's key.
 pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Result<Value> {
     let mut r = quick().post(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")

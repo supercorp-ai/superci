@@ -1908,3 +1908,68 @@ fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
     config.set_name("SuperCI");
     assert!(config.name.is_none());
 }
+
+#[test]
+fn what_a_jobs_tests_leave_is_kept_when_switched_on_and_only_then() {
+    use base64::Engine;
+    let user_data = |clouds: &FakeClouds| String::from_utf8(base64::engine::general_purpose::STANDARD.decode(field(&launches(clouds)[0], "UserData")).unwrap()).unwrap();
+    let with = |output: bool| {
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        config.bucket = Some((superci_core::aws::bucket(PLANE_ID), "us-east-1".into()));
+        config.plugins.output = output;
+        config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        config
+    };
+    // Off (as every control plane starts): the machine is as before, and nothing is taken from anyone.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let config = with(false);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    run(webhook("queued", None));
+    assert!(!user_data(&clouds).contains("/opt/superci") && !store.0.borrow().keys().any(|k| k.starts_with("keep:")));
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/kept?runner=superci-{PLANE_ID}-7&t=aaaaaaaaaaaaaaaaaaaaaaaa")).with_body("3\ta.xml\n")).status, 404);
+    assert_eq!(json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")))["plugins"]["output"], false);
+
+    // On: the machine gets its own link and the hook that uses it.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let config = with(true);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    run(webhook("queued", None));
+    let runner = format!("superci-{PLANE_ID}-7");
+    let token: String = serde_json::from_str(&store.0.borrow()[&format!("keep:{runner}")]).unwrap();
+    let link = format!("{PLANE_URL}/kept?runner={runner}&t={token}");
+    let script = user_data(&clouds);
+    assert!(script.contains(&format!("link='{link}'")) && script.contains("ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/superci/kept.sh"));
+    // Only the machine's own link is answered.
+    let said = "120\tapp/playwright-report/index.html\n7\t../outside.xml\n9\t/etc/passwd\n4\treports dir/junit results.xml\n4\treports dir/junit results.xml\n999999999999\thuge.webm\n";
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/kept?runner={runner}&t=aaaaaaaaaaaaaaaaaaaaaaaa")).with_body(said)).status, 404);
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/kept?runner=superci-{PLANE_ID}-8&t={token}")).with_body(said)).status, 404);
+    // What it names: a link for each file taken, in order; none for a path out of its folder, one named twice, or
+    // one too large.
+    let answer = run(Request::new("POST", &link).with_body(said));
+    let links: Vec<String> = String::from_utf8(answer.body.clone()).unwrap().split('\n').map(str::to_string).collect();
+    assert_eq!((answer.status, links.len()), (200, 7), "{links:?}");
+    assert!(links[0].starts_with(&format!("https://superci-plane-{PLANE_ID}.s3.us-east-1.amazonaws.com/jobs/{runner}/app/playwright-report/index.html?")) && links[0].contains("X-Amz-Expires=900") && links[0].contains("X-Amz-Signature="));
+    assert!(links[3].contains(&format!("/jobs/{runner}/reports%20dir/junit%20results.xml?")));
+    assert!(links[1].is_empty() && links[2].is_empty() && links[4].is_empty() && links[5].is_empty());
+    // Said once; then done.
+    assert_eq!(run(Request::new("POST", &link).with_body("1\tlate.xml\n")).status, 409);
+    assert_eq!(run(Request::new("POST", &format!("{link}&done=1"))).status, 200);
+
+    // Whoever may read lists a job's files and is sent to one; no one else is.
+    assert_eq!(run(get("/job/files?id=7")).status, 404);
+    run(webhook("in_progress", Some(&runner)));
+    run(webhook("completed", Some(&runner)));
+    let files = json(&run(get("/job/files?id=7").with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!((files["kept"].clone(), files["done"].clone(), files["files"].clone()), (true.into(), true.into(), serde_json::json!([{ "path": "app/playwright-report/index.html", "size": 120 }, { "path": "reports dir/junit results.xml", "size": 4 }])));
+    let one = json(&run(get("/job/file?id=7&path=reports%20dir/junit%20results.xml").with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert!(one["url"].as_str().unwrap().contains(&format!("/jobs/{runner}/reports%20dir/junit%20results.xml?")) && one["url"].as_str().unwrap().contains("X-Amz-Expires=300"));
+    assert_eq!(run(get("/job/file?id=7&path=../outside.xml").with_header("authorization", "Bearer dashboard-session-key-1")).status, 404);
+    assert_eq!(json(&run(get("/job/files?id=99").with_header("authorization", "Bearer dashboard-session-key-1")))["kept"], false);
+    for (path, ok) in [("a/b.xml", true), ("a b/ü.xml", true), ("", false), ("/a", false), ("a/../b", false), ("a//b", false), ("./a", false), ("a\\b", false), ("a\nb", false)] {
+        assert_eq!(superci_core::plane::kept_path(path), ok, "{path:?}");
+    }
+}

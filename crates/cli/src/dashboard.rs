@@ -1776,6 +1776,24 @@ impl Dashboard {
                 self.views = None;
                 Ok(Response::redirect("/?p=workflows"))
             }
+            // A plugin switched on or off: what the control plane does beside running jobs, with nothing in any
+            // workflow. `output` (what a job's tests leave is kept) makes the bucket first, and lets the control
+            // plane's role use it.
+            ("POST", "/plugins") => {
+                let plane = self.plane()?;
+                let seen = view::plane_view(&plane, Some(&self.status_key));
+                if view::older(seen.version.as_deref(), "0.13.0") { return Ok(message(409, "Update the control plane first", "Plugins come with control plane 0.13.0 (Control plane → Update).")) }
+                let (which, on) = (field("plugin"), field("on") == "true");
+                if which != "output" { return Ok(message(400, "No such plugin", "")) }
+                let Plane::Aws { region, plane_id, .. } = &plane else { return Ok(message(409, "Not on this control plane yet", "Keeping a job's files needs a control plane in AWS for now.")) };
+                if on { aws_plane::keep_files(&self.aws_creds()?, region, plane_id)?; }
+                let mut plugins = seen.status.as_ref().map(|s| s["plugins"].clone()).filter(|p| p.is_object()).unwrap_or_else(|| serde_json::json!({}));
+                plugins[which.as_str()] = on.into();
+                self.put_secret(&plane, "PLUGINS", &plugins.to_string())?;
+                wait_for(plane.url(), &self.status_key, |s| s["plugins"][which.as_str()] == on);
+                self.views = None;
+                Ok(Response::redirect("/?p=workflows"))
+            }
             // The default machine: what `runs-on: superci` alone gets.
             ("POST", "/machine") => {
                 let plane = self.plane()?;

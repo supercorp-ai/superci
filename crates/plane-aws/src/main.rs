@@ -146,6 +146,9 @@ fn config(secrets: &Secrets, account_id: &str) -> Config {
     c.aws_networks = secrets.get("AWS_NETWORKS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
     c.aws_own = Some((account_id.to_string(), var("RUNNER_REGION").or(var("AWS_REGION")).unwrap_or_default()));
     c.aws_own_creds = Some(own_credentials());
+    // Where files are kept, once that is switched on (the switch makes the bucket and lets this role use it).
+    c.plugins = secrets.get("PLUGINS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+    c.bucket = c.aws_own.as_ref().filter(|(_, region)| !region.is_empty()).map(|(_, region)| (superci_core::aws::bucket(&c.plane_id), region.clone()));
     c.aws_runners_off = secrets.get("AWS_RUNNERS") == Some("off");
     c
 }

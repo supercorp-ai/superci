@@ -48,6 +48,8 @@ impl PlaneView {
         let said: Vec<String> = self.status.as_ref().and_then(|s| s["labels"].as_array().cloned()).unwrap_or_default().iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
         if said.is_empty() { vec![self.plane.label().to_string()] } else { said }
     }
+    /// Whether a plugin is switched on (see `superci_core::plane::Plugins`).
+    pub fn plugin(&self, name: &str) -> bool { self.status.as_ref().is_some_and(|s| s["plugins"][name] == true) }
     /// The label shown in examples: the first of them.
     pub fn label(&self) -> String { self.labels().into_iter().next().unwrap_or_else(|| "superci".into()) }
     /// What it is called (SuperCI, unless named; one from before it could be named: SuperCI).

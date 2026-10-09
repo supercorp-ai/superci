@@ -28,6 +28,15 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
+pub fn sha256(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(data).to_vec()
+}
+
+/// Bytes from base64url (padded or not). None when it is not base64url.
+pub fn unb64url(text: &str) -> Option<Vec<u8>> {
+    URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')).ok()
+}
+
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
     mac.update(data);

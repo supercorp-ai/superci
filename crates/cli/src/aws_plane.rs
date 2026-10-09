@@ -134,6 +134,19 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     Ok(Deployed { url })
 }
 
+/// How long what a job's tests left is kept, in days.
+pub const KEPT_DAYS: u32 = 30;
+
+/// Lets the control plane keep jobs' files: its bucket (private; what is in it goes after [`KEPT_DAYS`]), and its
+/// role's leave to put files there and read them. Safe to repeat.
+pub fn keep_files(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
+    let (a, bucket) = (api(creds, region), aws::bucket(plane_id));
+    block_on(aws::make_bucket(&a.http, &bucket, region, KEPT_DAYS, creds, now_ms()))?;
+    let policy = json!({ "Version": "2012-10-17", "Statement": [{ "Sid": "KeptFiles", "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"], "Resource": format!("arn:aws:s3:::{bucket}/*") }] });
+    a.iam("PutRolePolicy", json!({ "RoleName": name(plane_id), "PolicyName": "kept-files", "PolicyDocument": policy.to_string() }))?;
+    Ok(())
+}
+
 /// Deletes the control plane `plane_id` from `region`: its schedule, function, table, parameters, logs and role. Safe
 /// to repeat (what is gone already is skipped). Machines it started end by themselves.
 pub fn delete(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
@@ -151,7 +164,9 @@ pub fn delete(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
         a.ssm("DeleteParameters", json!({ "Names": names }))?;
     }
     ok_if(a.target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{name}") })), &gone)?;
-    for policy in ["control-plane", "runner-machines"] { ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": name, "PolicyName": policy })), &gone)?; }
+    // The files it kept, with their bucket (none, when keeping was never switched on).
+    block_on(aws::delete_bucket(&a.http, &aws::bucket(plane_id), region, creds, &now_ms))?;
+    for policy in ["control-plane", "runner-machines", "kept-files"] { ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": name, "PolicyName": policy })), &gone)?; }
     ok_if(a.iam("DeleteRole", json!({ "RoleName": name })), &gone)
 }
 
