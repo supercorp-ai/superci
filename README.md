@@ -32,6 +32,12 @@ Documentation: [superci.dev/docs](https://superci.dev/docs).
 
 How it compares with GitHub's own runners, RunsOn, Actions Runner Controller and the hosted services: [superci.dev/compare](https://superci.dev/compare), including [Blacksmith alternatives](https://superci.dev/compare/blacksmith-alternatives). What a month of your jobs would cost: [the calculator](https://superci.dev/calculator).
 
+To let a coding agent move a repository's jobs (from GitHub's runners, Blacksmith, Depot, Namespace, WarpBuild, Ubicloud, BuildJet or RunsOn), add the skill in [`skills/superci`](skills/superci/SKILL.md):
+
+```sh
+npx skills add supercorp-ai/superci
+```
+
 ## How it is put together
 
 - **The dashboard** (`crates/cli`) runs on your computer. It deploys and updates everything else with SuperCI's own sign-ins to your clouds, kept in `~/.superci` (it reads no other tool's credentials), by workspace when you look after several CIs from one computer; everything it does is also a command on the same sign-ins, for scripts and coding agents (`superci status --json`, `superci planes update`, `superci runners update aws --max-jobs=20`; `superci` alone lists them), and `superci logout` removes them.
