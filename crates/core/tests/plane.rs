@@ -6985,7 +6985,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
-        spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first
+        spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first,
+        what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

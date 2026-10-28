@@ -533,20 +533,30 @@ mod answers {
     /// end: kept as it meant it, once each.
     #[test]
     fn what_modal_says_beside_its_answers_is_heard_once_each() {
-        let joined = says(vec![kept(&pb::ImageJoinStreamingResponse { result: None, entry_id: "e1".into(), eof: false })]);
-        let aws = modal(vec![("ImageJoinStreaming", joined), ("AppList", refuses("AppList")), ("EnvironmentGetOrCreate", says(vec![kept(&pb::EnvironmentGetOrCreateResponse::default())]))]);
-        *aws.modal_warning.lock().unwrap() = Some("modal-go%200.11.1%20is%20deprecated%2C%20upgrade%20by%202027-01-01, 100%ZZ, , 5%2Z".into());
+        let joined = kept(&pb::ImageJoinStreamingResponse { result: None, entry_id: "e1".into(), eof: false });
+        // (ImageJoinStreaming answered whole, then refused before any answer, then broken off after one.)
+        let aws = modal(vec![("ImageJoinStreaming", says(vec![joined.clone()])), ("ImageJoinStreaming", refuses("ImageJoinStreaming")),
+            ("ImageJoinStreaming", json!({ "answers": [joined], "error": "Modal ImageJoinStreaming: broken off" })), ("AppList", refuses("AppList")),
+            ("EnvironmentGetOrCreate", says(vec![kept(&pb::EnvironmentGetOrCreateResponse::default())]))]);
+        let heard_now = |warning: &str, call: &mut dyn FnMut()| { *aws.modal_warning.lock().unwrap() = Some(warning.into()); call(); said() };
         with(&aws.url, || {
             let mut c = Client::new(Some(session())).unwrap();
-            let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap();
-            assert!(c.unary::<_, pb::AppListResponse>("AppList", pb::AppListRequest { environment_name: String::new() }).is_err());
-            assert_eq!(c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 10).unwrap().len(), 1);
+            let mut join = |c: &mut Client| c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 10);
+            // Answered: as Modal meant it, once each however often it is said.
+            let heard = heard_now("modal-go%200.11.1%20is%20deprecated%2C%20upgrade%20by%202027-01-01, 100%ZZ, , 5%2Z", &mut || { let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap(); });
+            assert!(heard.contains(&"modal-go 0.11.1 is deprecated, upgrade by 2027-01-01".to_string()) && heard.contains(&"100%ZZ".to_string()) && heard.contains(&"5%2Z".to_string()) && !heard.contains(&String::new()), "{heard:?}");
+            let heard = heard_now("modal-go%200.11.1%20is%20deprecated%2C%20upgrade%20by%202027-01-01", &mut || { let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap(); });
+            assert_eq!(heard.iter().filter(|w| w.starts_with("modal-go 0.11.1 is deprecated")).count(), 1, "once: {heard:?}");
+            // Refused, a stream to its end, a stream refused at once, one broken off: each heard.
+            assert!(heard_now("refused", &mut || assert!(c.unary::<_, pb::AppListResponse>("AppList", pb::AppListRequest { environment_name: String::new() }).is_err())).contains(&"refused".to_string()));
+            assert!(heard_now("at a stream's end", &mut || assert_eq!(join(&mut c).unwrap().len(), 1)).contains(&"at a stream's end".to_string()));
+            assert!(heard_now("refused a stream", &mut || assert!(join(&mut c).is_err())).contains(&"refused a stream".to_string()));
+            assert!(heard_now("broke a stream off", &mut || assert!(join(&mut c).unwrap_err().contains("broken off"))).contains(&"broke a stream off".to_string()));
+            // A stream read only up to its limit: what comes after is not waited for (its break is not reached).
             assert_eq!(c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 1).unwrap().len(), 1);
         });
-        let heard = HEARD.lock().unwrap().clone();
-        assert_eq!(heard.iter().filter(|w| *w == "modal-go 0.11.1 is deprecated, upgrade by 2027-01-01").count(), 1, "{heard:?}");
-        assert!(heard.contains(&"100%ZZ".to_string()) && heard.contains(&"5%2Z".to_string()) && !heard.contains(&String::new()), "{heard:?}");
     }
+
 
     #[test]
     fn modals_own_api_is_reached_without_a_stand_in() {

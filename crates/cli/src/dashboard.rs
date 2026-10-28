@@ -7876,6 +7876,23 @@ mod tests {
         assert!(!plane.contains(r#"<select name="account""#), "one account needs no choice");
     }
 
+    /// What the control plane in use kept of what a cloud said (`cloud_says` in its status): a line each above the
+    /// pages, as said (escaped), with the way on; none from a control plane not in use, nor when nothing was said.
+    #[test]
+    fn what_a_cloud_said_to_the_control_plane_in_use_is_a_line_each_above_the_pages() {
+        let plane = |id: &str| Plane::Modal { workspace: "acme".into(), url: format!("https://acme--superci-plane-{id}.modal.run"), plane_id: id.into(), label: "superci".into() };
+        let view = |id: &str, said: serde_json::Value, standby: bool| PlaneView { plane: plane(id), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby,
+            version: Some(superci_core::plane::VERSION.into()), status: Some(serde_json::json!({ "cloud_says": said })) };
+        let says = serde_json::json!([{ "cloud": "modal", "said": "modal 1.6 is <deprecated>" }, { "cloud": "modal", "said": "upgrade by 2027-01-01" }]);
+        let notice = Dashboard::cloud_says_notice(&[view("p00000000001", says.clone(), false)]);
+        assert_eq!(notice.matches(r#"<div class="notice warn">"#).count() - Dashboard::cloud_says_notice(&[]).matches(r#"<div class="notice warn">"#).count(), 2, "{notice}");
+        assert!(notice.contains("<span>Modal says: “modal 1.6 is &lt;deprecated&gt;” A newer SuperCI answers it: update it, then the control plane.</span><a class=\"button secondary sm\" href=\"/?p=planes\">Control plane</a></div>"), "{notice}");
+        assert!(notice.contains("Modal says: “upgrade by 2027-01-01”"), "{notice}");
+        // The control plane in use's alone (a standby one's is not shown), and nothing when nothing was said.
+        let in_use = Dashboard::cloud_says_notice(&[view("p00000000002", serde_json::json!([]), false), view("p00000000003", says, true)]);
+        assert!(!in_use.contains("deprecated") && !in_use.contains("upgrade by"), "{in_use}");
+    }
+
     #[test]
     fn runners_and_control_planes_are_added_from_the_same_list() {
         let mut d = with_cloudflare(&[("a1", "Acme Inc.")]);
