@@ -44,9 +44,13 @@ impl Http for Blocking {
 
 /// In a debug build with `SUPERCI_RECORD=FILE`: every exchange with AWS (and Cloudflare's API) is appended to that file, a line each (the
 /// address, what was asked, the status, the answer's telling headers and the whole answer), to make test fixtures of what a real account answers.
-/// No header is kept (the credentials are in them), nor a sign-in's exchange unless `SUPERCI_RECORD_SIGN_INS=1` too (for
+/// No header is kept (the credentials are in them) but those that say which client asked (`SENT_KEPT`), nor a sign-in's exchange unless `SUPERCI_RECORD_SIGN_INS=1` too (for
 /// fixtures of sign-ins and renewals: their tokens are real). The answers name the account: they are sanitized before
 /// they are kept anywhere (`scripts/sanitize-recording.py`).
+/// The headers a recording keeps of what was sent: which client asked (none holds a credential).
+#[cfg(debug_assertions)]
+const SENT_KEPT: [&str; 3] = ["x-modal-client-type", "x-modal-client-version", "x-modal-libmodal-version"];
+
 #[cfg(debug_assertions)]
 pub(crate) fn record(r: &Request, status: u16, headers: &[(String, String)], body: &[u8]) {
     let Some(file) = std::env::var_os("SUPERCI_RECORD").filter(|f| !f.is_empty()) else { return };
@@ -54,7 +58,10 @@ pub(crate) fn record(r: &Request, status: u16, headers: &[(String, String)], bod
     let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.clone()).unwrap_or_default();
     // (Of the answer's headers, those that say something: what kind of error, where to, which version.)
     let said: Vec<(&String, &String)> = headers.iter().filter(|(k, _)| ["x-amzn-errortype", "location", "etag", "content-type", "content-range"].contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| (k, v)).collect();
-    let line = serde_json::json!({ "method": r.method, "url": r.url, "target": target, "asked": String::from_utf8_lossy(&r.body), "status": status, "headers": said, "answer": String::from_utf8_lossy(body) });
+    // (Of what was sent, only what says which client asked: Modal holds a client to it, and the test kit does too.)
+    let sent: serde_json::Map<String, serde_json::Value> = r.headers.iter().filter(|(k, _)| SENT_KEPT.contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| (k.to_ascii_lowercase(), v.clone().into())).collect();
+    let mut line = serde_json::json!({ "method": r.method, "url": r.url, "target": target, "asked": String::from_utf8_lossy(&r.body), "status": status, "headers": said, "answer": String::from_utf8_lossy(body) });
+    if !sent.is_empty() { line["sent"] = sent.into() }
     use std::io::Write;
     // (One line at a time: questions are asked side by side.)
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());

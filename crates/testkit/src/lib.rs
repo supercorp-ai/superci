@@ -420,6 +420,12 @@ pub struct Aws {
     pub worker_secrets: Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>,
     /// What Modal's settings Dicts were given (`DictUpdate`), by key: a Modal control plane's settings.
     pub modal_settings: Arc<Mutex<BTreeMap<String, String>>>,
+    /// A Modal sign-in as Modal has it (see `modal_approve`): the calls waiting for its approval now, and whether it
+    /// was approved (then each call waiting at that moment is given the token, and none after).
+    pub modal_flow: Arc<(Mutex<ModalFlow>, std::sync::Condvar)>,
+    /// What Modal says beside its answers from now on (`x-modal-warning`, as it warns of a client it will stop taking),
+    /// as it sends it: each warning percent-encoded, joined with commas.
+    pub modal_warning: Arc<Mutex<Option<String>>>,
     /// Workers on workers.dev, by host (`superci.acme.workers.dev`), and the control plane on this computer each stands
     /// for (its address).
     pub workers: Arc<Mutex<BTreeMap<String, String>>>,
@@ -452,6 +458,51 @@ pub struct Aws {
     pub stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A Modal sign-in's approval as Modal hands it out (see `Aws::modal_approve`).
+#[derive(Default)]
+pub struct ModalFlow {
+    /// Calls to `TokenFlowWait` waiting now, and how many came in all (each call's place among them).
+    waiting: usize,
+    entered: u64,
+    /// Approved: the calls that had come by then (those still waiting are given `token`; the ones after, never).
+    approved_upto: Option<u64>,
+    token: Vec<u8>,
+}
+
+/// A protobuf message's fields, as far as the test kit reads them: each number with its varint, or its bytes (a
+/// fixed32 as its four).
+fn proto_fields(mut b: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
+    fn varint(b: &mut &[u8]) -> Option<u64> {
+        let mut v = 0;
+        for shift in (0..64).step_by(7) { let (&x, rest) = b.split_first()?; *b = rest; v |= u64::from(x & 0x7F) << shift; if x & 0x80 == 0 { return Some(v) } }
+        None
+    }
+    let mut out = vec![];
+    while let Some(key) = varint(&mut b) {
+        let (no, wire) = (key >> 3, key & 7);
+        let field = match wire {
+            0 => (no, varint(&mut b).unwrap_or_default(), vec![]),
+            5 if b.len() >= 4 => { let (f, rest) = b.split_at(4); b = rest; (no, 0, f.to_vec()) }
+            2 => { let n = varint(&mut b).unwrap_or_default() as usize; let (f, rest) = b.split_at(n.min(b.len())); b = rest; (no, 0, f.to_vec()) }
+            _ => break,
+        };
+        out.push(field);
+    }
+    out
+}
+
+/// Modal's refusal of a call, by what the client said it is (its headers), as Modal answered on 2026-10-28: a Go
+/// client (`x-modal-client-type: 9`) creates an app (`AppGetOrCreate` asked to create one when missing) only when
+/// its `x-modal-libmodal-version` reads as the Go SDK says it (`modal-go/0.11.1`, `modal-go/v0.7.3`), or when it says
+/// none. The test kit's workspace has none of SuperCI's apps yet: each create-if-missing creates one.
+fn modal_refuses(method: &str, headers: &http::HeaderMap, message: &[u8]) -> Option<(u32, String)> {
+    let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+    let creates = method == "AppGetOrCreate" && proto_fields(message).iter().any(|(no, v, _)| *no == 3 && *v != 0);
+    let read = header("x-modal-libmodal-version").is_none_or(|v| v.strip_prefix("modal-go/").map(|v| v.trim_start_matches('v')).is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())));
+    (creates && header("x-modal-client-type") == Some("9") && !read)
+        .then(|| (9, "Could not determine the SDK version for client type CLIENT_TYPE_LIBMODAL_GO, so it cannot be used to create new apps.".to_string()))
+}
+
 /// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
 pub fn ec2_error(code: &str, message: &str) -> String {
     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response><Errors><Error><Code>{code}</Code><Message>{message}</Message></Error></Errors><RequestID>00000000-0000-4000-8000-00000000e001</RequestID></Response>")
@@ -469,13 +520,19 @@ pub(crate) fn action(target: &str, asked: &str) -> String {
 impl Aws {
     /// Modal's answer to one call (`method`, its request's message), as a recording has it: each answer's message, or
     /// Modal's refusal as a gRPC status (its code and message).
-    fn modal_answer(&self, method: &str, message: &[u8]) -> (Vec<Vec<u8>>, Option<(u32, String)>) {
+    fn modal_answer(&self, method: &str, headers: &http::HeaderMap, message: &[u8]) -> (Vec<Vec<u8>>, Option<(u32, String)>) {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let url = format!("https://api.modal.com/modal.client.ModalClient/{method}");
         let asked = b64.encode(message);
         // (A sweep's fault: Modal's own status for an internal error.)
         if self.faults.call(format!("POST {url}")).is_some() { return (vec![], Some((13, "internal error".to_string()))) }
+        // (What Modal refuses whatever a recording has: a client it cannot tell the version of; and a client that says
+        // it is another than the one recorded.)
+        if let Some((code, message)) = modal_refuses(method, headers, message).or_else(|| self.modal_sent_differs(&url, headers).map(|m| (3, m))) {
+            self.asked.lock().unwrap().push(json!({ "method": "POST", "url": url, "target": "", "asked": asked, "status": 500, "answer": json!({ "error": format!("Modal {method}: {message}") }).to_string() }));
+            return (vec![], Some((code, message)))
+        }
         // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
         if method == "DictUpdate" { for (k, v) in modal_entries(message) { self.modal_settings.lock().unwrap().insert(k, v); } }
         // (What a sandbox is given on its input, taken as Modal takes it: nothing answered but that it was, a recording
@@ -497,7 +554,60 @@ impl Aws {
                 _ => (answers, Some((2, e.strip_prefix(&said).unwrap_or(e).to_string()))),
             }
         }
+        // A sign-in's approval is answered as Modal hands it out, whatever a recording's order was (see `modal_wait`).
+        if method == "TokenFlowWait" {
+            let timeout = proto_fields(message).into_iter().find(|(no, _, f)| *no == 1 && f.len() == 4).map(|(_, _, f)| f32::from_le_bytes([f[0], f[1], f[2], f[3]])).unwrap_or_default();
+            return (vec![self.modal_wait(timeout)], None)
+        }
         (answers, None)
+    }
+
+    /// How what a client says it is (`x-modal-client-type` and the like) differs from what it said when the newest
+    /// recording of this call was made: a header left out, another client type, another SDK. A release's number may
+    /// differ (Modal's rule is `modal_refuses`'s; the newest release, scripts/modal-drift.py's).
+    fn modal_sent_differs(&self, url: &str, headers: &http::HeaderMap) -> Option<String> {
+        let recorded = self.recorded.lock().unwrap();
+        let sent = recorded.iter().filter(|r| r["url"] == url && r["sent"].is_object()).max_by_key(|r| r["recording"].as_u64().unwrap_or(0))?["sent"].clone();
+        sent.as_object()?.iter().find_map(|(k, was)| {
+            let now = headers.get(k).and_then(|h| h.to_str().ok());
+            let kind = |v: Option<&str>| v.map(|v| if k == "x-modal-libmodal-version" { v.split('/').next().unwrap_or_default().to_string() } else { v.to_string() });
+            (kind(now) != kind(was.as_str())).then(|| format!("the test kit's Modal: {k} was {was} when this was recorded, and is {} now", now.unwrap_or("not said")))
+        })
+    }
+
+    /// One `TokenFlowWait` as Modal answers it: it waits up to `timeout` seconds, and is given the token only when the
+    /// sign-in is approved while it waits (see `modal_approve`); otherwise, and after, it is told to wait on.
+    fn modal_wait(&self, timeout: f32) -> Vec<u8> {
+        let (flow, changed) = &*self.modal_flow;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f32(timeout.max(0.0));
+        let mut f = flow.lock().unwrap();
+        (f.entered, f.waiting) = (f.entered + 1, f.waiting + 1);
+        let ticket = f.entered;
+        changed.notify_all();
+        loop {
+            if f.approved_upto.is_some_and(|upto| ticket <= upto) { f.waiting -= 1; return f.token.clone() }
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            // (`timeout: true`, as Modal says it.)
+            if left.is_zero() { f.waiting -= 1; return vec![0x18, 0x01] }
+            f = changed.wait_timeout(f, left).unwrap().0;
+        }
+    }
+
+    /// The person approves the Modal sign-in on Modal's page: once a call waits for it (five seconds at most, as they
+    /// would not wait for one), its token (the one a recording has) goes to each call waiting at that moment. Modal
+    /// keeps it for no call after: approved with none waiting, a sign-in never ends.
+    pub fn modal_approve(&self) {
+        let recorded: Vec<Value> = self.recorded.lock().unwrap().iter().filter(|r| r["url"].as_str().is_some_and(|u| u.ends_with("/TokenFlowWait"))).cloned().collect();
+        use base64::Engine;
+        let token = recorded.iter().filter_map(|r| serde_json::from_str::<Value>(r["answer"].as_str()?).ok()?["answers"][0].as_str().map(str::to_string))
+            .filter_map(|a| base64::engine::general_purpose::STANDARD.decode(a).ok()).find(|m| !proto_fields(m).iter().any(|(no, v, _)| *no == 3 && *v != 0))
+            .expect("a recording with the sign-in's approved answer");
+        let (flow, changed) = &*self.modal_flow;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut f = flow.lock().unwrap();
+        while f.waiting == 0 && std::time::Instant::now() < end { f = changed.wait_timeout(f, end.saturating_duration_since(std::time::Instant::now())).unwrap().0 }
+        (f.token, f.approved_upto) = (token, Some(f.entered));
+        changed.notify_all();
     }
 
     /// One HTTP/2 connection, each request a gRPC call to Modal (`modal_answer`): its message out of gRPC's frame, each
@@ -513,16 +623,22 @@ impl Aws {
                 let a = a.clone();
                 tokio::spawn(async move {
                     let method = req.uri().path().rsplit('/').next().unwrap_or_default().to_string();
+                    let headers = req.headers().clone();
                     let mut body = req.into_body();
                     let mut data = vec![];
                     while let Some(Ok(chunk)) = body.data().await { let _ = body.flow_control().release_capacity(chunk.len()); data.extend_from_slice(&chunk); }
-                    // (gRPC's frame: a flag, four bytes of length, the message.)
-                    let (answers, refused) = a.modal_answer(&method, data.get(5..).unwrap_or_default());
+                    // (gRPC's frame: a flag, four bytes of length, the message. Answered apart: a sign-in's wait waits.)
+                    let asked = a.clone();
+                    let Ok((answers, refused)) = tokio::task::spawn_blocking(move || asked.modal_answer(&method, &headers, data.get(5..).unwrap_or_default())).await else { return };
                     // (Its message percent-encoded where gRPC asks it to be.)
                     let encode = |message: &str| -> String { message.bytes().map(|b| if (0x20..0x7f).contains(&b) && b != b'%' { (b as char).to_string() } else { format!("%{b:02X}") }).collect() };
+                    // (What Modal says beside it, in the trailers, as it does.)
+                    let warning = a.modal_warning.lock().unwrap().clone();
                     // A refusal with nothing before it comes as gRPC servers send one, in the answer's headers alone.
                     if let (Some((code, message)), true) = (&refused, answers.is_empty()) {
-                        let _ = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").header("grpc-status", code.to_string()).header("grpc-message", encode(message)).body(()).unwrap(), true);
+                        let mut r = http::Response::builder().status(200).header("content-type", "application/grpc").header("grpc-status", code.to_string()).header("grpc-message", encode(message));
+                        if let Some(w) = &warning { r = r.header("x-modal-warning", w) }
+                        let _ = respond.send_response(r.body(()).unwrap(), true);
                         return;
                     }
                     let Ok(mut send) = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap(), false) else { return };
@@ -536,6 +652,7 @@ impl Aws {
                     let (code, message) = refused.unwrap_or((0, String::new()));
                     trailers.insert("grpc-status", code.to_string().parse().unwrap());
                     if code != 0 { if let Ok(v) = encode(&message).parse() { trailers.insert("grpc-message", v); } }
+                    if let Some(w) = warning.and_then(|w| w.parse().ok()) { trailers.insert("x-modal-warning", w); }
                     let _ = send.send_trailers(trailers);
                 });
             }

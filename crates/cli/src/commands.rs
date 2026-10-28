@@ -1601,6 +1601,10 @@ fn status_lines(v: &Value) -> Vec<String> {
     let jobs = st["jobs"].as_array().cloned().unwrap_or_default();
     let count = |states: &[&str]| jobs.iter().filter(|j| states.contains(&j["state"].as_str().unwrap_or_default())).count();
     out.push(format!("Jobs          {} listed · {} running · {} starting · {} waiting", jobs.len(), count(&["running"]), count(&["launching", "launched"]), count(&["waiting"])));
+    // What a cloud said beside its answers: a client release it will stop taking, which a newer SuperCI answers.
+    for c in st["cloud_says"].as_array().into_iter().flatten() {
+        out.push(format!("{:<14}{} (a newer SuperCI answers it: update it, then `superci planes update`)", format!("{} says", superci_core::plane::cloud_name(c["cloud"].as_str().unwrap_or_default())), c["said"].as_str().unwrap_or_default()));
+    }
     out
 }
 

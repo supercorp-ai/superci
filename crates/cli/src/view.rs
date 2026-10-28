@@ -93,6 +93,12 @@ impl PlaneView {
     }
     /// Whether this control plane keeps limits for a day and what the AWS account's own budget does.
     pub fn daily_limits(&self) -> bool { self.status.as_ref().is_some_and(|s| s["daily_limits"] == true) }
+    /// What a cloud said beside its answers, as the control plane kept it (a client release it will stop taking): each
+    /// cloud's name, and what it said.
+    pub fn cloud_says(&self) -> Vec<(String, String)> {
+        self.status.as_ref().and_then(|s| s["cloud_says"].as_array().cloned()).unwrap_or_default().iter()
+            .filter_map(|c| Some((superci_core::plane::cloud_name(c["cloud"].as_str()?).to_string(), c["said"].as_str()?.to_string()))).collect()
+    }
     /// When AWS last refused a machine by its budget's rule, if it has.
     pub fn budget_stopped_ms(&self) -> Option<u64> { self.status.as_ref().and_then(|s| s["aws_budget_stopped_ms"].as_u64()) }
     /// Whether this control plane keeps a limit for the whole CI and for a cloud account (one from before does not).

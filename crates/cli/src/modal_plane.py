@@ -9,8 +9,24 @@ import json
 import os
 import subprocess
 import time
+import warnings
 
 import modal
+
+
+# What Modal says beside its answers (a client release it will stop taking): its client issues each as a ServerWarning.
+# Heard here for the control plane's status (its `cloud:says`), so the dashboard says it before Modal stops taking it.
+heard = []
+_shown = warnings.showwarning
+
+
+def hear(message, category, *rest, **kw):
+    if issubclass(category, modal.exception.ServerWarning) and str(message) not in heard:
+        heard.append(str(message))
+    _shown(message, category, *rest, **kw)
+
+
+warnings.showwarning = hear
 
 
 def runner_command(jit, fail=None):
@@ -208,6 +224,21 @@ class Plane:
 
 
 plane = Plane()
+told = set()
+
+
+async def tell():
+    """Keeps what Modal said that the status does not have yet, as the control plane keeps a launcher's (`cloud:says`:
+    once each, the newest ten)."""
+    new = [s for s in heard if s not in told]
+    if not new:
+        return
+    kept = json.loads(await kind_of("cloud:says").get.aio("cloud:says") or "[]")
+    for s in new:
+        if {"cloud": "modal", "said": s} not in kept:
+            kept.append({"cloud": "modal", "said": s})
+    await kind_of("cloud:says").put.aio("cloud:says", json.dumps(kept[-10:]))
+    told.update(new)
 
 
 @app.function(image=image, max_containers=1, scaledown_window=300, timeout=900)
@@ -226,6 +257,7 @@ def web():
         url = f"https://{request.headers.get('host', '')}{request.url.path}{query}"
         m = await plane.run({"kind": "request", "method": request.method, "url": url, "headers": dict(request.headers),
                              "body": base64.b64encode(body).decode()})
+        await tell()
         headers = {k: v for k, v in m.get("headers", {}).items() if k.lower() not in ("content-length", "transfer-encoding")}
         # An answer that says to wait (a runner asking for a message when there is none) waits here, the program let
         # go: the requests behind it are answered meanwhile.
@@ -250,5 +282,6 @@ async def sweep():
     except KeyError:
         pass
     m = await plane.run({"kind": "alarm"})
+    await tell()
     if m.get("error"):
         print(f"superci: {m['error']}")
