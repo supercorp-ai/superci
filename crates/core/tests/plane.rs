@@ -1183,6 +1183,34 @@ fn an_image_of_the_control_planes_own_goes_to_modals_sandbox_by_its_name_and_els
     assert!(own.0.borrow().iter().all(|c| c.contains(" fail ")) && !clouds.calls.borrow().iter().any(|c| c.2.contains("RunInstances")), "{:?}", own.0.borrow());
 }
 
+/// A further Modal workspace's launcher (`modal:<workspace>`) is told the image and its Secret as the first one's is
+/// (the Secret is read in that workspace); one from before images of one's own says to make it again with `--account`.
+#[test]
+fn an_image_of_ones_own_goes_to_a_further_modal_workspaces_launcher_too() {
+    let old = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| (r.url == "https://acme-two--superci-runners.modal.run/launch").then(|| {
+        let image = if old.get() { serde_json::Value::Null } else { serde_json::from_str::<serde_json::Value>(body).unwrap()["image"].clone() };
+        Response::new(200, "application/json", serde_json::json!({ "id": "sb-8", "kind": "sandbox", "image": image }).to_string())
+    }));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal-acme-two".into(), url: "https://acme-two--superci-runners.modal.run".into() }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal-acme-two".into(), max_jobs: None, monthly_usd: None }];
+    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false }] };
+    config.routing.images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci:2".into(), modal_secret: Some("ghcr-read".into()) })].into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=rust-ci")));
+    assert_eq!((job(&store, 1)["state"].as_str(), job(&store, 1)["cloud"].as_str()), (Some("launched"), Some("modal-acme-two")), "{}", job(&store, 1));
+    let launch = clouds.0.calls.borrow().iter().find(|c| c.1 == "https://acme-two--superci-runners.modal.run/launch").map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap()).expect("launch");
+    assert_eq!((launch["image"].as_str(), launch["image_secret"].as_str()), (Some("ghcr.io/acme/ci:2"), Some("ghcr-read")));
+    old.set(true);
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/image=rust-ci")));
+    let j = job(&store, 2);
+    assert!(j["error"].as_str().is_some_and(|e| e.contains("the modal-acme-two launcher is from before images of your own, and would start GitHub's runner image in place of ghcr.io/acme/ci:2: update it (`superci runners create modal --account=acme-two`)")), "{j}");
+    assert!(clouds.0.calls.borrow().iter().any(|c| c.1 == "https://acme-two--superci-runners.modal.run/stop" && c.2.contains("sb-8")), "its sandbox stopped");
+}
+
 #[test]
 fn an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise() {
     let (store, clouds, wakes, cache, own) = (Mem::default(), Kinds { clouds: FakeClouds::default(), no_gpus: true }, Wakes::default(), Cache::default(), OwnContainers::default());
@@ -7148,6 +7176,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         gpus_and_windows_get_their_own_images_types_and_prices,
         a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price,
         an_image_of_the_control_planes_own_goes_to_modals_sandbox_by_its_name_and_elsewhere_is_refused,
+        an_image_of_ones_own_goes_to_a_further_modal_workspaces_launcher_too,
         an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise,
         the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it,
         limits_make_jobs_wait_or_move_down_the_order,
