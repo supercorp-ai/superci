@@ -225,6 +225,11 @@ impl Work {
 pub trait Containers {
     /// Starts a runner for `work` on a machine of `size`; its id.
     async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: crate::spec::Size) -> Result<String>;
+    /// The same, from an image of the control plane's own (`plane::RunnerImage`: its address, and the Modal Secret
+    /// for a private registry). Only Modal's sandboxes start one (placement sends no such job elsewhere).
+    async fn start_from(&self, _name: &str, _work: &Work, _max_minutes: u32, _size: crate::spec::Size, _image: &str, _secret: Option<&str>) -> Result<String> {
+        Err("these containers start from no image of your own".into())
+    }
     async fn stop(&self, id: &str) -> Result<()>;
 }
 
