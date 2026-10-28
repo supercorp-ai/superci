@@ -41,7 +41,7 @@ Keep the job's size as `key=value` pairs after the label. Memory follows CPUs at
 
 https://superci.dev/docs/labels.md lists every key (`disk=`, `image=ubuntu26`, `provider=aws`, ...). A label SuperCI does not understand fails the job at once, saying why.
 
-A job that installs the same tools at each run can start from an image that has them, on Modal: an image `FROM ghcr.io/actions/actions-runner`, named once with `superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG` (a tag of its own for each build, or a digest), then `runs-on: superci/image=NAME`. Only Modal runs it; on AWS or Cloudflare, keep the install steps.
+A job that installs the same tools at each run can start from an image that has them, on Modal: an image `FROM ghcr.io/actions/actions-runner`, named once with `superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG` (a tag of its own for each build, or a digest), then `runs-on: superci/image=NAME`. A new build: `superci runner_images update NAME --reference=REGISTRY/IMAGE:NEWTAG`, one change, never a delete and a create. Only Modal runs it; on AWS or Cloudflare, keep the install steps.
 
 ## 4. Replace vendor actions
 
