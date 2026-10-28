@@ -230,6 +230,12 @@ pub trait Containers {
     async fn start_from(&self, _name: &str, _work: &Work, _max_minutes: u32, _size: crate::spec::Size, _image: &str, _secret: Option<&str>) -> Result<String> {
         Err("these containers start from no image of your own".into())
     }
+    /// The same as a preemptible Modal Function (`plane::Pool::function`), from GitHub's runner image or an image of
+    /// the control plane's own (its address and Modal Secret), told `notice`: the link it says it was preempted with.
+    /// Only a Modal control plane's start one.
+    async fn start_function(&self, _name: &str, _work: &Work, _max_minutes: u32, _size: crate::spec::Size, _image: Option<(&str, Option<&str>)>, _notice: &str) -> Result<String> {
+        Err("these containers run no Modal Functions".into())
+    }
     async fn stop(&self, id: &str) -> Result<()>;
 }
 

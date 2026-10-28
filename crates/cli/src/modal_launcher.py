@@ -3,6 +3,7 @@
 # (ES256, its public keys pinned here when the dashboard set this agent up), for this agent's URL, from its subject.
 # Deployed by the SuperCI dashboard with Modal's own `modal deploy`; the sandboxes are Modal's official SDK.
 import base64
+import hashlib
 import json
 import os
 import time
@@ -83,6 +84,43 @@ def image_refused(reference, e):
     return None
 
 
+
+# Jobs as Modal Functions (`superci runners update modal --mode=function`): deployed apart, as `superci-jobs-<id>` (see
+# modal_jobs.py), one Function per image, named by its address.
+def function_name(reference=None, secret=None):
+    """The Function a job's image runs as: `run` for GitHub's runner image, else `run_` and the first 12 hex digits of
+    the SHA-256 of its address and Secret (the same in the control plane's and the launcher's code)."""
+    if not reference:
+        return "run"
+    return "run_" + hashlib.sha256(f"{reference}\n{secret or ''}".encode()).hexdigest()[:12]
+
+
+async def start_function(jobs, q, cpu, ram_gb, max_minutes, gpu):
+    """A job's runner as a preemptible Function call of the app `jobs`, told the link it says a preemption with; its
+    call's id (`fc-…`). A Function not deployed (Function mode set, or an image changed, and not deployed since) is
+    said, as Modal refusing it."""
+    name = function_name(q.get("image"), q.get("image_secret"))
+    try:
+        f = modal.Function.from_name(jobs, name).with_options(cpu=(cpu / 2,) * 2, memory=(ram_gb * 1024,) * 2, timeout=max_minutes * 60, gpu=gpu)
+        call = await f.spawn.aio(q["jit"], q.get("fail"), q.get("notice"))
+    except modal.exception.NotFoundError as e:
+        return None, (f"Modal refused: no Function {name} in the app {jobs} (Function mode deploys one per image: "
+                      f"`superci runners create modal`, or `modal --account=WORKSPACE`, deploys them again). Modal: {e}")
+    return call.object_id, None
+
+
+async def stop_machine(id):
+    """Ends a job's sandbox (`sb-…`) or Function call (`fc-…`, its container with it)."""
+    if id.startswith("fc-"):
+        await modal.FunctionCall.from_id(id).cancel.aio(terminate_containers=True)
+    else:
+        sandbox = await modal.Sandbox.from_id.aio(id)
+        await sandbox.terminate.aio()
+
+
+# (This launcher's own name, superci-runners-<id>, says its control plane's.)
+FUNCTIONS = NAME.replace("superci-runners-", "superci-functions-", 1)
+
 def b64url(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
@@ -138,6 +176,12 @@ def web():
         body = await check(request)
         if "jit" not in body:  # GitLab's jobs run in Docker, which Modal's sandboxes do not have
             raise HTTPException(status_code=400, detail="Modal runs no Docker for GitLab jobs")
+        if body.get("function"):
+            id, error = await start_function(FUNCTIONS, body, float(body.get("cpu") or 2), int(body.get("ram_gb") or 8), int(body.get("max_minutes", 70)), body.get("gpu"))
+            if error:
+                raise HTTPException(status_code=400, detail=error)
+            # (A launcher from before Function mode says back a sandbox: the control plane stops it, see `kind`.)
+            return {"id": id, "kind": "function", "image": body.get("image")}
         try:
             sandbox = await modal.Sandbox.create.aio(
                 *runner_command(body["jit"], body.get("fail")),
@@ -162,8 +206,7 @@ def web():
     @api.post("/stop")
     async def stop(request: Request):
         body = await check(request)
-        sandbox = await modal.Sandbox.from_id.aio(body["id"])
-        await sandbox.terminate.aio()
+        await stop_machine(body["id"])
         return {"stopped": True, "cloud_says": heard[-10:]}
 
     return api

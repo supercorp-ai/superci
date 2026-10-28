@@ -103,18 +103,24 @@ struct Sandboxes<'a>(&'a Bridge);
 impl Sandboxes<'_> {
     /// One, from GitHub's runner image or an image of the control plane's own (`image`, with the Modal Secret for its
     /// registry).
-    fn sandbox(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: Option<&str>, secret: Option<&str>) -> io::Result<String> {
+    /// As a preemptible Modal Function in place of a sandbox when `notice` is given: the link it says a preemption with.
+    fn sandbox(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: Option<&str>, secret: Option<&str>, notice: Option<&str>) -> io::Result<String> {
         // Placement keeps GitLab jobs (Docker) away from Modal's sandboxes.
         let (jit, fail) = match work { Work::GitHub { jit } => (jit, None), Work::Fail { jit, why } => (jit, Some(why)), Work::GitLab { .. } => return Err("Modal runs no Docker for GitLab jobs".into()) };
-        let a = self.0.ask(json!({ "op": "sandbox_start", "name": name, "jit": jit, "fail": fail, "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "gpu": size.gpu.map(str::to_uppercase), "image": image, "image_secret": secret }))?;
+        let mut q = json!({ "op": "sandbox_start", "name": name, "jit": jit, "fail": fail, "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "gpu": size.gpu.map(str::to_uppercase), "image": image, "image_secret": secret });
+        if let Some(n) = notice { q["function"] = true.into(); q["notice"] = n.into() }
+        let a = self.0.ask(q)?;
         a["id"].as_str().map(str::to_string).ok_or_else(|| "no sandbox id".to_string())
     }
 }
 
 #[async_trait(?Send)]
 impl Containers for Sandboxes<'_> {
-    async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, None, None) }
-    async fn start_from(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: &str, secret: Option<&str>) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, Some(image), secret) }
+    async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, None, None, None) }
+    async fn start_from(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: &str, secret: Option<&str>) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, Some(image), secret, None) }
+    async fn start_function(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: Option<(&str, Option<&str>)>, notice: &str) -> io::Result<String> {
+        self.sandbox(name, work, max_minutes, size, image.map(|i| i.0), image.and_then(|i| i.1), Some(notice))
+    }
     async fn stop(&self, id: &str) -> io::Result<()> { self.0.ask(json!({ "op": "sandbox_stop", "id": id })).map(|_| ()) }
 }
 

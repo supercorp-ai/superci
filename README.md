@@ -22,6 +22,8 @@ Each job gets a machine of its own, of the size its label asks for (`superci/cpu
 
 On Modal, a job can start from an image of your own with its tools in it already: make it `FROM ghcr.io/actions/actions-runner`, name it once (`superci runner_images create rust-ci --reference=ghcr.io/acme/ci:2026-10`), and say `runs-on: superci/image=rust-ci`. Give each build a tag of its own or use its digest: Modal keeps an image by its address. Move the name to a new build in one step with `superci runner_images update rust-ci --reference=ghcr.io/acme/ci:2026-11`. For a private registry, add `--modal-secret=NAME`, a Secret with `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` in each Modal workspace that runs jobs: a further workspace (`modal:WORKSPACE`) reads its own.
 
+Modal's jobs can run as Modal Functions, at a third of a sandbox's price: `superci runners update modal --mode=function`. Modal may preempt a Function; SuperCI then runs its job again by itself on a sandbox once its run has finished, and `superci status` counts the preemptions of the month.
+
 Without Node, the same program installs as `superci`:
 
 ```sh

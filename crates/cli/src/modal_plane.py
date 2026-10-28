@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import hmac
+import hashlib
 import json
 import os
 import subprocess
@@ -104,6 +105,42 @@ def image_refused(reference, e):
         return (f"Modal could not start from the image {reference}: Modal must be able to pull it (a private registry with a Modal Secret, "
                 f"see `superci help runner_images`), and it must be made FROM ghcr.io/actions/actions-runner. Modal: {said}")
     return None
+
+
+# Jobs as Modal Functions (`superci runners update modal --mode=function`): deployed apart, as `superci-jobs-<id>` (see
+# modal_jobs.py), one Function per image, named by its address.
+def function_name(reference=None, secret=None):
+    """The Function a job's image runs as: `run` for GitHub's runner image, else `run_` and the first 12 hex digits of
+    the SHA-256 of its address and Secret (the same in the control plane's and the launcher's code)."""
+    if not reference:
+        return "run"
+    return "run_" + hashlib.sha256(f"{reference}\n{secret or ''}".encode()).hexdigest()[:12]
+
+
+async def start_function(jobs, q, cpu, ram_gb, max_minutes, gpu):
+    """A job's runner as a preemptible Function call of the app `jobs`, told the link it says a preemption with; its
+    call's id (`fc-…`). A Function not deployed (Function mode set, or an image changed, and not deployed since) is
+    said, as Modal refusing it."""
+    name = function_name(q.get("image"), q.get("image_secret"))
+    try:
+        f = modal.Function.from_name(jobs, name).with_options(cpu=(cpu / 2,) * 2, memory=(ram_gb * 1024,) * 2, timeout=max_minutes * 60, gpu=gpu)
+        call = await f.spawn.aio(q["jit"], q.get("fail"), q.get("notice"))
+    except modal.exception.NotFoundError as e:
+        return None, (f"Modal refused: no Function {name} in the app {jobs} (Function mode deploys one per image: "
+                      f"`superci runners create modal`, or `modal --account=WORKSPACE`, deploys them again). Modal: {e}")
+    return call.object_id, None
+
+
+async def stop_machine(id):
+    """Ends a job's sandbox (`sb-…`) or Function call (`fc-…`, its container with it)."""
+    if id.startswith("fc-"):
+        await modal.FunctionCall.from_id(id).cancel.aio(terminate_containers=True)
+    else:
+        sandbox = await modal.Sandbox.from_id.aio(id)
+        await sandbox.terminate.aio()
+
+
+FUNCTIONS = f"superci-functions-{PLANE_ID}"
 state = modal.Dict.from_name(f"{NAME}-state", create_if_missing=True)
 # Each kind of record (the key up to its first colon: job, live, rline, …) in a Dict of its own, so listing one kind
 # never reads every record. Before, all were in `state`: until they are moved (`migrate`, at each sweep), what is not
@@ -268,6 +305,9 @@ class Plane:
                 await state.put.aio("__wake_at", q["at_ms"])
             return {}
         if op == "sandbox_start":
+            if q.get("function"):
+                id, error = await start_function(FUNCTIONS, q, float(q["cpu"]), int(q["ram_gb"]), int(q["max_minutes"]), q.get("gpu"))
+                return {"error": error} if error else {"id": id}
             try:
                 sandbox = await modal.Sandbox.create.aio(
                     *runner_command(q["jit"], q.get("fail")),
@@ -287,8 +327,7 @@ class Plane:
                 return {"error": refused}
             return {"id": sandbox.object_id}
         if op == "sandbox_stop":
-            sandbox = await modal.Sandbox.from_id.aio(q["id"])
-            await sandbox.terminate.aio()
+            await stop_machine(q["id"])
             return {}
         return {"error": f"unknown question {op}"}
 
