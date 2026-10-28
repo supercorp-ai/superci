@@ -252,13 +252,15 @@ pub fn authorize(_back: &str) -> Result<Pending> {
 }
 
 /// A call waiting for the sign-in's approval all the time, `each` long, one after another (as `modal token new` waits),
-/// for `until`: the token, when it comes, kept in `approved`. A call Modal refuses is made again after a second.
+/// for `until`: the token, when it comes, kept in `approved`. A call Modal refuses is made again after a second, and
+/// one it ends early not before a second has passed since it was made (never many a second).
 fn keep_waiting(client: &mut Client, flow_id: &str, wait_secret: &str, approved: &Mutex<Option<Session>>, each: Duration, until: Duration) {
     let started = Instant::now();
     while started.elapsed() < until {
+        let asked = Instant::now();
         match ask(client, flow_id, wait_secret, each.as_secs_f32()) {
             Ok(Some(session)) => { *lock(approved) = Some(session); return }
-            Ok(None) => {}
+            Ok(None) => std::thread::sleep(Duration::from_secs(1).saturating_sub(asked.elapsed())),
             Err(_) => std::thread::sleep(Duration::from_secs(1)),
         }
     }
@@ -500,6 +502,11 @@ mod answers {
         assert!(kept.into_inner().unwrap().is_none());
         assert_eq!(waited(&modal(vec![("TokenFlowWait", refuses("TokenFlowWait"))]), false), None);
         assert_eq!(waited(&modal(vec![("TokenFlowWait", approved.clone())]), false), None, "never approved");
+        // Waits Modal ends at once (none waited, here): asked again once a second, not at once.
+        let aws = modal(vec![("TokenFlowWait", approved.clone())]);
+        with(&aws.url, || keep_waiting(&mut Client::new(None).unwrap(), "tf-1", "w", &Mutex::new(None), Duration::ZERO, Duration::from_millis(2500)));
+        let asked = aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/TokenFlowWait"))).count();
+        assert!((2..=4).contains(&asked), "{asked} waits in 2.5 s");
         assert_eq!(waited(&modal(vec![("TokenFlowWait", approved)]), true), Some(("ak-1".into(), "as-1".into(), "acmeorg".into())));
     }
 
