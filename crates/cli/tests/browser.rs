@@ -243,7 +243,9 @@ fn a_sign_in_started_in_the_terminal_shows_its_own_page_at_each_step_until_it_is
     let (_, _, page) = common::get(&link, "/");
     let page = common::words(&page);
     assert!(page.contains("Approve it in Modal's tab") || page.contains("Signed in with Modal"), "{page}");
-    // (Approved there, while no page here is being read: Modal gives the token only to a call waiting then.)
+    // (Approved there a moment later, while no page here is being read: the command's own look at Modal has come back
+    // with nothing meanwhile, and Modal gives the token only to a call waiting then.)
+    std::thread::sleep(std::time::Duration::from_millis(2500));
     served.aws.modal_approve();
     // (Approved: its last page, then the command ends.)
     let mut done = String::new();
@@ -7304,6 +7306,9 @@ fn a_modal_sign_in_started_before_any_other_waits_on_every_page_and_all_control_
         b.goto(&format!("{link}&p={p}"));
         b.wait("document.querySelector('main') !== null && document.querySelector('main').innerText.length > 0");
     }
+    // Waiting meanwhile: the page looks again by itself until it is approved.
+    b.goto(&format!("{link}&p=overview"));
+    b.wait("document.querySelector('main [data-refresh]') !== null");
     // Approved in Modal (with no page here being read then): kept, wherever the page was.
     account.modal_approve();
     let file = home.join("workspaces/default/sign-ins.json");
