@@ -97,7 +97,9 @@ class Plane:
         self.slots = asyncio.Semaphore(SIDE_BY_SIDE)
         self.cached = ({}, 0.0)
         # A swap is a read then a write (a Dict has no write over what was read): one at a time, so two programs
-        # answering side by side never both take what one read (a job claimed twice, a write of settings lost).
+        # answering side by side never both take what one read (a job claimed twice). Within this container: the
+        # settings, which an old and a new container may write side by side during an update, are made with
+        # `put_if_absent` instead (Modal's `skip_if_exists`, one write whole: see the control plane's `SETTINGS`).
         self.swapping = asyncio.Lock()
 
     def process(self):

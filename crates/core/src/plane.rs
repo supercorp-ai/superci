@@ -728,12 +728,22 @@ fn place_of(j: &Job) -> &str { if j.cloud == "aws" && j.on_demand { AWS_ON_DEMAN
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Launcher { pub cloud: String, pub url: String }
 
-/// Where the control plane keeps its settings that are not secrets (where jobs run and the launchers it calls), with
-/// the version each write made: written through it (`POST /settings`) as changes, each to one field (see `settings`),
-/// so changes made at the same moment on different computers are all kept; read at each request in place of what its
-/// cloud's own settings hold (`ROUTING`, `LAUNCHERS`, which a control plane without this record goes on reading, and
-/// an older SuperCI goes on writing: see `Stored::taken`).
-pub const SETTINGS: &str = "settings";
+/// Where the control plane keeps its settings that are not secrets (where jobs run and the launchers it calls): a
+/// record for each version (`settings:000000000012`), the newest standing. Written through it (`POST /settings`) as
+/// changes, each to one field (see `settings`), so changes made at the same moment on different computers are all
+/// kept; read at each request in place of what its cloud's own settings hold (`ROUTING`, `LAUNCHERS`, which a control
+/// plane without these records goes on reading, and an older SuperCI goes on writing: see `Stored::taken`).
+///
+/// A version is made only where none is yet (`Store::put_if_absent`), so of two writes over the same version one is
+/// made and the other made again over it. Every store makes that one write whole, a Modal Dict too (where a read
+/// then a write is not, while an old and a new container answer side by side during an update).
+pub const SETTINGS: &str = "settings:";
+
+/// The record of the settings' `version` (see `SETTINGS`).
+pub fn settings_key(version: u64) -> String { format!("{SETTINGS}{version:012}") }
+
+/// How many versions before the newest are kept (for a read of one made a moment ago to go on).
+const SETTINGS_KEPT: u64 = 10;
 
 /// The settings record (see `SETTINGS`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -1266,14 +1276,14 @@ impl<'a> ControlPlane<'a> {
         let raw = match kept {
             Some((_, raw)) => raw,
             None => {
-                let raw = self.store.get(SETTINGS).await?;
+                let raw = self.newest_settings().await?;
                 let raw = match raw { Some(raw) => Some(self.take_cloud_copy(raw).await?), None => None };
                 *self.cache.settings.borrow_mut() = Some((now, raw.clone()));
                 raw
             }
         };
         let Some(raw) = raw else { return Ok(None) };
-        let stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
+        let stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("settings: {e}"))?;
         Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, ..self.config.clone() }))
     }
 
@@ -1283,7 +1293,7 @@ impl<'a> ControlPlane<'a> {
     /// The record, with its cloud's copy taken over it when an older SuperCI wrote that copy (one not taken before,
     /// nor in the last minute: see `Stored::taken`). Lost to another write at the same moment: the record as it is.
     async fn take_cloud_copy(&self, raw: String) -> Result<String> {
-        let mut stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
+        let mut stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("settings: {e}"))?;
         let (copy, now) = (self.cloud_copy(), self.clock.now_ms());
         let newest = stored.taken.last().is_some_and(|(f, _)| *f == copy);
         if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) { return Ok(raw) }
@@ -1293,18 +1303,27 @@ impl<'a> ControlPlane<'a> {
         let n = stored.taken.len();
         stored.taken.drain(..n.saturating_sub(5));
         let written = crate::io::json(&stored);
-        Ok(if self.store.swap(SETTINGS, Some(&raw), written.clone()).await? { written } else { self.store.get(SETTINGS).await?.unwrap_or(raw) })
+        Ok(if self.made_settings(stored.version, &written).await? { written } else { self.newest_settings().await?.unwrap_or(raw) })
     }
 
-    /// The settings as they stand (kept, or its cloud's own where none are kept yet), their version (0: none kept),
-    /// and the record as read.
-    async fn settings_now(&self) -> Result<(Stored, Option<String>)> {
-        let raw = self.store.get(SETTINGS).await?;
-        let stored = match raw.as_deref() {
-            Some(r) => serde_json::from_str(r).map_err(|e| format!("{SETTINGS}: {e}"))?,
+    /// The newest version of the settings (see `SETTINGS`), as it was written.
+    async fn newest_settings(&self) -> Result<Option<String>> { Ok(self.store.list_last(SETTINGS, 1).await?.pop().map(|(_, v)| v)) }
+
+    /// A version of the settings made, where none was made yet (see `SETTINGS`): whether it was. One far enough
+    /// behind goes.
+    async fn made_settings(&self, version: u64, written: &str) -> Result<bool> {
+        if !self.store.put_if_absent(&settings_key(version), written.to_string()).await? { return Ok(false) }
+        if version > SETTINGS_KEPT { let _ = self.store.delete(&settings_key(version - SETTINGS_KEPT)).await; }
+        Ok(true)
+    }
+
+    /// The settings as they stand (kept, or its cloud's own where none are kept yet), with their version (0: none
+    /// kept).
+    async fn settings_now(&self) -> Result<Stored> {
+        Ok(match self.newest_settings().await? {
+            Some(r) => serde_json::from_str(&r).map_err(|e| format!("settings: {e}"))?,
             None => Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] },
-        };
-        Ok((stored, raw))
+        })
     }
 
     /// A write of the settings (`POST /settings`, a computer's): `{ "changes": [...] }` (see `settings::Change`),
@@ -1315,7 +1334,7 @@ impl<'a> ControlPlane<'a> {
         struct Asked { changes: Vec<crate::settings::Change> }
         let Ok(asked) = serde_json::from_slice::<Asked>(&req.body) else { return Ok(Response::text(400, "settings are written as { changes: [...] }")) };
         for _ in 0..SETTINGS_TRIES {
-            let (now, raw) = self.settings_now().await?;
+            let now = self.settings_now().await?;
             let doc = serde_json::to_value(Document { routing: now.routing, launchers: now.launchers }).map_err(|e| e.to_string())?;
             let changed = match crate::settings::apply(&doc, &asked.changes) {
                 Ok(changed) => changed,
@@ -1325,7 +1344,7 @@ impl<'a> ControlPlane<'a> {
             let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, taken: now.taken };
             let written = crate::io::json(&next);
             if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
-            if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
+            if self.made_settings(next.version, &written).await? {
                 *self.cache.settings.borrow_mut() = Some((self.clock.now_ms(), Some(written)));
                 return Ok(Response::json(&serde_json::json!({ "version": next.version })))
             }
@@ -1953,7 +1972,7 @@ impl<'a> ControlPlane<'a> {
             "daily_limits": true,
             // (And its settings kept and written through it, with their version: see `SETTINGS`.)
             "settings": true,
-            "settings_version": self.settings_now().await.map(|(s, _)| s.version).unwrap_or(0),
+            "settings_version": self.settings_now().await.map(|s| s.version).unwrap_or(0),
             "spend_today": day_spend,
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // (What a cloud said beside its answers: a client release it will stop taking.)

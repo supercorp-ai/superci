@@ -114,8 +114,8 @@ pub fn dashboard(home: &std::path::Path) -> (Dashboard, String) { dashboard_with
 
 /// The same, with these settings of its own.
 pub fn dashboard_with(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboard, String) {
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).envs(envs.iter().copied())
+    // (On a port the system gives it: one picked here could be taken by another before it is, many starting at once.)
+    let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", "0").envs(envs.iter().copied())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
     let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
@@ -130,16 +130,12 @@ pub fn dashboard_with(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboa
 /// A dashboard as `dashboard_with` starts it, and each line it wrote to its errors (a panic among them), kept for the
 /// test to read.
 pub fn dashboard_heard(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboard, String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    // (Started again on another port when the one picked was taken meanwhile: many start side by side in a sweep.)
-    let (mut child, link) = (0..5).find_map(|_| {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-        let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).envs(envs.iter().copied())
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
-        let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string));
-        std::thread::spawn(move || lines.for_each(drop));
-        match link { Some(link) => Some((child, link)), None => { let _ = child.kill(); let _ = child.wait(); None } }
-    }).expect("the dashboard's link");
+    // (On a port the system gives it: many start side by side in a sweep.)
+    let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", "0").envs(envs.iter().copied())
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+    let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
+    std::thread::spawn(move || lines.for_each(drop));
     let heard = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let kept = heard.clone();
     let errors = BufReader::new(child.stderr.take().unwrap()).lines().map_while(Result::ok);
@@ -242,8 +238,7 @@ pub fn kept_at(home: &std::path::Path, url: &str) {
 /// A dashboard on this computer for `home`, started as `superci dashboard` is with these arguments (none: no
 /// workspace named, as one started with several workspaces kept), and these settings of its own; its link.
 pub fn dashboard_args(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> (Dashboard, String) {
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let mut child = command(home).args([&["dashboard", "--no-browser"][..], args].concat()).env("SUPERCI_PORT", port.to_string()).envs(envs.iter().copied())
+    let mut child = command(home).args([&["dashboard", "--no-browser"][..], args].concat()).env("SUPERCI_PORT", "0").envs(envs.iter().copied())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
     let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");

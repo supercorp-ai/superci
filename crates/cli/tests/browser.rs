@@ -19990,7 +19990,8 @@ fn teammate_changes(served: &superci_testkit::Served, changes: serde_json::Value
 }
 
 /// A provider's dialog left open while a teammate changes one of its fields on another computer: saved with another of
-/// its fields changed, the teammate's change stays; saved with that same field changed, refused, saying what it is now.
+/// its fields changed, the teammate's change stays; saved with that same field changed, refused, saying what it is now,
+/// and Set it anyway sets that field alone (refused again if it changed yet again).
 #[test]
 fn a_dialog_saved_after_a_teammate_changed_one_of_its_fields_keeps_theirs_or_says_it_changed() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -20021,6 +20022,22 @@ fn a_dialog_saved_after_a_teammate_changed_one_of_its_fields_keeps_theirs_or_say
     b.wait(&page_shows("Changed on another computer meanwhile"));
     assert!(b.eval("document.body.innerText").as_str().unwrap().contains("Cloudflare's jobs at once is 9 now"));
     assert_eq!(pool()["max_jobs"], 9);
+    // Set anyway, after the teammate also changed the budget the dialog showed: theirs stays, the jobs at once are
+    // this computer's.
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "monthly_usd"], "value": 40.0 }]));
+    b.click("button.button", "Set it anyway");
+    until("set anyway", || pool()["max_jobs"] == 5);
+    assert_eq!(pool()["monthly_usd"], 40.0, "{}", pool());
+    // Refused once more where the teammate changed it yet again before Set anyway.
+    open(&mut b);
+    b.fill("#pool-0 input[name=max]", "6");
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 8 }]));
+    b.click("#pool-0 button.primary", "Save");
+    b.wait(&page_shows("Cloudflare's jobs at once is 8 now"));
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 2 }]));
+    b.click("button.button", "Set it anyway");
+    b.wait(&page_shows("Cloudflare's jobs at once is 2 now"));
+    assert_eq!(pool()["max_jobs"], 2);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

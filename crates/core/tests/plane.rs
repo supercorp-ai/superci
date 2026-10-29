@@ -11,7 +11,7 @@ use futures::executor::block_on;
 use sha2::{Digest, Sha256};
 use superci_core::crypto::{hex, hmac_sha256};
 use superci_core::github::App;
-use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule};
+use superci_core::plane::{role_arn, settings_key, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule, SETTINGS};
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
 /// The store: kept in memory. `1`: what another request does meanwhile, run before each operation (its name and
@@ -7276,10 +7276,10 @@ fn settings_changed_at_the_same_moment_on_two_computers_are_both_kept() {
     // Another computer's change lands between this one's read and its write: both kept.
     let other = std::rc::Rc::new(std::cell::Cell::new(true));
     let once = other.clone();
-    p.mem.meddling(move |op, k, m| if op == "swap" && k == "settings" && once.replace(false) {
-        let mut v: serde_json::Value = serde_json::from_str(&m["settings"]).unwrap();
+    p.mem.meddling(move |op, k, m| if op == "put_if_absent" && k == settings_key(2) && once.replace(false) {
+        let mut v: serde_json::Value = serde_json::from_str(&m[&settings_key(1)]).unwrap();
         (v["version"], v["routing"]["monthly_usd"]) = (2.into(), 50.0.into());
-        m.insert("settings".into(), v.to_string());
+        m.insert(k.into(), v.to_string());
     });
     let r = p.write(serde_json::json!([set(&["routing", "max_cpu"], 8.into(), Some(16.into()))]));
     assert_eq!((r.status, json(&r)["version"].as_u64(), other.get()), (200, Some(3), false));
@@ -7287,10 +7287,11 @@ fn settings_changed_at_the_same_moment_on_two_computers_are_both_kept() {
     let s = p.status();
     assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["monthly_usd"].as_f64(), s["routing"]["max_minutes"].as_u64()), (Some(8), Some(50.0), Some(90)), "{s}");
     // A write lost to others each time it is made, as long as it is made: said, nothing written.
-    p.mem.meddling(|op, k, m| if op == "swap" && k == "settings" {
-        let mut v: serde_json::Value = serde_json::from_str(&m["settings"]).unwrap();
-        v["version"] = (v["version"].as_u64().unwrap() + 1).into();
-        m.insert("settings".into(), v.to_string());
+    p.mem.meddling(|op, k, m| if op == "put_if_absent" && k.starts_with(SETTINGS) {
+        let version: u64 = k[SETTINGS.len()..].parse().unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&m[&settings_key(version - 1)]).unwrap();
+        v["version"] = version.into();
+        m.insert(k.into(), v.to_string());
     });
     let r = p.write(serde_json::json!([set(&["routing", "max_cpu"], 4.into(), None)]));
     assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
@@ -7363,7 +7364,7 @@ fn a_settings_write_that_is_not_one_or_too_long_is_refused() {
     let r = p.write(serde_json::json!([{ "op": "add", "path": ["routing", "public_repos"], "value": "a".repeat(60_000) }]));
     assert_eq!((r.status, json(&r)["error"].as_str()), (413, Some("a setting longer than 60 kB")));
     assert_eq!(block_on(p.plane().handle(Request::new("POST", &format!("{PLANE_URL}/settings")).with_body("{}"))).status, 404);
-    assert!(p.mem.0.borrow().get("settings").is_none());
+    assert!(!p.mem.0.borrow().keys().any(|k| k.starts_with(SETTINGS)));
 }
 
 /// An older SuperCI writes the cloud's own copy of the settings, knowing no other way: the control plane takes it,
@@ -7397,14 +7398,18 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(3)), "{s}");
     // Lost to another write at the same moment: the record as that one left it.
     p.later(61_000);
-    p.mem.meddling(|op, k, m| if op == "swap" && k == "settings" { let v = m["settings"].replace("\"version\":3", "\"version\":7"); m.insert("settings".into(), v); });
+    p.mem.meddling(|op, k, m| if op == "put_if_absent" && k == settings_key(4) { let v = m[&settings_key(3)].replace("\"version\":3", "\"version\":4"); m.insert(k.into(), v); });
     let s = read_by(&p, &instance(&p, 2));
     p.mem.meddling(|_, _, _| {});
-    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(7)), "{s}");
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(4)), "{s}");
     // (Only the last five copies are kept.)
     for n in 0..6 { p.later(61_000); read_by(&p, &instance(&p, 20 + n)); }
-    let kept: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+    let kept: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()[&settings_key(10)]).unwrap();
     assert_eq!(kept["taken"].as_array().map(|t| t.len()), Some(5));
+    // (And the versions before the last ten go.)
+    for _ in 0..2 { p.later(61_000); read_by(&p, &instance(&p, 40)); read_by(&p, &instance(&p, 41)); }
+    let versions: Vec<String> = p.mem.0.borrow().keys().filter(|k| k.starts_with(SETTINGS)).cloned().collect();
+    assert_eq!((versions.len(), versions[0].as_str()), (10, settings_key(5).as_str()), "{versions:?}");
 }
 
 /// A request within ten seconds of a read goes on with what it read (the status sees a write at once); one after reads
@@ -7415,12 +7420,12 @@ fn settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_sai
     assert_eq!(p.write(serde_json::json!([set(&["routing", "max_cpu"], 8.into(), None)])).status, 200);
     let health = || block_on(p.plane().handle(get("/health"))).status;
     assert_eq!(health(), 200);
-    let kept = p.mem.0.borrow()["settings"].replace("\"max_cpu\":8", "\"max_cpu\":2");
-    p.mem.0.borrow_mut().insert("settings".into(), kept);
+    let kept = p.mem.0.borrow()[&settings_key(1)].replace("\"max_cpu\":8", "\"max_cpu\":2");
+    p.mem.0.borrow_mut().insert(settings_key(1), kept);
     assert_eq!(p.status()["routing"]["max_cpu"].as_u64(), Some(2));
     p.later(11_000);
     assert_eq!(health(), 200);
-    p.mem.0.borrow_mut().insert("settings".into(), "not settings".into());
+    p.mem.0.borrow_mut().insert(settings_key(2), "not settings".into());
     p.later(11_000);
     let r = block_on(p.plane().handle(get("/health")));
     assert!(r.status == 500 && String::from_utf8_lossy(&r.body).starts_with("settings:"), "{}", String::from_utf8_lossy(&r.body));

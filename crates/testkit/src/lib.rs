@@ -41,6 +41,11 @@ pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(S
     pub Arc<std::sync::atomic::AtomicU64>);
 
 /// What another request writes over a record (`None`: takes it out), from what is there.
+/// The newest version of a served control plane's settings, as its store keeps it (see `superci_core::plane::SETTINGS`).
+pub fn newest_settings(store: &BTreeMap<String, String>) -> Option<String> {
+    store.range(superci_core::plane::SETTINGS.to_string()..).take_while(|(k, _)| k.starts_with(superci_core::plane::SETTINGS)).last().map(|(_, v)| v.clone())
+}
+
 thread_local! {
     /// On a served control plane's own thread: the settings views (`Aws::settings`, …) are its cloud's copy there,
     /// what a control plane builds its configuration from; elsewhere (a test's) they are what it reads, its record's.
@@ -876,10 +881,11 @@ impl Aws {
         let field = [("ROUTING", "routing"), ("LAUNCHERS", "launchers")].into_iter().find(|(k, _)| name.starts_with("/superci/") && name.ends_with(&format!("/{k}"))).map(|(_, f)| f);
         if let (Some(field), Some(store)) = (field, self.plane_store.lock().unwrap().clone()) {
             let mut kept = store.lock().unwrap();
-            if let Some(mut stored) = kept.get(superci_core::plane::SETTINGS).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            if let Some(mut stored) = newest_settings(&kept).and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
                 stored[field] = serde_json::from_str(value).unwrap();
-                stored["version"] = (stored["version"].as_u64().unwrap() + 1).into();
-                kept.insert(superci_core::plane::SETTINGS.into(), stored.to_string());
+                let version = stored["version"].as_u64().unwrap() + 1;
+                stored["version"] = version.into();
+                kept.insert(superci_core::plane::settings_key(version), stored.to_string());
                 return
             }
         }
@@ -903,7 +909,7 @@ impl Aws {
     fn overlaid(&self, store: Option<Arc<Mutex<BTreeMap<String, String>>>>, mut kept: Vec<(String, String)>) -> Vec<(String, String)> {
         // (A control plane served here reads its cloud's copy, as a real one does: see `AS_PLANE`.)
         if AS_PLANE.with(|p| p.get()) { return kept }
-        let stored = store.and_then(|s| s.lock().unwrap().get(superci_core::plane::SETTINGS).cloned());
+        let stored = store.and_then(|s| newest_settings(&s.lock().unwrap()));
         if let Some(stored) = stored.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
             for (key, name) in [("ROUTING", "routing"), ("LAUNCHERS", "launchers")] {
                 kept.retain(|(k, _)| k != key);
