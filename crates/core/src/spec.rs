@@ -17,7 +17,8 @@ pub struct Spec {
     /// "linux", "windows" or "macos".
     #[serde(default, skip_serializing_if = "Option::is_none")] pub os: Option<String>,
     /// Which Ubuntu a Linux machine runs, as GitHub's runners: "ubuntu26" (26.04, Docker 29) or "ubuntu24" (24.04,
-    /// Docker 28). Unset: as `ubuntu-latest` is (see `ubuntu`).
+    /// Docker 28). Unset: as `ubuntu-latest` is (see `ubuntu`). Or an image of the control plane's own, by the name it
+    /// was given there (see `valid_image_name`, `plane::RunnerImage`): a container image a job's sandbox starts from.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub image: Option<String>,
     /// One GPU: by name (one of `GPUS`), or "any" (each place's least costly).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub gpu: Option<String>,
@@ -47,6 +48,18 @@ pub const KEYS: [&str; 14] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "
 
 /// The Ubuntu images a Linux machine can run.
 pub const UBUNTUS: [&str; 2] = ["ubuntu26", "ubuntu24"];
+
+/// Whether a word can name an image of a control plane's own (`image=NAME` in a label): two to thirty-two lowercase
+/// letters, digits and dashes, a letter first, no dash last. Not a registry's address: a label is lowercased and split at
+/// each `/`, and an address has slashes and may have capitals, so a label names the image and the control plane keeps
+/// its address. A name beginning with `ubuntu` is SuperCI's (`UBUNTUS`), for the Ubuntus to come.
+pub fn valid_image_name(name: &str) -> Result<(), String> {
+    let ok = (2..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name.as_bytes()[0].is_ascii_lowercase() && !name.ends_with('-');
+    if !ok { return Err("An image's name is 2 to 32 lowercase letters, digits and dashes, starting with a letter (rust-ci, node22).".into()) }
+    if name.starts_with("ubuntu") { return Err(format!("{name} begins with ubuntu, which SuperCI keeps for the Ubuntus its machines run: choose another.")) }
+    Ok(())
+}
 
 /// When a machine that says no image runs Ubuntu 26.04: as GitHub's `ubuntu-latest` does once its move is done
 /// (2026-11-19, 00:00 UTC; announced in actions/runner-images#14748). Before, 24.04.
@@ -145,7 +158,8 @@ impl Spec {
             "disk-iops" => self.disk_iops = Some(number("IOPS", DISK_IOPS_INCLUDED, 80_000)?),
             "arch" => self.arch = Some(one_of(&["x64", "arm64"])?),
             "os" => self.os = Some(one_of(&["linux", "windows", "macos"])?),
-            "image" => self.image = Some(one_of(&UBUNTUS)?),
+            "image" => self.image = Some(if UBUNTUS.contains(&value) || valid_image_name(value).is_ok() { value.to_string() }
+                else { return Err(format!("image is ubuntu26 or ubuntu24, or the name of an image of your own (`superci runner_images`), not “{value}”")) }),
             "gpu" => self.gpu = Some(if value == "any" { value.to_string() } else { one_of(&GPUS).map_err(|_| format!("gpu is any, or one of {}, not “{value}”", GPUS.join(", ")))? }),
             "family" => {
                 let named: Vec<String> = value.split('+').map(str::to_string).collect();
@@ -167,8 +181,9 @@ impl Spec {
         let (arm, local) = (|f: &String| f.contains('g'), |f: &String| f.ends_with('d'));
         if let (Some(a), Some(b)) = (self.families.iter().find(|f| arm(f)), self.families.iter().find(|f| !arm(f))) { return Err(format!("{a} machines are arm64 and {b} machines are x64: a job runs on one or the other")) }
         if let (Some(f), Some(arch)) = (self.families.first(), self.arch.as_deref()) { if arm(f) != (arch == "arm64") { return Err(format!("{f} machines are {}, and the label says arch={arch}", if arm(f) { "arm64" } else { "x64" })) } }
-        if let (Some(i), true) = (&self.image, self.os() != "linux") { return Err(format!("image={i} is an Ubuntu for Linux machines, and the label says os={}", self.os())) }
-        if self.docker_cache.is_some() && (self.os() != "linux" || self.image.as_deref() == Some("ubuntu24")) { return Err(format!("the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says {}", if self.os() != "linux" { format!("os={}", self.os()) } else { "image=ubuntu24".into() })) }
+        if let (Some(i), true) = (&self.image, self.os() != "linux") { return Err(format!("image={i} is {} for Linux machines, and the label says os={}", if self.own_image().is_some() { "an image" } else { "an Ubuntu" }, self.os())) }
+        if let (true, Some(i)) = (self.docker_cache.is_some(), self.image.as_deref().filter(|i| *i != "ubuntu26").filter(|_| self.os() == "linux")) { return Err(format!("the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says image={i}")) }
+        if self.docker_cache.is_some() && self.os() != "linux" { return Err(format!("the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says os={}", self.os())) }
         if !self.families.is_empty() && self.gpu.is_some() { return Err("a GPU's machine family follows the GPU: say gpu or family, not both".into()) }
         if self.scratch.as_deref() == Some("localdisk") { if let Some(f) = self.families.iter().find(|f| !local(f)) { return Err(format!("{f} machines have no local disk: name a family that has one (m8id, c8id, r8id; m8gd on arm64), or leave family out")) } }
         Ok(())
@@ -218,7 +233,9 @@ impl Spec {
     pub fn localdisk(&self) -> bool { self.scratch.as_deref() == Some("localdisk") }
     pub fn os(&self) -> &str { self.os.as_deref().unwrap_or("linux") }
     /// The Ubuntu a Linux machine runs: as asked, else as `ubuntu-latest` is at `now_ms` (see `UBUNTU_26_FROM_MS`).
-    pub fn ubuntu(&self, now_ms: u64) -> &str { self.image.as_deref().unwrap_or(if now_ms >= UBUNTU_26_FROM_MS { "ubuntu26" } else { "ubuntu24" }) }
+    pub fn ubuntu(&self, now_ms: u64) -> &str { self.image.as_deref().filter(|i| UBUNTUS.contains(i)).unwrap_or(if now_ms >= UBUNTU_26_FROM_MS { "ubuntu26" } else { "ubuntu24" }) }
+    /// The name of an image of the control plane's own it asks for (`image=NAME`), when it names no Ubuntu.
+    pub fn own_image(&self) -> Option<&str> { self.image.as_deref().filter(|i| !UBUNTUS.contains(i)) }
     /// Memory: as asked, else 4 GB per CPU.
     pub fn ram(&self) -> Option<u32> { self.ram_gb.or(self.cpu.map(|c| c * 4)) }
 
@@ -230,7 +247,7 @@ impl Spec {
         if let Some(d) = self.disk_gb { parts.push(format!("{d} GB disk")) }
         if self.arch.is_some() { parts.push(self.arch().to_string()) }
         if self.os.is_some() { parts.push(os_name(self.os()).to_string()) }
-        match self.image.as_deref() { Some("ubuntu26") => parts.push("Ubuntu 26.04".into()), Some("ubuntu24") => parts.push("Ubuntu 24.04".into()), _ => {} }
+        match self.image.as_deref() { Some("ubuntu26") => parts.push("Ubuntu 26.04".into()), Some("ubuntu24") => parts.push("Ubuntu 24.04".into()), Some(i) => parts.push(format!("image {i}")), None => {} }
         match self.gpu.as_deref() { Some("any") => parts.push("a GPU".into()), Some(g) => parts.push(format!("{} GPU", g.to_uppercase())), None => {} }
         if self.on_demand() { parts.push("no spot machines".into()) }
         match self.docker_cache { Some(false) => parts.push("no Docker image cache".into()), Some(true) => parts.push("Docker image cache from the start".into()), None => {} }
@@ -251,6 +268,9 @@ pub struct Capacity {
     pub max_cpu: u32, pub max_ram_gb: u32, pub max_disk_gb: u32, pub arch: Vec<String>, pub os: Vec<String>, pub on_demand: bool,
     /// The Ubuntu images it can start (a label's `image`).
     pub images: Vec<String>,
+    /// Whether it can start a job from an image of the control plane's own, from a container registry (Modal's
+    /// sandboxes, see `plane::RunnerImage`).
+    #[serde(default)] pub own_images: bool,
     pub std_cpu: u32, pub std_ram_gb: u32, pub std_disk_gb: u32,
     /// Memory for each CPU asked for when the label names no memory (up to the most it has); 0: none promised.
     pub ram_per_cpu: u32,
@@ -284,7 +304,8 @@ impl Capacity {
         if disk > self.max_disk_gb { return Err(format!("at most {} GB disk", self.max_disk_gb)) }
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
         if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.iter().map(|o| os_name(o)).collect::<Vec<_>>().join(", "))) }
-        if let Some(i) = s.image.as_deref().filter(|i| !self.images.iter().any(|x| x == i)) { return Err(format!("no {i} image (only {})", self.images.join(", "))) }
+        if let (Some(i), false) = (s.own_image(), self.own_images) { return Err(format!("no images of your own (image={i}: Modal only)")) }
+        if let Some(i) = s.image.as_deref().filter(|i| !self.images.iter().any(|x| x == i) && s.own_image().is_none()) { return Err(format!("no {i} image (only {})", self.images.join(", "))) }
         if !s.families.is_empty() && !self.scratch { return Err("no AWS machine families".into()) }
         if s.scratch.is_some() && !self.scratch { return Err(format!("no {}", if s.ramdisk() { "RAM disk" } else { "machines with a local disk to ask for" })) }
         if s.scratch.is_some() && s.os() != "linux" { return Err("a RAM disk or a local disk on Linux only".into()) }
@@ -308,14 +329,15 @@ impl Capacity {
 
     /// AWS: any size EC2 has, x64 and arm64, Linux and Windows, spot or on-demand; standard 4 CPU, 8 GB, 60 GB disk.
     /// GPUs: NVIDIA T4 (g4dn), L4 (g6), A10G (g5), L40S (g6e), one per machine.
-    pub fn aws() -> Self { Capacity { max_cpu: 192, max_ram_gb: 1536, max_disk_gb: 16_000, arch: vec!["x64".into(), "arm64".into()], os: vec!["linux".into(), "windows".into()], on_demand: true, images: vec!["ubuntu26".into(), "ubuntu24".into()],
+    pub fn aws() -> Self { Capacity { max_cpu: 192, max_ram_gb: 1536, max_disk_gb: 16_000, arch: vec!["x64".into(), "arm64".into()], os: vec!["linux".into(), "windows".into()], on_demand: true, images: vec!["ubuntu26".into(), "ubuntu24".into()], own_images: false,
         std_cpu: 4, std_ram_gb: 8, std_disk_gb: 60, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: ["t4", "l4", "a10g", "l40s"].map(String::from).to_vec(), scratch: true } }
     /// Cloudflare containers, sized per job: 1 to 4 CPU, at least 3 GB per CPU, up to 12 GB and 20 GB disk, x64. CPU is
     /// billed only while used, so the standard machine is the largest: 4 CPU, 12 GB, 20 GB.
-    pub fn cloudflare() -> Self { Capacity { max_cpu: 4, max_ram_gb: 12, max_disk_gb: 20, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true, images: vec!["ubuntu24".into()],
+    pub fn cloudflare() -> Self { Capacity { max_cpu: 4, max_ram_gb: 12, max_disk_gb: 20, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true, images: vec!["ubuntu24".into()], own_images: false,
         std_cpu: 4, std_ram_gb: 12, std_disk_gb: 20, ram_per_cpu: 4, min_ram_per_cpu: 3, gpus: vec![], scratch: false } }
-    /// Modal sandboxes (non-preemptible, x64); standard 2 CPU, 8 GB; any of Modal's GPUs, one per sandbox.
-    pub fn modal() -> Self { Capacity { max_cpu: 64, max_ram_gb: 336, max_disk_gb: 512, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true, images: vec!["ubuntu24".into()],
+    /// Modal sandboxes (non-preemptible, x64); standard 2 CPU, 8 GB; any of Modal's GPUs, one per sandbox; GitHub's
+    /// runner image, or one of the control plane's own.
+    pub fn modal() -> Self { Capacity { max_cpu: 64, max_ram_gb: 336, max_disk_gb: 512, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true, images: vec!["ubuntu24".into()], own_images: true,
         std_cpu: 2, std_ram_gb: 8, std_disk_gb: 64, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: GPUS.map(String::from).to_vec(), scratch: false } }
 }
 
@@ -412,7 +434,7 @@ mod tests {
         assert_eq!((parse("superci").unwrap().ubuntu(before), parse("superci").unwrap().ubuntu(after)), ("ubuntu24", "ubuntu26"));
         assert_eq!((parse("superci/image=ubuntu24").unwrap().ubuntu(after), parse("superci/image=ubuntu26").unwrap().ubuntu(before)), ("ubuntu24", "ubuntu26"));
         assert_eq!(parse("superci/image=ubuntu26/cpu=8").unwrap().label("superci"), "superci/cpu=8/image=ubuntu26");
-        assert_eq!(parse("superci/image=ubuntu22").unwrap_err(), "image is ubuntu26 or ubuntu24, not “ubuntu22” (runs-on: superci/image=ubuntu22)");
+        assert_eq!(parse("superci/image=ubuntu22").unwrap_err(), "image is ubuntu26 or ubuntu24, or the name of an image of your own (`superci runner_images`), not “ubuntu22” (runs-on: superci/image=ubuntu22)");
         assert!(parse("superci/os=windows/image=ubuntu26").unwrap_err().contains("an Ubuntu for Linux machines"));
         // The Docker image cache: off, or on from the start, for a job; Ubuntu 26.04 only.
         let s = parse("superci/docker-cache=false/image=ubuntu26").unwrap();
@@ -431,6 +453,30 @@ mod tests {
         assert!(Capacity::aws().fit(&s).is_ok());
         assert_eq!(Capacity::cloudflare().fit(&s).unwrap_err(), "no ubuntu26 image (only ubuntu24)");
         assert!(Capacity::modal().fit(&parse("superci/image=ubuntu24").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn an_image_of_ones_own_is_named_in_a_label_and_only_modal_starts_from_one() {
+        let parse = |l: &str| Spec::parse(l, "superci").unwrap();
+        let s = parse("superci/image=rust-ci/cpu=8").unwrap();
+        assert_eq!((s.own_image(), s.ubuntu(UBUNTU_26_FROM_MS), s.label("superci"), s.describe()), (Some("rust-ci"), "ubuntu26", "superci/cpu=8/image=rust-ci".to_string(), "8 CPU, image rust-ci".to_string()));
+        assert_eq!((parse("superci/image=ubuntu24").unwrap().own_image(), parse("superci").unwrap().own_image()), (None, None), "an Ubuntu is no image of one's own");
+        // A label is lowercased and split at each slash: a registry's address is not a value it can hold.
+        assert_eq!(parse("superci/image=ghcr.io/acme/ci:1").unwrap_err(), "image is ubuntu26 or ubuntu24, or the name of an image of your own (`superci runner_images`), not “ghcr.io” (runs-on: superci/image=ghcr.io/acme/ci:1)");
+        for bad in ["ghcr.io", "ci:1", "-ci", "ci-", "x", "rust_ci", "ubuntu-rust", &"a".repeat(33)] {
+            assert!(parse(&format!("superci/image={bad}")).unwrap_err().contains("or the name of an image of your own"), "{bad}");
+        }
+        assert!(valid_image_name("rust-ci").is_ok() && valid_image_name("node22").is_ok() && valid_image_name("ubuntu-ci").unwrap_err().contains("begins with ubuntu"));
+        // A Linux image, with no Docker image cache (that is Ubuntu 26.04's on AWS).
+        assert_eq!(parse("superci/image=rust-ci/os=windows").unwrap_err(), "image=rust-ci is an image for Linux machines, and the label says os=windows (runs-on: superci/image=rust-ci/os=windows)");
+        assert!(parse("superci/image=rust-ci/docker-cache=false").unwrap_err().contains("and the label says image=rust-ci"));
+        // Modal's sandboxes start from one; AWS's machines and Cloudflare's containers say they cannot.
+        assert_eq!(Capacity::modal().fit(&s), Ok(Size { cpu: 8, ram_gb: 32, disk_gb: 64, gpu: None }));
+        assert_eq!(Capacity::aws().refuses(&s), Some("no images of your own (image=rust-ci: Modal only)".into()));
+        assert_eq!(Capacity::cloudflare().refuses(&parse("superci/image=rust-ci").unwrap()), Some("no images of your own (image=rust-ci: Modal only)".into()));
+        assert!(Capacity::modal().fit(&parse("superci/image=ubuntu26").unwrap()).is_err(), "nor does Modal have 26.04 for it");
+        // The default machine's image comes along, as an Ubuntu does.
+        assert_eq!(parse("superci/cpu=4").unwrap().or(&Spec { image: Some("rust-ci".into()), ..Default::default() }).own_image(), Some("rust-ci"));
     }
 
     #[test]

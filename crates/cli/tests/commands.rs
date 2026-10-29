@@ -2918,3 +2918,39 @@ fn a_control_planes_aws_role_is_given_what_this_version_asks_for() {
     assert!(code == 0 && v["said"].as_str().unwrap_or_default().contains("Its AWS role has what this version asks for."), "{code} {v}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn an_image_of_ones_own_moves_to_a_new_tag_in_one_write_and_an_unknown_name_is_refused() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let ok = |args: &[&str]| { let (code, v) = json(&home, args); assert_eq!(code, 0, "{args:?}: {v}"); v };
+    let images = || serde_json::from_str::<serde_json::Value>(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or("{}".into())).unwrap()["images"].clone();
+    let writes = || served.aws.asked.lock().unwrap().len();
+
+    ok(&["runner_images", "create", "rust-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=ghcr-read"]);
+    assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:1", "modal_secret": "ghcr-read" } }));
+    // A new tag: one write of the routing, the Secret kept as it was.
+    let before = writes();
+    let said = ok(&["runner_images", "update", "rust-ci", "--reference=ghcr.io/acme/ci:2"]);
+    assert_eq!(said["said"], "Jobs on Modal start from ghcr.io/acme/ci:2 (Modal Secret ghcr-read) when their label says image=rust-ci (runs-on: superci/image=rust-ci).");
+    assert_eq!(writes() - before, 1, "{:?}", &served.aws.asked.lock().unwrap()[before..]);
+    assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2", "modal_secret": "ghcr-read" } }));
+    // The Secret taken off (a public image now); the address kept.
+    ok(&["runner_images", "update", "rust-ci", "--modal-secret="]);
+    assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2" } }));
+    assert_eq!(ok(&["runner_images", "list"])["runner_images"], images());
+    // With --dry-run, what it would do, and nothing done.
+    let before = writes();
+    let would = ok(&["runner_images", "update", "rust-ci", "--reference=ghcr.io/acme/ci:3", "--dry-run"]);
+    assert_eq!((would["dry_run"].as_bool(), would["would"].as_str(), would["form"]["fields"]["action"].as_str(), would["form"]["fields"].get("modal_secret")),
+        (Some(true), Some("let jobs on Modal whose label says image=rust-ci start from ghcr.io/acme/ci:3, in place of ghcr.io/acme/ci:2"), Some("image_update"), None), "{would}");
+    assert_eq!((writes(), images()["rust-ci"]["reference"].as_str()), (before, Some("ghcr.io/acme/ci:2")));
+    // A name the control plane does not have: refused, with or without --dry-run, and nothing written.
+    for dry in [&[][..], &["--dry-run"]] {
+        let (code, refused) = json(&home, &[&["runner_images", "update", "gone", "--reference=ghcr.io/acme/ci:3"][..], dry].concat());
+        assert_eq!((code, refused["error"].as_str()), (1, Some("There is no image gone here (`superci runner_images list`). `superci runner_images create gone --reference=REGISTRY/IMAGE:TAG` adds it.")), "{refused}");
+    }
+    assert_eq!((writes(), images()), (before, serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2" } })));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}

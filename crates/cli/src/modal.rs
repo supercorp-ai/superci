@@ -568,6 +568,24 @@ mod tests {
         }
     }
 
+    /// A job's sandbox, from the launcher or a Modal control plane, starts from GitHub's runner image, or from an image
+    /// of the control plane's own: from its registry with its Secret, checked for GitHub's runner; one Modal could not
+    /// make fails its job, saying why (see fixtures/modal/job-images.py). Checked with Python, if present.
+    #[test]
+    fn a_jobs_sandbox_starts_from_the_image_its_label_names() {
+        use base64::Engine;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode("{}"));
+        for (kind, source) in [("launcher", launcher.as_str()), ("plane", include_str!("modal_plane.py"))] {
+            let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/job-images.py"), kind]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+            let Ok(mut python) = python else { return };
+            python.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
+            let out = python.wait_with_output().unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&format!("ok {kind}")), "{kind}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
     /// A runner sandbox with a 3-minute bound, as the control plane starts one, ends by itself; and a job's sandbox,
     /// holding no token, cannot read this workspace's stored settings (SUPERCI_MODAL_TOKEN_ID/SECRET, plus live.rs's settings).
     #[test]
