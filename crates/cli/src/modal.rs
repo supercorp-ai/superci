@@ -407,7 +407,7 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
     let app: pb::AppGetOrCreateResponse = c.unary("AppGetOrCreate", pb::AppGetOrCreateRequest { app_name: "superci-setup".into(), environment_name: String::new(), object_creation_type: 1 })?;
     // An image with Modal's own client, to run `modal deploy` from.
     let image: pb::ImageGetOrCreateResponse = c.unary("ImageGetOrCreate", pb::ImageGetOrCreateRequest {
-        image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.0".into()] }),
+        image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.3".into()] }),
         app_id: app.app_id.clone(), builder_version: settings.image_builder_version.clone(),
     })?;
     let mut result = image.result.filter(|r| r.status != 0);
@@ -697,7 +697,7 @@ def say(*a): print(*a, file=sys.stderr, flush=True)
 app = modal.App.lookup("superci-leaktest", create_if_missing=True)
 d = modal.Dict.from_name("superci-leaktest-probe", create_if_missing=True)
 d["secret"] = "visible"
-probe = modal.Sandbox.create("python", "-c", "import modal\ntry:\n    print('PROBE read:', modal.Dict.from_name('superci-leaktest-probe').get('secret'))\nexcept Exception as e:\n    print('PROBE blocked:', type(e).__name__, str(e)[:160])", app=app, image=modal.Image.debian_slim().pip_install("modal==1.6.0"), timeout=300)
+probe = modal.Sandbox.create("python", "-c", "import modal\ntry:\n    print('PROBE read:', modal.Dict.from_name('superci-leaktest-probe').get('secret'))\nexcept Exception as e:\n    print('PROBE blocked:', type(e).__name__, str(e)[:160])", app=app, image=modal.Image.debian_slim().pip_install("modal==1.6.3"), timeout=300)
 probe.wait(raise_on_termination=False)
 say(probe.stdout.read().strip())
 try:
@@ -741,7 +741,7 @@ except Exception as e:
             let settings = env.metadata.and_then(|m| m.settings).unwrap_or_default();
             let app: pb::AppGetOrCreateResponse = c.unary("AppGetOrCreate", pb::AppGetOrCreateRequest { app_name: "superci-setup".into(), environment_name: String::new(), object_creation_type: 1 }).unwrap();
             let image: pb::ImageGetOrCreateResponse = c.unary("ImageGetOrCreate", pb::ImageGetOrCreateRequest {
-                image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.0".into()] }),
+                image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.3".into()] }),
                 app_id: app.app_id.clone(), builder_version: settings.image_builder_version.clone(),
             }).unwrap();
             use base64::Engine;
@@ -789,7 +789,7 @@ except Exception as e:
         let settings = env.metadata.and_then(|m| m.settings).unwrap_or_default();
         let app: pb::AppGetOrCreateResponse = c.unary("AppGetOrCreate", pb::AppGetOrCreateRequest { app_name: "superci-setup".into(), environment_name: String::new(), object_creation_type: 1 }).unwrap();
         let image: pb::ImageGetOrCreateResponse = c.unary("ImageGetOrCreate", pb::ImageGetOrCreateRequest {
-            image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.0".into()] }),
+            image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.3".into()] }),
             app_id: app.app_id.clone(), builder_version: settings.image_builder_version.clone(),
         }).unwrap();
         let mut env_vars: std::collections::HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
