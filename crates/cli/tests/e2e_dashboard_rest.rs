@@ -824,7 +824,9 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
         k["cloudflare"] = cloudflare_signed_in();
     });
     served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl"), &[]);
-    // (Its launchers' setting refused; the deploy's upload, which names them too, taken.)
+    // (One from before settings were written through it: its launchers' setting refused by Cloudflare; the deploy's
+    // upload, which names them too, taken.)
+    cf.answer_as("0.19.21", &["settings", "settings_version"]);
     served.aws.fail("scripts/superci/secrets|LAUNCHERS", 500, CF_FAILED, None);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     // (Its key handed as a page is first read.)
@@ -833,6 +835,14 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
     assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
     // (Refused at the launcher's place given up: its containers were switched on before it.)
     assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "CONTAINERS" && v == "on"), "{said}");
+    // One that keeps its settings, its store refusing them (the launcher listed again): refused the same, the launcher
+    // still listed.
+    cf.answer_as("", &[]);
+    served.aws.worker_secrets.lock().unwrap().entry("superci".into()).or_default().insert("LAUNCHERS".into(), r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00002.acme.workers.dev"}]"#.into());
+    cf.store_refuses(Some(superci_core::plane::SETTINGS));
+    let (status, said) = sent(&link, "/runners/cloudflare", &[]);
+    assert!(status >= 400 && said.contains("the control plane answered 500"), "{status} {said}");
+    assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "LAUNCHERS" && v.contains("cloudflare")));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -857,5 +867,24 @@ fn an_aws_role_and_account_are_read_while_the_control_plane_or_aws_do_not_answer
     served.aws.fail("signin.aws.amazon.com/v1/token", 500, r#"{"error":"server_error"}"#, None);
     let (ok, said) = common::superci_in_time(&home, &["accounts", "retrieve", "aws"], &[("SUPERCI_PAUSE_MS", "1")], 60);
     assert!(!ok && said.contains("server_error"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A limit set while another computer changes the settings between this one's read and its write: refused, saying
+/// so, and the other computer's change kept; set again, it is taken.
+#[test]
+fn a_setting_changed_on_another_computer_meanwhile_is_not_written_over() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    served.written_meanwhile(superci_core::plane::SETTINGS, 1, |_| Some(r#"{"version":7,"routing":{"max_cpu":4},"launchers":[]}"#.into()));
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert_eq!(status, 409, "{said}");
+    assert!(common::words(&said).contains("Changed on another computer meanwhile"), "{said}");
+    let routing = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert!(routing().contains(r#""max_cpu":4"#), "{}", routing());
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert_eq!(status, 303, "{said}");
+    assert!(routing().contains(r#""max_cpu":16"#), "{}", routing());
     let _ = std::fs::remove_dir_all(&home);
 }

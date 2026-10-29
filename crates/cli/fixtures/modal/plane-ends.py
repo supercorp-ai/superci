@@ -71,6 +71,11 @@ assert asked({"op": "swap", "key": "job:1", "was": "one", "value": "x"})[0] == {
 assert asked({"op": "swap", "key": "job:1", "was": "uno", "value": "dos", "until": 7000})[0] == {"swapped": True}
 assert every()["job:1"] == "dos" and every()["~e:job:1"] == "7000", every()
 assert asked({"op": "swap", "key": "job:2", "was": None, "value": "new"})[0] == {"swapped": True}
+# Two swaps over the same record at once (two programs answering side by side): one takes it, the other is refused.
+async def both():
+    return await asyncio.gather(plane.answer({"op": "swap", "key": "job:2", "was": "new", "value": "a"}), plane.answer({"op": "swap", "key": "job:2", "was": "new", "value": "b"}))
+assert sorted(r["swapped"] for r in asyncio.run(both())) == [False, True]
+asked({"op": "put", "key": "job:2", "value": "new"})
 # Made only when absent: then with no end left from before.
 asked({"op": "put", "key": "~e:job:3", "value": "1"})
 assert asked({"op": "put_if_absent", "key": "job:3", "value": "three"})[0] == {"created": True}

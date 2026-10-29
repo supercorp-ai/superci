@@ -6987,7 +6987,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first,
         what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten,
-        the_newest_jobs_are_read_from_one_record_made_once_from_the_index
+        the_newest_jobs_are_read_from_one_record_made_once_from_the_index,
+        settings_are_kept_and_written_over_the_version_read
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
@@ -7221,4 +7222,61 @@ fn the_newest_jobs_are_read_from_one_record_made_once_from_the_index() {
     // A record that is not one: said.
     mem.0.borrow_mut().insert("newest".into(), "not a list".into());
     assert!(String::from_utf8_lossy(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))).body).contains("newest:"));
+}
+
+/// Its settings (where jobs run, the launchers), kept by the control plane and written through it over the version the
+/// writer read: none kept, its cloud's own stand and the first write makes them; a write over an older version, or one
+/// another request made meanwhile, is refused with the version now; what a write leaves out stays; read again ten
+/// seconds on (the status at once); a record that is not one stops what reads it, saying so.
+#[test]
+fn settings_are_kept_and_written_over_the_version_read() {
+    let (mem, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.routing.max_cpu = Some(16);
+    let plane = ControlPlane { store: &mem, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let dashboard = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let status = || json(&block_on(plane.handle(dashboard(get("/status")))));
+    let write = |body: serde_json::Value| block_on(plane.handle(dashboard(Request::new("POST", &format!("{PLANE_URL}/settings")).with_body(body.to_string()))));
+    // None kept: its cloud's own, version 0.
+    let s = status();
+    assert_eq!((s["settings"].as_bool(), s["settings_version"].as_u64(), s["routing"]["max_cpu"].as_u64()), (Some(true), Some(0), Some(16)), "{s}");
+    // The first write, over version 0: kept as version 1; what it leaves out (the launchers) as they stood.
+    let r = write(serde_json::json!({ "version": 0, "routing": { "max_cpu": 8 } }));
+    assert_eq!((r.status, json(&r)["version"].as_u64()), (200, Some(1)));
+    let s = status();
+    assert_eq!((s["settings_version"].as_u64(), s["routing"]["max_cpu"].as_u64()), (Some(1), Some(8)), "{s}");
+    // Over a version before the one kept: refused, saying the version now.
+    let r = write(serde_json::json!({ "version": 0, "routing": { "max_cpu": 4 } }));
+    assert_eq!((r.status, json(&r)["version"].as_u64(), json(&r)["error"].as_str()), (409, Some(1), Some("changed meanwhile")));
+    // Launchers alone: the routing stays.
+    let launchers = serde_json::json!([{ "cloud": "modal", "url": "https://acme--superci-runners.modal.run" }]);
+    assert_eq!(write(serde_json::json!({ "version": 1, "launchers": launchers })).status, 200);
+    let s = status();
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), &s["launchers"], s["settings_version"].as_u64()), (Some(8), &launchers, Some(2)), "{s}");
+    // Another request writes between this one's read and its write: refused.
+    mem.meddling(|op, k, m| if op == "swap" && k == "settings" { let v = m["settings"].replace("\"version\":2", "\"version\":3"); m.insert("settings".into(), v); });
+    assert_eq!(write(serde_json::json!({ "version": 2, "routing": { "max_cpu": 2 } })).status, 409);
+    mem.meddling(|_, _, _| {});
+    // Not a write of settings, or not a dashboard's: refused.
+    assert_eq!(write(serde_json::json!({ "routing": {} })).status, 400);
+    assert_eq!(block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/settings")).with_body("{}"))).status, 404);
+    // What another process wrote: a request within ten seconds goes on with what it read (the status sees it at once),
+    // one after reads it again.
+    mem.0.borrow_mut().insert("settings".into(), serde_json::json!({ "version": 9, "routing": { "max_cpu": 2 } }).to_string());
+    let health = || block_on(plane.handle(get("/health"))).status;
+    assert_eq!(health(), 200);
+    assert_eq!(status()["routing"]["max_cpu"].as_u64(), Some(2));
+    clock.0.set(clock.0.get() + 11_000);
+    assert_eq!(health(), 200);
+    // A record that is not one: each request, the sweep and what was left for after an answer stop, saying so.
+    mem.0.borrow_mut().insert("settings".into(), "not settings".into());
+    clock.0.set(clock.0.get() + 11_000);
+    let r = block_on(plane.handle(get("/health")));
+    assert!(r.status == 500 && String::from_utf8_lossy(&r.body).starts_with("settings:"), "{}", String::from_utf8_lossy(&r.body));
+    assert!(block_on(plane.alarm()).unwrap_err().starts_with("settings:"));
+    assert!(block_on(plane.later(PLANE_URL, "start job:1")).unwrap_err().starts_with("settings:"));
+    assert!(write(serde_json::json!({ "version": 9 })).status == 500);
 }

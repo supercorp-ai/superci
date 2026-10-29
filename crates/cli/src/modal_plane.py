@@ -96,6 +96,9 @@ class Plane:
         self.free = []
         self.slots = asyncio.Semaphore(SIDE_BY_SIDE)
         self.cached = ({}, 0.0)
+        # A swap is a read then a write (a Dict has no write over what was read): one at a time, so two programs
+        # answering side by side never both take what one read (a job claimed twice, a write of settings lost).
+        self.swapping = asyncio.Lock()
 
     def process(self):
         """A program not answering anything now, or a new one."""
@@ -158,11 +161,12 @@ class Plane:
                 await self.end(q["key"], None)
             return {"created": created}
         if op == "swap":
-            # Read, then written (a Dict has no write over what was read; the program answers one request at a time).
-            if await self.get(q["key"]) != q.get("was"):
-                return {"swapped": False}
-            await asyncio.gather(kind_of(q["key"]).put.aio(q["key"], q["value"]), self.end(q["key"], q.get("until")))
-            return {"swapped": True}
+            # Read, then written, one swap at a time in this container (see `swapping`).
+            async with self.swapping:
+                if await self.get(q["key"]) != q.get("was"):
+                    return {"swapped": False}
+                await asyncio.gather(kind_of(q["key"]).put.aio(q["key"], q["value"]), self.end(q["key"], q.get("until")))
+                return {"swapped": True}
         if op == "delete":
             await asyncio.gather(self.drop(q["key"]), self.drop(f"~e:{q['key']}"))
             return {}

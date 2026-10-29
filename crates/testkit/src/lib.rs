@@ -41,6 +41,9 @@ pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(S
     pub Arc<std::sync::atomic::AtomicU64>);
 
 /// What another request writes over a record (`None`: takes it out), from what is there.
+/// Each control plane served, by its address: its store (where what was written through it is kept).
+static SERVED: Mutex<BTreeMap<String, Arc<Mutex<BTreeMap<String, String>>>>> = Mutex::new(BTreeMap::new());
+
 pub type Change = Arc<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
 
 #[async_trait(?Send)]
@@ -266,6 +269,8 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     let aws = Aws::serve();
     let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
+    *aws.plane_store.lock().unwrap() = Some(store.0.clone());
+    SERVED.lock().unwrap().insert(url.clone(), store.0.clone());
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
     *github.aws.lock().unwrap() = Some(aws.clone());
@@ -468,6 +473,8 @@ pub struct Aws {
     /// The control plane answering as an older version does, its key taken as now (see `Served::answer_as`): the
     /// version its health says (none: as it is), and what its status leaves out.
     pub answers_as: Arc<Mutex<Option<(String, Vec<String>)>>>,
+    /// The store of the control plane served beside it: where the settings written through it are kept (`settings`).
+    pub plane_store: Arc<Mutex<Option<Arc<Mutex<BTreeMap<String, String>>>>>>,
     /// Answers given once each without some of their fields, once a request to a path was answered (see
     /// `Served::then_answer`): that path (none: from now on), and each answer's path and the fields it leaves out.
     pub answers_next: Arc<Mutex<(Option<String>, Vec<(String, Vec<String>)>)>>,
@@ -764,7 +771,8 @@ impl Aws {
                 continue;
             }
             // A Worker on workers.dev: the control plane on this computer it stands for.
-            if let Some(to) = a.workers.lock().unwrap().get(&host).cloned() {
+            let worker = a.workers.lock().unwrap().get(&host).cloned();
+            if let Some(to) = worker {
                 let rest = target.splitn(3, '/').nth(2).unwrap_or_default();
                 let u = to.trim_start_matches("http://");
                 let (h, _) = u.split_once('/').unwrap_or((u, ""));
@@ -823,10 +831,10 @@ impl Aws {
 
     /// What Modal's settings Dicts were given, as a Modal control plane reads them (its settings; an empty value is
     /// one taken out).
-    pub fn modal_plane_settings(&self) -> Vec<(String, String)> { self.modal_settings.lock().unwrap().iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect() }
+    pub fn modal_plane_settings(&self) -> Vec<(String, String)> { self.overlaid(self.served_at(|h| h.ends_with(".modal.run")), self.modal_settings.lock().unwrap().iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect()) }
 
     /// A Worker's secrets, as a control plane there reads them (its settings).
-    pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default() }
+    pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.overlaid(self.served_at(|h| h.starts_with(&format!("{script}."))), self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()) }
 
     /// The answer `fail` set for this call, if one was (counted once more).
     fn failed(&self, url: &str, target: &str, asked: &str) -> Option<(u16, Vec<(String, String)>, String)> {
@@ -855,8 +863,24 @@ impl Aws {
         self.fail(action, status, answer, times)
     }
 
-    /// A parameter written as the dashboard writes one.
+    /// A parameter written as the dashboard writes one: the routing and launchers of a control plane that keeps its
+    /// settings (once written through it) into that record, as a write through it would (its version one more).
     pub fn put(&self, name: &str, value: &str) {
+        let field = [("ROUTING", "routing"), ("LAUNCHERS", "launchers")].into_iter().find(|(k, _)| name.starts_with("/superci/") && name.ends_with(&format!("/{k}"))).map(|(_, f)| f);
+        if let (Some(field), Some(store)) = (field, self.plane_store.lock().unwrap().clone()) {
+            let mut kept = store.lock().unwrap();
+            if let Some(mut stored) = kept.get(superci_core::plane::SETTINGS).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                stored[field] = serde_json::from_str(value).unwrap();
+                stored["version"] = (stored["version"].as_u64().unwrap() + 1).into();
+                kept.insert(superci_core::plane::SETTINGS.into(), stored.to_string());
+                return
+            }
+        }
+        self.put_param(name, value)
+    }
+
+    /// A parameter written as SSM's `PutParameter` writes one.
+    pub fn put_param(&self, name: &str, value: &str) {
         let mut p = self.params.lock().unwrap();
         let version = p.get(name).map(|(_, v, _)| v + 1).unwrap_or(1);
         p.insert(name.to_string(), (value.to_string(), version, system_ms()));
@@ -865,7 +889,26 @@ impl Aws {
     /// A control plane's settings, by name, as it reads them (`/superci/<id>/<NAME>`).
     pub fn settings(&self, plane: &str) -> Vec<(String, String)> {
         let prefix = format!("/superci/{plane}/");
-        self.params.lock().unwrap().iter().filter_map(|(k, (v, _, _))| Some((k.strip_prefix(&prefix)?.to_string(), v.clone()))).filter(|(k, _)| !k.contains('/')).collect()
+        self.overlaid(self.plane_store.lock().unwrap().clone(), self.params.lock().unwrap().iter().filter_map(|(k, (v, _, _))| Some((k.strip_prefix(&prefix)?.to_string(), v.clone()))).filter(|(k, _)| !k.contains('/')).collect())
+    }
+
+    /// Settings as a deploy left them, with what was written through the control plane over them: what it reads.
+    fn overlaid(&self, store: Option<Arc<Mutex<BTreeMap<String, String>>>>, mut kept: Vec<(String, String)>) -> Vec<(String, String)> {
+        let stored = store.and_then(|s| s.lock().unwrap().get(superci_core::plane::SETTINGS).cloned());
+        if let Some(stored) = stored.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+            for (key, name) in [("ROUTING", "routing"), ("LAUNCHERS", "launchers")] {
+                kept.retain(|(k, _)| k != key);
+                kept.push((key.into(), stored[name].to_string()));
+            }
+        }
+        kept
+    }
+
+    /// The store of the control plane served for a host (a Worker, a Modal app) this stands in for, as `workers` maps
+    /// it; none mapped: the one served beside it.
+    fn served_at(&self, host: impl Fn(&str) -> bool) -> Option<Arc<Mutex<BTreeMap<String, String>>>> {
+        let url = self.workers.lock().unwrap().iter().find(|(h, _)| host(h)).map(|(_, u)| u.clone());
+        match url { Some(url) => SERVED.lock().unwrap().get(&url).cloned(), None => self.plane_store.lock().unwrap().clone() }
     }
 
     /// One exchange: `url` is AWS's own (`https://ssm.us-east-1.amazonaws.com/`).
@@ -952,7 +995,7 @@ impl Aws {
         match target {
             "AmazonSSM.PutParameter" => {
                 if self.params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }
-                self.put(&name, a["Value"].as_str().unwrap_or_default());
+                self.put_param(&name, a["Value"].as_str().unwrap_or_default());
                 (200, json!({ "Tier": "Standard", "Version": self.params.lock().unwrap()[&name].1 }))
             }
             "AmazonSSM.GetParameter" => match self.params.lock().unwrap().get(&name) {
@@ -1113,6 +1156,8 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let aws = Aws::serve();
     let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
+    *aws.plane_store.lock().unwrap() = Some(store.0.clone());
+    SERVED.lock().unwrap().insert(url.clone(), store.0.clone());
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
     *github.aws.lock().unwrap() = Some(aws.clone());
@@ -1193,6 +1238,8 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let aws = Aws::serve();
     let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
+    *aws.plane_store.lock().unwrap() = Some(store.0.clone());
+    SERVED.lock().unwrap().insert(url.clone(), store.0.clone());
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
     *github.aws.lock().unwrap() = Some(aws.clone());

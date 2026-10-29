@@ -2208,6 +2208,23 @@ impl Dashboard {
     }
 
     /// Writes one of a control plane's secrets through its cloud's API (a Worker secret; an SSM parameter).
+    /// Writes the control plane's settings that are not secrets (where jobs run, its launchers): through it, over the
+    /// version `status` was read at, where it keeps them (its status says `settings`); else into its cloud, as before.
+    /// Whether it took them: not when another computer changed them since `status` was read (see `CHANGED_MEANWHILE`).
+    fn put_settings(&mut self, plane: &Plane, status: &serde_json::Value, routing: Option<&Routing>, launchers: Option<&[superci_core::plane::Launcher]>) -> Result<bool> {
+        if status["settings"] == true {
+            let body = serde_json::json!({ "version": status["settings_version"].as_u64().unwrap_or(0), "routing": routing, "launchers": launchers });
+            return match cloudflare::plane_post(plane.url(), &self.status_key, "/settings", &body) {
+                Ok(_) => Ok(true),
+                Err(e) if e.contains(" 409") => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+        if let Some(r) = routing { self.put_secret(plane, "ROUTING", &json_text(r))? }
+        if let Some(l) = launchers { self.put_secret(plane, "LAUNCHERS", &json_text(&l))? }
+        Ok(true)
+    }
+
     fn put_secret(&mut self, plane: &Plane, name: &str, value: &str) -> Result<()> {
         self.own().check(plane)?;
         match plane {
@@ -2794,15 +2811,17 @@ impl Dashboard {
                 if routing.default.as_deref() == Some(cloud.as_str()) { routing.default = None }
                 // (AWS's own budget for the account goes with AWS: see below.)
                 let had_budget = cloud == "aws" && routing.aws_budget.take().is_some();
-                self.put_secret(&plane, "ROUTING", &json_text(&routing))?;
+                // (Its launcher, when it has one, out of the launchers in the same write.)
+                let launchers = (cloud != "aws" && !own_containers).then(|| {
+                    let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
+                    launchers.retain(|a| a.cloud != cloud);
+                    launchers
+                });
+                if !self.put_settings(&plane, &status, Some(&routing), launchers.as_deref())? { return Ok(changed_meanwhile()) }
                 if cloud == "aws" {
                     if matches!(plane, Plane::Aws { .. }) { self.put_secret(&plane, "AWS_RUNNERS", "off")? } else { cloudflare::plane_post(plane.url(), &self.status_key, "/aws/forget", &serde_json::json!({}))?; }
                 } else if own_containers {
                     self.put_secret(&plane, "CONTAINERS", "off")?;
-                } else {
-                    let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
-                    launchers.retain(|a| a.cloud != cloud);
-                    self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
                 }
                 let c = cloud.clone();
                 let forgotten = wait_for(plane.url(), &self.status_key, move |s| !provider_connected(s, &c));
@@ -3421,7 +3440,8 @@ impl Dashboard {
             ("POST", "/runners/modal") => {
                 let plane = self.plane()?;
                 let session = self.modal.clone().ok_or("Sign in with Modal first.")?;
-                let Some(mut launchers) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Vec<superci_core::plane::Launcher>>(s["launchers"].clone()).ok()) else {
+                let status = status_soon(plane.url(), &self.status_key).unwrap_or_default();
+                let Some(mut launchers) = serde_json::from_value::<Vec<superci_core::plane::Launcher>>(status["launchers"].clone()).ok().filter(|_| !status.is_null()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
                 let keys = plane_keys(plane.url())?;
@@ -3430,7 +3450,7 @@ impl Dashboard {
                 launcher_up(&url);
                 launchers.retain(|a| a.cloud != "modal");
                 launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
-                self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                if !self.put_settings(&plane, &status, None, Some(&launchers))? { return Ok(changed_meanwhile()) }
                 wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
                 Ok(Response::redirect("/?p=runners"))
             }
@@ -3450,7 +3470,7 @@ impl Dashboard {
                         let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
                         if launchers.iter().any(|a| a.cloud == "cloudflare") {
                             launchers.retain(|a| a.cloud != "cloudflare");
-                            self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                            if !self.put_settings(&plane, &status, None, Some(&launchers))? { return Ok(changed_meanwhile()) }
                             let _ = cf.delete_runners(account_id, plane.plane_id());
                         }
                         wait_for(plane.url(), &self.status_key, |s| s["containers"] == true && !s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
@@ -3470,7 +3490,7 @@ impl Dashboard {
                         let url = cf.deploy_runners(&account, plane.url(), plane.plane_id())?;
                         launchers.retain(|a| a.cloud != "cloudflare");
                         launchers.push(superci_core::plane::Launcher { cloud: "cloudflare".into(), url });
-                        self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                        if !self.put_settings(&plane, &status, None, Some(&launchers))? { return Ok(changed_meanwhile()) }
                         wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
                     }
                 }
@@ -3796,7 +3816,7 @@ impl Dashboard {
                     _ => return Ok(message(400, "Unknown change", "")),
                 }
                 let want = json_value(&routing);
-                self.put_secret(&plane, "ROUTING", &want.to_string())?;
+                if !self.put_settings(&plane, status.as_ref().unwrap_or(&serde_json::Value::Null), Some(&routing), None)? { return Ok(changed_meanwhile()) }
                 self.shown(&plane, |s| s["routing"] == want)?;
                 Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
@@ -7161,11 +7181,17 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
         }).unwrap_or_else(|| Err(format!("{} did not take its move token", plane.url())))
     };
     let out = call(from, &out_token, "/move/export", serde_json::json!({}))?;
+    // The new one's settings, as written through it (one from before: as its cloud keeps them), from the version it
+    // has now: it is on standby, and nothing but this move writes them.
+    let to_status = cloudflare::status(to.url(), key).unwrap_or_default();
+    let mut version = (to_status["settings"] == true).then(|| to_status["settings_version"].as_u64().unwrap_or(0));
     [("GITHUB_APP", "app"), ("GITLAB", "gitlab"), ("ROUTING", "routing"), ("MACHINE", "machine")].into_iter().filter(|(_, k)| !out[k].is_null()).try_for_each(|(name, k)| {
         // (A budget in AWS itself is for the old control plane's role: not carried. The new one says there is none,
         // until it is made again; the old one's goes when the old control plane is deleted.)
         let mut carried = out[k].clone();
         if k == "routing" { if let Some(routing) = carried.as_object_mut() { routing.remove("aws_budget"); } }
+        // (Routing that is not one, a control plane's that is not as SuperCI makes it: not carried.)
+        if k == "routing" { return if serde_json::from_value::<Routing>(carried.clone()).is_ok() { carry_settings(w, to, key, &mut version, Some(carried), None) } else { Ok(()) } }
         w.put(to, name, &carried.to_string())
     })?;
     // Further organizations' Apps, each a secret of its own. One the new control plane has from an earlier move and
@@ -7257,7 +7283,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     }
     for c in plan { if let Carry::Cannot(p, why) = c { left.push(format!("{} runners stayed behind: {why}.", cloud_name(p))) } }
     if launchers.len() != launchers_before || plan.iter().any(|c| matches!(c, Carry::Comes("cloudflare") | Carry::Comes("modal"))) {
-        w.put(to, "LAUNCHERS", &json_text(&launchers))?;
+        carry_settings(w, to, key, &mut version, None, Some(json_value(&launchers)))?;
     }
     // The new one says each provider it was given is there, before any job is sent to it: a control plane given its
     // containers a moment ago starts again with them, and until it has, a job for them would find none.
@@ -7312,6 +7338,24 @@ fn report_to_plane(plane_url: &str, report: &serde_json::Value) -> Result<()> {
 fn wait_for_version(url: &str, version: &str) { tries(60, 2000, || cloudflare::health(url).filter(|h| h["version"] == version)); }
 
 fn wait_online(url: &str) { tries(30, 2000, || cloudflare::health(url)); }
+
+/// Settings brought to the control plane moved to: through it, over `version` (then the one it wrote), when it keeps
+/// them (see `Dashboard::put_settings`); into its cloud when it is one from before that (`None`).
+fn carry_settings(w: &Writer, to: &Plane, key: &str, version: &mut Option<u64>, routing: Option<serde_json::Value>, launchers: Option<serde_json::Value>) -> Result<()> {
+    if let Some(v) = version {
+        let body = serde_json::json!({ "version": v, "routing": routing, "launchers": launchers });
+        *v = cloudflare::plane_post(to.url(), key, "/settings", &body)?["version"].as_u64().ok_or("the control plane did not say its settings' version")?;
+        return Ok(())
+    }
+    if let Some(r) = routing { w.put(to, "ROUTING", &r.to_string())? }
+    if let Some(l) = launchers { w.put(to, "LAUNCHERS", &l.to_string())? }
+    Ok(())
+}
+
+/// A change refused because another computer changed the control plane's settings since this one read them.
+fn changed_meanwhile() -> Response {
+    message(409, "Changed on another computer meanwhile", "The settings were changed from another computer a moment ago. Look again, then make your change once more.")
+}
 
 /// The keys a control plane signs its launchers' requests with (its JWKS), for a launcher to trust.
 fn plane_keys(url: &str) -> Result<serde_json::Value> {

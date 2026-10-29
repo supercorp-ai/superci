@@ -4993,7 +4993,8 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
     step("04-modal-agent");
     let (ok, said) = run("", &["runners", "create", "modal", "--plane=awsplane0001"]);
     assert!(ok && said.contains("modal runs jobs now."), "{said}");
-    let agents = served.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
+    // (Written through the control plane served for it: kept in its store.)
+    let agents = second.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
     assert!(agents.contains("\"cloud\":\"cloudflare\"") && agents.contains("\"cloud\":\"modal\""), "{agents}");
     let (ok, said) = run("", &["runners", "list", "--plane=awsplane0001"]);
     assert!(ok && said.contains("aws ") && said.contains("cloudflare") && said.contains("modal"), "{said}");
@@ -6584,9 +6585,10 @@ fn removing_aws_deletes_its_budget_in_aws_as_aws_answered_and_a_launcher_the_con
     assert!(page.contains("Removed AWS.") && !page.contains("its budget in AWS"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
-    // A launcher in Modal removed while the control plane does not take the change (its settings written, not read):
-    // its part in Modal is left until it has, and said so.
+    // A launcher in Modal removed while the control plane does not take the change (one from before settings were
+    // written through it: its settings written, not read): its part in Modal is left until it has, and said so.
     let served = serve(|_| {});
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
     served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
     served.aws.fail("AmazonSSM.PutParameter|/LAUNCHERS", 200, r#"{"Tier":"Standard","Version":2}"#, None);
     let home = signed_in(&served);

@@ -530,7 +530,11 @@ pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Resul
     let key = &plane_key(key, plane_url);
     let mut r = quick().post(&crate::aws::stand_in(&format!("{plane_url}{path}"))).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")
         .send(body.to_string()).map_err(|e| e.to_string())?;
-    if r.status().as_u16() != 200 { return Err(format!("the control plane answered {}", r.status())) }
+    if r.status().as_u16() != 200 {
+        // What it said of why, when it said it (`{"error": …}`).
+        let why = r.body_mut().read_json::<Value>().ok().and_then(|v| v["error"].as_str().map(|e| format!(": {e}"))).unwrap_or_default();
+        return Err(format!("the control plane answered {}{why}", r.status()))
+    }
     serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
