@@ -34,7 +34,8 @@ fn mark(provider: &str) -> Option<(&'static str, &'static str)> { MARKS.iter().f
 /// A provider's logo on a rounded tile (`size` in px).
 pub fn logo(provider: &str, size: u32) -> String {
     let inner = size * 58 / 100;
-    match provider {
+    // (A further Modal workspace, `modal:<workspace>`, carries Modal's.)
+    match superci_core::plane::kind_of(provider) {
         "aws" => {
             let w = size * 84 / 100;
             format!(r##"<span class="logo" style="width:{size}px;height:{size}px;background:#232F3E"><svg width="{w}" height="{w}" viewBox="0 0 24 24"><text x="12" y="13" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="700" font-size="10.5" letter-spacing="-.3" fill="#fff">aws</text><path d="M4.6 15.6c4.8 2.9 10.1 2.9 14.8 0" fill="none" stroke="#FF9900" stroke-width="1.8" stroke-linecap="round"/><path d="M17.2 14.6l2.4.8-.7 2.3" fill="none" stroke="#FF9900" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>"##)

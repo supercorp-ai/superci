@@ -39,7 +39,7 @@ pub fn job_minutes(set: Option<u32>, cloud: &str) -> u32 { set.unwrap_or(MAX_JOB
 /// job run on a runner of your own (five days); Cloudflare keeps a container six hours at most; a Modal sandbox
 /// lives a day at most. The longest a job may run (`Routing::max_minutes`, six hours unless set) is never more.
 pub fn max_minutes(cloud: &str) -> u32 {
-    match cloud { "cloudflare" => 6 * 60, "modal" => 24 * 60, _ => 5 * 24 * 60 }
+    match kind_of(cloud) { "cloudflare" => 6 * 60, "modal" => 24 * 60, _ => 5 * 24 * 60 }
 }
 
 /// What the runtime gives a control plane: its id and label, and (once set up on the user's machine) the App and AWS connect
@@ -784,7 +784,13 @@ fn pool_of(key: &str) -> (String, String) {
 }
 
 /// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
+/// (A further Modal workspace, `modal:<workspace>`, is an account of its own.)
 pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
+
+/// What kind of cloud a place in the order is. A Modal workspace signed in to beside the first one is a place of its
+/// own, `modal:<workspace>`, with its own launcher, limits and spend: it runs jobs as Modal does. Every other place is
+/// its own kind (`machine:<name>` is a computer's).
+pub fn kind_of(cloud: &str) -> &str { cloud.split_once(':').map_or(cloud, |(kind, _)| kind) }
 
 /// A limit in dollars as it is said: whole dollars without cents ($200), another amount with them ($12.50).
 pub fn dollars(usd: f64) -> String { if usd.fract() == 0.0 { format!("${usd:.0}") } else { format!("${usd:.2}") } }
@@ -954,7 +960,7 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
 
 /// What a cloud's containers can be (Cloudflare's, or Modal's sandboxes): started by this control plane itself, or
 /// by a launcher.
-fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
+fn capacity_of(cloud: &str) -> Capacity { if kind_of(cloud) == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
 
@@ -2420,8 +2426,12 @@ impl<'a> ControlPlane<'a> {
             if order.contains(c) { continue }
             match order.iter().position(|o| o == "aws") { Some(at) if c == AWS_ON_DEMAND => order.insert(at + 1, c.clone()), _ => order.push(c.clone()) }
         }
-        // A label or a rule naming AWS means both of its places, as the order has them.
-        let named = |c: &str| -> Vec<String> { if c == "aws" { order.iter().filter(|o| *o == "aws" || *o == AWS_ON_DEMAND).cloned().collect() } else { vec![c.to_string()] } };
+        // A label or a rule naming AWS means both of its places, as the order has them; naming Modal, each Modal workspace.
+        let named = |c: &str| -> Vec<String> { match c {
+            "aws" => order.iter().filter(|o| *o == "aws" || *o == AWS_ON_DEMAND).cloned().collect(),
+            "modal" => order.iter().filter(|o| kind_of(o) == "modal").cloned().collect(),
+            _ => vec![c.to_string()],
+        } };
         let candidates: Vec<String> = if let Some(c) = &spec.cloud { let v = named(c); if v.is_empty() { vec![c.clone()] } else { v } }
             else if let Some(c) = routing.rule_for(repo) { let v = named(c); if v.is_empty() { vec![c.to_string()] } else { v } }
             else if !routing.order.is_empty() { order.clone() }
@@ -2479,7 +2489,7 @@ impl<'a> ControlPlane<'a> {
                 never.push(format!("{name} is not connected"));
                 continue
             };
-            if gitlab && cloud == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
+            if gitlab && kind_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
             // Its label asks for an on-demand machine: not AWS's spot ones.
@@ -3440,7 +3450,7 @@ impl<'a> ControlPlane<'a> {
         enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| a.cloud == *c)).map(|a| Place::Launcher(a.clone())));
+        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| kind_of(&a.cloud) == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };

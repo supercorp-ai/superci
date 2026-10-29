@@ -20,7 +20,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("dashboard", "  superci dashboard                 Opens your dashboard in the browser (on this machine only, while it runs).",
         "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it. With several workspaces it opens on the\none shown last, and the name at the top of its sidebar switches between them.\n\n  --no-browser    Prints its link without opening it."),
     ("login", "  superci login [CLOUD]             Signs in with a cloud in the browser (aws, cloudflare, modal), and ends.",
-        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci, by workspace) and commands use it\nfrom then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account.\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account, beside those signed in to."),
+        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci, by workspace) and commands use it\nfrom then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account; `superci login modal --add`, to one more Modal\nworkspace, whose runners are then a provider of their own (`superci runners create modal --account=WORKSPACE`).\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account or Modal workspace, beside those signed in to."),
     ("logout", "  superci logout                    Removes SuperCI's sign-ins from this machine (the workspace's).",
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
@@ -32,8 +32,8 @@ const HELP: &[(&str, &str, &str)] = &[
           it is of, when the checkout's origin is not GitHub's (else its cache is its own, apart from GitHub's jobs').\n          It waits for the run and prints its jobs' lines, then each step's result and time and what its machines cost;\n          it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\ncancel    Stops a run, as GitHub's Cancel does: its jobs not started end (one whose `if` holds after a cancel, as\n          `always()`, runs), and a running one is told to stop (its steps have five minutes), then its machine ends. A GitHub run is cancelled by GitHub, asked with your App's token.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
-    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
-        "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's settings: jobs at once, dollars a month (`none` lifts one), and where it starts machines:\n          --regions for aws and aws-on-demand (each its own; aws's spot machines start where a job costs least, the\n          first counted 15% cheaper; aws-on-demand's in order), --location for cloudflare. --networks (AWS's, a\n          network of your own per region; give it once per region) and --image (Cloudflare's) are the account's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal: the ones named, in that order; any not named is\n          taken out (its settings kept). A job goes to the first that can run it and is within its limits; when one\n          cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
+    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal [--account=WORKSPACE]\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
+        "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself. modal --account: a further Modal workspace signed in to (`superci login modal\n          --add`); its launcher is a provider of its own, modal:WORKSPACE, with its own limits and spend.\nupdate    A provider's settings: jobs at once, dollars a month (`none` lifts one), and where it starts machines:\n          --regions for aws and aws-on-demand (each its own; aws's spot machines start where a job costs least, the\n          first counted 15% cheaper; aws-on-demand's in order), --location for cloudflare. --networks (AWS's, a\n          network of your own per region; give it once per region) and --image (Cloudflare's) are the account's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal: the ones named, in that order; any not named is\n          taken out (its settings kept). A job goes to the first that can run it and is within its limits; when one\n          cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
     ("labels", "  superci labels list\n  superci labels create NAME\n  superci labels delete NAME --confirm",
         "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci/cpu=8`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
     ("name", "  superci name retrieve\n  superci name update NAME",
@@ -1220,20 +1220,24 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let plane = in_use(&d)?;
             // As the Add runners page does: a control plane starts machines in its own cloud itself; elsewhere it is
             // connected (AWS: a role it may assume; Cloudflare, Modal: a small launcher there).
+            // Modal: `--account=WORKSPACE` is a further workspace signed in to (`superci login modal --add`), whose
+            // launcher is a provider of its own (`modal:WORKSPACE`).
+            let workspace = args.get("account").filter(|_| cloud == "modal").map(str::trim).filter(|w| !w.is_empty());
             let (path, fields) = match (cloud, &plane) {
                 ("aws", Plane::Aws { .. }) => ("/runners/aws-own", vec![]),
                 ("aws", _) => match args.get("region") { Some(r) => ("/aws/connect", vec![field("region", r)]), None => return usage("Say where its machines start: `superci runners create aws --region=us-east-1`.") },
-                ("modal", Plane::Modal { .. }) => ("/runners/modal-own", vec![]),
-                ("modal", _) => ("/runners/modal", vec![]),
+                ("modal", Plane::Modal { workspace: own, .. }) if workspace.is_none_or(|w| w == own) => ("/runners/modal-own", vec![]),
+                ("modal", _) => ("/runners/modal", workspace.map(|w| vec![field("account", w)]).unwrap_or_default()),
                 _ => ("/runners/cloudflare", args.get("account").map(|a| vec![field("account", a)]).unwrap_or_default()),
             };
             // (Done, it says nothing of its own.)
+            let cloud = match workspace { Some(w) if path == "/runners/modal" => format!("modal:{w}"), _ => cloud.to_string() };
             apply!(d, args, format!("let {cloud} run jobs for the control plane in use ({})", plane.place()), path, &fields);
             Ok(Done::said(format!("{cloud} runs jobs now.")))
         }
         ("runners", "delete") => {
             let cloud = w(2);
-            if !CLOUDS.contains(&cloud) { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal).") }
+            if !CLOUDS.contains(&cloud) && !cloud.starts_with("modal:") { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal, modal:WORKSPACE).") }
             let would = format!("remove {cloud} as a runner provider{}", if args.has("only-here") { ", leaving what SuperCI made for it there" } else { " and delete what SuperCI made for it there" });
             confirmed(args, &would)?;
             let mut d = ready()?;
@@ -1507,11 +1511,11 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
                 c => match CLOUDS.iter().find(|k| **k == c) { Some(k) => Some(*k), None => return Some(usage("Say which: `superci login aws`, `cloudflare` or `modal`.")) },
             };
             let mut d = signed_in();
-            // `--add`: one more AWS account beside those signed in to (a sign-in adds an account; it replaces none).
-            let add = args.has("add") && cloud == Some("aws");
+            // `--add`: one more AWS account, or Modal workspace, beside those signed in to (it replaces none).
+            let add = args.has("add") && matches!(cloud, Some("aws" | "modal"));
             let there = match cloud { Some(c) => d.signed_in_as().is_some_and(|s| s.to_lowercase().contains(c)), None => d.signed_in_as().is_some() };
             if there && !add {
-                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), if cloud == Some("aws") { " `superci login aws --add` signs in to another AWS account beside it." } else { "" });
+                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), match cloud { Some("aws") => " `superci login aws --add` signs in to another AWS account beside it.", Some("modal") => " `superci login modal --add` signs in to another Modal workspace beside it.", _ => "" });
                 return Some(Ok(()))
             }
             d.adding = add;

@@ -1121,6 +1121,43 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
     assert!((price - superci_core::plane::modal_usd_per_hour(2, 8) - 0.5904).abs() < 1e-6, "{price}");
 }
 
+/// Two Modal workspaces are two places in the order (`modal`, and `modal:<workspace>` for the one signed in to beside
+/// it), each with its own launcher, limit and spend: at the first one's limit, jobs go to the second's launcher at
+/// Modal's prices; at both, a job fails saying each. A label naming Modal may go to either.
+#[test]
+fn a_second_modal_workspace_takes_the_jobs_once_the_first_reaches_its_limit() {
+    use superci_core::plane::{job_minutes, kind_of};
+    assert_eq!((kind_of("modal:acme-two"), kind_of("modal"), kind_of("aws-on-demand"), kind_of("machine:mac")), ("modal", "modal", "aws-on-demand", "machine"));
+    // (A sandbox lives a day at most, in any workspace.)
+    assert_eq!((job_minutes(Some(30 * 60), "modal:acme-two"), job_minutes(Some(30 * 60), "aws")), (24 * 60, 30 * 60));
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://acme--superci-runners.modal.run".into() }, Launcher { cloud: "modal:acme-two".into(), url: "https://runners.acme.workers.dev".into() }];
+    let pool = |cloud: &str, usd: f64| Pool { regions: vec![], off: false, cloud: cloud.into(), max_jobs: None, monthly_usd: Some(usd) };
+    config.routing.order = vec![pool("modal", 1.0), pool("modal:acme-two", 25.0)];
+    // An hour at $2 in the first workspace this month: over its $1.
+    store.0.borrow_mut().insert("job:50".into(), serde_json::json!({ "job_id": 50, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_996_400_000u64, "ended_ms": 1_790_000_000_000u64,
+        "installation_id": 42, "cloud": "modal", "usd_per_hour": 2.0, "seen_in_progress": true }).to_string());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 51, "acme/app", None)));
+    let launched = |url: &str| clouds.calls.borrow().iter().filter(|c| c.1 == format!("{url}/launch")).count();
+    assert_eq!((job(&store, 51)["state"].as_str(), job(&store, 51)["cloud"].as_str()), (Some("launched"), Some("modal:acme-two")), "{}", job(&store, 51));
+    assert_eq!((launched("https://acme--superci-runners.modal.run"), launched("https://runners.acme.workers.dev")), (0, 1));
+    let price = job(&store, 51)["usd_per_hour"].as_f64().unwrap();
+    assert!((price - superci_core::plane::modal_usd_per_hour(2, 8)).abs() < 1e-6, "Modal's price: {price}");
+    // A label naming Modal: either workspace, as the order has them.
+    block_on(plane.handle(labelled("queued", 52, "acme/app", None, "superci/provider=modal")));
+    assert_eq!(job(&store, 52)["cloud"], "modal:acme-two", "{}", job(&store, 52));
+    // The second at its limit too: nowhere, and each says why.
+    store.0.borrow_mut().insert("job:53".into(), serde_json::json!({ "job_id": 53, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_996_400_000u64, "ended_ms": 1_790_000_000_000u64,
+        "installation_id": 42, "cloud": "modal:acme-two", "usd_per_hour": 30.0, "seen_in_progress": true }).to_string());
+    block_on(plane.handle(job_event("queued", 54, "acme/app", None)));
+    let e = job(&store, 54)["error"].as_str().unwrap_or_default().to_string();
+    assert_eq!(job(&store, 54)["state"], "failed", "{e}");
+    assert!(e.contains("Modal reached its $1 a month") && e.contains("modal:acme-two reached its $25 a month (`superci runners update modal:acme-two --monthly-usd=N` raises it)"), "{e}");
+}
+
 #[test]
 fn an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise() {
     let (store, clouds, wakes, cache, own) = (Mem::default(), Kinds { clouds: FakeClouds::default(), no_gpus: true }, Wakes::default(), Cache::default(), OwnContainers::default());
@@ -6856,6 +6893,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission,
         gpus_and_windows_get_their_own_images_types_and_prices,
         a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price,
+        a_second_modal_workspace_takes_the_jobs_once_the_first_reaches_its_limit,
         an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise,
         the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it,
         limits_make_jobs_wait_or_move_down_the_order,

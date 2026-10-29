@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.22
+- Several Modal workspaces run jobs side by side, each a runner provider of its own with its own limits and spend: `superci login modal --add` signs in to one more workspace, and `superci runners create modal --account=WORKSPACE` adds its launcher as `modal:WORKSPACE`. At one workspace's monthly limit (`superci runners update modal:WORKSPACE --monthly-usd=25`), jobs go on to the next in the order. The first workspace stays `modal`, as it was. A label naming Modal goes to any of them. Update your control plane for it.
 - A run from a computer whose workflow names `actions/checkout` by its commit (`actions/checkout@3d3c42e…`, as security guides advise) checks out the working tree as with a version (`@v4`). GitHub's runner took its own copy of GitHub's checkout, kept on the machine by that commit, which failed asking for a token. Update your control plane for it.
 - A run from a computer whose checkout names a full path inside the workspace (`path: ${{ github.workspace }}/src/github.com/acme/app`, as Go projects do) checks out there, as GitHub's checkout does; one outside the workspace is refused, saying so. The full path was put under the workspace again, so the steps after found no checkout. Update your control plane for it.
 
