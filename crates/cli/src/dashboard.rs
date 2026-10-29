@@ -3639,6 +3639,26 @@ impl Dashboard {
                         if !routing.public_repos.iter().any(|r| r.eq_ignore_ascii_case(&repo)) { routing.public_repos.push(repo) }
                     }
                     "public_remove" => { let repo = field("repo"); routing.public_repos.retain(|r| *r != repo) }
+                    // An image of the control plane's own, by the name a label gives it (`image=NAME`), or none by it.
+                    // An update changes one there is, in this one write of the routing: a job that names it never
+                    // meets a moment with no image by that name. What it does not say (its address, its Modal
+                    // Secret) stays as the control plane has it now.
+                    "image_add" | "image_update" => {
+                        if !status.as_ref().is_some_and(|s| s["runner_images"] == true) { return Ok(message(409, "Update the control plane first", "Images of your own need a newer control plane: update it on the Control plane page (or `superci planes update`), then add one.")) }
+                        let name = field("name").trim().to_string();
+                        let had = if field("action") == "image_update" {
+                            let Some(had) = routing.images.get(&name).cloned() else { return Ok(message(404, "No image by that name", &esc(&no_image(&name)))) };
+                            Some(had)
+                        } else { None };
+                        let given = |n: &str, had: Option<String>| match had { Some(h) if !form_has(n) => h, _ => field(n).trim().to_string() };
+                        let reference = given("reference", had.as_ref().map(|i| i.reference.clone()));
+                        let secret = given("modal_secret", had.as_ref().map(|i| i.modal_secret.clone().unwrap_or_default()));
+                        if let Err(e) = superci_core::spec::valid_image_name(&name) { return Ok(message(400, "Check the image's name", &esc(&e))) }
+                        if !superci_core::plane::valid_image_reference(&reference) { return Ok(message(400, "Check the image's address", "As `docker pull` takes it: ghcr.io/acme/ci:2026-10, or by its digest (ghcr.io/acme/ci@sha256:…).")) }
+                        if !secret.is_empty() && !superci_core::plane::valid_modal_secret(&secret) { return Ok(message(400, "Check the Modal Secret's name", "Letters, digits, dashes, underscores and dots, as Modal names a Secret.")) }
+                        routing.images.insert(name, superci_core::plane::RunnerImage { reference, modal_secret: Some(secret).filter(|s| !s.is_empty()) });
+                    }
+                    "image_remove" => { routing.images.remove(field("name").trim()); }
                     // The cache: on or off, what a repository keeps, how long an entry may go unused.
                     "cache_on" => routing.cache.off = field("on") != "on",
                     "cache_images" => routing.cache.images_off = field("on") != "on",
@@ -3785,7 +3805,7 @@ impl Dashboard {
                 let want = json_value(&routing);
                 self.put_secret(&plane, "ROUTING", &want.to_string())?;
                 self.shown(&plane, |s| s["routing"] == want)?;
-                Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
+                Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || field("action").starts_with("image") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
             // A run cancelled (see `superci runs cancel`), then its page again.
             ("POST", "/run/cancel") => {
@@ -5817,6 +5837,9 @@ fn setup_step(n: u8, state: &str, title: String, body: String) -> String {
 
 /// What a step of Set up waits for.
 fn setup_locked(what: &str) -> String { format!(r#"<div class="locked-note">{}Needs {what} first</div>"#, icon("lock")) }
+
+/// What is said of an image name the control plane does not have (`superci runner_images update`).
+pub fn no_image(name: &str) -> String { format!("There is no image {name} here (`superci runner_images list`). `superci runner_images create {name} --reference=REGISTRY/IMAGE:TAG` adds it.") }
 
 /// The order as a page showed it (`current`: every place, taken out ones too, by name), each with its stored settings,
 /// and any stored place the page did not show after them.
@@ -9832,6 +9855,48 @@ mod rest_tests {
         d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Globex".into())];
         let r = send(&mut d, "/runners/cloudflare", &[]).unwrap();
         assert!(r.status == 409 && words_of(&r).contains("Your Cloudflare sign-in reaches 2: Acme (a1), Globex (a2)."), "{}", words_of(&r));
+    }
+
+    #[test]
+    fn an_image_of_ones_own_is_checked_before_it_is_written_and_needs_a_control_plane_that_keeps_it() {
+        let add = |d: &mut Dashboard, name: &str, reference: &str, secret: &str| send(d, "/routing", &[("action", "image_add"), ("name", name), ("reference", reference), ("modal_secret", secret)]);
+        // A control plane from before images of one's own would drop it unsaid.
+        let mut d = modal_answering(serde_json::json!({ "routing": {} }));
+        let r = add(&mut d, "rust-ci", "ghcr.io/acme/ci:1", "").unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("Images of your own need a newer control plane"), "{}", words_of(&r));
+        let mut d = modal_answering(serde_json::json!({ "routing": {}, "runner_images": true }));
+        for (name, reference, secret, says) in [("Rust", "ghcr.io/acme/ci:1", "", "Check the image's name"), ("ubuntu-ci", "ghcr.io/acme/ci:1", "", "begins with ubuntu"),
+            ("rust-ci", "", "", "Check the image's address"), ("rust-ci", "ghcr.io/acme/ci:1 --privileged", "", "Check the image's address"), ("rust-ci", "https://ghcr.io/acme/ci", "", "Check the image's address"),
+            ("rust-ci", "ghcr.io/acme/ci:1", "a secret", "Check the Modal Secret's name")] {
+            let r = add(&mut d, name, reference, secret).unwrap();
+            assert!(r.status == 400 && words_of(&r).contains(says), "{name} {reference}: {}", words_of(&r));
+        }
+        // What can be taken stops at writing it, without a sign-in to Modal.
+        for (reference, secret) in [("ghcr.io/acme/ci:1", ""), ("ghcr.io/acme/ci@sha256:0f1e", "ghcr-read"), ("acme/node-ci:22", "")] {
+            assert_eq!(add(&mut d, "rust-ci", reference, secret).err().as_deref(), Some("Sign in with Modal first."), "{reference}");
+        }
+        assert_eq!(send(&mut d, "/routing", &[("action", "image_remove"), ("name", "rust-ci")]).err().as_deref(), Some("Sign in with Modal first."));
+    }
+
+    #[test]
+    fn an_image_changes_in_place_only_when_the_control_plane_has_it_by_that_name() {
+        let update = |d: &mut Dashboard, fields: &[(&str, &str)]| send(d, "/routing", &[&[("action", "image_update")][..], fields].concat());
+        let mut d = modal_answering(serde_json::json!({ "routing": { "images": { "rust-ci": { "reference": "ghcr.io/acme/ci:1", "modal_secret": "ghcr-read" } } }, "runner_images": true }));
+        // A name it does not have: refused, saying how to add it; nothing written.
+        let r = update(&mut d, &[("name", "gone"), ("reference", "ghcr.io/acme/ci:2")]).unwrap();
+        assert!(r.status == 404 && words_of(&r).contains("There is no image gone here (`superci runner_images list`)"), "{}", words_of(&r));
+        // What it says is checked as a new one's is; what it leaves out is kept, so it is checked too.
+        for (fields, says) in [(&[("name", "rust-ci"), ("reference", "https://ghcr.io/acme/ci")][..], "Check the image's address"), (&[("name", "rust-ci"), ("modal_secret", "a secret")], "Check the Modal Secret's name")] {
+            let r = update(&mut d, fields).unwrap();
+            assert!(r.status == 400 && words_of(&r).contains(says), "{fields:?}: {}", words_of(&r));
+        }
+        // A new tag, a Secret taken off (empty), or both: each goes as far as the one write, without a sign-in to Modal.
+        for fields in [&[("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:2")][..], &[("name", "rust-ci"), ("modal_secret", "")], &[("name", "rust-ci"), ("reference", "ghcr.io/acme/ci@sha256:0f1e"), ("modal_secret", "ghcr-other")]] {
+            assert_eq!(update(&mut d, fields).err().as_deref(), Some("Sign in with Modal first."), "{fields:?}");
+        }
+        // A control plane from before images of one's own has none to change.
+        let mut d = modal_answering(serde_json::json!({ "routing": {} }));
+        assert_eq!(update(&mut d, &[("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:2")]).unwrap().status, 409);
     }
 
     #[test]

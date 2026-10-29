@@ -756,7 +756,35 @@ pub struct Routing {
     /// The cache (see `cache`): on unless turned off, and how much it keeps.
     #[serde(default, skip_serializing_if = "cache::Settings::is_default")]
     pub cache: cache::Settings,
+    /// Images of this control plane's own, by the name a label gives (`image=NAME`): what a job's sandbox starts from
+    /// in place of GitHub's runner image, with a repository's tools in it already.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, RunnerImage>,
 }
+
+/// An image of a control plane's own, in a container registry (`ghcr.io/acme/ci:2026-10`, or by its digest), that a
+/// job's sandbox starts from on Modal. It is made FROM `ghcr.io/actions/actions-runner` (GitHub's runner at
+/// /home/runner/run.sh, which starts the job): one without the runner fails its job, saying so. Modal keeps an image
+/// by its address, so one that names a tag that is pushed again is not fetched again: a new tag, or a digest, is.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RunnerImage {
+    /// Where it is: a registry's address, as `docker pull` takes it.
+    pub reference: String,
+    /// For a private registry: the name of a Secret in the Modal workspace with REGISTRY_USERNAME and REGISTRY_PASSWORD
+    /// (Modal's names for them). Only its name is kept here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_secret: Option<String>,
+}
+
+/// Whether an image's address is one a registry could have (`ghcr.io/acme/ci:1`, `acme/ci@sha256:…`): letters, digits
+/// and `._-/:@`, not more than 255, beginning and ending with a letter or digit, and no `//` (not a web address).
+pub fn valid_image_reference(r: &str) -> bool {
+    let edge = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric());
+    (1..=255).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/:@".contains(&b)) && edge(r.as_bytes().first()) && edge(r.as_bytes().last()) && !r.contains("//")
+}
+
+/// Whether a word can be a Modal Secret's name (letters, digits, dashes, underscores and dots, up to 64, as Modal has them).
+pub fn valid_modal_secret(name: &str) -> bool { (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) }
 
 /// What the AWS account's own budget does beside its emails.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -845,6 +873,12 @@ impl Routing {
 
     /// The limits for a cloud, from its place in the order.
     pub fn pool(&self, cloud: &str) -> Option<&Pool> { self.order.iter().find(|p| p.cloud == cloud) }
+
+    /// The image of this control plane's own a machine names (`image=NAME`), or why there is none by that name.
+    pub fn image_of(&self, spec: &Spec) -> std::result::Result<Option<&RunnerImage>, String> {
+        let Some(name) = spec.own_image() else { return Ok(None) };
+        self.images.get(name).map(Some).ok_or_else(|| format!("image={name} is no image of this control plane's: give it one with `superci runner_images create {name} --reference=REGISTRY/IMAGE:TAG`"))
+    }
 }
 
 enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
@@ -1805,6 +1839,8 @@ impl<'a> ControlPlane<'a> {
             "account_limits": true,
             // (And for a day; and what the AWS account's own budget does.)
             "daily_limits": true,
+            // (And images of its own, `Routing::images`.)
+            "runner_images": true,
             "spend_today": day_spend,
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
@@ -2933,6 +2969,7 @@ impl<'a> ControlPlane<'a> {
         let result: Result<()> = async {
             let spec = match spec { Ok(s) => s, Err(e) => { intrinsic = true; return Err(e) } };
             if let Some(why) = self.config.routing.too_large(&spec) { intrinsic = true; return Err(why) }
+            let image = match self.config.routing.image_of(&spec) { Ok(i) => i, Err(why) => { intrinsic = true; return Err(why) } };
             let now = self.clock.now_ms();
             let places = match self.place(&job.repo, &spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), &job.failed_at).await? {
                 Placement::Run(p) => p,
@@ -3234,7 +3271,9 @@ impl<'a> ControlPlane<'a> {
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) } else { cloudflare_usd_per_hour(size) });
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, self.machine_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
+                        let containers = self.containers.ok_or("no containers here")?;
+                        let minutes = self.machine_minutes(&self.config.own_cloud);
+                        Ok(Tried::Started(match image { Some(i) => containers.start_from(&name, &work, minutes, size, &i.reference, i.modal_secret.as_deref()).await?, None => containers.start(&name, &work, minutes, size).await? }, machine_name(size)))
                     }.await,
                     Runner::Launcher(a) => async {
                         job.cpu = Some(size.cpu);
@@ -3244,8 +3283,17 @@ impl<'a> ControlPlane<'a> {
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
+                        // (An image of its own: where it is, and the Modal Secret that reaches a private registry.)
+                        if let Some(i) = image { body["image"] = i.reference.clone().into(); if let Some(s) = &i.modal_secret { body["image_secret"] = s.clone().into() } }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
-                        Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
+                        let id = v["id"].as_str().ok_or("launcher answered without an id")?.to_string();
+                        // A launcher from before images of one's own starts GitHub's runner image whatever it is told
+                        // (it says back no image): its sandbox is stopped, and the job says to update it.
+                        if let Some(i) = image.filter(|i| v["image"].as_str() != Some(&i.reference)) {
+                            let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
+                            return Err(format!("the {} launcher is from before images of your own, and would start GitHub's runner image in place of {}: update it (`superci runners create {}`)", cloud_name(&a.cloud), i.reference, a.cloud))
+                        }
+                        Ok(Tried::Started(id, v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
                 match tried {

@@ -40,6 +40,35 @@ runner_image = (
     .dockerfile_commands(["USER root", "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xz-utils zstd zip unzip jq git wget build-essential pkg-config && rm -rf /var/lib/apt/lists/*"])
     .env({"RUNNER_ALLOW_RUNASROOT": "1"})
 )
+
+# An image of the control plane's own (`superci runner_images`): a registry's address, made FROM GitHub's runner image
+# with what a repository's jobs use in it already. Modal makes it once and keeps it by its address (a tag pushed again is
+# not fetched again). The one thing checked is the runner, which starts the job: an image without it is not made, and
+# the job says why.
+NO_RUNNER = "test -x /home/runner/run.sh || { echo 'This image has no GitHub runner at /home/runner/run.sh: make it FROM ghcr.io/actions/actions-runner' >&2; exit 1; }"
+
+
+def job_image(reference=None, secret=None):
+    """The image a job's sandbox starts from: GitHub's runner image, or one of the control plane's own at `reference`
+    (`secret`: the name of a Modal Secret with REGISTRY_USERNAME and REGISTRY_PASSWORD, for a private registry)."""
+    if not reference:
+        return runner_image
+    return (
+        modal.Image.from_registry(reference, secret=modal.Secret.from_name(secret) if secret else None)
+        .dockerfile_commands(["USER root", f"RUN {NO_RUNNER}"])
+        .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+    )
+
+
+def image_refused(reference, e):
+    """What a job is told when Modal could not make a sandbox from an image of the control plane's own (it is not in
+    its registry, its registry is private and its Secret is missing or wrong, or it has no runner), or None when what
+    failed was not the image (a build cut short, or timed out, is tried again)."""
+    said = str(e)
+    if isinstance(e, modal.exception.NotFoundError) or (isinstance(e, modal.exception.RemoteError) and said.startswith("Image build") and " failed" in said):
+        return (f"Modal could not start from the image {reference}: Modal must be able to pull it (a private registry with a Modal Secret, "
+                f"see `superci help runner_images`), and it must be made FROM ghcr.io/actions/actions-runner. Modal: {said}")
+    return None
 state = modal.Dict.from_name(f"{NAME}-state", create_if_missing=True)
 # Each kind of record (the key up to its first colon: job, live, rline, …) in a Dict of its own, so listing one kind
 # never reads every record. Before, all were in `state`: until they are moved (`migrate`, at each sweep), what is not
@@ -155,7 +184,7 @@ class Plane:
             try:
                 sandbox = await modal.Sandbox.create.aio(
                     *runner_command(q["jit"], q.get("fail")),
-                    app=app, image=runner_image, workdir="/home/runner",
+                    app=app, image=job_image(q.get("image"), q.get("image_secret")), workdir="/home/runner",
                     # CPUs as GitHub counts them (vCPUs); Modal's are physical cores of two each. Held to what it asks
                     # for, so it is billed exactly that (Modal bills the higher of reserved and used).
                     cpu=(float(q["cpu"]) / 2,) * 2, memory=(int(q["ram_gb"]) * 1024,) * 2, timeout=int(q["max_minutes"]) * 60,
@@ -164,6 +193,11 @@ class Plane:
             except modal.exception.InvalidError as e:
                 # What was asked cannot be had (no GPUs without a payment method): said as it is, not tried again.
                 return {"error": f"Modal refused: {e}"}
+            except (modal.exception.NotFoundError, modal.exception.RemoteError) as e:
+                refused = q.get("image") and image_refused(q["image"], e)
+                if not refused:
+                    raise
+                return {"error": refused}
             return {"id": sandbox.object_id}
         if op == "sandbox_stop":
             sandbox = await modal.Sandbox.from_id.aio(q["id"])

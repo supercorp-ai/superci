@@ -11,7 +11,7 @@ use futures::executor::block_on;
 use sha2::{Digest, Sha256};
 use superci_core::crypto::{hex, hmac_sha256};
 use superci_core::github::App;
-use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule};
+use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule, RunnerImage};
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
 /// The store: kept in memory. `1`: what another request does meanwhile, run before each operation (its name and
@@ -631,6 +631,11 @@ impl Containers for OwnContainers {
         self.0.borrow_mut().push(format!("start {name} {what} {}cpu {}gb {}disk", size.cpu, size.ram_gb, size.disk_gb));
         Ok(name.to_string())
     }
+    async fn start_from(&self, name: &str, work: &superci_core::io::Work, max: u32, size: superci_core::spec::Size, image: &str, secret: Option<&str>) -> io::Result<String> {
+        self.start(name, work, max, size).await?;
+        self.0.borrow_mut().push(format!("from {image} {}", secret.unwrap_or("public")));
+        Ok(name.to_string())
+    }
     async fn stop(&self, id: &str) -> io::Result<()> { faults::container(id)?; self.0.borrow_mut().push(format!("stop {id}")); Ok(()) }
 }
 
@@ -1119,6 +1124,70 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&launch.2).unwrap()["gpu"], "T4", "any GPU: the least costly");
     let price = job(&store, 1)["usd_per_hour"].as_f64().unwrap();
     assert!((price - superci_core::plane::modal_usd_per_hour(2, 8) - 0.5904).abs() < 1e-6, "{price}");
+}
+
+#[test]
+fn an_image_of_the_control_planes_own_goes_to_modals_sandbox_by_its_name_and_elsewhere_is_refused() {
+    let images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci@sha256:0f1e".into(), modal_secret: Some("ghcr-read".into()) }), ("node".to_string(), RunnerImage { reference: "docker.io/acme/node-ci:22".into(), modal_secret: None })];
+    // (Modal's launcher says back the image it started from; one from before images of one's own says none.)
+    let old = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| (r.url == "https://runners.acme.workers.dev/launch").then(|| {
+        let image = if old.get() { serde_json::Value::Null } else { serde_json::from_str::<serde_json::Value>(body).unwrap()["image"].clone() };
+        Response::new(200, "application/json", serde_json::json!({ "id": "sb-7", "kind": "sandbox", "image": image }).to_string())
+    }));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.routing.images = images.clone().into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // Modal's launcher is told where the image is, and the Secret for its registry; a public one has none.
+    let launched = |n: usize| serde_json::from_str::<serde_json::Value>(&clouds.0.calls.borrow().iter().filter(|c| c.1 == "https://runners.acme.workers.dev/launch").nth(n).expect("launch").2).unwrap();
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=rust-ci/cpu=8")));
+    assert_eq!(job(&store, 1)["state"], "launched", "{}", job(&store, 1));
+    assert_eq!((launched(0)["image"].as_str(), launched(0)["image_secret"].as_str(), launched(0)["cpu"].as_u64()), (Some("ghcr.io/acme/ci@sha256:0f1e"), Some("ghcr-read"), Some(8)));
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/image=node")));
+    assert_eq!((launched(1)["image"].as_str(), launched(1).get("image_secret")), (Some("docker.io/acme/node-ci:22"), None));
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci")));
+    assert_eq!(launched(2).get("image"), None, "GitHub's runner image, as before");
+    // A name the control plane does not have: failed at once, saying how to add it, with no machine started.
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/image=gone")));
+    let j = job(&store, 4);
+    assert_eq!((j["state"].as_str(), j["error"].as_str()), (Some("failed"), Some("image=gone is no image of this control plane's: give it one with `superci runner_images create gone --reference=REGISTRY/IMAGE:TAG`")));
+    // (Its one machine is the runner that fails it on GitHub, saying why: GitHub's runner image.)
+    assert_eq!((clouds.0.calls.borrow().iter().filter(|c| c.1.ends_with("/launch")).count(), launched(3)["fail"].is_string(), launched(3).get("image")), (4, true, None));
+    // A launcher from before images of one's own: its sandbox (of GitHub's runner image) is stopped, and the job says to update it.
+    old.set(true);
+    block_on(plane.handle(labelled("queued", 9, "acme/app", None, "superci/image=node")));
+    let j = job(&store, 9);
+    assert!(j["error"].as_str().is_some_and(|e| e.contains("the Modal launcher is from before images of your own, and would start GitHub's runner image in place of docker.io/acme/node-ci:22: update it (`superci runners create modal`)")), "{j}");
+    assert!(clouds.0.calls.borrow().iter().any(|c| c.1 == "https://runners.acme.workers.dev/stop" && c.2.contains("sb-7")), "its sandbox stopped");
+    let clouds = FakeClouds::default();
+    // A Modal control plane's own sandbox starts from it too.
+    let (store, own) = (Mem::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "modal".into());
+    config.routing.images = images.clone().into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 5, "acme/app", None, "superci/image=rust-ci")));
+    assert_eq!(job(&store, 5)["state"], "launched", "{}", job(&store, 5));
+    assert!(own.0.borrow().iter().any(|c| c == "from ghcr.io/acme/ci@sha256:0f1e ghcr-read"), "{:?}", own.0.borrow());
+    // AWS's machines and Cloudflare's containers start from no such image: said, not tried.
+    let (store, own) = (Mem::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "cloudflare".into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.images = images.into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 6, "acme/app", None, "superci/image=rust-ci")));
+    let j = job(&store, 6);
+    assert_eq!(j["state"], "failed", "{j}");
+    let e = j["error"].as_str().unwrap();
+    assert_eq!(e, "nowhere to run image rust-ci: AWS runs no images of your own (image=rust-ci: Modal only); AWS on-demand runs no images of your own (image=rust-ci: Modal only); Cloudflare runs no images of your own (image=rust-ci: Modal only)");
+    // (Only the runner that fails it on GitHub was started.)
+    assert!(own.0.borrow().iter().all(|c| c.contains(" fail ")) && !clouds.calls.borrow().iter().any(|c| c.2.contains("RunInstances")), "{:?}", own.0.borrow());
 }
 
 #[test]
@@ -6856,6 +6925,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission,
         gpus_and_windows_get_their_own_images_types_and_prices,
         a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price,
+        an_image_of_the_control_planes_own_goes_to_modals_sandbox_by_its_name_and_elsewhere_is_refused,
         an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise,
         the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it,
         limits_make_jobs_wait_or_move_down_the_order,

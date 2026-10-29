@@ -72,14 +72,21 @@ impl Timer for Bridge {
 /// The jobs' sandboxes, started by plane.py with Modal's client (no token needed inside Modal).
 struct Sandboxes<'a>(&'a Bridge);
 
-#[async_trait(?Send)]
-impl Containers for Sandboxes<'_> {
-    async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> {
+impl Sandboxes<'_> {
+    /// One, from GitHub's runner image or an image of the control plane's own (`image`, with the Modal Secret for its
+    /// registry).
+    fn sandbox(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: Option<&str>, secret: Option<&str>) -> io::Result<String> {
         // Placement keeps GitLab jobs (Docker) away from Modal's sandboxes.
         let (jit, fail) = match work { Work::GitHub { jit } => (jit, None), Work::Fail { jit, why } => (jit, Some(why)), Work::GitLab { .. } => return Err("Modal runs no Docker for GitLab jobs".into()) };
-        let a = self.0.ask(json!({ "op": "sandbox_start", "name": name, "jit": jit, "fail": fail, "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "gpu": size.gpu.map(str::to_uppercase) }))?;
+        let a = self.0.ask(json!({ "op": "sandbox_start", "name": name, "jit": jit, "fail": fail, "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "gpu": size.gpu.map(str::to_uppercase), "image": image, "image_secret": secret }))?;
         a["id"].as_str().map(str::to_string).ok_or_else(|| "no sandbox id".to_string())
     }
+}
+
+#[async_trait(?Send)]
+impl Containers for Sandboxes<'_> {
+    async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, None, None) }
+    async fn start_from(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: &str, secret: Option<&str>) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, Some(image), secret) }
     async fn stop(&self, id: &str) -> io::Result<()> { self.0.ask(json!({ "op": "sandbox_stop", "id": id })).map(|_| ()) }
 }
 
