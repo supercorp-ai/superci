@@ -22,6 +22,18 @@ const CLIENT_TYPE: &str = "9";
 /// deploy creates one in a workspace that has none of SuperCI's yet. When Modal comes to stop taking a release, it says
 /// so beside its answers first (see `heard`).
 const LIBMODAL_VERSION: &str = "modal-go/0.11.1";
+/// Modal's Python client the deploys run (`modal deploy` in a sandbox, and so the control plane's and launchers' own
+/// client), and the image builder version every image is built with, the deploy's and theirs (`MODAL_IMAGE_BUILDER_VERSION`):
+/// tested together. A client builds with the workspace's own version unless told, and refuses one newer than it knows,
+/// which is any new workspace's once Modal has a newer one ("This version of the modal client supports the following
+/// image builder versions": 1.6.0 in a workspace on 2026.10). Told, every workspace builds alike, however old or new.
+/// scripts/modal-drift.py holds the pair to Modal's: the version among the client's, and none newer out.
+const MODAL_CLIENT: &str = "1.6.3";
+const IMAGE_BUILDER: &str = "2026.10";
+
+/// The image `modal` runs in for a deploy: Python with Modal's client.
+fn setup_image() -> pb::Image { pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), format!("RUN pip install --no-cache-dir modal=={MODAL_CLIENT}")] } }
+
 /// What this client says it is, on every call: Modal's Go SDK of a release (see `LIBMODAL_VERSION`), behaving like its
 /// Python client 1.0.0, as the Go SDK says. None is a secret: a recording keeps them, as sent (see `record`).
 const SAYS: [(&str, &str); 4] = [("x-modal-client-type", CLIENT_TYPE), ("x-modal-client-version", "1.0.0"), ("x-modal-libmodal-version", LIBMODAL_VERSION), ("x-modal-host", "api.modal.com")];
@@ -284,7 +296,7 @@ pub fn deploy_runners(session: &Session, plane_url: &str, plane_id: &str, keys: 
     let name = format!("superci-runners-{plane_id}");
     let trust = serde_json::json!({ "issuer": plane_url, "subject": format!("plane:{plane_id}"), "keys": keys });
     use base64::Engine;
-    let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode(trust.to_string())).replace("__NAME__", &name);
+    let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode(trust.to_string())).replace("__NAME__", &name).replace("__IMAGE_BUILDER__", IMAGE_BUILDER);
     let suffix = modal_deploy(session, &launcher, None)?;
     Ok(format!("https://{}--{name}.{suffix}", session.workspace))
 }
@@ -300,7 +312,7 @@ pub const DEPLOY_STEPS: [&str; 3] = ["Building its images in your workspace", "D
 pub fn deploy_plane(session: &Session, plane_id: &str, label: &str, step: &dyn Fn(usize)) -> Result<String> {
     step(0);
     let name = plane_app(plane_id);
-    let script = include_str!("modal_plane.py").replace("__NAME__", &name).replace("__PLANE_ID__", plane_id).replace("__LABEL__", label);
+    let script = include_str!("modal_plane.py").replace("__NAME__", &name).replace("__PLANE_ID__", plane_id).replace("__LABEL__", label).replace("__IMAGE_BUILDER__", IMAGE_BUILDER);
     let suffix = modal_deploy(session, &script, Some(PLANE_BINARY))?;
     step(1);
     Ok(format!("https://{}--{name}.{suffix}", session.workspace))
@@ -407,8 +419,8 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
     let app: pb::AppGetOrCreateResponse = c.unary("AppGetOrCreate", pb::AppGetOrCreateRequest { app_name: "superci-setup".into(), environment_name: String::new(), object_creation_type: 1 })?;
     // An image with Modal's own client, to run `modal deploy` from.
     let image: pb::ImageGetOrCreateResponse = c.unary("ImageGetOrCreate", pb::ImageGetOrCreateRequest {
-        image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.3".into()] }),
-        app_id: app.app_id.clone(), builder_version: settings.image_builder_version.clone(),
+        image: Some(setup_image()),
+        app_id: app.app_id.clone(), builder_version: IMAGE_BUILDER.into(),
     })?;
     let mut result = image.result.filter(|r| r.status != 0);
     let mut last = String::new();
@@ -428,6 +440,7 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
     let mut vars = std::collections::HashMap::new();
     vars.insert("MODAL_TOKEN_ID".to_string(), session.token_id.clone());
     vars.insert("MODAL_TOKEN_SECRET".to_string(), session.token_secret.clone());
+    vars.insert("MODAL_IMAGE_BUILDER_VERSION".to_string(), IMAGE_BUILDER.to_string());
     let receive = if file.is_some() { "base64 -d > /tmp/superci-plane && " } else { "" };
     let sandbox: pb::SandboxCreateResponse = c.unary("SandboxCreate", pb::SandboxCreateRequest { app_id: app.app_id, definition: Some(pb::Sandbox {
         entrypoint_args: vec!["sh".into(), "-c".into(), format!("IFS= read -r script && printf %s \"$script\" | base64 -d > /tmp/app.py && {receive}cd /tmp && {command}")],
@@ -548,7 +561,7 @@ mod answers {
         let heard_now = |warning: &str, call: &mut dyn FnMut()| { *aws.modal_warning.lock().unwrap() = Some(warning.into()); call(); said() };
         with(&aws.url, || {
             let mut c = Client::new(Some(session())).unwrap();
-            let mut join = |c: &mut Client| c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 10);
+            let join = |c: &mut Client| c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 10);
             // Answered: as Modal meant it, once each however often it is said.
             let heard = heard_now("modal-go%200.11.1%20is%20deprecated%2C%20upgrade%20by%202027-01-01, 100%ZZ, , 5%2Z", &mut || { let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap(); });
             assert!(heard.contains(&"modal-go 0.11.1 is deprecated, upgrade by 2027-01-01".to_string()) && heard.contains(&"100%ZZ".to_string()) && heard.contains(&"5%2Z".to_string()) && !heard.contains(&String::new()), "{heard:?}");
@@ -673,6 +686,7 @@ mod answers {
 
 #[cfg(test)]
 mod tests {
+    use super::{setup_image, IMAGE_BUILDER, MODAL_CLIENT};
     /// The bytes Python's pickle (protocol 4, as Modal's client uses) gives a string, checked against Python if present.
     #[test]
     fn strings_pickle_as_modal_writes_them() {
@@ -697,7 +711,7 @@ def say(*a): print(*a, file=sys.stderr, flush=True)
 app = modal.App.lookup("superci-leaktest", create_if_missing=True)
 d = modal.Dict.from_name("superci-leaktest-probe", create_if_missing=True)
 d["secret"] = "visible"
-probe = modal.Sandbox.create("python", "-c", "import modal\ntry:\n    print('PROBE read:', modal.Dict.from_name('superci-leaktest-probe').get('secret'))\nexcept Exception as e:\n    print('PROBE blocked:', type(e).__name__, str(e)[:160])", app=app, image=modal.Image.debian_slim().pip_install("modal==1.6.3"), timeout=300)
+probe = modal.Sandbox.create("python", "-c", "import modal\ntry:\n    print('PROBE read:', modal.Dict.from_name('superci-leaktest-probe').get('secret'))\nexcept Exception as e:\n    print('PROBE blocked:', type(e).__name__, str(e)[:160])", app=app, image=modal.Image.debian_slim().pip_install("modal==__MODAL_CLIENT__"), timeout=300)
 probe.wait(raise_on_termination=False)
 say(probe.stdout.read().strip())
 try:
@@ -737,18 +751,18 @@ except Exception as e:
                 seen
             });
             let mut c = Client::new(Some(session.clone())).unwrap();
-            let env: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap();
-            let settings = env.metadata.and_then(|m| m.settings).unwrap_or_default();
+            let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap();
             let app: pb::AppGetOrCreateResponse = c.unary("AppGetOrCreate", pb::AppGetOrCreateRequest { app_name: "superci-setup".into(), environment_name: String::new(), object_creation_type: 1 }).unwrap();
             let image: pb::ImageGetOrCreateResponse = c.unary("ImageGetOrCreate", pb::ImageGetOrCreateRequest {
-                image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.3".into()] }),
-                app_id: app.app_id.clone(), builder_version: settings.image_builder_version.clone(),
+                image: Some(setup_image()),
+                app_id: app.app_id.clone(), builder_version: IMAGE_BUILDER.into(),
             }).unwrap();
             use base64::Engine;
             let mut vars = std::collections::HashMap::new();
             vars.insert("MODAL_TOKEN_ID".to_string(), session.token_id.clone());
             vars.insert("MODAL_TOKEN_SECRET".to_string(), session.token_secret.clone());
-            vars.insert("SCRIPT".to_string(), base64::engine::general_purpose::STANDARD.encode(script));
+            vars.insert("SCRIPT".to_string(), base64::engine::general_purpose::STANDARD.encode(script.replace("__MODAL_CLIENT__", MODAL_CLIENT)));
+            vars.insert("MODAL_IMAGE_BUILDER_VERSION".to_string(), IMAGE_BUILDER.to_string());
             vars.insert("JIT".to_string(), idle.jit.clone());
             let sandbox: pb::SandboxCreateResponse = c.unary("SandboxCreate", pb::SandboxCreateRequest { app_id: app.app_id, definition: Some(pb::Sandbox {
                 entrypoint_args: vec!["sh".into(), "-c".into(), "echo \"$SCRIPT\" | base64 -d > /tmp/t.py && python /tmp/t.py".into()],
@@ -785,17 +799,17 @@ except Exception as e:
         use super::{pb, Client};
         use base64::Engine;
         let mut c = Client::new(Some(session.clone())).unwrap();
-        let env: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap();
-        let settings = env.metadata.and_then(|m| m.settings).unwrap_or_default();
+        let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap();
         let app: pb::AppGetOrCreateResponse = c.unary("AppGetOrCreate", pb::AppGetOrCreateRequest { app_name: "superci-setup".into(), environment_name: String::new(), object_creation_type: 1 }).unwrap();
         let image: pb::ImageGetOrCreateResponse = c.unary("ImageGetOrCreate", pb::ImageGetOrCreateRequest {
-            image: Some(pb::Image { dockerfile_commands: vec!["FROM python:3.12-slim".into(), "RUN pip install --no-cache-dir modal==1.6.3".into()] }),
-            app_id: app.app_id.clone(), builder_version: settings.image_builder_version.clone(),
+            image: Some(setup_image()),
+            app_id: app.app_id.clone(), builder_version: IMAGE_BUILDER.into(),
         }).unwrap();
         let mut env_vars: std::collections::HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         env_vars.insert("MODAL_TOKEN_ID".into(), session.token_id.clone());
         env_vars.insert("MODAL_TOKEN_SECRET".into(), session.token_secret.clone());
         env_vars.insert("SCRIPT".into(), base64::engine::general_purpose::STANDARD.encode(script));
+        env_vars.insert("MODAL_IMAGE_BUILDER_VERSION".into(), IMAGE_BUILDER.into());
         let sandbox: pb::SandboxCreateResponse = c.unary("SandboxCreate", pb::SandboxCreateRequest { app_id: app.app_id, definition: Some(pb::Sandbox {
             entrypoint_args: vec!["sh".into(), "-c".into(), "echo \"$SCRIPT\" | base64 -d > /tmp/t.py && python /tmp/t.py".into()],
             image_id: image.image_id, resources: Some(pb::Resources { memory_mb: 1024, milli_cpu: 1000 }), timeout_secs: 600,

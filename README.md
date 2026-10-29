@@ -63,7 +63,7 @@ The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS,
 ## Contributors
 
 - [Domas Bitvinskas](https://github.com/Nedomas)
-- [Taras Kornichuk](https://github.com/artile): Modal deploys in a new workspace and Modal sign-ins ([#2](https://github.com/supercorp-ai/superci/pull/2))
+- [Taras Kornichuk](https://github.com/artile): Modal deploys in a new workspace and Modal sign-ins ([#2](https://github.com/supercorp-ai/superci/pull/2), [#7](https://github.com/supercorp-ai/superci/pull/7))
 
 ## License
 

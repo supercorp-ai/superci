@@ -11,6 +11,11 @@ import subprocess
 import time
 import warnings
 
+# The image builder version every image here is built with (the runner's too), whatever the workspace's own is: the one
+# SuperCI's Modal client was tested with (`IMAGE_BUILDER` in modal.rs). A client refuses a newer one than it knows, and
+# a new workspace has Modal's newest. Read by Modal's client, so before it is imported.
+os.environ["MODAL_IMAGE_BUILDER_VERSION"] = "__IMAGE_BUILDER__"
+
 import modal
 
 

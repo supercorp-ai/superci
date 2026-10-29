@@ -503,6 +503,34 @@ fn modal_refuses(method: &str, headers: &http::HeaderMap, message: &[u8]) -> Opt
         .then(|| (9, "Could not determine the SDK version for client type CLIENT_TYPE_LIBMODAL_GO, so it cannot be used to create new apps.".to_string()))
 }
 
+/// What Modal's Python client says when it is to build with an image builder version newer than it knows (1.6.0 in a
+/// workspace on 2026.10, as it said on 2026-10-29): the test kit's workspace stands for one on a version no client knows
+/// yet, as every new workspace comes to be. A client told which to build with (`MODAL_IMAGE_BUILDER_VERSION`) builds.
+pub const MODAL_BUILDER_REFUSED: &str = "This version of the modal client supports the following image builder versions: {'2025.06', '2026.10'}. You are using '2099.01'. Please update your client library.";
+
+/// What Modal's client in a sandbox, or in an app it deploys, refuses: running `modal` (a deploy) without being told
+/// which image builder version to build with, or a script whose `import modal` comes before it is told (the app
+/// builds its runner's image as it runs). `asked` is `SandboxCreate`'s request, or `SandboxStdinWrite`'s (the script
+/// comes first on a sandbox's input, in base64).
+fn modal_builder_refuses(method: &str, asked: &[u8]) -> bool {
+    use base64::Engine;
+    let field = |m: &[u8], no: u64| -> Vec<Vec<u8>> { proto_fields(m).into_iter().filter(|(n, _, _)| *n == no).map(|(_, _, b)| b).collect() };
+    match method {
+        "SandboxCreate" => field(asked, 2).first().is_some_and(|definition| {
+            let runs_modal = field(definition, 1).iter().any(|a| String::from_utf8_lossy(a).contains("modal "));
+            let told = field(definition, 40).iter().flat_map(|map| field(map, 1)).any(|entry| field(&entry, 1).first().is_some_and(|k| k == b"MODAL_IMAGE_BUILDER_VERSION"));
+            runs_modal && !told
+        }),
+        "SandboxStdinWrite" => field(asked, 2).first().and_then(|input| input.split(|b| *b == b'\n').next().map(<[u8]>::to_vec))
+            .and_then(|line| base64::engine::general_purpose::STANDARD.decode(line).ok()).is_some_and(|script| {
+                let script = String::from_utf8_lossy(&script);
+                let (told, imported) = (script.find("os.environ[\"MODAL_IMAGE_BUILDER_VERSION\"] = \"20"), script.find("\nimport modal"));
+                imported.is_some_and(|i| told.is_none_or(|t| t > i))
+            }),
+        _ => false,
+    }
+}
+
 /// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
 pub fn ec2_error(code: &str, message: &str) -> String {
     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response><Errors><Error><Code>{code}</Code><Message>{message}</Message></Error></Errors><RequestID>00000000-0000-4000-8000-00000000e001</RequestID></Response>")
@@ -529,7 +557,8 @@ impl Aws {
         if self.faults.call(format!("POST {url}")).is_some() { return (vec![], Some((13, "internal error".to_string()))) }
         // (What Modal refuses whatever a recording has: a client it cannot tell the version of; and a client that says
         // it is another than the one recorded.)
-        if let Some((code, message)) = modal_refuses(method, headers, message).or_else(|| self.modal_sent_differs(&url, headers).map(|m| (3, m))) {
+        if let Some((code, message)) = modal_refuses(method, headers, message).or_else(|| self.modal_sent_differs(&url, headers).map(|m| (3, m)))
+            .or_else(|| modal_builder_refuses(method, message).then(|| (9, MODAL_BUILDER_REFUSED.to_string()))) {
             self.asked.lock().unwrap().push(json!({ "method": "POST", "url": url, "target": "", "asked": asked, "status": 500, "answer": json!({ "error": format!("Modal {method}: {message}") }).to_string() }));
             return (vec![], Some((code, message)))
         }
