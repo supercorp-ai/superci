@@ -522,6 +522,12 @@ const LIVE_AFTER_MS: u64 = 30 * 60_000;
 const RUNNER_KEPT_MS: u64 = MAX_JOB_MINUTES as u64 * 60_000 + 86_400_000;
 /// Where it is said that the jobs' indexes are complete.
 const INDEXED: &str = "indexed";
+/// The newest jobs, by when each was made and its id, the newest last, in one record: read whole, where the newest of
+/// the `recent:` index would be read by listing all of it on a store that cannot read the last few of a kind (a
+/// Modal Dict, a Durable Object's storage), ninety days of jobs at every status. As many as the most read at once
+/// (cancelling a GitHub run looks among the newest 200).
+const NEWEST: &str = "newest";
+const NEWEST_KEPT: usize = 200;
 /// Set once the runs of jobs counted before runs were are counted (`recount_runs`).
 const RUNS_COUNTED: &str = "runs-counted";
 /// How long a day's totals are kept.
@@ -565,6 +571,19 @@ impl Hour {
 
 /// Where a day's totals are kept: by the day's number since the epoch, so they sort by time.
 pub fn day_key(day: u64) -> String { format!("day:{day:06}") }
+
+/// What machines cost this month and today, by place, from each day's spend by place (days before this month left out).
+fn month_and_day(now: u64, by_day: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>) -> (HashMap<String, f64>, HashMap<String, f64>) {
+    let (month_day, today) = (month_start_ms(now) / 86_400_000, now / 86_400_000);
+    let (mut month, mut day) = (HashMap::new(), HashMap::new());
+    for (d, by) in by_day.into_iter().filter(|(d, _)| *d >= month_day) {
+        for (place, usd) in by {
+            *month.entry(place.clone()).or_insert(0.0) += usd;
+            if d == today { *day.entry(place).or_insert(0.0) += usd }
+        }
+    }
+    (month, day)
+}
 
 /// What one job adds to its hour (the hour it was queued in, counted from the epoch), as it stands at `now`.
 pub fn hour_of(j: &Job, host_price: f64, now: u64) -> (u64, Hour) {
@@ -1767,11 +1786,13 @@ impl<'a> ControlPlane<'a> {
         for gl in self.config.gitlabs() { gitlabs.push(serde_json::json!({ "id": gl.id, "url": gl.url, "scopes": self.gitlab_scopes(gl).await })) }
         // The newest fifty jobs; the ones still going; what this month and today cost.
         let jobs = self.newest_jobs(50).await?;
-        let live: Vec<Job> = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect();
-        let (month_spend, day_spend) = self.spend().await?;
-        // What jobs used over a day, a week and 30 days, beside what the code host's runners would have charged.
+        // (The jobs still going and the days' totals read once: thirty-one days hold this month's.)
+        let live_kept = self.live_jobs().await?;
+        let (hours, by_day) = self.hours_with(31, &live_kept).await?;
+        let live: Vec<Job> = live_kept.into_iter().map(|(_, j)| j).collect();
         let now = self.clock.now_ms();
-        let (hours, _) = self.hours(31).await?;
+        let (month_spend, day_spend) = month_and_day(now, by_day);
+        // What jobs used over a day, a week and 30 days, beside what the code host's runners would have charged.
         let usage: serde_json::Map<String, serde_json::Value> = USAGE_PERIODS.iter().map(|(name, step, steps)| (name.to_string(), usage_of(&hours, now, *step, *steps))).collect();
         // Each with what its machine said of its own start, where one did (kept apart: see `MachineStart`).
         let hello_keys: Vec<String> = jobs.iter().map(|j| format!("hello:{}", job_key(j).trim_start_matches("job:"))).collect();
@@ -2683,14 +2704,51 @@ impl<'a> ControlPlane<'a> {
             all.truncate(n);
             return Ok(all)
         }
-        // (`recent:<when>:<id>`.)
-        let keys: Vec<String> = self.store.list_last("recent:", n).await?.into_iter().rev().map(|(k, _)| format!("job:{}", k.splitn(3, ':').nth(2).unwrap_or_default())).collect();
+        let (was, newest) = self.newest().await?;
+        // (One made from the `recent:` index, kept, so that the next is read at once.)
+        if was.is_none() && !newest.is_empty() { self.store.put_if_absent(NEWEST, crate::io::json(&newest)).await?; }
+        let keys: Vec<String> = newest.iter().rev().take(n).map(|(_, id)| format!("job:{id}")).collect();
         Ok(self.store.get_many(&keys).await?.into_iter().flatten().filter_map(|v| serde_json::from_str(&v).ok()).collect())
+    }
+
+    /// The newest jobs' record (see `NEWEST`) as kept, and what it holds; one never kept yet (a control plane from before
+    /// it), made from the `recent:` index: its newest, listed once.
+    async fn newest(&self) -> Result<(Option<String>, Vec<(u64, String)>)> {
+        let was = self.store.get(NEWEST).await?;
+        let newest = match was.as_deref().map(serde_json::from_str::<Vec<(u64, String)>>) {
+            Some(read) => read.map_err(|e| format!("{NEWEST}: {e}"))?,
+            // (`recent:<when>:<id>`.)
+            None => self.store.list_last("recent:", NEWEST_KEPT).await?.into_iter()
+                .filter_map(|(k, _)| { let mut p = k.splitn(3, ':').skip(1); Some((p.next()?.parse().ok()?, p.next()?.to_string())) }).collect(),
+        };
+        Ok((was, newest))
+    }
+
+    /// A new job among the newest (see `NEWEST`), written over what was read (a request made another meanwhile: read
+    /// again).
+    async fn note_newest(&self, at_ms: u64, id: &str) -> Result<()> {
+        for _ in 0..8 {
+            let (was, mut newest) = self.newest().await?;
+            // (One made from the index has it already: kept, then.)
+            let has = newest.iter().any(|(_, i)| i == id);
+            if has && was.is_some() { return Ok(()) }
+            if !has { newest.push((at_ms, id.to_string())) }
+            newest.sort();
+            let newest = newest.split_off(newest.len().saturating_sub(NEWEST_KEPT));
+            if self.store.swap(NEWEST, was.as_deref(), crate::io::json(&newest)).await? { return Ok(()) }
+        }
+        Err("the newest jobs' record kept being written by other requests".into())
     }
 
     /// Each hour's totals over the last `days` days and today, from each day's (jobs still going counted as they
     /// stand now), by the hour since the epoch; and each day's spend by place.
     async fn hours(&self, days: u64) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
+        let live = if self.indexed().await { self.live_jobs().await? } else { vec![] };
+        self.hours_with(days, &live).await
+    }
+
+    /// The same, with the jobs still going as read already (see `live_jobs`; none needed before the indexes).
+    async fn hours_with(&self, days: u64, live: &[(String, Job)]) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
         let now = self.clock.now_ms();
         let today = now / 86_400_000;
         let (mut hours, mut spend) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::<u64, std::collections::BTreeMap<String, f64>>::new());
@@ -2711,24 +2769,15 @@ impl<'a> ControlPlane<'a> {
             let s = spend.entry(day).or_default();
             for (place, usd) in d.spend { *s.entry(place).or_insert(0.0) += usd }
         }
-        for (_, j) in self.live_jobs().await? { if j.counted_usd.is_none() && j.at_ms >= (today - days) * 86_400_000 { add(&j, &mut hours, &mut spend) } }
+        for (_, j) in live { if j.counted_usd.is_none() && j.at_ms >= (today - days) * 86_400_000 { add(j, &mut hours, &mut spend) } }
         Ok((hours, spend))
     }
 
     /// What machines cost this month and today, by place (see `place_of`).
     async fn spend(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
         let now = self.clock.now_ms();
-        let (month_day, today) = (month_start_ms(now) / 86_400_000, now / 86_400_000);
-        let (_, spend) = self.hours(today - month_day).await?;
-        let (mut month, mut day) = (HashMap::new(), HashMap::new());
-        for (d, by) in spend {
-            for (place, usd) in by {
-                // (Every day `hours` gives is of this month: it is asked from the month's first day on.)
-                *month.entry(place.clone()).or_insert(0.0) += usd;
-                if d == today { *day.entry(place).or_insert(0.0) += usd }
-            }
-        }
-        Ok((month, day))
+        let (_, spend) = self.hours((now - month_start_ms(now)) / 86_400_000).await?;
+        Ok(month_and_day(now, spend))
     }
 
     /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
@@ -2783,6 +2832,8 @@ impl<'a> ControlPlane<'a> {
         else { self.store.put_until(&format!("live:{id}"), String::new(), now + LIVE_AFTER_MS).await? }
         if new {
             self.store.put_until(&format!("recent:{:013}:{id}", j.at_ms), String::new(), j.at_ms + JOB_KEPT_MS).await?;
+            // (Not put in it, the record goes: the next read makes it again from the index, this job among them.)
+            if self.note_newest(j.at_ms, id).await.is_err() { self.store.delete(NEWEST).await? }
             // A repository's newest job of GitHub's, for the look for jobs GitHub never told of (two weeks of them).
             if j.provider.is_empty() {
                 let at = format!("repo:{}", j.repo);

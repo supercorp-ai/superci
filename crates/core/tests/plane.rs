@@ -6986,11 +6986,14 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first,
-        what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten
+        what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten,
+        the_newest_jobs_are_read_from_one_record_made_once_from_the_index
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
-        "a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done", "a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner", "every_test_here_holds_with_each_call_and_store_operation_failing"];
+        "a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done", "a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner", "every_test_here_holds_with_each_call_and_store_operation_failing",
+        // (And one that measures, over a thousand jobs: a fault would only make it slower.)
+        "a_busy_request_costs_the_same_however_many_jobs_are_kept_and_fits_what_waits_for_it"];
     let all: Vec<&str> = include_str!("plane.rs").split("#[test]\nfn ").skip(1).filter_map(|t| t.split('(').next()).collect();
     let missing: Vec<&&str> = all.iter().filter(|t| !stepping.contains(t) && !tests.iter().any(|(n, _)| n == *t)).collect();
     assert!(missing.is_empty(), "tests not in the sweep: {missing:?}");
@@ -7086,4 +7089,134 @@ fn what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_stat
     block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
     let j = job(&store, 7);
     assert!(j["state"] != "launched" && j["error"].as_str().is_some_and(|e| e.contains("modal launcher: expected value")), "{j}");
+}
+
+/// A store that counts round trips as a Modal control plane makes them (its store the slowest: some 120 ms each; a read
+/// of several records one, a swap a read and a write) and the records each list gives.
+struct Trips<'a> { inner: &'a Mem, trips: std::cell::Cell<usize>, listed: std::cell::Cell<usize> }
+impl Trips<'_> {
+    /// The round trips and records listed since last taken.
+    fn take(&self) -> (usize, usize) { (self.trips.replace(0), self.listed.replace(0)) }
+    fn trip(&self, n: usize) { self.trips.set(self.trips.get() + n) }
+}
+#[async_trait(?Send)]
+impl Store for Trips<'_> {
+    async fn get(&self, k: &str) -> io::Result<Option<String>> { self.trip(1); self.inner.get(k).await }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.trip(1); self.inner.put(k, v).await }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.trip(1); self.inner.put_if_absent(k, v).await }
+    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> { self.trip(2); self.inner.swap(k, was, v).await }
+    async fn delete(&self, k: &str) -> io::Result<()> { self.trip(1); self.inner.delete(k).await }
+    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { self.trip(1); let l = self.inner.list(p).await?; self.listed.set(self.listed.get() + l.len()); Ok(l) }
+    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
+        self.trip(1);
+        let mut out = vec![];
+        for k in keys { out.push(self.inner.get(k).await?) }
+        Ok(out)
+    }
+}
+
+/// A runtime that answers first and does what was left after (as AWS's and Modal's do: see `Timer::later`).
+#[derive(Default)]
+struct AnswersFirst(Wakes, RefCell<Vec<String>>);
+#[async_trait(?Send)]
+impl Timer for AnswersFirst {
+    async fn wake_in(&self, ms: u64) -> io::Result<()> { self.0.wake_in(ms).await }
+    async fn pause(&self, ms: u64) { self.0.pause(ms).await }
+    fn later(&self, what: &str) -> bool { self.1.borrow_mut().push(what.to_string()); true }
+}
+
+/// What each busy request costs, as a Modal control plane pays it (round trips to its store, and records listed), with
+/// a hundred jobs kept and with a thousand: what GitHub waits for (ten seconds, then the delivery failed) in under a
+/// third of that, a job's start after its answer, the status the CLI waits for, a sweep; and nothing listed growing with
+/// the jobs kept (a store that cannot read the last few of a kind, as Modal's Dicts and a Durable Object's, lists all).
+#[test]
+fn a_busy_request_costs_the_same_however_many_jobs_are_kept_and_fits_what_waits_for_it() {
+    // (At some 120 ms a round trip: 25 are three seconds.)
+    let budgets = [("a job queued, answered", 25), ("its start, after the answer", 60), ("in progress", 25), ("completed", 25), ("a sweep", 60), ("the status", 20)];
+    let mut at = vec![];
+    for n in [100u64, 1000] {
+        let (mem, clouds, timer, cache) = (Mem::default(), FakeClouds::default(), AnswersFirst::default(), Cache::default());
+        let store = Trips { inner: &mem, trips: Default::default(), listed: Default::default() };
+        // (A job every two hours, up to now: the oldest of a thousand some 83 days back, within what is kept.)
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000 - n * 2 * 3_600_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        // (Ends kept beside the records by plane.py, a write and its end the Dict's calls side by side: one round trip.)
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &timer, config: &config, cache: &cache, containers: None };
+        let left = || loop {
+            let Some(what) = ({ let mut l = timer.1.borrow_mut(); (!l.is_empty()).then(|| l.remove(0)) }) else { break };
+            block_on(plane.later(PLANE_URL, &what)).unwrap();
+        };
+        block_on(plane.alarm()).unwrap();
+        let mut costs = vec![];
+        for id in 1..=n {
+            let runner = format!("superci-{PLANE_ID}-{id}");
+            store.take();
+            block_on(plane.handle(job_event("queued", id, "acme/app", None)));
+            let queued = store.take();
+            left();
+            let start = store.take();
+            block_on(plane.handle(job_event("in_progress", id, "acme/app", Some(&runner))));
+            let running = store.take();
+            block_on(plane.handle(job_event("completed", id, "acme/app", Some(&runner))));
+            let done = store.take();
+            assert_eq!(job(&mem, id)["state"], "done");
+            costs = vec![queued, start, running, done];
+            clock.0.set(clock.0.get() + 2 * 3_600_000);
+            if id % 50 == 0 { block_on(plane.alarm()).unwrap(); }
+        }
+        store.take();
+        block_on(plane.alarm()).unwrap();
+        costs.push(store.take());
+        assert_eq!(block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))).status, 200);
+        costs.push(store.take());
+        for ((what, budget), (trips, _)) in budgets.iter().zip(&costs) { assert!(trips <= budget, "{what} with {n} jobs: {trips} round trips (budget {budget}): {costs:?}") }
+        at.push(costs);
+    }
+    for (i, (what, _)) in budgets.iter().enumerate() {
+        assert!(at[1][i].1 <= at[0][i].1, "{what} lists {} records with a thousand jobs kept, {} with a hundred: it grows with them", at[1][i].1, at[0][i].1);
+    }
+}
+
+/// The newest jobs, read from one record: made once from the `recent:` index where a control plane from before it has
+/// none (the status lists the index then, and not after); a job is put in it over what another request wrote meanwhile
+/// (read again); written over each time, the record goes, to be made again; a record that is not one is said as that.
+#[test]
+fn the_newest_jobs_are_read_from_one_record_made_once_from_the_index() {
+    let (mem, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &mem, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let status = || json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    block_on(plane.alarm()).unwrap();
+    for id in 1..=3 { block_on(plane.handle(job_event("queued", id, "acme/app", None))); }
+    let newest = || serde_json::from_str::<Vec<(u64, String)>>(&mem.0.borrow()["newest"]).unwrap().into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+    assert_eq!(newest(), ["1", "2", "3"]);
+    // A control plane from before the record: its status makes it from the index, once.
+    mem.0.borrow_mut().remove("newest");
+    let jobs = |s: serde_json::Value| s["jobs"].as_array().unwrap().iter().map(|j| j["job_id"].as_u64().unwrap()).collect::<Vec<_>>();
+    assert_eq!(jobs(status()), [3, 2, 1]);
+    assert_eq!(newest(), ["1", "2", "3"]);
+    // Another request writes it meanwhile: read again, both kept.
+    let mut once = true;
+    mem.meddling(move |op, k, m| if op == "swap" && k == "newest" && std::mem::take(&mut once) {
+        let mut n: Vec<(u64, String)> = serde_json::from_str(&m["newest"]).unwrap();
+        n.push((1_790_000_000_000, "99".into()));
+        m.insert("newest".into(), serde_json::to_string(&n).unwrap());
+    });
+    block_on(plane.handle(job_event("queued", 4, "acme/app", None)));
+    assert_eq!(newest(), ["1", "2", "3", "4", "99"]);
+    // Written over every time: the record goes, and is made again from the index at the next read, the job in it.
+    mem.meddling(|op, k, m| if op == "swap" && k == "newest" { let v = m["newest"].replace("]]", "],[0,\"x\"]]"); m.insert("newest".into(), v); });
+    block_on(plane.handle(job_event("queued", 5, "acme/app", None)));
+    mem.meddling(|_, _, _| {});
+    assert!(mem.0.borrow().contains_key("job:5") && !mem.0.borrow().contains_key("newest"));
+    assert_eq!(jobs(status()), [5, 4, 3, 2, 1]);
+    // A record that is not one: said.
+    mem.0.borrow_mut().insert("newest".into(), "not a list".into());
+    assert!(String::from_utf8_lossy(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))).body).contains("newest:"));
 }

@@ -710,6 +710,19 @@ mod tests {
         assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane store"), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
+    /// A Modal control plane's records with their ends, kept by plane.py as the control plane's `io::Ending` keeps them,
+    /// each write with its end one question (see fixtures/modal/plane-ends.py). Checked with Python, if present.
+    #[test]
+    fn a_modal_control_plane_keeps_ends_beside_its_records_each_write_one_question() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/plane-ends.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let Ok(mut python) = python else { return };
+        python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
+        let out = python.wait_with_output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane ends"), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// A runner sandbox with a 3-minute bound, as the control plane starts one, ends by itself; and a job's sandbox,
     /// holding no token, cannot read this workspace's stored settings (SUPERCI_MODAL_TOKEN_ID/SECRET, plus live.rs's settings).
     #[test]

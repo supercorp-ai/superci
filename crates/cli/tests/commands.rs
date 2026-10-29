@@ -2959,3 +2959,25 @@ fn what_a_cloud_said_to_the_control_plane_is_said_with_its_status() {
     let said = text(&["status"]);
     assert!(said.contains("Modal says    modal 1.6 is deprecated: upgrade by 2027-01-01 (a newer SuperCI answers it: update it, then `superci planes update`)"), "{said}");
 }
+
+/// A control plane whose store is as slow as a Modal control plane's (some 120 ms a round trip), with the fifty jobs its
+/// status shows:
+/// `superci status` reads its status in good time, not nothing (its records read several at once; one by one, it was
+/// some 85 round trips, longer than the CLI waited).
+#[test]
+fn a_control_plane_with_a_store_as_slow_as_modals_has_its_status_read_in_time() {
+    let served = superci_testkit::serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    for i in 0..50 {
+        let (id, queued) = served.github.queue(&format!("job {i}"), "superci", served.now_ms());
+        served.webhook(queued);
+        served.webhook(served.github.start(id));
+        served.webhook(served.github.finish(id, "success", "ok", served.now_ms()));
+    }
+    served.store_takes(120);
+    let asked = std::time::Instant::now();
+    let (code, status) = json(&home, &["status"]);
+    let read = asked.elapsed();
+    assert!(code == 0 && status["status"]["jobs"].as_array().is_some_and(|j| j.len() == 50) && read < std::time::Duration::from_secs(10), "{read:?}: {status}");
+}

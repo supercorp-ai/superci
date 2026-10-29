@@ -122,6 +122,24 @@ class Plane:
             value = await state.get.aio(key)
         return value
 
+    async def drop(self, key):
+        """A record taken out, from its kind's Dict and (until the records are moved) the old one."""
+        for d in ([kind_of(key)] + ([] if await moved() else [state])):
+            try:
+                await d.pop.aio(key)
+            except KeyError:
+                pass
+
+    async def end(self, key, until):
+        """A record's end, kept beside it as the control plane's `io::Ending` keeps one (the same records): its end
+        (`~e:<key>`) and a mark that sorts by it (`~x:<until>:<key>`) for `expire`; written without one, it has none
+        (an older mark then removes nothing). Written side by side: each is a call to Modal's API."""
+        if until is None:
+            await self.drop(f"~e:{key}")
+        else:
+            mark = f"~x:{int(until):013d}:{key}"
+            await asyncio.gather(kind_of(f"~e:{key}").put.aio(f"~e:{key}", str(until)), kind_of(mark).put.aio(mark, ""))
+
     async def answer(self, q):
         op = q["op"]
         if op == "get":
@@ -130,19 +148,40 @@ class Plane:
             # Side by side: each is a call to Modal's API (the status a page shows asks for some 150 records).
             return {"values": list(await asyncio.gather(*(self.get(k) for k in q["keys"])))}
         if op == "put":
-            await kind_of(q["key"]).put.aio(q["key"], q["value"])
+            await asyncio.gather(kind_of(q["key"]).put.aio(q["key"], q["value"]), self.end(q["key"], q.get("until")))
             return {}
         if op == "put_if_absent":
             if not await moved() and (await state.get.aio(q["key"])) is not None:
                 return {"created": False}
-            return {"created": bool(await kind_of(q["key"]).put.aio(q["key"], q["value"], skip_if_exists=True))}
+            created = bool(await kind_of(q["key"]).put.aio(q["key"], q["value"], skip_if_exists=True))
+            if created:
+                await self.end(q["key"], None)
+            return {"created": created}
+        if op == "swap":
+            # Read, then written (a Dict has no write over what was read; the program answers one request at a time).
+            if await self.get(q["key"]) != q.get("was"):
+                return {"swapped": False}
+            await asyncio.gather(kind_of(q["key"]).put.aio(q["key"], q["value"]), self.end(q["key"], q.get("until")))
+            return {"swapped": True}
         if op == "delete":
-            for d in ([kind_of(q["key"])] + ([] if await moved() else [state])):
-                try:
-                    await d.pop.aio(q["key"])
-                except KeyError:
-                    pass
+            await asyncio.gather(self.drop(q["key"]), self.drop(f"~e:{q['key']}"))
             return {}
+        if op == "expire":
+            # What has passed its end, by its marks: taken out while the mark is still its end (written again since,
+            # it keeps its newer one); each mark that is due goes.
+            due = []
+            for mark, _ in (await self.answer({"op": "list", "prefix": "~x:"}))["items"]:
+                until, _, key = mark[3:].partition(":")
+                if until.isdigit() and key and int(until) <= q["now_ms"]:
+                    due.append((mark, int(until), key))
+
+            async def gone(mark, until, key):
+                ended = await self.get(f"~e:{key}") == str(until)
+                if ended:
+                    await asyncio.gather(self.drop(key), self.drop(f"~e:{key}"))
+                await self.drop(mark)
+                return ended
+            return {"gone": sum(await asyncio.gather(*(gone(*d) for d in due)))}
         if op == "list":
             items = {k: v async for k, v in kind_of(q["prefix"]).items.aio() if isinstance(k, str) and k.startswith(q["prefix"])}
             if not await moved():
@@ -238,6 +277,14 @@ plane = Plane()
 told = set()
 
 
+async def after(url, what):
+    """Has a program do what the control plane left for after an answer (see `later` in the program)."""
+    m = await plane.run({"kind": "later", "url": url, "what": what})
+    if m.get("error"):
+        print(f"superci: {m['error']}")
+    await tell()
+
+
 async def tell():
     """Keeps what Modal said that the status does not have yet, as the control plane keeps a launcher's (`cloud:says`:
     once each, the newest ten)."""
@@ -258,6 +305,7 @@ async def tell():
 def web():
     from fastapi import FastAPI, Request
     from fastapi.responses import Response
+    from starlette.background import BackgroundTask
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -275,7 +323,10 @@ def web():
         hold = next((v for k, v in headers.items() if k.lower() == "x-superci-hold"), None)
         if hold and hold.isdigit():
             await asyncio.sleep(int(hold) / 1000)
-        return Response(content=base64.b64decode(m.get("body", "")), status_code=m.get("status", 500), headers=headers)
+        # What the control plane left for after its answer (a queued job's sandbox): GitHub has its answer first (it
+        # waits ten seconds), then a program is given it.
+        left = BackgroundTask(after, url, m["later"]) if m.get("later") else None
+        return Response(content=base64.b64decode(m.get("body", "")), status_code=m.get("status", 500), headers=headers, background=left)
 
     return api
 
