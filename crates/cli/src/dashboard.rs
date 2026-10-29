@@ -349,7 +349,7 @@ fn pictured() -> &'static Mutex<String> { frame(2) }
 fn pictured() -> &'static Mutex<String> { thread_local!(static PICTURED: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); PICTURED.with(|s| *s) }
 fn called_now() -> String { let c = lock(called()); if c.is_empty() { "SuperCI".to_string() } else { c.clone() } }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
 
 thread_local! {
     /// The last page that said one thing (its status, heading and text): what a command, which asked in a browser's
@@ -3238,7 +3238,14 @@ impl Dashboard {
                 let cf_launcher = launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
                 // Its launcher in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
                 // that is over stops nothing else, and is said with the result.
+                // Its Modal launcher likewise, with Modal's sign-in: it keeps the Modal client it was deployed with, and
+                // Modal stops taking old ones (see `modal::heard`).
+                let modal_launcher = launchers.as_array().into_iter().flatten().find(|a| a["cloud"] == "modal").and_then(|a| a["url"].as_str()).map(str::to_string);
+                // (Signed in to the workspace it is in: another's would get a second one.)
+                let modal_for_launcher = self.modal.clone().filter(|m| modal_launcher.as_deref().is_some_and(|u| u.starts_with(&format!("https://{}--", m.workspace))));
+                let modal_note = if modal_launcher.is_some() && modal_for_launcher.is_none() { "Its Modal launcher was not updated: Modal is not signed in to here, or to another workspace. Sign in to its own (`superci login modal`) and update once more." } else { "" };
                 let note = if cf_launcher && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare launcher was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
+                let note = [note.as_str(), modal_note].iter().filter(|n| !n.is_empty()).copied().collect::<Vec<_>>().join(" ");
                 *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
@@ -3269,6 +3276,8 @@ impl Dashboard {
                         };
                         // A separate Cloudflare launcher (for a control plane elsewhere) is updated with it.
                         if let (true, Some(cf), Some(account)) = (cf_launcher && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }
+                        // (And a Modal launcher, at the address it has: its name stays.)
+                        if let Some(session) = &modal_for_launcher { plane_keys(&url).and_then(|keys| modal::deploy_runners(session, plane.url(), plane.plane_id(), &keys))?; }
                         // An AWS control plane's machines get their own network in each of its regions too.
                         if let (Deploying::Aws { creds, .. }, true) = (&deploying, aws_runners) { aws::make_networks(creds, plane.plane_id(), &regions)?; }
                         if let Some((creds, account)) = &aws_give {
@@ -4001,7 +4010,7 @@ mark();load()})();</script>"#;
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
         let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
-        let html = format!("{said_once}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), d.render(section, &views, last));
+        let html = format!("{said_once}{}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), Dashboard::cloud_says_notice(&views), d.render(section, &views, last));
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
         // A change's note is said once: once a page showed it (a page still loading has no place for it, and keeps it).
         if let Some(f) = d.flash.clone() { if html.contains(&esc(&f)) { d.flash = None } }
@@ -4036,6 +4045,14 @@ mark();load()})();</script>"#;
             out.push_str(&format!(r#"<div class="notice warn"><span>{} did not answer ({}). What is there is not shown; it is asked again on the next page.</span></div>"#, esc(cloud), esc(why)))
         }
         out
+    }
+
+    /// What a cloud said beside its answers (a client release it will stop taking): to this program, or to the control
+    /// plane in use and its launchers, as it kept it. Each once, with the way on: a newer SuperCI, then updating.
+    fn cloud_says_notice(views: &[PlaneView]) -> String {
+        let mut said: Vec<(String, String)> = crate::modal::said().into_iter().map(|s| ("Modal".to_string(), s)).collect();
+        for c in views.get(view::in_use(views)).map(|v| v.cloud_says()).unwrap_or_default() { if !said.contains(&c) { said.push(c) } }
+        said.iter().map(|(cloud, s)| format!(r#"<div class="notice warn"><span>{} says: “{}” A newer SuperCI answers it: update it, then the control plane.</span><a class="button secondary sm" href="/?p=planes">Control plane</a></div>"#, esc(cloud), esc(s))).collect()
     }
 
     /// A page's live part, with the workspace switcher's rows (see `workspaces_menu`).
@@ -7857,6 +7874,24 @@ mod tests {
         assert!(plane.contains(r#"action="/plane/cloudflare""#) && plane.contains(r#"action="/plane/aws""#) && plane.contains(r#"name="region""#) && plane.matches(">Set up</button>").count() == 2);
         assert!(plane.contains(r#"action="/modal/signin""#), "the cloud not signed in to is one click away");
         assert!(!plane.contains(r#"<select name="account""#), "one account needs no choice");
+    }
+
+    /// What the control plane in use kept of what a cloud said (`cloud_says` in its status): a line each above the
+    /// pages, as said (escaped), with the way on; none from a control plane not in use, nor when nothing was said.
+    #[test]
+    fn what_a_cloud_said_to_the_control_plane_in_use_is_a_line_each_above_the_pages() {
+        let plane = |id: &str| Plane::Modal { workspace: "acme".into(), url: format!("https://acme--superci-plane-{id}.modal.run"), plane_id: id.into(), label: "superci".into() };
+        let view = |id: &str, said: serde_json::Value, standby: bool| PlaneView { plane: plane(id), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby,
+            version: Some(superci_core::plane::VERSION.into()), status: Some(serde_json::json!({ "cloud_says": said })) };
+        // (An entry without its cloud or what it said, as a control plane of another version might keep one: passed over.)
+        let says = serde_json::json!([{ "cloud": "modal", "said": "modal 1.6 is <deprecated>" }, { "said": "no cloud" }, { "cloud": "modal" }, { "cloud": "modal", "said": "upgrade by 2027-01-01" }]);
+        let notice = Dashboard::cloud_says_notice(&[view("p00000000001", says.clone(), false)]);
+        assert_eq!(notice.matches(r#"<div class="notice warn">"#).count() - Dashboard::cloud_says_notice(&[]).matches(r#"<div class="notice warn">"#).count(), 2, "{notice}");
+        assert!(notice.contains("<span>Modal says: “modal 1.6 is &lt;deprecated&gt;” A newer SuperCI answers it: update it, then the control plane.</span><a class=\"button secondary sm\" href=\"/?p=planes\">Control plane</a></div>"), "{notice}");
+        assert!(notice.contains("Modal says: “upgrade by 2027-01-01”") && !notice.contains("no cloud"), "{notice}");
+        // The control plane in use's alone (a standby one's is not shown), and nothing when nothing was said.
+        let in_use = Dashboard::cloud_says_notice(&[view("p00000000002", serde_json::json!([]), false), view("p00000000003", says, true)]);
+        assert!(!in_use.contains("deprecated") && !in_use.contains("upgrade by"), "{in_use}");
     }
 
     #[test]

@@ -5,8 +5,24 @@
 import base64
 import json
 import time
+import warnings
 
 import modal
+
+# What Modal says beside its answers (a client release it will stop taking): its client issues each as a ServerWarning.
+# Heard here for the control plane, which keeps it for its status (`cloud:says`), so the dashboard says it before Modal
+# stops taking it.
+heard = []
+_shown = warnings.showwarning
+
+
+def hear(message, category, *rest, **kw):
+    if issubclass(category, modal.exception.ServerWarning) and str(message) not in heard:
+        heard.append(str(message))
+    _shown(message, category, *rest, **kw)
+
+
+warnings.showwarning = hear
 
 TRUST = json.loads(base64.b64decode("__TRUST__"))  # {"issuer", "subject", "keys": {"keys": [...]}}
 
@@ -99,13 +115,13 @@ def web():
         except modal.exception.InvalidError as e:
             # Modal refuses what was asked (a GPU without a payment method on the workspace): said as it says it.
             raise HTTPException(status_code=400, detail=f"Modal: {e}")
-        return {"id": sandbox.object_id, "kind": "sandbox"}
+        return {"id": sandbox.object_id, "kind": "sandbox", "cloud_says": heard[-10:]}
 
     @api.post("/stop")
     async def stop(request: Request):
         body = await check(request)
         sandbox = await modal.Sandbox.from_id.aio(body["id"])
         await sandbox.terminate.aio()
-        return {"stopped": True}
+        return {"stopped": True, "cloud_says": heard[-10:]}
 
     return api

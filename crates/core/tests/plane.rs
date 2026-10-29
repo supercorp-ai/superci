@@ -6985,7 +6985,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
-        spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first
+        spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first,
+        what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
@@ -7051,4 +7052,38 @@ fn run_faulted(test: fn(), fault: Option<faults::Fault>, cap: usize) -> Option<S
     faults::on(fault, cap);
     let ended = std::panic::catch_unwind(test);
     ended.err().map(|_| PANICKED.with(|p| p.borrow_mut().take()).unwrap_or_else(|| "a panic".into()))
+}
+
+#[test]
+fn what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten() {
+    // Modal's launcher answers each launch with what Modal said to its client (a release it will stop taking).
+    let said = std::cell::RefCell::new(vec!["modal 1.6 is deprecated: upgrade by 2027-01-01".to_string()]);
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://runners.acme.workers.dev/launch")
+        .then(|| Response::new(200, "application/json", serde_json::json!({ "id": "sb-1", "kind": "sandbox", "cloud_says": *said.borrow() }).to_string())));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let status = || json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))["cloud_says"].clone();
+    assert_eq!(status(), serde_json::json!([]), "nothing said yet");
+    // Said at two launches: kept once.
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+    assert_eq!(job(&store, 7)["state"], "launched");
+    assert_eq!(status(), serde_json::json!([{ "cloud": "modal", "said": "modal 1.6 is deprecated: upgrade by 2027-01-01" }]));
+    // Twelve things said in all: the newest ten.
+    *said.borrow_mut() = (1..=12).map(|n| format!("warning {n}")).collect();
+    block_on(plane.handle(job_event("queued", 9, "acme/app", None)));
+    let kept = status();
+    assert_eq!((kept.as_array().map(Vec::len), kept[0]["said"].as_str(), kept[9]["said"].as_str()), (Some(10), Some("warning 3"), Some("warning 12")), "{kept}");
+    // A launcher answering with no JSON: said as that, the job not started there.
+    let garbled = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://runners.acme.workers.dev/launch").then(|| Response::new(200, "text/html", "<html>a proxy's page</html>")));
+    let store = Mem::default();
+    let plane = ControlPlane { store: &store, http: &garbled, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    let j = job(&store, 7);
+    assert!(j["state"] != "launched" && j["error"].as_str().is_some_and(|e| e.contains("modal launcher: expected value")), "{j}");
 }

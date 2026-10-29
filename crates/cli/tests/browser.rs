@@ -243,6 +243,10 @@ fn a_sign_in_started_in_the_terminal_shows_its_own_page_at_each_step_until_it_is
     let (_, _, page) = common::get(&link, "/");
     let page = common::words(&page);
     assert!(page.contains("Approve it in Modal's tab") || page.contains("Signed in with Modal"), "{page}");
+    // (Approved there a moment later, while no page here is being read: the command's own look at Modal has come back
+    // with nothing meanwhile, and Modal gives the token only to a call waiting then.)
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    served.aws.modal_approve();
     // (Approved: its last page, then the command ends.)
     let mut done = String::new();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -2047,6 +2051,8 @@ fn modal_signed_in_again_after_its_sign_in_ended_is_taken_as_signed_in() {
     let (mut child, link) = dashboard(&home);
     let (status, _, page) = common::get(&link, "/connect/modal");
     assert!(status == 200 && page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{status} {}", common::words(&page));
+    // (Approved on Modal's page, the dashboard's pages not read meanwhile: it is waited for all the same.)
+    served.aws.modal_approve();
     until("signed in", || !common::words(&common::part(&link, "/?p=add-runners&fragment=1").1).contains("Waiting for Modal"));
     let (status, said) = common::part(&link, "/run/artifact?run=1&name=report");
     let said = common::words(&said);
@@ -7300,7 +7306,11 @@ fn a_modal_sign_in_started_before_any_other_waits_on_every_page_and_all_control_
         b.goto(&format!("{link}&p={p}"));
         b.wait("document.querySelector('main') !== null && document.querySelector('main').innerText.length > 0");
     }
-    // Approved in Modal (as its token flow answered, after a while): kept, wherever the page was.
+    // Waiting meanwhile: the page looks again by itself until it is approved.
+    b.goto(&format!("{link}&p=overview"));
+    b.wait("document.querySelector('main [data-refresh]') !== null");
+    // Approved in Modal (with no page here being read then): kept, wherever the page was.
+    account.modal_approve();
     let file = home.join("workspaces/default/sign-ins.json");
     let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
     while !std::fs::read_to_string(&file).unwrap_or_default().contains("token_id") {
@@ -15229,6 +15239,8 @@ mod dashboard_suite_in_browser {
             // The browser opens the sign-in: to Modal's page, its flow made.
             let (_, _, page) = common::get(&link, "/connect/modal");
             assert!(page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{}", words(&page));
+            // Approved on Modal's page (Modal gives the token only to a call waiting then).
+            served.aws.modal_approve();
             // The tab, open meanwhile, asks Modal itself as its page is read, until the sign-in is approved there.
             if tab_open {
                 let asked = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -19939,6 +19951,31 @@ fn a_machine_start_out_of_time_ended_meanwhile_or_with_its_runner_name_taken_is_
         b.goto(&format!("{link}&p=job&id={id}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
     }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What Modal says beside its answers (a client release it will stop taking): to the dashboard's own calls, or to the
+/// control plane's launchers as it kept it, a line above every page with the way on, once each.
+#[test]
+fn what_modal_says_beside_its_answers_is_a_line_above_the_pages() {
+    // To the dashboard itself, looking in Modal too (its workspace as Modal answered).
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/modal/01-look.jsonl"), &[]);
+    *served.aws.modal_warning.lock().unwrap() = Some("modal-go%200.11%20is%20deprecated%2C%20upgrade%20by%202027-01-01".into());
+    let (mut child, link) = dashboard(&home);
+    let page = || common::part(&link, "/?p=overview&fragment=1").1;
+    until("Modal's word", || common::words(&page()).contains("Modal says: “modal-go 0.11 is deprecated, upgrade by 2027-01-01” A newer SuperCI answers it"));
+    // And the control plane's launcher's, as the control plane kept it; each once.
+    served.store.0.lock().unwrap().insert("cloud:says".into(), serde_json::json!([{ "cloud": "modal", "said": "modal 1.6 is deprecated" }, { "cloud": "modal", "said": "modal-go 0.11 is deprecated, upgrade by 2027-01-01" }]).to_string());
+    until("the control plane's word", || page().contains("Modal says: “modal 1.6 is deprecated”"));
+    let page = page();
+    assert!(page.matches("modal-go 0.11 is deprecated").count() == 1 && page.contains(r#"href="/?p=planes">Control plane</a>"#), "{}", common::words(&page));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

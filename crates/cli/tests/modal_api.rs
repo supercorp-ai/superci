@@ -1,6 +1,7 @@
-//! A Modal control plane from the CLI and the dashboard, Modal's API answering as it answered a real workspace
-//! (`fixtures/modal`, recorded 2026-10-16 with a control plane made for it and deleted after), and the control plane
-//! itself one served on this computer, reading what its settings Dict was given.
+//! A Modal control plane from the CLI and the dashboard, Modal's API answering as it answered a real workspace with
+//! nothing of SuperCI's in it yet (`fixtures/modal`, recorded 2026-10-28 with a control plane made for it and deleted
+//! after; its dashboard step 2026-10-16), and the control plane itself one served on this computer, reading what its
+//! settings Dict was given.
 mod common;
 use common::{part, words};
 use superci_testkit::{serve, serve_as};

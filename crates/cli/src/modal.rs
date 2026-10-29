@@ -10,15 +10,21 @@ use std::time::{Duration, Instant};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+use crate::dashboard::lock;
 use crate::Result;
 
 const API: &str = "https://api.modal.com";
 /// Modal's server knows its own clients only; this one behaves like its Go SDK and says who it is.
 const CLIENT_TYPE: &str = "9";
-/// The Go SDK's release it behaves like, as that SDK says it (`modal-go/<version>`). Modal reads the SDK's version from
-/// it and refuses to create an app for a Go client whose version it cannot read ("Could not determine the SDK
-/// version for client type CLIENT_TYPE_LIBMODAL_GO"): every deploy (control plane, launcher) creates one.
-const LIBMODAL_VERSION: &str = "modal-go/v0.7.3";
+/// The Go SDK's release whose calls these are, said as that SDK says it (`modal-go/` and its `sdkVersion`, in
+/// modal-labs/modal-client's go/version.go). Modal reads a Go client's version from it, and creates no app for one
+/// whose version it cannot read ("Could not determine the SDK version for client type CLIENT_TYPE_LIBMODAL_GO"); a
+/// deploy creates one in a workspace that has none of SuperCI's yet. When Modal comes to stop taking a release, it says
+/// so beside its answers first (see `heard`).
+const LIBMODAL_VERSION: &str = "modal-go/0.11.1";
+/// What this client says it is, on every call: Modal's Go SDK of a release (see `LIBMODAL_VERSION`), behaving like its
+/// Python client 1.0.0, as the Go SDK says. None is a secret: a recording keeps them, as sent (see `record`).
+const SAYS: [(&str, &str); 4] = [("x-modal-client-type", CLIENT_TYPE), ("x-modal-client-version", "1.0.0"), ("x-modal-libmodal-version", LIBMODAL_VERSION), ("x-modal-host", "api.modal.com")];
 
 mod pb {
     #[derive(Clone, PartialEq, prost::Message)] pub struct Empty {}
@@ -142,13 +148,15 @@ impl Client {
     }
 
     /// In a debug build with `SUPERCI_RECORD`: the call, kept as the test kit answers it (what was asked by its size
-    /// only: it can hold a token); the answers as protobuf in base64.
+    /// only: it can hold a token; what this client said it is, which the test kit holds a later call to); the answers
+    /// as protobuf in base64.
     #[cfg(debug_assertions)]
     fn record(method: &str, asked: usize, answered: std::result::Result<Vec<Vec<u8>>, &str>) {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let (status, answer) = match answered { Ok(a) => (200, serde_json::json!({ "answers": a.iter().map(|m| b64.encode(m)).collect::<Vec<_>>() })), Err(e) => (500, serde_json::json!({ "error": e })) };
-        crate::aws::record(&superci_core::io::Request::new("POST", &format!("{API}/modal.client.ModalClient/{method}")).with_body(format!("({asked} bytes)").into_bytes()), status, &[], answer.to_string().as_bytes());
+        let r = SAYS.iter().fold(superci_core::io::Request::new("POST", &format!("{API}/modal.client.ModalClient/{method}")), |r, (k, v)| r.with_header(k, v));
+        crate::aws::record(&r.with_body(format!("({asked} bytes)").into_bytes()), status, &[], answer.to_string().as_bytes());
     }
 
     /// (With the sign-in's token once it has one: every call after `AuthTokenGet`, which is asked before any other.)
@@ -156,10 +164,7 @@ impl Client {
         let mut r = tonic::Request::new(message);
         let m = r.metadata_mut();
         let set = |m: &mut tonic::metadata::MetadataMap, k: &'static str, v: &str| { if let Ok(v) = MetadataValue::try_from(v) { m.insert(k, v); } };
-        set(m, "x-modal-client-type", CLIENT_TYPE);
-        set(m, "x-modal-client-version", "1.0.0");
-        set(m, "x-modal-libmodal-version", LIBMODAL_VERSION);
-        set(m, "x-modal-host", "api.modal.com");
+        SAYS.iter().for_each(|(k, v)| set(m, k, v));
         if let Some(s) = &self.session {
             set(m, "x-modal-token-id", &s.token_id);
             set(m, "x-modal-token-secret", &s.token_secret);
@@ -178,7 +183,8 @@ impl Client {
         let asked = message.encoded_len();
         let req = self.request(message);
         let got: Result<R> = self.rt.block_on(async {
-            ready(&self.channel).await.unary(req, path(method), tonic_prost::ProstCodec::default()).await.map(|r| r.into_inner()).map_err(|s| refused(method, &s))
+            ready(&self.channel).await.unary(req, path(method), tonic_prost::ProstCodec::default()).await
+                .map(|r| { heard(r.metadata()); r.into_inner() }).map_err(|s| { heard(s.metadata()); refused(method, &s) })
         });
         #[cfg(debug_assertions)]
         Self::record(method, asked, got.as_ref().map(|r| vec![r.encode_to_vec()]).map_err(String::as_str));
@@ -191,9 +197,11 @@ impl Client {
         let asked = message.encoded_len();
         let req = self.request(message);
         let got: Result<Vec<R>> = self.rt.block_on(async {
-            let mut s = ready(&self.channel).await.server_streaming(req, path(method), tonic_prost::ProstCodec::default()).await.map_err(|s| refused(method, &s))?.into_inner();
+            let mut s = ready(&self.channel).await.server_streaming(req, path(method), tonic_prost::ProstCodec::default()).await.map_err(|s| { heard(s.metadata()); refused(method, &s) })?.into_inner();
             let mut out = vec![];
-            while let Some(m) = s.message().await.map_err(|s| refused(method, &s))? { out.push(m); if out.len() >= limit { break } }
+            while let Some(m) = s.message().await.map_err(|s| { heard(s.metadata()); refused(method, &s) })? { out.push(m); if out.len() >= limit { return Ok(out) } }
+            // (They come at a stream's end, as gRPC ends one.)
+            heard(&s.trailers().await.ok().flatten().unwrap_or_default());
             Ok(out)
         });
         #[cfg(debug_assertions)]
@@ -239,24 +247,28 @@ pub fn authorize(_back: &str) -> Result<Pending> {
     });
     let approved = Arc::new(Mutex::new(None));
     let (kept, flow, secret) = (approved.clone(), r.token_flow_id.clone(), r.wait_secret.clone());
-    std::thread::spawn(move || {
-        let (started, mut failed) = (Instant::now(), 0);
-        while started.elapsed() < SIGN_IN_WAITED && failed < 3 {
-            let asked = Instant::now();
-            match ask(&mut client, &flow, &secret, WAITED_AT_ONCE.as_secs_f32()) {
-                Ok(Some(session)) => { *kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(session); return }
-                // (A wait Modal ends early is not asked again at once.)
-                Ok(None) => { failed = 0; std::thread::sleep(WAITED_AT_ONCE.saturating_sub(asked.elapsed())) }
-                Err(_) => { failed += 1; std::thread::sleep(Duration::from_secs(2)) }
-            }
-        }
-    });
+    std::thread::spawn(move || keep_waiting(&mut client, &flow, &secret, &kept, WAITED_AT_ONCE, SIGN_IN_WAITED));
     Ok(Pending { web_url: r.web_url, flow_id: r.token_flow_id, wait_secret: r.wait_secret, approved })
+}
+
+/// A call waiting for the sign-in's approval all the time, `each` long, one after another (as `modal token new` waits),
+/// for `until`: the token, when it comes, kept in `approved`. A call Modal refuses is made again after a second, and
+/// one it ends early not before a second has passed since it was made (never many a second).
+fn keep_waiting(client: &mut Client, flow_id: &str, wait_secret: &str, approved: &Mutex<Option<Session>>, each: Duration, until: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < until {
+        let asked = Instant::now();
+        match ask(client, flow_id, wait_secret, each.as_secs_f32()) {
+            Ok(Some(session)) => { *lock(approved) = Some(session); return }
+            Ok(None) => std::thread::sleep(Duration::from_secs(1).saturating_sub(asked.elapsed())),
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+        }
+    }
 }
 
 /// Whether the sign-in was approved in the browser (waiting up to `seconds`).
 pub fn wait(p: &Pending, seconds: f32) -> Result<Option<Session>> {
-    if let Some(session) = p.approved.lock().unwrap_or_else(|e| e.into_inner()).clone() { return Ok(Some(session)) }
+    if let Some(session) = lock(&p.approved).clone() { return Ok(Some(session)) }
     ask(&mut Client::new(None)?, &p.flow_id, &p.wait_secret, seconds)
 }
 
@@ -299,6 +311,34 @@ pub fn plane_app(plane_id: &str) -> String { format!("superci-plane-{plane_id}")
 
 /// How it is said that Modal no longer takes a kept token (deleted in Modal, or expired): Modal's own words follow.
 pub const ENDED: &str = "the Modal sign-in is no longer accepted: sign in again";
+
+/// What Modal said beside its answers, each once (see `heard`).
+static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What Modal says beside an answer, refused or not (`x-modal-warning`, each percent-encoded, as it warns of a client
+/// release it will stop taking; Modal's own SDKs log it): said on standard error, once each.
+/// What Modal said beside its answers to this program so far (see `heard`), once each.
+pub fn said() -> Vec<String> { lock(&HEARD).clone() }
+
+fn heard(m: &tonic::metadata::MetadataMap) {
+    let digit = |x: &u8| (*x as char).to_digit(16).map(|d| d as u8);
+    let decoded = |w: &str| -> String {
+        let b = w.trim().as_bytes();
+        let mut out = vec![];
+        let mut i = 0;
+        while i < b.len() {
+            match (b[i], b.get(i + 1..i + 3).and_then(|h| Some(digit(&h[0])? * 16 + digit(&h[1])?))) {
+                (b'%', Some(x)) => { out.push(x); i += 3 }
+                (c, _) => { out.push(c); i += 1 }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let mut said = lock(&HEARD);
+    for w in m.get_all("x-modal-warning").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(decoded).filter(|w| !w.is_empty()) {
+        if !said.contains(&w) { eprintln!("Modal says: {w}"); said.push(w) }
+    }
+}
 
 /// What Modal said no with, for a person: a token it does not take is said as that (see `ENDED`).
 fn refused(method: &str, status: &tonic::Status) -> String {
@@ -443,12 +483,87 @@ mod answers {
 
     fn session() -> Session { Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acmeorg".into() } }
 
-    /// Modal creates apps only for a Go client whose version it can read: `modal-go/` and a release, as the Go SDK says.
+    /// A sign-in waited for in the background: a call Modal refuses is made again, a wait it ends is waited again, and
+    /// the token is kept once the sign-in is approved while one waits; nothing is kept once the time is up.
     #[test]
-    fn it_says_its_go_sdk_version_as_the_go_sdk_does() {
-        let version = LIBMODAL_VERSION.strip_prefix("modal-go/v").expect("modal-go/v<release>");
-        assert_eq!(version.split('.').filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).count(), 3, "{LIBMODAL_VERSION}");
+    fn a_sign_in_is_waited_for_until_it_is_approved_or_the_time_is_up() {
+        let approved = says(vec![kept(&pb::TokenFlowWaitResponse { token_id: "ak-1".into(), token_secret: "as-1".into(), timeout: false, workspace_username: "acmeorg".into() })]);
+        let waited = |aws: &superci_testkit::Aws, approve: bool| {
+            let kept = Mutex::new(None);
+            with(&aws.url, || std::thread::scope(|s| {
+                if approve { s.spawn(|| aws.modal_approve()); }
+                keep_waiting(&mut Client::new(None).unwrap(), "tf-1", "w", &kept, Duration::from_millis(300), Duration::from_secs(2));
+            }));
+            kept.into_inner().unwrap().map(|s: Session| (s.token_id, s.token_secret, s.workspace))
+        };
+        // (No time to wait: Modal is not asked.)
+        let kept = Mutex::new(None);
+        with(&modal(vec![]).url, || keep_waiting(&mut Client::new(None).unwrap(), "tf-1", "w", &kept, Duration::from_millis(300), Duration::ZERO));
+        assert!(kept.into_inner().unwrap().is_none());
+        assert_eq!(waited(&modal(vec![("TokenFlowWait", refuses("TokenFlowWait"))]), false), None);
+        assert_eq!(waited(&modal(vec![("TokenFlowWait", approved.clone())]), false), None, "never approved");
+        // Waits Modal ends at once (none waited, here): asked again once a second, not at once.
+        let aws = modal(vec![("TokenFlowWait", approved.clone())]);
+        with(&aws.url, || keep_waiting(&mut Client::new(None).unwrap(), "tf-1", "w", &Mutex::new(None), Duration::ZERO, Duration::from_millis(2500)));
+        let asked = aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/TokenFlowWait"))).count();
+        assert!((2..=4).contains(&asked), "{asked} waits in 2.5 s");
+        assert_eq!(waited(&modal(vec![("TokenFlowWait", approved)]), true), Some(("ak-1".into(), "as-1".into(), "acmeorg".into())));
     }
+
+    /// A recording keeps what this client said it is, and no secret; a call that says it is another client than the one
+    /// recorded is not answered as recorded (another SDK, another type), while another release of it is.
+    #[test]
+    fn a_recording_keeps_what_the_client_said_it_is_and_a_call_is_held_to_it() {
+        let file = std::env::temp_dir().join(format!("superci-modal-record-{}.jsonl", std::process::id()));
+        let aws = modal(vec![("EnvironmentGetOrCreate", says(vec![kept(&pb::EnvironmentGetOrCreateResponse::default())]))]);
+        let env = || -> Result<pb::EnvironmentGetOrCreateResponse> { Client::new(Some(session()))?.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }) };
+        with(&aws.url, || { std::env::set_var("SUPERCI_RECORD", &file); let got = env(); std::env::remove_var("SUPERCI_RECORD"); got }).unwrap();
+        let recorded = std::fs::read_to_string(&file).unwrap();
+        let _ = std::fs::remove_file(&file);
+        let line: Value = serde_json::from_str(recorded.lines().last().unwrap()).unwrap();
+        assert_eq!(line["sent"], json!({ "x-modal-client-type": "9", "x-modal-client-version": "1.0.0", "x-modal-libmodal-version": LIBMODAL_VERSION }), "{recorded}");
+        assert!(!recorded.contains("as-test") && !recorded.contains("ak-test"), "no token: {recorded}");
+        // Held to it: another release is answered, another SDK or client type is not.
+        let held = |sent: Value| {
+            let aws = superci_testkit::Aws::serve();
+            let answer = says(vec![kept(&pb::EnvironmentGetOrCreateResponse::default())]).to_string();
+            let lines = [("AuthTokenGet", says(vec![kept(&pb::AuthTokenGetResponse { token: "t".into() })]).to_string()), ("EnvironmentGetOrCreate", answer)].map(|(m, a)| json!({ "method": "POST", "url": format!("https://api.modal.com/modal.client.ModalClient/{m}"), "target": "", "asked": "", "status": 200, "answer": a, "sent": sent }).to_string());
+            aws.replaying(&lines.join("\n"), &[]);
+            with(&aws.url, env).map(|_| ())
+        };
+        assert!(held(json!({ "x-modal-client-type": "9", "x-modal-libmodal-version": "modal-go/0.7.3" })).is_ok());
+        assert!(held(json!({ "x-modal-client-type": "8" })).unwrap_err().contains("x-modal-client-type was \"8\" when this was recorded, and is 9 now"));
+        assert!(held(json!({ "x-modal-libmodal-version": "modal-js/0.11.1" })).unwrap_err().contains("x-modal-libmodal-version"));
+    }
+
+    /// What Modal says beside its answers (a release it will stop taking), answered or refused, alone or at a stream's
+    /// end: kept as it meant it, once each.
+    #[test]
+    fn what_modal_says_beside_its_answers_is_heard_once_each() {
+        let joined = kept(&pb::ImageJoinStreamingResponse { result: None, entry_id: "e1".into(), eof: false });
+        // (ImageJoinStreaming answered whole, then refused before any answer, then broken off after one.)
+        let aws = modal(vec![("ImageJoinStreaming", says(vec![joined.clone()])), ("ImageJoinStreaming", refuses("ImageJoinStreaming")),
+            ("ImageJoinStreaming", json!({ "answers": [joined], "error": "Modal ImageJoinStreaming: broken off" })), ("AppList", refuses("AppList")),
+            ("EnvironmentGetOrCreate", says(vec![kept(&pb::EnvironmentGetOrCreateResponse::default())]))]);
+        let heard_now = |warning: &str, call: &mut dyn FnMut()| { *aws.modal_warning.lock().unwrap() = Some(warning.into()); call(); said() };
+        with(&aws.url, || {
+            let mut c = Client::new(Some(session())).unwrap();
+            let mut join = |c: &mut Client| c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 10);
+            // Answered: as Modal meant it, once each however often it is said.
+            let heard = heard_now("modal-go%200.11.1%20is%20deprecated%2C%20upgrade%20by%202027-01-01, 100%ZZ, , 5%2Z", &mut || { let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap(); });
+            assert!(heard.contains(&"modal-go 0.11.1 is deprecated, upgrade by 2027-01-01".to_string()) && heard.contains(&"100%ZZ".to_string()) && heard.contains(&"5%2Z".to_string()) && !heard.contains(&String::new()), "{heard:?}");
+            let heard = heard_now("modal-go%200.11.1%20is%20deprecated%2C%20upgrade%20by%202027-01-01", &mut || { let _: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() }).unwrap(); });
+            assert_eq!(heard.iter().filter(|w| w.starts_with("modal-go 0.11.1 is deprecated")).count(), 1, "once: {heard:?}");
+            // Refused, a stream to its end, a stream refused at once, one broken off: each heard.
+            assert!(heard_now("refused", &mut || assert!(c.unary::<_, pb::AppListResponse>("AppList", pb::AppListRequest { environment_name: String::new() }).is_err())).contains(&"refused".to_string()));
+            assert!(heard_now("at a stream's end", &mut || assert_eq!(join(&mut c).unwrap().len(), 1)).contains(&"at a stream's end".to_string()));
+            assert!(heard_now("refused a stream", &mut || assert!(join(&mut c).is_err())).contains(&"refused a stream".to_string()));
+            assert!(heard_now("broke a stream off", &mut || assert!(join(&mut c).unwrap_err().contains("broken off"))).contains(&"broke a stream off".to_string()));
+            // A stream read only up to its limit: what comes after is not waited for (its break is not reached).
+            assert_eq!(c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest::default(), 1).unwrap().len(), 1);
+        });
+    }
+
 
     #[test]
     fn modals_own_api_is_reached_without_a_stand_in() {

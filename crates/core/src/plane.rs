@@ -772,6 +772,11 @@ pub const BUDGET_STOPPED: &str = "AWS's budget for this account reached its limi
 /// Where the control plane notes when AWS last refused a machine by the budget's rule (the dashboard says so).
 const BUDGET_STOPPED_KEY: &str = "aws:budget-stopped";
 
+/// Where the control plane keeps what a cloud said beside its answers (Modal's warning of a client release it will
+/// stop taking, heard by a launcher or by a Modal control plane's own client): `[{"cloud", "said"}]`, the newest ten,
+/// each once. Its status says them, so the dashboard does, before the cloud stops taking it.
+pub const CLOUD_SAYS_KEY: &str = "cloud:says";
+
 /// Where the control plane notes a spot pool (a machine type in a zone of a region) that had no machine or took one
 /// back, with when: the next jobs ask the other pools first.
 fn pool_key(region: &str, kind: &str, zone: &str) -> String { format!("aws:pool:{region}:{kind}:{zone}") }
@@ -1807,6 +1812,8 @@ impl<'a> ControlPlane<'a> {
             "daily_limits": true,
             "spend_today": day_spend,
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
+            // (What a cloud said beside its answers: a client release it will stop taking.)
+            "cloud_says": self.store.get(CLOUD_SAYS_KEY).await.ok().flatten().and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_else(|| serde_json::json!([])),
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
             "active": live.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
             // What the clouds and code hosts allow it (see permissions.rs): what the App asks for (each installation's
@@ -2507,7 +2514,21 @@ impl<'a> ControlPlane<'a> {
             let said = serde_json::from_slice::<serde_json::Value>(&r.body).ok().and_then(|v| v["detail"].as_str().map(str::to_string)).unwrap_or_else(|| r.body_text());
             return Err(format!("{} launcher: {} {}", a.cloud, r.status, said.chars().take(300).collect::<String>()));
         }
-        serde_json::from_slice(&r.body).map_err(|e| format!("{} launcher: {e}", a.cloud))
+        let v: serde_json::Value = serde_json::from_slice(&r.body).map_err(|e| format!("{} launcher: {e}", a.cloud))?;
+        // (What its cloud said beside its answers, kept for the status.)
+        let said: Vec<String> = v["cloud_says"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string)).collect();
+        if !said.is_empty() { self.keep_said(&a.cloud, &said).await }
+        Ok(v)
+    }
+
+    /// Keeps what `cloud` said (see `CLOUD_SAYS_KEY`): once each, the newest ten. Not kept is no fault of the call.
+    async fn keep_said(&self, cloud: &str, said: &[String]) {
+        let mut kept: Vec<serde_json::Value> = self.store.get(CLOUD_SAYS_KEY).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+        let before = kept.len();
+        kept = said.iter().map(|s| serde_json::json!({ "cloud": cloud, "said": s })).fold(kept, |mut kept, one| { if !kept.contains(&one) { kept.push(one) } kept });
+        if kept.len() == before { return }
+        let from = kept.len().saturating_sub(10);
+        let _ = self.store.put(CLOUD_SAYS_KEY, serde_json::Value::from(kept.split_off(from)).to_string()).await;
     }
 
     /// Ends the machine that ran (or would have run) a job, wherever it is.

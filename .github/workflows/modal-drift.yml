@@ -1,0 +1,26 @@
+name: Modal drift
+
+# SuperCI's Modal client held to Modal's own, every week and when it changes: the messages it declares by hand
+# against Modal's API, the Go SDK release it says it is and the Python client it deploys with against their newest
+# (scripts/modal-drift.py). Modal changes on its side without SuperCI changing: a failed run says what moved, before
+# a person meets it. No sign-in: it reads Modal's public sources only.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/cli/src/modal.rs
+      - scripts/modal-drift.py
+      - .github/workflows/modal-drift.yml
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -I scripts/modal-drift.py

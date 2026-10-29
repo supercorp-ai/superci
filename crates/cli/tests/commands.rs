@@ -965,7 +965,7 @@ fn a_region_is_added_with_its_network_and_its_network_deleted_as_aws_answered_a_
 fn the_control_plane_is_updated_with_its_cloudflare_and_modal_launchers_as_a_real_account_answered() {
     let served = serve(|_| {});
     let plane = superci_testkit::PLANE;
-    served.aws.put(&format!("/superci/{plane}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners-testplane0001.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{plane}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"},{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
     served.aws.put(&format!("/superci/{plane}/CONTAINERS"), "off");
     let home = common::signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
@@ -974,6 +974,9 @@ fn the_control_plane_is_updated_with_its_cloudflare_and_modal_launchers_as_a_rea
     kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
     std::fs::write(&file, kept.to_string()).unwrap();
     served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", plane), ("http://new-plane.test", &served.url)]);
+    // (Its Modal launcher deployed again, as Modal answered a deploy of one.)
+    let deployed: Vec<&str> = include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().filter(|l| ["/AppGetOrCreate\"", "/ImageGetOrCreate\"", "/SandboxCreate\"", "/SandboxWait\""].iter().any(|m| l.contains(m))).collect();
+    served.aws.replaying(&deployed.join("\n"), &[("awsplane0001", plane)]);
     // (The launchers' health, which the update waits for: a server here answers for each.)
     { let mut w = served.aws.workers.lock().unwrap(); for host in [format!("superci-runners-{plane}.acme.workers.dev"), format!("acmeorg--superci-runners-{plane}.modal.run")] { w.insert(host, served.url.clone()); } }
     let o = superci(&home, &["planes", "update"]);
@@ -982,6 +985,29 @@ fn the_control_plane_is_updated_with_its_cloudflare_and_modal_launchers_as_a_rea
     // Its Cloudflare launcher went up with it, on the image of GitHub's runner its containers run.
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap_or_default(), a["url"].as_str().unwrap_or_default())).collect();
     assert!(asked.iter().any(|a| a.starts_with("PUT https://api.cloudflare.com/") && a.contains(&format!("/workers/scripts/superci-runners-{plane}"))), "{asked:?}");
+    // And its Modal launcher, which keeps the Modal client it was deployed with: deployed again in its workspace.
+    assert!(asked.iter().any(|a| a.ends_with("/SandboxCreate")), "{asked:?}");
+    let _ = std::fs::remove_dir_all(&home);
+    // Signed in to another Modal workspace than the launcher's: not deployed there (that would be a second one), said.
+    served.aws.asked.lock().unwrap().clear();
+    let home = common::signed_in(&served);
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "globex" });
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), kept.to_string()).unwrap();
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Its Modal launcher was not updated: Modal is not signed in to here, or to another workspace."), "{said}");
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxCreate"))), "nothing deployed in another workspace");
+    let _ = std::fs::remove_dir_all(&home);
+    // Modal refusing to deploy it again: the update says so.
+    let home = common::signed_in(&served);
+    kept["modal"]["workspace"] = "acmeorg".into();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), kept.to_string()).unwrap();
+    served.aws.replaying(&serde_json::json!({ "method": "POST", "url": "https://api.modal.com/modal.client.ModalClient/SandboxCreate", "target": "", "asked": "", "status": 500, "answer": serde_json::json!({ "error": "Modal SandboxCreate: Workspace is over its sandbox limit" }).to_string() }).to_string(), &[]);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("Workspace is over its sandbox limit"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2917,4 +2943,19 @@ fn a_control_planes_aws_role_is_given_what_this_version_asks_for() {
     let (code, v) = json(&home, &["planes", "allow"]);
     assert!(code == 0 && v["said"].as_str().unwrap_or_default().contains("Its AWS role has what this version asks for."), "{code} {v}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What a cloud said to the control plane's launchers or its own client (a release it will stop taking), as the
+/// control plane keeps it: its status says it, and how a newer SuperCI answers it; nothing when nothing was said.
+#[test]
+fn what_a_cloud_said_to_the_control_plane_is_said_with_its_status() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let text = |args: &[&str]| String::from_utf8_lossy(&superci(&home, args).stdout).to_string();
+    assert!(!text(&["status"]).contains(" says "), "nothing said");
+    served.store.0.lock().unwrap().insert("cloud:says".into(), serde_json::json!([{ "cloud": "modal", "said": "modal 1.6 is deprecated: upgrade by 2027-01-01" }]).to_string());
+    let (code, status) = json(&home, &["status"]);
+    assert_eq!((code, status["status"]["cloud_says"][0]["said"].as_str()), (0, Some("modal 1.6 is deprecated: upgrade by 2027-01-01")), "{status}");
+    let said = text(&["status"]);
+    assert!(said.contains("Modal says    modal 1.6 is deprecated: upgrade by 2027-01-01 (a newer SuperCI answers it: update it, then `superci planes update`)"), "{said}");
 }
