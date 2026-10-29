@@ -729,9 +729,10 @@ fn place_of(j: &Job) -> &str { if j.cloud == "aws" && j.on_demand { AWS_ON_DEMAN
 pub struct Launcher { pub cloud: String, pub url: String }
 
 /// Where the control plane keeps its settings that are not secrets (where jobs run and the launchers it calls), with
-/// the version each write made: written through it (`POST /settings`) over the version the writer read, so a change
-/// made meanwhile on another computer is never written over; read at each request in place of what its cloud's own
-/// settings hold (`ROUTING`, `LAUNCHERS`, which a control plane without this record goes on reading).
+/// the version each write made: written through it (`POST /settings`) as changes, each to one field (see `settings`),
+/// so changes made at the same moment on different computers are all kept; read at each request in place of what its
+/// cloud's own settings hold (`ROUTING`, `LAUNCHERS`, which a control plane without this record goes on reading, and
+/// an older SuperCI goes on writing: see `Stored::taken`).
 pub const SETTINGS: &str = "settings";
 
 /// The settings record (see `SETTINGS`).
@@ -740,12 +741,25 @@ pub struct Stored {
     pub version: u64,
     #[serde(default)] pub routing: Routing,
     #[serde(default)] pub launchers: Vec<Launcher>,
+    /// Its cloud's own copy of them as taken (a fingerprint, and when: ms), the newest last. One that differs from
+    /// all of these was written there by an older SuperCI, which knows no other way: it is taken, whole, as that
+    /// version always meant it. One taken in the last minute is a copy an instance read before (AWS's are read every
+    /// 15 seconds), not taken again.
+    #[serde(default)] pub taken: Vec<(String, u64)>,
 }
 
+/// The settings as the changes see them (see `settings`).
+#[derive(Serialize, Deserialize)]
+struct Document { #[serde(default)] routing: Routing, #[serde(default)] launchers: Vec<Launcher> }
+
 /// How long a read of the settings record stands for a request that need not see a write just made.
-const SETTINGS_READ_MS: u64 = 10_000;
+pub const SETTINGS_READ_MS: u64 = 10_000;
 /// The most the settings record may hold: what the smallest store keeps in one record (a Modal Dict's value).
 const SETTINGS_MAX_BYTES: usize = 60_000;
+/// How long a cloud copy taken stands for one an instance still holds (see `Stored::taken`).
+const SETTINGS_TAKEN_MS: u64 = 60_000;
+/// How many writes lost to others at the same moment a write is made again over (each loss is another's success).
+const SETTINGS_TRIES: usize = 8;
 
 /// Where jobs run. A job naming a cloud in its label (`superci/provider=aws`) runs only there; else the first rule whose
 /// repository pattern matches ("owner/repo", "owner/*" or "*") names its only cloud; else the places in `order` are tried
@@ -1244,17 +1258,42 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Its settings as the control plane keeps them (see `SETTINGS`): its configuration with them, or none where it
-    /// keeps none yet (its cloud's own settings stand). Read again after ten seconds, or now when `fresh`.
+    /// keeps none yet (its cloud's own settings stand). Read again after ten seconds, or now when `fresh`. A cloud copy
+    /// an older SuperCI wrote is taken first (see `Stored::taken`).
     async fn settled(&self, fresh: bool) -> Result<Option<Config>> {
         let now = self.clock.now_ms();
         let kept = self.cache.settings.borrow().clone().filter(|(at, _)| !fresh && now.saturating_sub(*at) < SETTINGS_READ_MS);
         let raw = match kept {
             Some((_, raw)) => raw,
-            None => { let raw = self.store.get(SETTINGS).await?; *self.cache.settings.borrow_mut() = Some((now, raw.clone())); raw }
+            None => {
+                let raw = self.store.get(SETTINGS).await?;
+                let raw = match raw { Some(raw) => Some(self.take_cloud_copy(raw).await?), None => None };
+                *self.cache.settings.borrow_mut() = Some((now, raw.clone()));
+                raw
+            }
         };
         let Some(raw) = raw else { return Ok(None) };
         let stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
         Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, ..self.config.clone() }))
+    }
+
+    /// Its cloud's own copy of the settings (as this instance read it): a fingerprint.
+    fn cloud_copy(&self) -> String { crate::crypto::sha256_hex(crate::io::json(&(&self.config.routing, &self.config.launchers)).as_bytes()) }
+
+    /// The record, with its cloud's copy taken over it when an older SuperCI wrote that copy (one not taken before,
+    /// nor in the last minute: see `Stored::taken`). Lost to another write at the same moment: the record as it is.
+    async fn take_cloud_copy(&self, raw: String) -> Result<String> {
+        let mut stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
+        let (copy, now) = (self.cloud_copy(), self.clock.now_ms());
+        let newest = stored.taken.last().is_some_and(|(f, _)| *f == copy);
+        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) { return Ok(raw) }
+        stored.version += 1;
+        (stored.routing, stored.launchers) = (self.config.routing.clone(), self.config.launchers.clone());
+        stored.taken.push((copy, now));
+        let n = stored.taken.len();
+        stored.taken.drain(..n.saturating_sub(5));
+        let written = crate::io::json(&stored);
+        Ok(if self.store.swap(SETTINGS, Some(&raw), written.clone()).await? { written } else { self.store.get(SETTINGS).await?.unwrap_or(raw) })
     }
 
     /// The settings as they stand (kept, or its cloud's own where none are kept yet), their version (0: none kept),
@@ -1263,27 +1302,35 @@ impl<'a> ControlPlane<'a> {
         let raw = self.store.get(SETTINGS).await?;
         let stored = match raw.as_deref() {
             Some(r) => serde_json::from_str(r).map_err(|e| format!("{SETTINGS}: {e}"))?,
-            None => Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone() },
+            None => Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] },
         };
         Ok((stored, raw))
     }
 
-    /// A write of the settings (`POST /settings`, a dashboard's): `{ "version", "routing"?, "launchers"? }`, over the
-    /// version it read. One read before another computer's write is refused (409, with the version now); what it does
-    /// not give stays as it is.
+    /// A write of the settings (`POST /settings`, a computer's): `{ "changes": [...] }` (see `settings::Change`),
+    /// applied to them as they are now. One whose field changed since it was shown is refused, with the others (409,
+    /// each such field with what it holds now); a write lost to another at the same moment is made again over it.
     async fn write_settings(&self, req: &Request) -> Result<Response> {
         #[derive(Deserialize)]
-        struct Asked { version: u64, routing: Option<Routing>, launchers: Option<Vec<Launcher>> }
-        let Ok(asked) = serde_json::from_slice::<Asked>(&req.body) else { return Ok(Response::text(400, "settings are { version, routing, launchers }")) };
-        let (now, raw) = self.settings_now().await?;
-        let changed = || Response::json(&serde_json::json!({ "error": "changed meanwhile", "version": now.version })).with_status(409);
-        if asked.version != now.version { return Ok(changed()) }
-        let next = Stored { version: now.version + 1, routing: asked.routing.unwrap_or(now.routing.clone()), launchers: asked.launchers.unwrap_or(now.launchers.clone()) };
-        let written = crate::io::json(&next);
-        if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
-        if !self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? { return Ok(changed()) }
-        *self.cache.settings.borrow_mut() = Some((self.clock.now_ms(), Some(written)));
-        Ok(Response::json(&serde_json::json!({ "version": next.version })))
+        struct Asked { changes: Vec<crate::settings::Change> }
+        let Ok(asked) = serde_json::from_slice::<Asked>(&req.body) else { return Ok(Response::text(400, "settings are written as { changes: [...] }")) };
+        for _ in 0..SETTINGS_TRIES {
+            let (now, raw) = self.settings_now().await?;
+            let doc = serde_json::to_value(Document { routing: now.routing, launchers: now.launchers }).map_err(|e| e.to_string())?;
+            let changed = match crate::settings::apply(&doc, &asked.changes) {
+                Ok(changed) => changed,
+                Err(conflicts) => return Ok(Response::json(&serde_json::json!({ "error": "changed meanwhile", "conflicts": conflicts, "version": now.version })).with_status(409)),
+            };
+            let Ok(next) = serde_json::from_value::<Document>(changed) else { return Ok(Response::text(400, "those changes do not make settings SuperCI takes")) };
+            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, taken: now.taken };
+            let written = crate::io::json(&next);
+            if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
+            if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
+                *self.cache.settings.borrow_mut() = Some((self.clock.now_ms(), Some(written)));
+                return Ok(Response::json(&serde_json::json!({ "version": next.version })))
+            }
+        }
+        Ok(Response::text(503, "the settings were being changed by others all along: try again"))
     }
 
     async fn route(&self, req: Request) -> Result<Response> {

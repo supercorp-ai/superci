@@ -17,3 +17,4 @@ pub mod workflow;
 pub mod expression;
 pub mod runner_service;
 pub mod secrets;
+pub mod settings;

@@ -41,6 +41,12 @@ pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(S
     pub Arc<std::sync::atomic::AtomicU64>);
 
 /// What another request writes over a record (`None`: takes it out), from what is there.
+thread_local! {
+    /// On a served control plane's own thread: the settings views (`Aws::settings`, …) are its cloud's copy there,
+    /// what a control plane builds its configuration from; elsewhere (a test's) they are what it reads, its record's.
+    static AS_PLANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Each control plane served, by its address: its store (where what was written through it is kept).
 static SERVED: Mutex<BTreeMap<String, Arc<Mutex<BTreeMap<String, String>>>>> = Mutex::new(BTreeMap::new());
 
@@ -287,6 +293,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     // (Written before it answers anything: before a sweep's counting starts.)
     block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
+        AS_PLANE.with(|p| p.set(true));
         let cache = Cache::default();
         for stream in listener.incoming().flatten() {
             if st.load(std::sync::atomic::Ordering::SeqCst) { break }
@@ -894,6 +901,8 @@ impl Aws {
 
     /// Settings as a deploy left them, with what was written through the control plane over them: what it reads.
     fn overlaid(&self, store: Option<Arc<Mutex<BTreeMap<String, String>>>>, mut kept: Vec<(String, String)>) -> Vec<(String, String)> {
+        // (A control plane served here reads its cloud's copy, as a real one does: see `AS_PLANE`.)
+        if AS_PLANE.with(|p| p.get()) { return kept }
         let stored = store.and_then(|s| s.lock().unwrap().get(superci_core::plane::SETTINGS).cloned());
         if let Some(stored) = stored.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
             for (key, name) in [("ROUTING", "routing"), ("LAUNCHERS", "launchers")] {
@@ -1172,6 +1181,7 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let (s, m, a, u, c, g, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone(), stop.clone());
     block_on(io::Ending(store.clone()).put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
+        AS_PLANE.with(|p| p.set(true));
         let cache = Cache::default();
         let ending = io::Ending(s);
         for stream in listener.incoming().flatten() {
@@ -1254,6 +1264,7 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let (s, m, a, u, c, g, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone(), stop.clone());
     block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
+        AS_PLANE.with(|p| p.set(true));
         let (cache, left) = (Cache::default(), Deferring::default());
         for stream in listener.incoming().flatten() {
             if st.load(std::sync::atomic::Ordering::SeqCst) { break }

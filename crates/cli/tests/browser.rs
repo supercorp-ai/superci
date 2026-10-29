@@ -19981,3 +19981,46 @@ fn what_modal_says_beside_its_answers_is_a_line_above_the_pages() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A change a teammate makes on another computer, through the control plane (as their dashboard makes it).
+fn teammate_changes(served: &superci_testkit::Served, changes: serde_json::Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let r = agent.post(&format!("{}/settings", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(serde_json::json!({ "changes": changes }).to_string()).unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// A provider's dialog left open while a teammate changes one of its fields on another computer: saved with another of
+/// its fields changed, the teammate's change stays; saved with that same field changed, refused, saying what it is now.
+#[test]
+fn a_dialog_saved_after_a_teammate_changed_one_of_its_fields_keeps_theirs_or_says_it_changed() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare","max_jobs":3}]}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let pool = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, r)| serde_json::from_str::<serde_json::Value>(&r).ok()).map(|r| r["order"][0].clone()).unwrap_or_default();
+    let open = |b: &mut Browser| {
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(r#"document.querySelector('button[aria-label="Cloudflare settings"]') !== null && !document.body.classList.contains('busy')"#);
+        b.click(r#"button[aria-label="Cloudflare settings"]"#, "");
+        b.wait("document.getElementById('pool-0').open");
+    };
+    // Its budget set while the teammate made it 7 at once: theirs stays, the budget is taken.
+    open(&mut b);
+    assert_eq!(b.eval("document.querySelector('#pool-0 input[name=max]').value"), serde_json::json!("3"));
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 7 }]));
+    b.fill("#pool-0 input[name=usd]", "30");
+    b.click("#pool-0 button.primary", "Save");
+    until("the budget", || pool()["monthly_usd"] == 30.0);
+    assert_eq!(pool()["max_jobs"], 7, "{}", pool());
+    // Jobs at once set by both: refused, saying the teammate's.
+    open(&mut b);
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 9 }]));
+    b.fill("#pool-0 input[name=max]", "5");
+    b.click("#pool-0 button.primary", "Save");
+    b.wait(&page_shows("Changed on another computer meanwhile"));
+    assert!(b.eval("document.body.innerText").as_str().unwrap().contains("Cloudflare's jobs at once is 9 now"));
+    assert_eq!(pool()["max_jobs"], 9);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
