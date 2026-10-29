@@ -3,6 +3,7 @@
 # (ES256, its public keys pinned here when the dashboard set this agent up), for this agent's URL, from its subject.
 # Deployed by the SuperCI dashboard with Modal's own `modal deploy`; the sandboxes are Modal's official SDK.
 import base64
+import hashlib
 import json
 import time
 
@@ -31,6 +32,72 @@ runner_image = (
     .env({"RUNNER_ALLOW_RUNASROOT": "1"})
 )
 
+# An image of the control plane's own (`superci runner_images`): a registry's address, made FROM GitHub's runner image
+# with what a repository's jobs use in it already. Modal makes it once and keeps it by its address (a tag pushed again is
+# not fetched again). The one thing checked is the runner, which starts the job: an image without it is not made, and
+# the job says why.
+NO_RUNNER = "test -x /home/runner/run.sh || { echo 'This image has no GitHub runner at /home/runner/run.sh: make it FROM ghcr.io/actions/actions-runner' >&2; exit 1; }"
+
+
+def job_image(reference=None, secret=None):
+    """The image a job's sandbox starts from: GitHub's runner image, or one of the control plane's own at `reference`
+    (`secret`: the name of a Modal Secret with REGISTRY_USERNAME and REGISTRY_PASSWORD, for a private registry)."""
+    if not reference:
+        return runner_image
+    return (
+        modal.Image.from_registry(reference, secret=modal.Secret.from_name(secret) if secret else None)
+        .dockerfile_commands(["USER root", f"RUN {NO_RUNNER}"])
+        .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+    )
+
+
+def image_refused(reference, e):
+    """What a job is told when Modal could not make a sandbox from an image of the control plane's own (it is not in
+    its registry, its registry is private and its Secret is missing or wrong, or it has no runner), or None when what
+    failed was not the image (a build cut short, or timed out, is tried again)."""
+    said = str(e)
+    if isinstance(e, modal.exception.NotFoundError) or (isinstance(e, modal.exception.RemoteError) and said.startswith("Image build") and " failed" in said):
+        return (f"Modal could not start from the image {reference}: Modal must be able to pull it (a private registry with a Modal Secret, "
+                f"see `superci help runner_images`), and it must be made FROM ghcr.io/actions/actions-runner. Modal: {said}")
+    return None
+
+
+
+# Jobs as Modal Functions (`superci runners update modal --mode=function`): deployed apart, as `superci-jobs-<id>` (see
+# modal_jobs.py), one Function per image, named by its address.
+def function_name(reference=None, secret=None):
+    """The Function a job's image runs as: `run` for GitHub's runner image, else `run_` and the first 12 hex digits of
+    the SHA-256 of its address and Secret (the same in the control plane's and the launcher's code)."""
+    if not reference:
+        return "run"
+    return "run_" + hashlib.sha256(f"{reference}\n{secret or ''}".encode()).hexdigest()[:12]
+
+
+async def start_function(jobs, q, cpu, ram_gb, max_minutes, gpu):
+    """A job's runner as a preemptible Function call of the app `jobs`, told the link it says a preemption with; its
+    call's id (`fc-…`). A Function not deployed (Function mode set, or an image changed, and not deployed since) is
+    said, as Modal refusing it."""
+    name = function_name(q.get("image"), q.get("image_secret"))
+    try:
+        f = modal.Function.from_name(jobs, name).with_options(cpu=(cpu / 2,) * 2, memory=(ram_gb * 1024,) * 2, timeout=max_minutes * 60, gpu=gpu)
+        call = await f.spawn.aio(q["jit"], q.get("fail"), q.get("notice"))
+    except modal.exception.NotFoundError as e:
+        return None, (f"Modal refused: no Function {name} in the app {jobs} (Function mode deploys one per image: "
+                      f"`superci runners create modal`, or `modal --account=WORKSPACE`, deploys them again). Modal: {e}")
+    return call.object_id, None
+
+
+async def stop_machine(id):
+    """Ends a job's sandbox (`sb-…`) or Function call (`fc-…`, its container with it)."""
+    if id.startswith("fc-"):
+        await modal.FunctionCall.from_id(id).cancel.aio(terminate_containers=True)
+    else:
+        sandbox = await modal.Sandbox.from_id.aio(id)
+        await sandbox.terminate.aio()
+
+
+# (This launcher's own name, superci-runners-<id>, says its control plane's.)
+JOBS = NAME.replace("superci-runners-", "superci-jobs-", 1)
 
 def b64url(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
@@ -87,10 +154,16 @@ def web():
         body = await check(request)
         if "jit" not in body:  # GitLab's jobs run in Docker, which Modal's sandboxes do not have
             raise HTTPException(status_code=400, detail="Modal runs no Docker for GitLab jobs")
+        if body.get("function"):
+            id, error = await start_function(JOBS, body, float(body.get("cpu") or 2), int(body.get("ram_gb") or 8), int(body.get("max_minutes", 70)), body.get("gpu"))
+            if error:
+                raise HTTPException(status_code=400, detail=error)
+            # (A launcher from before Function mode says back a sandbox: the control plane stops it, see `kind`.)
+            return {"id": id, "kind": "function", "image": body.get("image")}
         try:
             sandbox = await modal.Sandbox.create.aio(
                 *runner_command(body["jit"], body.get("fail")),
-                app=app, image=runner_image, workdir="/home/runner",
+                app=app, image=job_image(body.get("image"), body.get("image_secret")), workdir="/home/runner",
                 # CPUs as GitHub counts them (vCPUs); Modal's are physical cores of two each. Held to what it asks for, so
                 # it is billed exactly that (Modal bills the higher of reserved and used).
                 cpu=(float(body.get("cpu") or 2) / 2,) * 2, memory=(int(body.get("ram_gb") or 8) * 1024,) * 2, timeout=int(body.get("max_minutes", 70)) * 60,
@@ -99,13 +172,19 @@ def web():
         except modal.exception.InvalidError as e:
             # Modal refuses what was asked (a GPU without a payment method on the workspace): said as it says it.
             raise HTTPException(status_code=400, detail=f"Modal: {e}")
-        return {"id": sandbox.object_id, "kind": "sandbox"}
+        except (modal.exception.NotFoundError, modal.exception.RemoteError) as e:
+            refused = body.get("image") and image_refused(body["image"], e)
+            if not refused:
+                raise
+            raise HTTPException(status_code=400, detail=refused)
+        # (The image it started from, said back: a control plane knows a launcher from before images of one's own by
+        # its saying none.)
+        return {"id": sandbox.object_id, "kind": "sandbox", "image": body.get("image")}
 
     @api.post("/stop")
     async def stop(request: Request):
         body = await check(request)
-        sandbox = await modal.Sandbox.from_id.aio(body["id"])
-        await sandbox.terminate.aio()
+        await stop_machine(body["id"])
         return {"stopped": True}
 
     return api

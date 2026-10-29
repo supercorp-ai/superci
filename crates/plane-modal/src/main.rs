@@ -51,6 +51,17 @@ impl Store for Bridge {
         Ok(self.ask(json!({ "op": "put_if_absent", "key": key, "value": value }))?["created"] == true)
     }
     async fn delete(&self, key: &str) -> io::Result<()> { self.ask(json!({ "op": "delete", "key": key })).map(|_| ()) }
+    /// A hundred at a time, read side by side by plane.py: one by one, each is a call to Modal's API, and the status a
+    /// page shows asks for some 150 (over ten seconds).
+    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(100) {
+            let a = self.ask(json!({ "op": "get_many", "keys": chunk }))?;
+            let values = a["values"].as_array().filter(|v| v.len() == chunk.len()).ok_or("plane.py did not say each record asked for")?;
+            out.extend(values.iter().map(|v| v.as_str().map(str::to_string)));
+        }
+        Ok(out)
+    }
     /// What the old one Dict still holds, moved into each kind's (see `modal_plane.py`).
     async fn migrate(&self, budget: usize) -> io::Result<bool> { Ok(self.ask(json!({ "op": "migrate", "budget": budget }))?["done"] == true) }
     async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
@@ -72,13 +83,26 @@ impl Timer for Bridge {
 /// The jobs' sandboxes, started by plane.py with Modal's client (no token needed inside Modal).
 struct Sandboxes<'a>(&'a Bridge);
 
-#[async_trait(?Send)]
-impl Containers for Sandboxes<'_> {
-    async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> {
+impl Sandboxes<'_> {
+    /// One, from GitHub's runner image or an image of the control plane's own (`image`, with the Modal Secret for its
+    /// registry).
+    /// As a preemptible Modal Function in place of a sandbox when `notice` is given: the link it says a preemption with.
+    fn sandbox(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: Option<&str>, secret: Option<&str>, notice: Option<&str>) -> io::Result<String> {
         // Placement keeps GitLab jobs (Docker) away from Modal's sandboxes.
         let (jit, fail) = match work { Work::GitHub { jit } => (jit, None), Work::Fail { jit, why } => (jit, Some(why)), Work::GitLab { .. } => return Err("Modal runs no Docker for GitLab jobs".into()) };
-        let a = self.0.ask(json!({ "op": "sandbox_start", "name": name, "jit": jit, "fail": fail, "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "gpu": size.gpu.map(str::to_uppercase) }))?;
+        let mut q = json!({ "op": "sandbox_start", "name": name, "jit": jit, "fail": fail, "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "gpu": size.gpu.map(str::to_uppercase), "image": image, "image_secret": secret });
+        if let Some(n) = notice { q["function"] = true.into(); q["notice"] = n.into() }
+        let a = self.0.ask(q)?;
         a["id"].as_str().map(str::to_string).ok_or_else(|| "no sandbox id".to_string())
+    }
+}
+
+#[async_trait(?Send)]
+impl Containers for Sandboxes<'_> {
+    async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, None, None, None) }
+    async fn start_from(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: &str, secret: Option<&str>) -> io::Result<String> { self.sandbox(name, work, max_minutes, size, Some(image), secret, None) }
+    async fn start_function(&self, name: &str, work: &Work, max_minutes: u32, size: Size, image: Option<(&str, Option<&str>)>, notice: &str) -> io::Result<String> {
+        self.sandbox(name, work, max_minutes, size, image.map(|i| i.0), image.and_then(|i| i.1), Some(notice))
     }
     async fn stop(&self, id: &str) -> io::Result<()> { self.0.ask(json!({ "op": "sandbox_stop", "id": id })).map(|_| ()) }
 }

@@ -116,7 +116,7 @@ impl PlaneView {
         let mut order: Vec<_> = routing.order.into_iter().filter(|p| places.contains(&p.cloud)).collect();
         for c in places {
             if order.iter().any(|p| p.cloud == c) { continue }
-            let new = Pool { regions: vec![], off: false, cloud: c.clone(), max_jobs: None, monthly_usd: None };
+            let new = Pool { regions: vec![], off: false, cloud: c.clone(), max_jobs: None, monthly_usd: None, function: false };
             match order.iter().position(|p| p.cloud == "aws") { Some(at) if c == AWS_ON_DEMAND => order.insert(at + 1, new), _ => order.push(new) }
         }
         order

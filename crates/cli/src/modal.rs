@@ -277,6 +277,19 @@ pub fn deploy_runners(session: &Session, plane_url: &str, plane_id: &str, keys: 
     Ok(format!("https://{}--{name}.{suffix}", session.workspace))
 }
 
+/// Deploys (or updates) a control plane's jobs as Modal Functions in this workspace (`superci runners update modal
+/// --mode=function`): app `superci-jobs-<id>`, one Function for GitHub's runner image and one for each image of the
+/// control plane's own (see modal_jobs.py). Done again whenever those images change, before the control plane is told.
+pub fn deploy_jobs(session: &Session, plane_id: &str, images: &std::collections::BTreeMap<String, superci_core::plane::RunnerImage>) -> Result<()> {
+    use base64::Engine;
+    let images: Vec<(&str, Option<&str>)> = images.values().map(|i| (i.reference.as_str(), i.modal_secret.as_deref())).collect();
+    let script = include_str!("modal_jobs.py").replace("__NAME__", &jobs_app(plane_id)).replace("__IMAGES__", &base64::engine::general_purpose::STANDARD.encode(serde_json::json!(images).to_string()));
+    modal_deploy(session, &script, None).map(|_| ())
+}
+
+/// A control plane's jobs as Modal Functions: their app's name in each workspace that runs them.
+pub fn jobs_app(plane_id: &str) -> String { format!("superci-jobs-{plane_id}") }
+
 /// The control plane program a Modal control plane runs (Linux x86_64), handed to `modal deploy` with plane.py.
 const PLANE_BINARY: &[u8] = superci_programs_planes::PLANE_MODAL;
 
@@ -345,13 +358,16 @@ fn pickle_str(s: &str) -> Result<Vec<u8>> {
 /// Modal's own client in a sandbox. Safe to repeat.
 pub fn delete_plane(session: &Session, plane_id: &str) -> Result<()> {
     let app = plane_app(plane_id);
-    modal_run(session, &format!("modal app stop --yes {app} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; modal app stop --yes superci-runners-{plane_id} || true"), "", None).map(|_| ())
+    modal_run(session, &format!("modal app stop --yes {app} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; modal app stop --yes superci-runners-{plane_id} || true; {}", stop_jobs(plane_id)), "", None).map(|_| ())
 }
 
-/// Deletes the launcher made for a control plane elsewhere.
+/// Deletes the launcher made for a control plane elsewhere (and its jobs' Functions, if any).
 pub fn delete_runners(session: &Session, plane_id: &str) -> Result<()> {
-    modal_run(session, &format!("modal app stop --yes superci-runners-{plane_id} || true"), "", None).map(|_| ())
+    modal_run(session, &format!("modal app stop --yes superci-runners-{plane_id} || true; {}", stop_jobs(plane_id)), "", None).map(|_| ())
 }
+
+/// What stops a control plane's jobs' Functions in a workspace, and deletes the Dict of their starts.
+fn stop_jobs(plane_id: &str) -> String { let jobs = jobs_app(plane_id); format!("modal app stop --yes {jobs} || true; modal dict delete --yes {jobs}-starts || true") }
 
 fn modal_deploy(session: &Session, script: &str, file: Option<&[u8]>) -> Result<String> {
     modal_run(session, "modal deploy app.py", script, file)
@@ -566,6 +582,58 @@ mod tests {
             let Ok(out) = std::process::Command::new("python3").args(["-c", "import pickle,sys; sys.stdout.buffer.write(pickle.dumps(sys.argv[1], protocol=4))", s]).output() else { return };
             assert_eq!(super::pickle_str(s).unwrap(), out.stdout, "{}", s.len());
         }
+    }
+
+    /// A job's sandbox, from the launcher or a Modal control plane, starts from GitHub's runner image, or from an image
+    /// of the control plane's own: from its registry with its Secret, checked for GitHub's runner; one Modal could not
+    /// make fails its job, saying why (see fixtures/modal/job-images.py). Checked with Python, if present.
+    #[test]
+    fn a_jobs_sandbox_starts_from_the_image_its_label_names() {
+        use base64::Engine;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode("{}"));
+        for (kind, source) in [("launcher", launcher.as_str()), ("plane", include_str!("modal_plane.py"))] {
+            let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/job-images.py"), kind]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+            let Ok(mut python) = python else { return };
+            python.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
+            let out = python.wait_with_output().unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&format!("ok {kind}")), "{kind}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// Jobs as Modal Functions: the launcher and a Modal control plane start one by the name of its image and stop it by
+    /// its call's id; the Function runs GitHub's runner once, and started again on the same input (a preemption) runs
+    /// none and tells the control plane (see fixtures/modal/job-functions.py). Checked with Python, if present.
+    #[test]
+    fn a_jobs_function_is_started_by_its_images_name_and_runs_its_runner_once() {
+        use base64::Engine;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &b64.encode("{}")).replace("__NAME__", "superci-runners-abc");
+        let plane = include_str!("modal_plane.py").replace("__PLANE_ID__", "abc");
+        let jobs = include_str!("modal_jobs.py").replace("__NAME__", &super::jobs_app("abc")).replace("__IMAGES__", &b64.encode(r#"[["ghcr.io/acme/ci:1", "ghcr-read"]]"#));
+        for (kind, source) in [("launcher", launcher.as_str()), ("plane", plane.as_str()), ("jobs", jobs.as_str())] {
+            let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/job-functions.py"), kind]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+            let Ok(mut python) = python else { return };
+            python.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
+            let out = python.wait_with_output().unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&format!("ok {kind}")), "{kind}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// A Modal control plane's records are read from each kind's Dict, else from the old one, and several at once side
+    /// by side (see fixtures/modal/plane-store.py). Checked with Python, if present.
+    #[test]
+    fn a_modal_control_plane_reads_several_records_side_by_side() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/plane-store.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let Ok(mut python) = python else { return };
+        python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
+        let out = python.wait_with_output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane store"), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
     /// A runner sandbox with a 3-minute bound, as the control plane starts one, ends by itself; and a job's sandbox,

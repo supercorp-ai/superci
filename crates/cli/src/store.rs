@@ -27,6 +27,10 @@ pub struct Kept {
     pub aws_more: Vec<aws::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modal: Option<modal::Session>,
+    /// Further Modal workspaces signed in to (`superci login modal --add`): each runs jobs through a launcher of its
+    /// own. `modal` stays the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modal_more: Vec<modal::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,7 +71,7 @@ pub struct About {
 pub struct Key { pub name: String, pub value: String, pub planes: Vec<String> }
 
 impl Kept {
-    pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() }
+    pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() || !self.modal_more.is_empty() }
     /// Worth keeping: a sign-in, or what is left of one that ended (the control plane, and the key it is read with:
     /// what the dashboard keeps always has one).
     pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended) && self.plane.is_some()) }
@@ -315,6 +319,14 @@ mod tests {
         let back = store.read();
         assert!(back.signed_in() && back.cloudflare.is_none());
         assert_eq!(back.modal.unwrap().workspace, "acme");
+        assert!(back.modal_more.is_empty() && !std::fs::read_to_string(store.path()).unwrap().contains("modal_more"), "none further: not written");
+        // Further Modal workspaces are kept beside the first, in order; with them alone, it is still a sign-in.
+        let session = |w: &str| modal::Session { token_id: format!("ak-{w}"), token_secret: format!("as-{w}"), workspace: w.into() };
+        store.write(&Kept { modal_more: vec![session("acme-two"), session("acme-three")], ..Default::default() }).unwrap();
+        let more = store.read();
+        assert!(more.signed_in() && more.modal.is_none());
+        assert_eq!(more.modal_more.iter().map(|m| m.workspace.as_str()).collect::<Vec<_>>(), ["acme-two", "acme-three"]);
+        store.write(&kept).unwrap();
         assert_eq!(back.aws.unwrap().account_id, "123456789012");
         assert!(back.key == kept.key && back.plane == kept.plane);
         // One a SuperCI from before 0.19.13 wrote: the same key under its new name, to be handed again under it.

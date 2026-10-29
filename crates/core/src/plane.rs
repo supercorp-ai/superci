@@ -39,7 +39,7 @@ pub fn job_minutes(set: Option<u32>, cloud: &str) -> u32 { set.unwrap_or(MAX_JOB
 /// job run on a runner of your own (five days); Cloudflare keeps a container six hours at most; a Modal sandbox
 /// lives a day at most. The longest a job may run (`Routing::max_minutes`, six hours unless set) is never more.
 pub fn max_minutes(cloud: &str) -> u32 {
-    match cloud { "cloudflare" => 6 * 60, "modal" => 24 * 60, _ => 5 * 24 * 60 }
+    match kind_of(cloud) { "cloudflare" => 6 * 60, "modal" => 24 * 60, _ => 5 * 24 * 60 }
 }
 
 /// What the runtime gives a control plane: its id and label, and (once set up on the user's machine) the App and AWS connect
@@ -469,6 +469,12 @@ fn is_zero(n: &u32) -> bool { *n == 0 }
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
 
+/// Where each Modal Function preempted is noted (`modal:preempted:<ms>:<job>`), and each job run again for one
+/// (`modal:rerun:<ms>:<job>`): counted for the month in the status (`preempted`), kept a little longer than a month.
+const PREEMPTED: &str = "modal:preempted:";
+const PREEMPTED_RERUN: &str = "modal:rerun:";
+const PREEMPTED_KEPT_MS: u64 = 32 * 86_400_000;
+
 /// How much cheaper the first of a place's spot regions counts when they are ranked by what a job costs (see
 /// `spot_steps`): its cache and Docker layers are there, where another region reads them from afar.
 const HOME_FAVOUR: f64 = 0.15;
@@ -611,6 +617,9 @@ pub const CLOUDFLARE_JOBS_AT_ONCE: u32 = 20;
 /// A Modal sandbox of `cpu` vCPUs (half as many of Modal's physical cores) and `ram_gb`, per hour, at Modal's sandbox
 /// rates: $0.00003942 a core-second, $0.00000667 a GiB-second (held to its size, it is billed exactly that).
 pub fn modal_usd_per_hour(cpu: u32, ram_gb: u32) -> f64 { (cpu as f64 / 2.0 * 0.00003942 + ram_gb as f64 * 0.00000667) * 3600.0 }
+/// The same as a Modal Function (preemptible), per hour, at Modal's Function rates: $0.0000131 a core-second, $0.00000222
+/// a GiB-second (a third of a sandbox's).
+pub fn modal_function_usd_per_hour(cpu: u32, ram_gb: u32) -> f64 { (cpu as f64 / 2.0 * 0.0000131 + ram_gb as f64 * 0.00000222) * 3600.0 }
 
 /// Modal's per-second list price of each GPU (A100: the 40 GB one).
 pub const MODAL_GPU_USD_PER_SECOND: [(&str, f64); 8] = [("t4", 0.000164), ("l4", 0.000222), ("a10g", 0.000306), ("l40s", 0.000542), ("a100", 0.000583),
@@ -756,7 +765,36 @@ pub struct Routing {
     /// The cache (see `cache`): on unless turned off, and how much it keeps.
     #[serde(default, skip_serializing_if = "cache::Settings::is_default")]
     pub cache: cache::Settings,
+    /// Images of this control plane's own, by the name a label gives (`image=NAME`): what a job's sandbox starts from
+    /// in place of GitHub's runner image, with a repository's tools in it already.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, RunnerImage>,
 }
+
+/// An image of a control plane's own, in a container registry (`ghcr.io/acme/ci:2026-10`, or by its digest), that a
+/// job's sandbox starts from on Modal. It is made FROM `ghcr.io/actions/actions-runner` (GitHub's runner at
+/// /home/runner/run.sh, which starts the job): one without the runner fails its job, saying so. Modal keeps an image
+/// by its address, so one that names a tag that is pushed again is not fetched again: a new tag, or a digest, is.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RunnerImage {
+    /// Where it is: a registry's address, as `docker pull` takes it.
+    pub reference: String,
+    /// For a private registry: the name of a Secret in each Modal workspace that runs jobs (`modal`, and each
+    /// `modal:<workspace>`, reads its own) with REGISTRY_USERNAME and REGISTRY_PASSWORD
+    /// (Modal's names for them). Only its name is kept here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_secret: Option<String>,
+}
+
+/// Whether an image's address is one a registry could have (`ghcr.io/acme/ci:1`, `acme/ci@sha256:…`): letters, digits
+/// and `._-/:@`, not more than 255, beginning and ending with a letter or digit, and no `//` (not a web address).
+pub fn valid_image_reference(r: &str) -> bool {
+    let edge = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric());
+    (1..=255).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/:@".contains(&b)) && edge(r.as_bytes().first()) && edge(r.as_bytes().last()) && !r.contains("//")
+}
+
+/// Whether a word can be a Modal Secret's name (letters, digits, dashes, underscores and dots, up to 64, as Modal has them).
+pub fn valid_modal_secret(name: &str) -> bool { (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) }
 
 /// What the AWS account's own budget does beside its emails.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -784,7 +822,13 @@ fn pool_of(key: &str) -> (String, String) {
 }
 
 /// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
+/// (A further Modal workspace, `modal:<workspace>`, is an account of its own.)
 pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
+
+/// What kind of cloud a place in the order is. A Modal workspace signed in to beside the first one is a place of its
+/// own, `modal:<workspace>`, with its own launcher, limits and spend: it runs jobs as Modal does. Every other place is
+/// its own kind (`machine:<name>` is a computer's).
+pub fn kind_of(cloud: &str) -> &str { cloud.split_once(':').map_or(cloud, |(kind, _)| kind) }
 
 /// A limit in dollars as it is said: whole dollars without cents ($200), another amount with them ($12.50).
 pub fn dollars(usd: f64) -> String { if usd.fract() == 0.0 { format!("${usd:.0}") } else { format!("${usd:.2}") } }
@@ -817,10 +861,14 @@ pub struct Pool {
     /// AWS's: the regions its machines start in, in order (the next when one has no room). None: all of the regions
     /// the control plane is set up in (`Config::aws_regions`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub regions: Vec<String>,
+    /// Modal's: its jobs run as Modal Functions (`superci runners update modal --mode=function`), not sandboxes. A
+    /// Function is preemptible, at a third of a sandbox's price: one Modal stops is said (`/interrupted`), and its job
+    /// is run again on a sandbox once its run has finished (see `Job::interrupted`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub function: bool,
 }
 
 impl Pool {
-    pub fn of(cloud: &str) -> Pool { Pool { regions: vec![], off: false, cloud: cloud.to_string(), max_jobs: None, monthly_usd: None } }
+    pub fn of(cloud: &str) -> Pool { Pool { regions: vec![], off: false, cloud: cloud.to_string(), max_jobs: None, monthly_usd: None, function: false } }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -845,6 +893,12 @@ impl Routing {
 
     /// The limits for a cloud, from its place in the order.
     pub fn pool(&self, cloud: &str) -> Option<&Pool> { self.order.iter().find(|p| p.cloud == cloud) }
+
+    /// The image of this control plane's own a machine names (`image=NAME`), or why there is none by that name.
+    pub fn image_of(&self, spec: &Spec) -> std::result::Result<Option<&RunnerImage>, String> {
+        let Some(name) = spec.own_image() else { return Ok(None) };
+        self.images.get(name).map(Some).ok_or_else(|| format!("image={name} is no image of this control plane's: give it one with `superci runner_images create {name} --reference=REGISTRY/IMAGE:TAG`"))
+    }
 }
 
 enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
@@ -954,7 +1008,18 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
 
 /// What a cloud's containers can be (Cloudflare's, or Modal's sandboxes): started by this control plane itself, or
 /// by a launcher.
-fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
+/// A Modal machine of this size, per hour: as a Function (`Pool::function`) or a sandbox, with its GPU.
+fn modal_price(size: Size, function: bool) -> f64 {
+    (if function { modal_function_usd_per_hour(size.cpu, size.ram_gb) } else { modal_usd_per_hour(size.cpu, size.ram_gb) }) + modal_gpu_usd_per_hour(size.gpu)
+}
+
+/// What a job's runner that was lost is said as, by its cloud: AWS took its spot machine back, or Modal preempted its
+/// Function; and what runs it again (`no_spot`: AWS's on-demand machines, Modal's sandboxes).
+fn lost_said(cloud: &str) -> (&'static str, &'static str) {
+    if kind_of(cloud) == "modal" { ("Modal preempted its Function", "on a sandbox") } else { ("AWS took back its spot machine", "off spot machines") }
+}
+
+fn capacity_of(cloud: &str) -> Capacity { if kind_of(cloud) == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
 
@@ -1231,7 +1296,8 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/webhook") => match self.forward(&req, "/webhook").await? { Some(r) => Ok(r), None => self.webhook(&req, &plane_url).await },
             ("POST", "/gitlab/webhook") => match self.forward(&req, "/gitlab/webhook").await? { Some(r) => Ok(r), None => self.gitlab_webhook(&req, &plane_url).await },
             ("POST", "/aws/callback") => self.aws_callback(&req, &plane_url).await,
-            // A spot machine saying AWS is taking it back (only it has its job's link).
+            // A spot machine saying AWS is taking it back, or a Modal Function started again after Modal preempted it
+            // (only it has its job's link).
             ("POST", "/interrupted") => {
                 let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
                 // The job its machine is on now: a GitHub runner may have taken another than the one it was started
@@ -1248,13 +1314,15 @@ impl<'a> ControlPlane<'a> {
                     self.keep(&job_key(&j), &j).await?;
                     // The pool that took it back is asked last for a while (it is short of machines now).
                     if let (Some(region), Some(kind), Some(zone)) = (&j.region, &j.machine_type, &j.zone) { let _ = self.store.put(&pool_key(region, kind, zone), self.clock.now_ms().to_string()).await; }
-                    // One record each (two machines may say so at once), counted by `spot_paused`.
+                    // One record each (two machines may say so at once), counted by `spot_paused`; Modal's apart (kept
+                    // for the month's count, see `preempted`), so they never pause AWS's spot machines.
                     let now = self.clock.now_ms();
-                    put_json(self.store, &format!("spot:interrupted:{now}:{}", j.job_id), &now).await?;
+                    let note = if kind_of(&j.cloud) == "modal" { PREEMPTED } else { "spot:interrupted:" };
+                    put_json(self.store, &format!("{note}{now}:{}", j.job_id), &now).await?;
                 }
                 // What the machine runs with this answer: the reason, in the job's own log on GitHub, where it is
                 // otherwise only "The runner has received a shutdown signal" (a GitHub job: GitLab's says its own).
-                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said("SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said("SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
+                let said = if !j.gitlab.is_empty() || q.contains_key("gl") || kind_of(&j.cloud) == "modal" { String::new() } else if j.provider == "local" { aws::reclaim_said("SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said("SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
                 Ok(Response::new(200, "text/x-shellscript", said))
             }
             // A machine saying how its own start went (see `MachineStart`): with its link, and only what it may say.
@@ -1636,6 +1704,10 @@ impl<'a> ControlPlane<'a> {
     /// with the control plane gone; a job's own time limit (`timeout-minutes`) ends it sooner.
     fn machine_minutes(&self, cloud: &str) -> u32 { job_minutes(self.config.routing.max_minutes, cloud) }
 
+    /// Whether a job runs as a Modal Function at this place: Modal's, in Function mode, and not a job run again after
+    /// its runner was lost (`no_spot`), which runs on a sandbox (so a job is run again for a preemption once at most).
+    fn modal_function(&self, place: &str, job: &Job) -> bool { kind_of(place) == "modal" && !job.no_spot && self.config.routing.pool(place).is_some_and(|p| p.function) }
+
     /// Whether a request may read: a dashboard session's key, or a key that only reads and has not expired.
     fn reader(&self, req: &Request) -> bool {
         if self.dashboard(req) { return true }
@@ -1805,7 +1877,12 @@ impl<'a> ControlPlane<'a> {
             "account_limits": true,
             // (And for a day; and what the AWS account's own budget does.)
             "daily_limits": true,
+            // (And images of its own, `Routing::images`; and Modal's Function mode, `Pool::function`.)
+            "runner_images": true,
+            "function_mode": true,
             "spend_today": day_spend,
+            // Modal Functions preempted this month (UTC), and jobs run again for it (see `Pool::function`).
+            "preempted": self.preempted(now).await,
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
             "active": live.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
@@ -2311,6 +2388,13 @@ impl<'a> ControlPlane<'a> {
         pools
     }
 
+    /// How many Modal Functions were preempted this month (UTC), and how many of their jobs were run again.
+    async fn preempted(&self, now: u64) -> serde_json::Value {
+        let since = month_start_ms(now);
+        let count = |all: Vec<(String, String)>| all.into_iter().filter(|(_, v)| v.trim_matches('"').parse::<u64>().is_ok_and(|at| at >= since)).count();
+        serde_json::json!({ "month": count(self.store.list(PREEMPTED).await.unwrap_or_default()), "rerun": count(self.store.list(PREEMPTED_RERUN).await.unwrap_or_default()) })
+    }
+
     /// Whether spot is paused now: AWS took back two machines within a quarter of an hour, less than half an hour ago.
     async fn spot_paused(&self, now: u64) -> bool {
         let mut times: Vec<u64> = self.store.list("spot:interrupted:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| v.parse().ok()).collect();
@@ -2356,7 +2440,10 @@ impl<'a> ControlPlane<'a> {
             None
         }.await;
         let Some(state) = settled else { return false };
-        j.error = Some(if state == "asked" { "AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines (the run's next attempt)".into() } else { format!("AWS took back its spot machine; {state}") });
+        let (lost, again) = lost_said(&j.cloud);
+        j.error = Some(if state == "asked" { format!("{lost}; SuperCI ran the job again by itself, {again} (the run's next attempt)") } else { format!("{lost}; {state}") });
+        // (Modal's counted for the month, see `preempted`.)
+        if state == "asked" && kind_of(&j.cloud) == "modal" { let _ = put_json(self.store, &format!("{PREEMPTED_RERUN}{now}:{}", j.job_id), &now).await; }
         r.state = state;
         j.rerun = Some(r);
         true
@@ -2420,8 +2507,12 @@ impl<'a> ControlPlane<'a> {
             if order.contains(c) { continue }
             match order.iter().position(|o| o == "aws") { Some(at) if c == AWS_ON_DEMAND => order.insert(at + 1, c.clone()), _ => order.push(c.clone()) }
         }
-        // A label or a rule naming AWS means both of its places, as the order has them.
-        let named = |c: &str| -> Vec<String> { if c == "aws" { order.iter().filter(|o| *o == "aws" || *o == AWS_ON_DEMAND).cloned().collect() } else { vec![c.to_string()] } };
+        // A label or a rule naming AWS means both of its places, as the order has them; naming Modal, each Modal workspace.
+        let named = |c: &str| -> Vec<String> { match c {
+            "aws" => order.iter().filter(|o| *o == "aws" || *o == AWS_ON_DEMAND).cloned().collect(),
+            "modal" => order.iter().filter(|o| kind_of(o) == "modal").cloned().collect(),
+            _ => vec![c.to_string()],
+        } };
         let candidates: Vec<String> = if let Some(c) = &spec.cloud { let v = named(c); if v.is_empty() { vec![c.clone()] } else { v } }
             else if let Some(c) = routing.rule_for(repo) { let v = named(c); if v.is_empty() { vec![c.to_string()] } else { v } }
             else if !routing.order.is_empty() { order.clone() }
@@ -2479,7 +2570,7 @@ impl<'a> ControlPlane<'a> {
                 never.push(format!("{name} is not connected"));
                 continue
             };
-            if gitlab && cloud == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
+            if gitlab && kind_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
             // Its label asks for an on-demand machine: not AWS's spot ones.
@@ -2933,6 +3024,7 @@ impl<'a> ControlPlane<'a> {
         let result: Result<()> = async {
             let spec = match spec { Ok(s) => s, Err(e) => { intrinsic = true; return Err(e) } };
             if let Some(why) = self.config.routing.too_large(&spec) { intrinsic = true; return Err(why) }
+            let image = match self.config.routing.image_of(&spec) { Ok(i) => i, Err(why) => { intrinsic = true; return Err(why) } };
             let now = self.clock.now_ms();
             let places = match self.place(&job.repo, &spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), &job.failed_at).await? {
                 Placement::Run(p) => p,
@@ -3232,20 +3324,49 @@ impl<'a> ControlPlane<'a> {
                     Runner::Own => async {
                         // (Sized for the job where it was placed.)
                         job.cpu = Some(size.cpu);
-                        job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) } else { cloudflare_usd_per_hour(size) });
+                        let function = self.modal_function(&place, job);
+                        job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_price(size, function) } else { cloudflare_usd_per_hour(size) });
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, self.machine_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
+                        let containers = self.containers.ok_or("no containers here")?;
+                        let minutes = self.machine_minutes(&self.config.own_cloud);
+                        job.notice = function.then(|| crate::crypto::random_token(18));
+                        if let Some(t) = &job.notice {
+                            let id = containers.start_function(&name, &work, minutes, size, image.map(|i| (i.reference.as_str(), i.modal_secret.as_deref())), &format!("{plane_url}/interrupted?runner={name}&t={t}")).await?;
+                            return Ok(Tried::Started(id, format!("{}-function", machine_name(size))))
+                        }
+                        Ok(Tried::Started(match image { Some(i) => containers.start_from(&name, &work, minutes, size, &i.reference, i.modal_secret.as_deref()).await?, None => containers.start(&name, &work, minutes, size).await? }, machine_name(size)))
                     }.await,
                     Runner::Launcher(a) => async {
                         job.cpu = Some(size.cpu);
                         // (Priced as its capacity is had: Cloudflare's, else Modal's, see `capacity_of`.)
-                        job.usd_per_hour = Some(if a.cloud == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) });
+                        let function = self.modal_function(&place, job);
+                        job.usd_per_hour = Some(if a.cloud == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_price(size, function) });
                         if a.cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
+                        // As a Function: with the link it says a preemption with.
+                        job.notice = function.then(|| crate::crypto::random_token(18));
+                        if let Some(t) = &job.notice { body["function"] = true.into(); body["notice"] = format!("{plane_url}/interrupted?runner={name}&t={t}").into() }
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
+                        // (An image of its own: where it is, and the Modal Secret that reaches a private registry.)
+                        if let Some(i) = image { body["image"] = i.reference.clone().into(); if let Some(s) = &i.modal_secret { body["image_secret"] = s.clone().into() } }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
-                        Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
+                        let id = v["id"].as_str().ok_or("launcher answered without an id")?.to_string();
+                        // A launcher from before images of one's own starts GitHub's runner image whatever it is told
+                        // (it says back no image): its sandbox is stopped, and the job says to update it.
+                        if let Some(i) = image.filter(|i| v["image"].as_str() != Some(&i.reference)) {
+                            let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
+                            // (A further Modal workspace's, `modal:<workspace>`, is made again with `--account`.)
+                            let again = a.cloud.split_once(':').map_or(a.cloud.clone(), |(kind, w)| format!("{kind} --account={w}"));
+                            return Err(format!("the {} launcher is from before images of your own, and would start GitHub's runner image in place of {}: update it (`superci runners create {again}`)", cloud_name(&a.cloud), i.reference))
+                        }
+                        // Nor one from before Function mode, which starts a sandbox whatever it is told (it says so).
+                        if function && v["kind"] != "function" {
+                            let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
+                            let again = a.cloud.split_once(':').map_or(a.cloud.clone(), |(kind, w)| format!("{kind} --account={w}"));
+                            return Err(format!("the {} launcher is from before Function mode, and would start a sandbox: update it (`superci runners create {again}`)", cloud_name(&a.cloud)))
+                        }
+                        Ok(Tried::Started(id, v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
                 match tried {
@@ -3440,7 +3561,7 @@ impl<'a> ControlPlane<'a> {
         enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| a.cloud == *c)).map(|a| Place::Launcher(a.clone())));
+        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| kind_of(&a.cloud) == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
@@ -4682,10 +4803,11 @@ impl<'a> ControlPlane<'a> {
             // (A run from a computer's is started again by its run, at once: see `advance_run`.)
             if j.interrupted && j.rerun.is_none() && !matches!(ev.conclusion.as_deref(), Some("success" | "skipped" | "neutral")) {
                 j.state = "failed".into();
+                let (lost, again) = lost_said(&j.cloud);
                 if j.provider == "local" {
-                    j.error = Some("AWS took back its spot machine; SuperCI starts the job again by itself, off spot machines".into());
+                    j.error = Some(format!("{lost}; SuperCI starts the job again by itself, {again}"));
                 } else {
-                    j.error = Some("AWS took back its spot machine; SuperCI runs the job again by itself, off spot machines, once its run has finished (GitHub runs a job again only then)".into());
+                    j.error = Some(format!("{lost}; SuperCI runs the job again by itself, {again}, once its run has finished (GitHub runs a job again only then)"));
                     j.rerun = Some(Rerun { job_id, run_id: ev.run_id, repo: ev.repo.clone(), name: ev.name.clone(), state: "pending".into(), at_ms: self.clock.now_ms() });
                     self.timer.wake_in(60_000).await?;
                 }
@@ -4981,7 +5103,7 @@ impl<'a> ControlPlane<'a> {
         self.sweep_gitlab_runners(now).await?;
         // Notes that only matter for a while: spot interruptions (counted for the pause), jobs asked to run again and
         // not arrived.
-        let mut notes = [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000)].into_iter();
+        let mut notes = [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000), (PREEMPTED, PREEMPTED_KEPT_MS), (PREEMPTED_RERUN, PREEMPTED_KEPT_MS)].into_iter();
         loop {
             let Some((prefix, keep)) = notes.next() else { break };
             for (k, v) in self.store.list(prefix).await? { if v.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > keep) { self.store.delete(&k).await? } }

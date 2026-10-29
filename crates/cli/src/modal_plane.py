@@ -5,6 +5,7 @@
 # Modal's client can do. Deployed by the SuperCI dashboard with Modal's own `modal deploy`.
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -40,6 +41,71 @@ runner_image = (
     .dockerfile_commands(["USER root", "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xz-utils zstd zip unzip jq git wget build-essential pkg-config && rm -rf /var/lib/apt/lists/*"])
     .env({"RUNNER_ALLOW_RUNASROOT": "1"})
 )
+
+# An image of the control plane's own (`superci runner_images`): a registry's address, made FROM GitHub's runner image
+# with what a repository's jobs use in it already. Modal makes it once and keeps it by its address (a tag pushed again is
+# not fetched again). The one thing checked is the runner, which starts the job: an image without it is not made, and
+# the job says why.
+NO_RUNNER = "test -x /home/runner/run.sh || { echo 'This image has no GitHub runner at /home/runner/run.sh: make it FROM ghcr.io/actions/actions-runner' >&2; exit 1; }"
+
+
+def job_image(reference=None, secret=None):
+    """The image a job's sandbox starts from: GitHub's runner image, or one of the control plane's own at `reference`
+    (`secret`: the name of a Modal Secret with REGISTRY_USERNAME and REGISTRY_PASSWORD, for a private registry)."""
+    if not reference:
+        return runner_image
+    return (
+        modal.Image.from_registry(reference, secret=modal.Secret.from_name(secret) if secret else None)
+        .dockerfile_commands(["USER root", f"RUN {NO_RUNNER}"])
+        .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+    )
+
+
+def image_refused(reference, e):
+    """What a job is told when Modal could not make a sandbox from an image of the control plane's own (it is not in
+    its registry, its registry is private and its Secret is missing or wrong, or it has no runner), or None when what
+    failed was not the image (a build cut short, or timed out, is tried again)."""
+    said = str(e)
+    if isinstance(e, modal.exception.NotFoundError) or (isinstance(e, modal.exception.RemoteError) and said.startswith("Image build") and " failed" in said):
+        return (f"Modal could not start from the image {reference}: Modal must be able to pull it (a private registry with a Modal Secret, "
+                f"see `superci help runner_images`), and it must be made FROM ghcr.io/actions/actions-runner. Modal: {said}")
+    return None
+
+
+# Jobs as Modal Functions (`superci runners update modal --mode=function`): deployed apart, as `superci-jobs-<id>` (see
+# modal_jobs.py), one Function per image, named by its address.
+def function_name(reference=None, secret=None):
+    """The Function a job's image runs as: `run` for GitHub's runner image, else `run_` and the first 12 hex digits of
+    the SHA-256 of its address and Secret (the same in the control plane's and the launcher's code)."""
+    if not reference:
+        return "run"
+    return "run_" + hashlib.sha256(f"{reference}\n{secret or ''}".encode()).hexdigest()[:12]
+
+
+async def start_function(jobs, q, cpu, ram_gb, max_minutes, gpu):
+    """A job's runner as a preemptible Function call of the app `jobs`, told the link it says a preemption with; its
+    call's id (`fc-…`). A Function not deployed (Function mode set, or an image changed, and not deployed since) is
+    said, as Modal refusing it."""
+    name = function_name(q.get("image"), q.get("image_secret"))
+    try:
+        f = modal.Function.from_name(jobs, name).with_options(cpu=(cpu / 2,) * 2, memory=(ram_gb * 1024,) * 2, timeout=max_minutes * 60, gpu=gpu)
+        call = await f.spawn.aio(q["jit"], q.get("fail"), q.get("notice"))
+    except modal.exception.NotFoundError as e:
+        return None, (f"Modal refused: no Function {name} in the app {jobs} (Function mode deploys one per image: "
+                      f"`superci runners create modal`, or `modal --account=WORKSPACE`, deploys them again). Modal: {e}")
+    return call.object_id, None
+
+
+async def stop_machine(id):
+    """Ends a job's sandbox (`sb-…`) or Function call (`fc-…`, its container with it)."""
+    if id.startswith("fc-"):
+        await modal.FunctionCall.from_id(id).cancel.aio(terminate_containers=True)
+    else:
+        sandbox = await modal.Sandbox.from_id.aio(id)
+        await sandbox.terminate.aio()
+
+
+JOBS = f"superci-jobs-{PLANE_ID}"
 state = modal.Dict.from_name(f"{NAME}-state", create_if_missing=True)
 # Each kind of record (the key up to its first colon: job, live, rline, …) in a Dict of its own, so listing one kind
 # never reads every record. Before, all were in `state`: until they are moved (`migrate`, at each sweep), what is not
@@ -95,13 +161,19 @@ class Plane:
             self.cached = (values, time.time())
         return values
 
+    async def get(self, key):
+        value = await kind_of(key).get.aio(key)
+        if value is None and not await moved():
+            value = await state.get.aio(key)
+        return value
+
     async def answer(self, q):
         op = q["op"]
         if op == "get":
-            value = await kind_of(q["key"]).get.aio(q["key"])
-            if value is None and not await moved():
-                value = await state.get.aio(q["key"])
-            return {"value": value}
+            return {"value": await self.get(q["key"])}
+        if op == "get_many":
+            # Side by side: each is a call to Modal's API (the status a page shows asks for some 150 records).
+            return {"values": list(await asyncio.gather(*(self.get(k) for k in q["keys"])))}
         if op == "put":
             await kind_of(q["key"]).put.aio(q["key"], q["value"])
             return {}
@@ -152,10 +224,13 @@ class Plane:
                 await state.put.aio("__wake_at", q["at_ms"])
             return {}
         if op == "sandbox_start":
+            if q.get("function"):
+                id, error = await start_function(JOBS, q, float(q["cpu"]), int(q["ram_gb"]), int(q["max_minutes"]), q.get("gpu"))
+                return {"error": error} if error else {"id": id}
             try:
                 sandbox = await modal.Sandbox.create.aio(
                     *runner_command(q["jit"], q.get("fail")),
-                    app=app, image=runner_image, workdir="/home/runner",
+                    app=app, image=job_image(q.get("image"), q.get("image_secret")), workdir="/home/runner",
                     # CPUs as GitHub counts them (vCPUs); Modal's are physical cores of two each. Held to what it asks
                     # for, so it is billed exactly that (Modal bills the higher of reserved and used).
                     cpu=(float(q["cpu"]) / 2,) * 2, memory=(int(q["ram_gb"]) * 1024,) * 2, timeout=int(q["max_minutes"]) * 60,
@@ -164,10 +239,14 @@ class Plane:
             except modal.exception.InvalidError as e:
                 # What was asked cannot be had (no GPUs without a payment method): said as it is, not tried again.
                 return {"error": f"Modal refused: {e}"}
+            except (modal.exception.NotFoundError, modal.exception.RemoteError) as e:
+                refused = q.get("image") and image_refused(q["image"], e)
+                if not refused:
+                    raise
+                return {"error": refused}
             return {"id": sandbox.object_id}
         if op == "sandbox_stop":
-            sandbox = await modal.Sandbox.from_id.aio(q["id"])
-            await sandbox.terminate.aio()
+            await stop_machine(q["id"])
             return {}
         return {"error": f"unknown question {op}"}
 
