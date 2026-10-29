@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.22
+- A Modal deploy works in any Modal workspace, however new: SuperCI tells Modal's client which image builder version to build with (2026.10, with Modal's client 1.6.3), where it took the workspace's own, and a client refuses one newer than it knows. A workspace made now is on 2026.10, which SuperCI's client before refused. By Taras Kornichuk (github.com/artile), who moved the client to 1.6.3. Update your control plane for it.
 - A Modal control plane or launcher deploys in a Modal workspace that has nothing of SuperCI's yet. Modal had begun to refuse to create an app for a client whose version it could not read ("Could not determine the SDK version for client type CLIENT_TYPE_LIBMODAL_GO"), and SuperCI said its own: it now says Modal's Go SDK's, as that SDK does. By Taras Kornichuk (github.com/artile).
 - A Modal sign-in ends once it is approved in Modal's tab, whatever the dashboard's tab does meanwhile. Modal hands the token only to a call waiting at that moment: one now waits all the time. By Taras Kornichuk (github.com/artile).
 - What Modal says of a client release it will stop taking is said: by `superci` when it asks Modal, above the dashboard's pages, and in `superci status` from the control plane, which keeps what its launchers and its own client heard. Update your control plane for it.

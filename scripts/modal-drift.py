@@ -2,16 +2,22 @@
 """Says where SuperCI's Modal client has drifted from Modal's own (the Modal drift workflow runs it every week).
 
     scripts/modal-drift.py [--proto FILE] [--go-version FILE] [--pypi-version VERSION]
+                           [--client-image FILE] [--newest-image FILE]
 
 SuperCI calls Modal's API with messages declared by hand (crates/cli/src/modal.rs, `mod pb`), says it is Modal's Go
-SDK of a release (`LIBMODAL_VERSION`), and deploys with Modal's Python client of a release (`modal==`). Each is held
-to Modal's sources: its API (modal_proto/api.proto in modal-labs/modal-client), its Go SDK's version (go/version.go
-there) and its Python client's newest release (PyPI). Read from there unless given. Exits 1, saying what moved, when:
+SDK of a release (`LIBMODAL_VERSION`), and deploys with Modal's Python client of a release (`MODAL_CLIENT`), telling it
+which image builder version to build with (`IMAGE_BUILDER`). Each is held to Modal's sources: its API
+(modal_proto/api.proto in modal-labs/modal-client), its Go SDK's version (go/version.go there), its Python client's
+newest release (PyPI), and the image builder versions a client release knows (py/modal/_image.py, at the pinned
+release and at the newest). Read from there unless given. Exits 1, saying what moved, when:
 
 - a message, field or method SuperCI uses is not in the API as declared (its number, its type), or an enum value it
   sends means something else;
 - the Go SDK or the Python client has a newer minor release than the one SuperCI says or installs (Modal stops
-  taking old releases, and says so first: see `heard` in modal.rs).
+  taking old releases, and says so first: see `heard` in modal.rs);
+- the image builder version is not one the pinned client knows, or Modal's newest client knows a newer one (new
+  workspaces get it; SuperCI moves to it on purpose, with a client that knows it);
+- a release of the client is written anywhere but `MODAL_CLIENT`.
 """
 import json, re, sys, urllib.request
 
@@ -19,6 +25,13 @@ MODAL_RS = "crates/cli/src/modal.rs"
 PROTO_URL = "https://raw.githubusercontent.com/modal-labs/modal-client/main/modal_proto/api.proto"
 GO_VERSION_URL = "https://raw.githubusercontent.com/modal-labs/modal-client/main/go/version.go"
 PYPI_URL = "https://pypi.org/pypi/modal/json"
+IMAGE_URL = "https://raw.githubusercontent.com/modal-labs/modal-client/py/v{}/py/modal/_image.py"
+
+
+def builders(image_py):
+    """The image builder versions a client release knows (its `ImageBuilderVersion`), without PREVIEW."""
+    known = re.search(r"ImageBuilderVersion = Literal\[([^\]]*)\]", image_py)
+    return sorted(v for v in re.findall(r'"([^"]+)"', known.group(1)) if v != "PREVIEW") if known else []
 
 # The enum values SuperCI sends or reads as numbers, and what each means to it.
 ENUMS = [
@@ -153,15 +166,22 @@ def main():
         drift.append(f"Go SDK: SuperCI says {said}, not modal-go/<version> as the Go SDK does (the x-modal-libmodal-version header, {MODAL_RS})")
     elif minor(version) < minor(newest_go):
         drift.append(f"Go SDK: SuperCI says {said}, Modal's newest is {newest_go} (LIBMODAL_VERSION in {MODAL_RS})")
-    pinned = set(re.findall(r"modal==([\w.]+)", source))
-    for p in sorted(pinned):
-        if minor(p) < minor(pypi):
-            drift.append(f"Python client: SuperCI installs modal=={p}, PyPI's newest is {pypi}")
-    if len(pinned) > 1:
-        drift.append(f"Python client: {MODAL_RS} installs several releases ({', '.join(sorted(pinned))}): one is meant")
+    client = re.search(r'const MODAL_CLIENT: &str = "([^"]+)"', source).group(1)
+    builder = re.search(r'const IMAGE_BUILDER: &str = "([^"]+)"', source).group(1)
+    if minor(client) < minor(pypi):
+        drift.append(f"Python client: SuperCI installs modal=={client}, PyPI's newest is {pypi} (MODAL_CLIENT in {MODAL_RS})")
+    written = sorted(set(re.findall(r"modal==(\d[\w.]*)", source)))
+    if written:
+        drift.append(f"Python client: {MODAL_RS} writes modal=={', '.join(written)} where MODAL_CLIENT is meant")
+    knows = builders(open(given("--client-image")).read() if given("--client-image") else fetch(IMAGE_URL.format(client)))
+    newest = builders(open(given("--newest-image")).read() if given("--newest-image") else fetch(IMAGE_URL.format(pypi)))
+    if builder not in knows:
+        drift.append(f"Image builder: SuperCI builds with {builder}, which modal=={client} does not know (it knows {', '.join(knows) or 'none'})")
+    if newest and newest[-1] > builder:
+        drift.append(f"Image builder: Modal's newest client knows {newest[-1]}, SuperCI builds with {builder}: new workspaces have it (IMAGE_BUILDER and MODAL_CLIENT in {MODAL_RS}, moved together)")
 
     print(f"Messages {len(declared) - len(NOT_MODALS & declared.keys())}, methods {len(calls)}, enum values {len(ENUMS)}; "
-          f"{said} (newest {newest_go}); modal=={', '.join(sorted(pinned))} (newest {pypi}).")
+          f"{said} (newest {newest_go}); modal=={client} (newest {pypi}), image builder {builder} (newest {newest[-1] if newest else 'unknown'}).")
     if drift:
         print("Drifted from Modal's own:\n" + "\n".join(f"- {d}" for d in drift))
         sys.exit(1)
