@@ -697,6 +697,19 @@ mod tests {
         }
     }
 
+    /// A Modal control plane's records are read from each kind's Dict, else from the old one, and several at once side
+    /// by side (see fixtures/modal/plane-store.py). Checked with Python, if present.
+    #[test]
+    fn a_modal_control_plane_reads_several_records_side_by_side() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/plane-store.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let Ok(mut python) = python else { return };
+        python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
+        let out = python.wait_with_output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane store"), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// A runner sandbox with a 3-minute bound, as the control plane starts one, ends by itself; and a job's sandbox,
     /// holding no token, cannot read this workspace's stored settings (SUPERCI_MODAL_TOKEN_ID/SECRET, plus live.rs's settings).
     #[test]

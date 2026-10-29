@@ -564,7 +564,10 @@ pub fn refused(plane_url: &str, key: &str) -> Option<String> {
 
 fn status_of(plane_url: &str, key: &str, query: &str) -> Option<Value> {
     let key = &plane_key(key, plane_url);
-    let mut r = quick().get(&crate::aws::stand_in(&format!("{plane_url}/status{query}"))).header("authorization", &format!("Bearer {key}")).call().ok()?;
+    // (Waited for longer than its health: a status is many reads of the control plane's store, and a busy one, or one
+    // just started, takes more than `quick` allows. One that does not answer at all is told by its health.)
+    let reading: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(30))).build().into();
+    let mut r = reading.get(&crate::aws::stand_in(&format!("{plane_url}/status{query}"))).header("authorization", &format!("Bearer {key}")).call().ok()?;
     if r.status().as_u16() != 200 { return None }
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
 }
@@ -645,6 +648,17 @@ mod answers {
             ("HEAD", "/registry.cloudflare.com/v2/acc/superci-runner/manifests/gh-latest") => Some(answer(200, "")),
             _ => None,
         }
+    }
+
+    /// A control plane slower to say its status than `quick` allows (a busy one: each is many reads of its store) is
+    /// waited for: its status is read, not taken for a key it refused.
+    #[test]
+    fn a_busy_control_planes_status_is_waited_for_longer_than_its_health() {
+        let at = clouds::serve(|_, path, _| match path {
+            "/acme--superci-plane-p1.modal.run/status" => { std::thread::sleep(Duration::from_secs(9)); answer(200, r#"{"jobs":[]}"#) }
+            _ => answer(404, "no"),
+        });
+        with(&at, || assert_eq!(status("https://acme--superci-plane-p1.modal.run", "k"), Some(json!({ "jobs": [] }))));
     }
 
     #[test]

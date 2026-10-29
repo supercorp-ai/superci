@@ -116,13 +116,19 @@ class Plane:
             self.cached = (values, time.time())
         return values
 
+    async def get(self, key):
+        value = await kind_of(key).get.aio(key)
+        if value is None and not await moved():
+            value = await state.get.aio(key)
+        return value
+
     async def answer(self, q):
         op = q["op"]
         if op == "get":
-            value = await kind_of(q["key"]).get.aio(q["key"])
-            if value is None and not await moved():
-                value = await state.get.aio(q["key"])
-            return {"value": value}
+            return {"value": await self.get(q["key"])}
+        if op == "get_many":
+            # Side by side: each is a call to Modal's API (the status a page shows asks for some 150 records).
+            return {"values": list(await asyncio.gather(*(self.get(k) for k in q["keys"])))}
         if op == "put":
             await kind_of(q["key"]).put.aio(q["key"], q["value"])
             return {}

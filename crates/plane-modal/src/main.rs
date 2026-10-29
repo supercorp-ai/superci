@@ -51,6 +51,17 @@ impl Store for Bridge {
         Ok(self.ask(json!({ "op": "put_if_absent", "key": key, "value": value }))?["created"] == true)
     }
     async fn delete(&self, key: &str) -> io::Result<()> { self.ask(json!({ "op": "delete", "key": key })).map(|_| ()) }
+    /// A hundred at a time, read side by side by plane.py: one by one, each is a call to Modal's API, and the status a
+    /// page shows asks for some 150 (over ten seconds).
+    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(100) {
+            let a = self.ask(json!({ "op": "get_many", "keys": chunk }))?;
+            let values = a["values"].as_array().filter(|v| v.len() == chunk.len()).ok_or("plane.py did not say each record asked for")?;
+            out.extend(values.iter().map(|v| v.as_str().map(str::to_string)));
+        }
+        Ok(out)
+    }
     /// What the old one Dict still holds, moved into each kind's (see `modal_plane.py`).
     async fn migrate(&self, budget: usize) -> io::Result<bool> { Ok(self.ask(json!({ "op": "migrate", "budget": budget }))?["done"] == true) }
     async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {

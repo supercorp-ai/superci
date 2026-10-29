@@ -71,6 +71,7 @@ impl PlanePy {
             let key = q["key"].as_str().unwrap_or_default().to_string();
             let a = match op.as_str() {
                 "get" => json!({ "value": self.dict.get(&key) }),
+                "get_many" => json!({ "values": q["keys"].as_array().unwrap().iter().map(|k| self.dict.get(k.as_str().unwrap())).collect::<Vec<_>>() }),
                 "put" => { self.dict.insert(key, q["value"].as_str().unwrap().into()); json!({}) }
                 "put_if_absent" => { let created = !self.dict.contains_key(&key); if created { self.dict.insert(key, q["value"].as_str().unwrap().into()); } json!({ "created": created }) }
                 "delete" => { self.dict.remove(&key); json!({}) }
@@ -268,4 +269,35 @@ fn a_job_on_aws_is_asked_again_after_a_wait_when_aws_refuses_it_for_its_rate() {
     let runs = aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).count();
     let asked: Vec<String> = aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["url"], a["asked"].as_str().unwrap_or_default().chars().take(60).collect::<String>())).collect();
     assert!(runs >= 2, "{runs} RunInstances: {}\n{asked:#?}", py.dict["job:90000000001"]);
+}
+
+/// The status a page shows reads the jobs it lists, their machines' starts and each day's totals several at once: as
+/// many questions to plane.py (each a call to Modal's API) for fifty jobs as for five.
+#[test]
+fn the_status_reads_its_records_several_at_once_however_many_jobs_there_are() {
+    let aws = aws();
+    let gh = aws.github.lock().unwrap().clone().unwrap();
+    let secrets = json!({ "CONTAINERS": "on", "GITHUB_APP": GitHub::app().to_string(), "DEVICE_KEY_4102444800_TEST": "dashboard-key-for-tests-0001" });
+    let mut py = PlanePy::start(&aws);
+    // (Its jobs indexed, as every control plane's are once its upkeep has run.)
+    py.dict.insert("indexed".into(), now_ms().to_string());
+    let (mut questions, mut queued) = (vec![], 0);
+    for jobs in [5, 50] {
+        while queued < jobs {
+            queued += 1;
+            let (_, hook) = gh.queue("build", "acmeci", now_ms());
+            py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+        }
+        // (Asked twice: the first after a new key also notes it.)
+        let status = |py: &mut PlanePy| py.exchange(request("GET", "/status", json!({ "authorization": "Bearer dashboard-key-for-tests-0001" }), b"", &secrets)).unwrap();
+        status(&mut py);
+        let before = py.asked.len();
+        let status = status(&mut py);
+        let said: Value = serde_json::from_str(&body(&status)).unwrap();
+        assert_eq!(said["jobs"].as_array().map(Vec::len), Some(jobs), "{}", body(&status));
+        let asked: Vec<String> = py.ops()[before..].to_vec();
+        assert!(asked.iter().any(|o| o == "get_many"), "{asked:?}");
+        questions.push(asked.len());
+    }
+    assert_eq!(questions[0], questions[1], "as many questions for 50 jobs as for 5");
 }

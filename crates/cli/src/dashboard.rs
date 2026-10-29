@@ -1446,8 +1446,12 @@ impl Dashboard {
         let p = views[i].plane.clone();
         self.select(i);
         let mut v = view::plane_view(&p, Some(&self.status_key));
-        // Just handed the key: its whole status, once it takes it (a few tries).
-        if v.online && v.status.is_none() && self.keyed.contains(p.plane_id()) { v.status = tries(8, 0, || { aws::pause(1500); cloudflare::status(p.url(), &self.status_key) }) }
+        // Just handed the key: its whole status, once it takes it (a few tries, for some twenty seconds: one slower than
+        // that to answer is not asked again and again).
+        if v.online && v.status.is_none() && self.keyed.contains(p.plane_id()) {
+            let began = std::time::Instant::now();
+            v.status = (0..8).take_while(|_| began.elapsed() < Duration::from_secs(20)).find_map(|_| { aws::pause(1500); cloudflare::status(p.url(), &self.status_key) })
+        }
         self.keep();
         if let Some(why) = self.key_refused(&v) { return Err(why) }
         Ok(Some(v))
