@@ -4,7 +4,8 @@
 //! with Modal's official Python SDK. Messages are declared by hand with the protocol's field numbers.
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -14,6 +15,10 @@ use crate::Result;
 const API: &str = "https://api.modal.com";
 /// Modal's server knows its own clients only; this one behaves like its Go SDK and says who it is.
 const CLIENT_TYPE: &str = "9";
+/// The Go SDK's release it behaves like, as that SDK says it (`modal-go/<version>`). Modal reads the SDK's version from
+/// it and refuses to create an app for a Go client whose version it cannot read ("Could not determine the SDK
+/// version for client type CLIENT_TYPE_LIBMODAL_GO"): every deploy (control plane, launcher) creates one.
+const LIBMODAL_VERSION: &str = "modal-go/v0.7.3";
 
 mod pb {
     #[derive(Clone, PartialEq, prost::Message)] pub struct Empty {}
@@ -153,7 +158,7 @@ impl Client {
         let set = |m: &mut tonic::metadata::MetadataMap, k: &'static str, v: &str| { if let Ok(v) = MetadataValue::try_from(v) { m.insert(k, v); } };
         set(m, "x-modal-client-type", CLIENT_TYPE);
         set(m, "x-modal-client-version", "1.0.0");
-        set(m, "x-modal-libmodal-version", concat!("superci/", env!("CARGO_PKG_VERSION")));
+        set(m, "x-modal-libmodal-version", LIBMODAL_VERSION);
         set(m, "x-modal-host", "api.modal.com");
         if let Some(s) = &self.session {
             set(m, "x-modal-token-id", &s.token_id);
@@ -199,13 +204,21 @@ impl Client {
 
 /// The browser sign-in: Modal's page, then the token for the workspace you choose there. Modal's page checks a tiny
 /// server on this machine that answers with the flow's id (as `modal token new` does).
+/// The token reaches SuperCI only as the answer to a call that is waiting when the sign-in is approved; asked for
+/// afterwards, Modal answers that it is still waiting. So one call waits all the time (`authorize`), and what it gets
+/// is kept here for `wait`.
 #[derive(Clone)]
-pub struct Pending { pub web_url: String, flow_id: String, wait_secret: String }
+pub struct Pending { pub web_url: String, flow_id: String, wait_secret: String, approved: Arc<Mutex<Option<Session>>> }
+
+/// How long a sign-in is waited for in the background: longer than anyone takes to approve it.
+const SIGN_IN_WAITED: Duration = Duration::from_secs(15 * 60);
+/// How long one of its calls waits.
+const WAITED_AT_ONCE: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 impl Pending {
     /// A sign-in waiting for approval that never reaches Modal, for rendering pages in tests.
-    pub fn for_test() -> Pending { Pending { web_url: "https://modal.com/token-flow/tf-test".into(), flow_id: "tf-test".into(), wait_secret: String::new() } }
+    pub fn for_test() -> Pending { Pending { web_url: "https://modal.com/token-flow/tf-test".into(), flow_id: "tf-test".into(), wait_secret: String::new(), approved: Default::default() } }
 }
 
 /// `_back`: where the dashboard would have Modal return. Modal's page says it will and never does (it stays on
@@ -224,13 +237,32 @@ pub fn authorize(_back: &str) -> Result<Pending> {
             let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", flow_id.len(), flow_id);
         });
     });
-    Ok(Pending { web_url: r.web_url, flow_id: r.token_flow_id, wait_secret: r.wait_secret })
+    let approved = Arc::new(Mutex::new(None));
+    let (kept, flow, secret) = (approved.clone(), r.token_flow_id.clone(), r.wait_secret.clone());
+    std::thread::spawn(move || {
+        let (started, mut failed) = (Instant::now(), 0);
+        while started.elapsed() < SIGN_IN_WAITED && failed < 3 {
+            let asked = Instant::now();
+            match ask(&mut client, &flow, &secret, WAITED_AT_ONCE.as_secs_f32()) {
+                Ok(Some(session)) => { *kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(session); return }
+                // (A wait Modal ends early is not asked again at once.)
+                Ok(None) => { failed = 0; std::thread::sleep(WAITED_AT_ONCE.saturating_sub(asked.elapsed())) }
+                Err(_) => { failed += 1; std::thread::sleep(Duration::from_secs(2)) }
+            }
+        }
+    });
+    Ok(Pending { web_url: r.web_url, flow_id: r.token_flow_id, wait_secret: r.wait_secret, approved })
 }
 
 /// Whether the sign-in was approved in the browser (waiting up to `seconds`).
 pub fn wait(p: &Pending, seconds: f32) -> Result<Option<Session>> {
-    let mut client = Client::new(None)?;
-    let r: pb::TokenFlowWaitResponse = client.unary("TokenFlowWait", pb::TokenFlowWaitRequest { timeout: seconds, token_flow_id: p.flow_id.clone(), wait_secret: p.wait_secret.clone() })?;
+    if let Some(session) = p.approved.lock().unwrap_or_else(|e| e.into_inner()).clone() { return Ok(Some(session)) }
+    ask(&mut Client::new(None)?, &p.flow_id, &p.wait_secret, seconds)
+}
+
+/// Modal's answer to one call waiting up to `seconds` for the sign-in's approval: its token once approved.
+fn ask(client: &mut Client, flow_id: &str, wait_secret: &str, seconds: f32) -> Result<Option<Session>> {
+    let r: pb::TokenFlowWaitResponse = client.unary("TokenFlowWait", pb::TokenFlowWaitRequest { timeout: seconds, token_flow_id: flow_id.into(), wait_secret: wait_secret.into() })?;
     Ok((!r.timeout).then(|| Session { token_id: r.token_id, token_secret: r.token_secret, workspace: r.workspace_username }))
 }
 
@@ -410,6 +442,13 @@ mod answers {
     }
 
     fn session() -> Session { Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acmeorg".into() } }
+
+    /// Modal creates apps only for a Go client whose version it can read: `modal-go/` and a release, as the Go SDK says.
+    #[test]
+    fn it_says_its_go_sdk_version_as_the_go_sdk_does() {
+        let version = LIBMODAL_VERSION.strip_prefix("modal-go/v").expect("modal-go/v<release>");
+        assert_eq!(version.split('.').filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).count(), 3, "{LIBMODAL_VERSION}");
+    }
 
     #[test]
     fn modals_own_api_is_reached_without_a_stand_in() {
