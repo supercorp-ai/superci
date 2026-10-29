@@ -576,12 +576,10 @@ pub fn day_key(day: u64) -> String { format!("day:{day:06}") }
 fn month_and_day(now: u64, by_day: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>) -> (HashMap<String, f64>, HashMap<String, f64>) {
     let (month_day, today) = (month_start_ms(now) / 86_400_000, now / 86_400_000);
     let (mut month, mut day) = (HashMap::new(), HashMap::new());
-    for (d, by) in by_day.into_iter().filter(|(d, _)| *d >= month_day) {
-        for (place, usd) in by {
-            *month.entry(place.clone()).or_insert(0.0) += usd;
-            if d == today { *day.entry(place).or_insert(0.0) += usd }
-        }
-    }
+    by_day.into_iter().filter(|(d, _)| *d >= month_day).flat_map(|(d, by)| by.into_iter().map(move |(place, usd)| (d, place, usd))).for_each(|(d, place, usd)| {
+        *month.entry(place.clone()).or_insert(0.0) += usd;
+        if d == today { *day.entry(place).or_insert(0.0) += usd }
+    });
     (month, day)
 }
 
@@ -2719,7 +2717,7 @@ impl<'a> ControlPlane<'a> {
             Some(read) => read.map_err(|e| format!("{NEWEST}: {e}"))?,
             // (`recent:<when>:<id>`.)
             None => self.store.list_last("recent:", NEWEST_KEPT).await?.into_iter()
-                .filter_map(|(k, _)| { let mut p = k.splitn(3, ':').skip(1); Some((p.next()?.parse().ok()?, p.next()?.to_string())) }).collect(),
+                .filter_map(|(k, _)| { let (at, id) = k["recent:".len()..].split_once(':')?; Some((at.parse().ok()?, id.to_string())) }).collect(),
         };
         Ok((was, newest))
     }
@@ -2727,7 +2725,9 @@ impl<'a> ControlPlane<'a> {
     /// A new job among the newest (see `NEWEST`), written over what was read (a request made another meanwhile: read
     /// again).
     async fn note_newest(&self, at_ms: u64, id: &str) -> Result<()> {
-        for _ in 0..8 {
+        let mut tries = 0;
+        while tries < 8 {
+            tries += 1;
             let (was, mut newest) = self.newest().await?;
             // (One made from the index has it already: kept, then.)
             let has = newest.iter().any(|(_, i)| i == id);

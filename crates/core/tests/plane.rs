@@ -7196,8 +7196,10 @@ fn the_newest_jobs_are_read_from_one_record_made_once_from_the_index() {
     for id in 1..=3 { block_on(plane.handle(job_event("queued", id, "acme/app", None))); }
     let newest = || serde_json::from_str::<Vec<(u64, String)>>(&mem.0.borrow()["newest"]).unwrap().into_iter().map(|(_, id)| id).collect::<Vec<_>>();
     assert_eq!(newest(), ["1", "2", "3"]);
-    // A control plane from before the record: its status makes it from the index, once.
+    // A control plane from before the record: its status makes it from the index, once (an entry of it that is not one
+    // passed over).
     mem.0.borrow_mut().remove("newest");
+    for damaged in ["recent:soon:7", "recent:1790000000000"] { mem.0.borrow_mut().insert(damaged.into(), String::new()); }
     let jobs = |s: serde_json::Value| s["jobs"].as_array().unwrap().iter().map(|j| j["job_id"].as_u64().unwrap()).collect::<Vec<_>>();
     assert_eq!(jobs(status()), [3, 2, 1]);
     assert_eq!(newest(), ["1", "2", "3"]);

@@ -348,3 +348,43 @@ fn the_status_reads_its_records_several_at_once_however_many_jobs_there_are() {
     }
     assert_eq!(questions[0], questions[1], "as many questions for 50 jobs as for 5");
 }
+
+/// What plane.py refuses (the Dict not answering a read of several, a swap, an expiry; a read of several answered with
+/// too few) is said as the control plane's own error, as is a job left for after its answer that cannot be started
+/// then; a status with nothing to read of several asks for none.
+#[test]
+fn what_plane_py_refuses_is_said_as_the_control_planes_error() {
+    let aws = aws();
+    let gh = aws.github.lock().unwrap().clone().unwrap();
+    let secrets = json!({ "CONTAINERS": "on", "GITHUB_APP": GitHub::app().to_string(), "DEVICE_KEY_4102444800_TEST": "dashboard-key-for-tests-0001" });
+    let mut py = PlanePy::start(&aws);
+    let status = |py: &mut PlanePy| py.exchange(request("GET", "/status", json!({ "authorization": "Bearer dashboard-key-for-tests-0001" }), b"", &secrets)).unwrap();
+    // (Its indexes made by its first upkeep: the status reads the days' totals several at once.)
+    py.exchange(json!({ "kind": "alarm", "secrets": secrets })).unwrap();
+    assert_eq!(status(&mut py)["status"].as_u64(), Some(200));
+    for (answer, says) in [(json!({ "error": "the Dict is busy" }), "the Dict is busy"), (json!({ "values": [] }), "plane.py did not say each record asked for")] {
+        py.answers.insert("get_many".into(), answer);
+        let r = status(&mut py);
+        assert!(r["status"].as_u64() >= Some(500) && body(&r).contains(says), "{r} {}", body(&r));
+    }
+    // A job queued with the Dict refusing its swaps: not claimed, said.
+    py.answers.insert("swap".into(), json!({ "error": "the Dict is busy" }));
+    let (_, hook) = gh.queue("build", "acmeci", now_ms());
+    let r = py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    assert_eq!(r["type"], "response", "{r}");
+    py.answers.clear();
+    // One claimed, its start left for after; the Dict not answering then: the left work's error given back.
+    let (_, hook) = gh.queue("test", "acmeci", now_ms());
+    let msg = request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets);
+    let answered = py.exchange(msg.clone()).unwrap();
+    assert!(answered["later"].as_array().is_some_and(|l| !l.is_empty()), "{answered}");
+    py.answers.insert("get".into(), json!({ "error": "the Dict is not there" }));
+    let done = py.exchange(json!({ "kind": "later", "url": msg["url"], "what": answered["later"], "secrets": secrets })).unwrap();
+    assert!(done["error"].as_str().is_some_and(|e| e.contains("the Dict is not there")), "{done}");
+    py.answers.clear();
+    // A first upkeep (it takes out what passed its end), the Dict refusing that: it goes on, the refusal asked once.
+    let mut py = PlanePy::start(&aws);
+    py.answers.insert("expire".into(), json!({ "error": "the Dict is busy" }));
+    let done = py.exchange(json!({ "kind": "alarm", "secrets": secrets })).unwrap();
+    assert!(done["type"] == "done" && py.ops().iter().filter(|o| *o == "expire").count() == 1, "{done} {:?}", py.ops());
+}
