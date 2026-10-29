@@ -105,7 +105,8 @@ pub fn played(served: &Served, dir: &std::path::Path) {
 
 /// A dashboard running for a test: ended when the test ends, a failed one too (`kill` ends it sooner).
 pub struct Dashboard(std::process::Child);
-impl Dashboard { pub fn kill(&mut self) -> std::io::Result<()> { self.0.kill() } }
+// (Waited for as it ends: one still ending can write its sign-ins over what a test writes next.)
+impl Dashboard { pub fn kill(&mut self) -> std::io::Result<()> { let _ = self.0.kill(); self.0.wait().map(|_| ()) } }
 impl Drop for Dashboard { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
 
 /// A dashboard on this computer for `home`'s workspace, and its link (with the key that opens it).

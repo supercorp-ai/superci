@@ -72,9 +72,28 @@ impl PlanePy {
             let a = match op.as_str() {
                 "get" => json!({ "value": self.dict.get(&key) }),
                 "get_many" => json!({ "values": q["keys"].as_array().unwrap().iter().map(|k| self.dict.get(k.as_str().unwrap())).collect::<Vec<_>>() }),
-                "put" => { self.dict.insert(key, q["value"].as_str().unwrap().into()); json!({}) }
-                "put_if_absent" => { let created = !self.dict.contains_key(&key); if created { self.dict.insert(key, q["value"].as_str().unwrap().into()); } json!({ "created": created }) }
-                "delete" => { self.dict.remove(&key); json!({}) }
+                "put" => { self.dict.insert(key.clone(), q["value"].as_str().unwrap().into()); self.end(&key, q["until"].as_u64()); json!({}) }
+                "put_if_absent" => {
+                    let created = !self.dict.contains_key(&key);
+                    if created { self.dict.insert(key.clone(), q["value"].as_str().unwrap().into()); self.end(&key, None) }
+                    json!({ "created": created })
+                }
+                "swap" => {
+                    let swapped = self.dict.get(&key).map(String::as_str) == q["was"].as_str();
+                    if swapped { self.dict.insert(key.clone(), q["value"].as_str().unwrap().into()); self.end(&key, q["until"].as_u64()) }
+                    json!({ "swapped": swapped })
+                }
+                "delete" => { self.dict.remove(&key); self.dict.remove(&format!("~e:{key}")); json!({}) }
+                "expire" => {
+                    let now = q["now_ms"].as_u64().unwrap();
+                    let due: Vec<(String, u64, String)> = self.dict.keys().filter_map(|m| { let (u, k) = m.strip_prefix("~x:")?.split_once(':')?; Some((m.clone(), u.parse().ok()?, k.to_string())) }).filter(|(_, u, _)| *u <= now).collect();
+                    let mut gone = 0;
+                    for (mark, until, k) in due {
+                        if self.dict.get(&format!("~e:{k}")).map(String::as_str) == Some(until.to_string().as_str()) { self.dict.remove(&k); self.dict.remove(&format!("~e:{k}")); gone += 1 }
+                        self.dict.remove(&mark);
+                    }
+                    json!({ "gone": gone })
+                }
                 "list" => { let p = q["prefix"].as_str().unwrap(); json!({ "items": self.dict.iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| json!([k, v])).collect::<Vec<_>>() }) }
                 "migrate" => json!({ "done": true }),
                 "wake" => json!({}),
@@ -84,6 +103,24 @@ impl PlanePy {
             };
             self.send(&a);
         }
+    }
+
+    /// A record's end, as plane.py keeps it beside it (`~e:<key>`, and a mark `~x:<until>:<key>`); none: taken out.
+    fn end(&mut self, key: &str, until: Option<u64>) {
+        match until {
+            Some(u) => { self.dict.insert(format!("~e:{key}"), u.to_string()); self.dict.insert(format!("~x:{u:013}:{key}"), String::new()); }
+            None => { self.dict.remove(&format!("~e:{key}")); }
+        }
+    }
+
+    /// An event delivered as plane.py delivers it: its answer, then what the program left for after it, handed back.
+    fn deliver(&mut self, msg: Value) -> Option<Value> {
+        let answer = self.exchange(msg.clone())?;
+        if answer["later"].as_array().is_some_and(|l| !l.is_empty()) {
+            let done = self.exchange(json!({ "kind": "later", "url": msg["url"], "what": answer["later"], "secrets": msg["secrets"] }))?;
+            assert_eq!(done["type"], "done", "{done}");
+        }
+        Some(answer)
     }
 
     fn ops(&self) -> Vec<String> { self.asked.iter().map(|q| q["op"].as_str().unwrap().to_string()).collect() }
@@ -118,26 +155,32 @@ fn the_control_plane_answers_plane_py_keeps_its_dict_and_starts_sandboxes_as_mod
     let bare = py.exchange(json!({ "kind": "request", "secrets": {} })).unwrap();
     assert_eq!(bare["type"], "response", "{bare}");
     // A job queued at GitHub: its sandbox started by plane.py, as large as asked, with its runner's settings.
+    // GitHub has its answer first (it waits ten seconds, and each read and write here is a call to Modal's API): the
+    // sandbox is left for after, and started once plane.py hands that back.
     let (_, hook) = gh.queue("build", "acmeci", now_ms());
-    let started = py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1, "content-type": "application/json" }), &hook.0, &secrets)).unwrap();
+    let msg = request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1, "content-type": "application/json" }), &hook.0, &secrets);
+    let started = py.exchange(msg.clone()).unwrap();
     assert!(started["status"].as_u64().unwrap() < 300, "{started} {}", body(&started));
+    assert!(started["later"].as_array().is_some_and(|l| l.len() == 1) && !py.ops().iter().any(|o| o == "sandbox_start"), "{started} {:?}", py.ops());
+    let done = py.exchange(json!({ "kind": "later", "url": msg["url"], "what": started["later"], "secrets": secrets })).unwrap();
+    assert_eq!(done, json!({ "type": "done", "error": null }));
     let start = py.asked.iter().find(|q| q["op"] == "sandbox_start").cloned().unwrap_or_else(|| panic!("{:?}", py.ops()));
     assert!(start["jit"].as_str().is_some_and(|j| !j.is_empty()) && start["cpu"].as_u64().is_some(), "{start}");
     // One plane.py starts without saying its sandbox, one it could not start: the job not left as started.
     for answer in [json!({}), json!({ "error": "Modal has no room" })] {
         py.answers.insert("sandbox_start".into(), answer);
         let (_, hook) = gh.queue("test", "acmeci", now_ms());
-        py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+        py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
     }
     // A label it cannot read: a sandbox that fails the job, saying why.
     let (_, hook) = gh.queue("odd", "acmeci/cpu=banana", now_ms());
-    py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
     assert!(py.asked.iter().any(|q| q["op"] == "sandbox_start" && q["fail"].is_string()), "{:?}", py.ops());
     // A GitLab job: no sandbox (Modal runs no Docker).
     let lab = GitLab::default();
     let (_, pending) = lab.pending("gl-test", &["acmeci"], now_ms());
     let before = py.ops().iter().filter(|o| *o == "sandbox_start").count();
-    py.exchange(request("POST", "/gitlab/webhook", json!({ "x-gitlab-event": "Job Hook", "x-gitlab-token": superci_testkit::gitlab::HOOK_SECRET }), &pending, &secrets)).unwrap();
+    py.deliver(request("POST", "/gitlab/webhook", json!({ "x-gitlab-event": "Job Hook", "x-gitlab-token": superci_testkit::gitlab::HOOK_SECRET }), &pending, &secrets)).unwrap();
     assert_eq!(py.ops().iter().filter(|o| *o == "sandbox_start").count(), before);
     // The first job's log, where GitHub keeps it (a link GitHub gives without following it).
     let first: u64 = start["name"].as_str().unwrap().rsplit('-').next().unwrap().parse().unwrap_or(0);
@@ -145,14 +188,14 @@ fn the_control_plane_answers_plane_py_keeps_its_dict_and_starts_sandboxes_as_mod
     eprintln!("log: {}", body(&log));
     // The first job done at GitHub: its sandbox stopped.
     let (id, _) = (first, ());
-    py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": gh.start(id).1 }), &gh.start(id).0, &secrets)).unwrap();
+    py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": gh.start(id).1 }), &gh.start(id).0, &secrets)).unwrap();
     let fin = gh.finish(id, "success", "ok", now_ms());
-    py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": fin.1 }), &fin.0, &secrets)).unwrap();
+    py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": fin.1 }), &fin.0, &secrets)).unwrap();
     // One cancelled at GitHub before its runner took it: its sandbox stopped.
     let (cancelled, hook) = gh.queue("lint", "acmeci", now_ms());
-    py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
     let fin = gh.finish(cancelled, "cancelled", "", now_ms());
-    py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": fin.1 }), &fin.0, &secrets)).unwrap();
+    py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": fin.1 }), &fin.0, &secrets)).unwrap();
     assert!(py.ops().iter().any(|o| o == "sandbox_stop"), "{:?}", py.ops());
     // A list from the Dict with entries that are not a name and a value: left out; one not made.
     py.answers.insert("list".into(), json!({ "items": [[1, "x"], ["k", 2], "neither"] }));
@@ -164,6 +207,10 @@ fn the_control_plane_answers_plane_py_keeps_its_dict_and_starts_sandboxes_as_mod
     // Its upkeep, as the schedule calls it.
     let done = py.exchange(json!({ "kind": "alarm", "secrets": secrets })).unwrap();
     assert_eq!(done, json!({ "type": "done", "error": null }));
+    // Each write with its end one question (plane.py keeps ends beside records), and what has passed its end taken out
+    // by plane.py in one.
+    assert!(py.asked.iter().any(|q| q["op"] == "put" && q["until"].is_u64()) && py.ops().iter().any(|o| o == "swap") && py.ops().iter().any(|o| o == "expire"), "{:?}", py.ops());
+    assert!(!py.asked.iter().any(|q| q["key"].as_str().is_some_and(|k| k.starts_with("~e:") || k.starts_with("~x:"))), "no end asked for apart");
     // The Dict not answering (what it lists, then what it holds): said, the upkeep's error given back.
     for op in ["list", "get"] {
         py.answers.insert(op.into(), json!({ "error": "the Dict is not there" }));
@@ -219,7 +266,7 @@ fn github_out_of_reach_leaves_the_job_unstarted() {
         let health = py.exchange(request("GET", "/health", json!({}), b"", &secrets)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&body(&health)).unwrap()["label"], "superci");
         let (_, hook) = gh.queue("build", "superci", now_ms());
-        let answer = py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+        let answer = py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
         assert_eq!(answer["type"], "response", "{answer}");
         assert!(!py.ops().iter().any(|o| o == "sandbox_start"), "{at}: {:?}", py.ops());
     }
@@ -235,7 +282,7 @@ fn a_run_from_a_computer_hands_its_job_once_then_tells_the_runner_to_wait() {
     let secrets = json!({ "CONTAINERS": "on", "GITHUB_APP": GitHub::app().to_string(), "READ_KEY_4102444800_AGENT": format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())) });
     let mut py = PlanePy::start(&aws);
     let workflow = "jobs:\n  test:\n    runs-on: acmeci\n    steps:\n      - run: echo hi\n";
-    let made = py.exchange(request("POST", "/runs", json!({ "authorization": format!("Bearer {key}") }), json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string().as_bytes(), &secrets)).unwrap();
+    let made = py.deliver(request("POST", "/runs", json!({ "authorization": format!("Bearer {key}") }), json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string().as_bytes(), &secrets)).unwrap();
     assert_eq!(made["status"].as_u64(), Some(200), "{}", body(&made));
     let start = py.asked.iter().find(|q| q["op"] == "sandbox_start").cloned().unwrap_or_else(|| panic!("{:?}", py.ops()));
     let unb64 = |v: &Value| -> Value { serde_json::from_slice(&STANDARD.decode(v.as_str().unwrap()).unwrap()).unwrap() };
@@ -264,7 +311,7 @@ fn a_job_on_aws_is_asked_again_after_a_wait_when_aws_refuses_it_for_its_rate() {
     py.dict.insert("aws".into(), json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": true }).to_string());
     py.dict.insert("aws:no-fleet".into(), now_ms().to_string());
     let (_, hook) = gh.queue("build", "acmeci", now_ms());
-    let answer = py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    let answer = py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
     assert!(answer["status"].as_u64().unwrap() < 300, "{answer} {}", body(&answer));
     let runs = aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).count();
     let asked: Vec<String> = aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["url"], a["asked"].as_str().unwrap_or_default().chars().take(60).collect::<String>())).collect();
@@ -286,7 +333,7 @@ fn the_status_reads_its_records_several_at_once_however_many_jobs_there_are() {
         while queued < jobs {
             queued += 1;
             let (_, hook) = gh.queue("build", "acmeci", now_ms());
-            py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+            py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
         }
         // (Asked twice: the first after a new key also notes it.)
         let status = |py: &mut PlanePy| py.exchange(request("GET", "/status", json!({ "authorization": "Bearer dashboard-key-for-tests-0001" }), b"", &secrets)).unwrap();
@@ -300,4 +347,44 @@ fn the_status_reads_its_records_several_at_once_however_many_jobs_there_are() {
         questions.push(asked.len());
     }
     assert_eq!(questions[0], questions[1], "as many questions for 50 jobs as for 5");
+}
+
+/// What plane.py refuses (the Dict not answering a read of several, a swap, an expiry; a read of several answered with
+/// too few) is said as the control plane's own error, as is a job left for after its answer that cannot be started
+/// then; a status with nothing to read of several asks for none.
+#[test]
+fn what_plane_py_refuses_is_said_as_the_control_planes_error() {
+    let aws = aws();
+    let gh = aws.github.lock().unwrap().clone().unwrap();
+    let secrets = json!({ "CONTAINERS": "on", "GITHUB_APP": GitHub::app().to_string(), "DEVICE_KEY_4102444800_TEST": "dashboard-key-for-tests-0001" });
+    let mut py = PlanePy::start(&aws);
+    let status = |py: &mut PlanePy| py.exchange(request("GET", "/status", json!({ "authorization": "Bearer dashboard-key-for-tests-0001" }), b"", &secrets)).unwrap();
+    // (Its indexes made by its first upkeep: the status reads the days' totals several at once.)
+    py.exchange(json!({ "kind": "alarm", "secrets": secrets })).unwrap();
+    assert_eq!(status(&mut py)["status"].as_u64(), Some(200));
+    for (answer, says) in [(json!({ "error": "the Dict is busy" }), "the Dict is busy"), (json!({ "values": [] }), "plane.py did not say each record asked for")] {
+        py.answers.insert("get_many".into(), answer);
+        let r = status(&mut py);
+        assert!(r["status"].as_u64() >= Some(500) && body(&r).contains(says), "{r} {}", body(&r));
+    }
+    // A job queued with the Dict refusing its swaps: not claimed, said.
+    py.answers.insert("swap".into(), json!({ "error": "the Dict is busy" }));
+    let (_, hook) = gh.queue("build", "acmeci", now_ms());
+    let r = py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    assert_eq!(r["type"], "response", "{r}");
+    py.answers.clear();
+    // One claimed, its start left for after; the Dict not answering then: the left work's error given back.
+    let (_, hook) = gh.queue("test", "acmeci", now_ms());
+    let msg = request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets);
+    let answered = py.exchange(msg.clone()).unwrap();
+    assert!(answered["later"].as_array().is_some_and(|l| !l.is_empty()), "{answered}");
+    py.answers.insert("get".into(), json!({ "error": "the Dict is not there" }));
+    let done = py.exchange(json!({ "kind": "later", "url": msg["url"], "what": answered["later"], "secrets": secrets })).unwrap();
+    assert!(done["error"].as_str().is_some_and(|e| e.contains("the Dict is not there")), "{done}");
+    py.answers.clear();
+    // A first upkeep (it takes out what passed its end), the Dict refusing that: it goes on, the refusal asked once.
+    let mut py = PlanePy::start(&aws);
+    py.answers.insert("expire".into(), json!({ "error": "the Dict is busy" }));
+    let done = py.exchange(json!({ "kind": "alarm", "secrets": secrets })).unwrap();
+    assert!(done["type"] == "done" && py.ops().iter().filter(|o| *o == "expire").count() == 1, "{done} {:?}", py.ops());
 }

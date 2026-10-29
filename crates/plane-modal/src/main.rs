@@ -20,10 +20,14 @@ use superci_core::spec::Size;
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
-/// The line protocol with plane.py: a question out, its answer in.
-struct Bridge { input: RefCell<std::io::StdinLock<'static>>, output: RefCell<std::io::Stdout> }
+/// The line protocol with plane.py: a question out, its answer in; and what was left for after an answer (see
+/// `Timer::later`), given to plane.py with the answer.
+struct Bridge { input: RefCell<std::io::StdinLock<'static>>, output: RefCell<std::io::Stdout>, later: RefCell<Vec<String>> }
 
 impl Bridge {
+    fn new() -> Bridge { Bridge { input: RefCell::new(std::io::stdin().lock()), output: RefCell::new(std::io::stdout()), later: RefCell::new(vec![]) } }
+    /// What was left for after the answer, taken.
+    fn left(&self) -> Vec<String> { std::mem::take(&mut *self.later.borrow_mut()) }
     fn send(&self, v: &Value) {
         let mut out = self.output.borrow_mut();
         let _ = writeln!(out, "{v}");
@@ -46,11 +50,21 @@ impl Bridge {
 #[async_trait(?Send)]
 impl Store for Bridge {
     async fn get(&self, key: &str) -> io::Result<Option<String>> { Ok(self.ask(json!({ "op": "get", "key": key }))?["value"].as_str().map(str::to_string)) }
+    // Ends kept by plane.py beside each record, as `io::Ending` keeps them (the same records), each write with its end
+    // one question: plane.py makes the Dict's calls side by side, where `Ending` asked for each in turn.
     async fn put(&self, key: &str, value: String) -> io::Result<()> { self.ask(json!({ "op": "put", "key": key, "value": value })).map(|_| ()) }
+    async fn put_until(&self, key: &str, value: String, until_ms: u64) -> io::Result<()> {
+        self.ask(json!({ "op": "put", "key": key, "value": value, "until": until_ms })).map(|_| ())
+    }
     async fn put_if_absent(&self, key: &str, value: String) -> io::Result<bool> {
         Ok(self.ask(json!({ "op": "put_if_absent", "key": key, "value": value }))?["created"] == true)
     }
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> io::Result<bool> { self.swap_until(key, was, value, None).await }
+    async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> io::Result<bool> {
+        Ok(self.ask(json!({ "op": "swap", "key": key, "was": was, "value": value, "until": until_ms }))?["swapped"] == true)
+    }
     async fn delete(&self, key: &str) -> io::Result<()> { self.ask(json!({ "op": "delete", "key": key })).map(|_| ()) }
+    async fn expire(&self, now_ms: u64) -> io::Result<usize> { Ok(self.ask(json!({ "op": "expire", "now_ms": now_ms }))?["gone"].as_u64().unwrap_or(0) as usize) }
     /// A hundred at a time, read side by side by plane.py: one by one, each is a call to Modal's API, and the status a
     /// page shows asks for some 150 (over ten seconds).
     async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
@@ -78,6 +92,9 @@ impl Timer for Bridge {
     /// plane.py holds the answer itself, once it has let go of the program: the program answers one request at a time,
     /// and a runner asking for its messages would hold every other request behind it (its job's end too).
     async fn hold(&self, _ms: u64) {}
+    /// plane.py answers first and hands it back after (`later`): GitHub and GitLab wait ten seconds for an event's
+    /// answer, and each of the control plane's reads and writes is a call to Modal's API.
+    fn later(&self, what: &str) -> bool { self.later.borrow_mut().push(what.to_string()); true }
 }
 
 /// The jobs' sandboxes, started by plane.py with Modal's client (no token needed inside Modal).
@@ -127,18 +144,27 @@ fn config(secrets: &Value) -> Config {
 }
 
 fn main() {
-    let bridge = Bridge { input: RefCell::new(std::io::stdin().lock()), output: RefCell::new(std::io::stdout()) };
+    let bridge = Bridge::new();
     let agent = |redirects: u32| ureq::Agent::config_builder().http_status_as_error(false).max_redirects(redirects).timeout_global(Some(Duration::from_secs(25))).build().into();
     let http = Blocking(agent(10), agent(0));
     let cache = Cache::default();
     while let Some(msg) = bridge.read() {
         let config = config(&msg["secrets"]);
         let sandboxes = Sandboxes(&bridge);
-        let store = superci_core::io::Ending(&bridge);
+        let store = &bridge;
         let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &bridge, config: &config, cache: &cache, containers: Some(&sandboxes) };
-        if msg["kind"] == "alarm" {
-            let r = block_on(plane.alarm());
+        // A sweep (nobody waits for its answer), or what was left for after an answer (one done may leave another):
+        // each in its turn, until none is left.
+        if msg["kind"] == "alarm" || msg["kind"] == "later" {
+            let mut r = if msg["kind"] == "alarm" { block_on(plane.alarm()) } else { Ok(()) };
             if let Err(e) = &r { eprintln!("superci: {e}") }
+            let url = msg["url"].as_str().unwrap_or_default();
+            let mut left: Vec<String> = msg["what"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();
+            while !left.is_empty() {
+                let what = left.remove(0);
+                if let Err(e) = block_on(plane.later(url, &what)) { eprintln!("superci: {what}: {e}"); r = Err(e) }
+                left.extend(bridge.left());
+            }
             bridge.send(&json!({ "type": "done", "error": r.err() }));
             continue;
         }
@@ -146,7 +172,7 @@ fn main() {
         for (k, v) in msg["headers"].as_object().into_iter().flatten() { if let Some(v) = v.as_str() { r.headers.push((k.to_ascii_lowercase(), v.to_string())) } }
         let response = block_on(plane.handle(r));
         let headers: serde_json::Map<String, Value> = response.headers.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
-        bridge.send(&json!({ "type": "response", "status": response.status, "headers": headers, "body": STANDARD.encode(&response.body) }));
+        bridge.send(&json!({ "type": "response", "status": response.status, "headers": headers, "body": STANDARD.encode(&response.body), "later": bridge.left() }));
     }
 }
 
@@ -157,7 +183,7 @@ mod tests {
     /// A GitLab job is never placed on Modal (its jobs need Docker), and were one given, nothing is asked of plane.py.
     #[test]
     fn a_gitlab_job_is_refused_a_sandbox() {
-        let bridge = Bridge { input: RefCell::new(std::io::stdin().lock()), output: RefCell::new(std::io::stdout()) };
+        let bridge = Bridge::new();
         let work = Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-x".into() };
         let said = block_on(Sandboxes(&bridge).start("superci-1", &work, 10, Size { cpu: 2, ram_gb: 8, disk_gb: 14, gpu: None }));
         assert_eq!(said, Err("Modal runs no Docker for GitLab jobs".to_string()));

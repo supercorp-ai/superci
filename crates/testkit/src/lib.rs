@@ -36,18 +36,21 @@ use superci_core::plane::{Cache, Config, ControlPlane};
 /// the records it refuses to write (`Served::store_refuses`), and its operations counted, one of them failing when a
 /// sweep says so (`Faults`).
 #[derive(Clone, Default)]
-pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(String, u32, Change)>>>, pub Arc<Mutex<Vec<String>>>, pub Faults);
+pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(String, u32, Change)>>>, pub Arc<Mutex<Vec<String>>>, pub Faults,
+    /// How long each round trip to it takes, in milliseconds (none unless set: see `Served::store_takes`).
+    pub Arc<std::sync::atomic::AtomicU64>);
 
 /// What another request writes over a record (`None`: takes it out), from what is there.
 pub type Change = Arc<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
 
 #[async_trait(?Send)]
 impl Store for Shared {
-    async fn get(&self, k: &str) -> io::Result<Option<String>> { self.3.op(format!("get {k}"))?; Ok(self.0.lock().unwrap().get(k).cloned()) }
-    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.3.op(format!("put {k}"))?; self.refused(k)?; self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
-    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.3.op(format!("put_if_absent {k}"))?; self.refused(k)?; let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn get(&self, k: &str) -> io::Result<Option<String>> { self.trip(); self.3.op(format!("get {k}"))?; Ok(self.0.lock().unwrap().get(k).cloned()) }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.trip(); self.3.op(format!("put {k}"))?; self.refused(k)?; self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.trip(); self.3.op(format!("put_if_absent {k}"))?; self.refused(k)?; let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
     // (Read, then written, as a Durable Object's store does: a control plane served here answers one request at a time.)
     async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> {
+        self.trip();
         self.3.op(format!("swap {k}"))?;
         self.refused(k)?;
         let meanwhile = { let mut w = self.1.lock().unwrap(); w.iter_mut().find(|(p, n, _)| *n > 0 && k.starts_with(p.as_str())).map(|e| { e.1 -= 1; e.2.clone() }) };
@@ -58,11 +61,24 @@ impl Store for Shared {
         m.insert(k.into(), v);
         Ok(true)
     }
-    async fn delete(&self, k: &str) -> io::Result<()> { self.3.op(format!("delete {k}"))?; self.0.lock().unwrap().remove(k); Ok(()) }
-    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { self.3.op(format!("list {p}"))?; Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+    async fn delete(&self, k: &str) -> io::Result<()> { self.trip(); self.3.op(format!("delete {k}"))?; self.0.lock().unwrap().remove(k); Ok(()) }
+    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { self.trip(); self.3.op(format!("list {p}"))?; Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+    /// Several at once, in one round trip (as AWS's DynamoDB and a Modal control plane read them).
+    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
+        self.trip();
+        self.3.op(format!("get_many {}", keys.first().map(String::as_str).unwrap_or_default()))?;
+        let m = self.0.lock().unwrap();
+        Ok(keys.iter().map(|k| m.get(k).cloned()).collect())
+    }
 }
 
 impl Shared {
+    /// One round trip to it: as long as it is set to take (see `Served::store_takes`).
+    fn trip(&self) {
+        let ms = self.4.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 { std::thread::sleep(std::time::Duration::from_millis(ms)) }
+    }
+
     /// Its refusal of a write of `k`, when it refuses records under a prefix of `k` (see `Served::store_refuses`).
     fn refused(&self, k: &str) -> io::Result<()> {
         match self.2.lock().unwrap().iter().any(|p| k.starts_with(p.as_str())) { true => Err(format!("the store refused to write {k}")), false => Ok(()) }
@@ -144,6 +160,10 @@ impl Served {
     pub fn now_ms(&self) -> u64 { self.clock.now_ms() }
 
     /// SuperCI's App for the organization `acme`, as the dashboard leaves it once made and installed (`GitHub`).
+    /// Each round trip to its store takes `ms` from now on, as a store in the cloud does (a Modal control plane's some
+    /// 120 ms; DynamoDB's a few).
+    pub fn store_takes(&self, ms: u64) { self.store.4.store(ms, std::sync::atomic::Ordering::Relaxed) }
+
     pub fn connect_github(&self) { self.aws.put(&format!("/superci/{}/GITHUB_APP", self.plane), &GitHub::app().to_string()) }
 
     /// A webhook GitHub sends (`GitHub::queue`, `start`, `finish`), as it sends it: the control plane's answer.
@@ -244,7 +264,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let aws = Aws::serve();
-    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
+    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
@@ -1091,7 +1111,7 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let aws = Aws::serve();
-    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
+    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
@@ -1171,7 +1191,7 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let aws = Aws::serve();
-    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
+    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
