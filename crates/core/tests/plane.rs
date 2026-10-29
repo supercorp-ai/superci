@@ -6987,7 +6987,14 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
         spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first,
         what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_status_says_the_newest_ten,
-        the_newest_jobs_are_read_from_one_record_made_once_from_the_index
+        the_newest_jobs_are_read_from_one_record_made_once_from_the_index,
+        settings_changed_at_the_same_moment_on_two_computers_are_both_kept,
+        a_setting_changed_since_it_was_shown_is_refused_for_that_field_alone,
+        the_order_launchers_and_lists_change_by_item_and_keep_what_others_changed,
+        a_settings_write_that_is_not_one_or_too_long_is_refused,
+        settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
+        settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
+        an_edit_is_the_changes_of_its_fields_and_they_apply_over_others
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
@@ -7221,4 +7228,266 @@ fn the_newest_jobs_are_read_from_one_record_made_once_from_the_index() {
     // A record that is not one: said.
     mem.0.borrow_mut().insert("newest".into(), "not a list".into());
     assert!(String::from_utf8_lossy(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))).body).contains("newest:"));
+}
+
+/// Its settings (where jobs run, the launchers), kept by the control plane and written through it over the version the
+/// writer read: none kept, its cloud's own stand and the first write makes them; a write over an older version, or one
+/// another request made meanwhile, is refused with the version now; what a write leaves out stays; read again ten
+/// seconds on (the status at once); a record that is not one stops what reads it, saying so.
+/// A control plane whose settings are written through it (see `settings`), and the calls a test makes of it.
+struct Settled { mem: Mem, clouds: FakeClouds, wakes: Wakes, cache: Cache, clock: MovingClock, config: Config }
+
+impl Settled {
+    fn new(f: impl FnOnce(&mut Config)) -> Settled {
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        f(&mut config);
+        Settled { mem: Mem::default(), clouds: FakeClouds::default(), wakes: Wakes::default(), cache: Cache::default(), clock: MovingClock(std::cell::Cell::new(1_790_000_000_000)), config }
+    }
+    fn plane(&self) -> ControlPlane<'_> { ControlPlane { store: &self.mem, http: &self.clouds, clock: &self.clock, timer: &self.wakes, config: &self.config, cache: &self.cache, containers: None } }
+    fn status(&self) -> serde_json::Value { json(&block_on(self.plane().handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")))) }
+    fn write(&self, changes: serde_json::Value) -> Response {
+        block_on(self.plane().handle(Request::new("POST", &format!("{PLANE_URL}/settings")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(serde_json::json!({ "changes": changes }).to_string())))
+    }
+    fn later(&self, ms: u64) { self.clock.0.set(self.clock.0.get() + ms) }
+}
+
+/// One change to one field: what the dashboard sends.
+fn set(path: &[&str], value: serde_json::Value, from: Option<serde_json::Value>) -> serde_json::Value {
+    let mut c = serde_json::json!({ "op": "set", "path": path, "value": value });
+    if let Some(f) = from { c["from"] = f }
+    c
+}
+
+/// Changes to different fields made at the same moment are all kept: one written between another's read and its
+/// write is not written over, the later one made again over it. Each write is one version more.
+#[test]
+fn settings_changed_at_the_same_moment_on_two_computers_are_both_kept() {
+    let p = Settled::new(|c| c.routing.max_cpu = Some(16));
+    // None kept: its cloud's own, version 0.
+    let s = p.status();
+    assert_eq!((s["settings"].as_bool(), s["settings_version"].as_u64(), s["routing"]["max_cpu"].as_u64()), (Some(true), Some(0), Some(16)), "{s}");
+    // The first change: kept as version 1, what it does not change as it stood.
+    let r = p.write(serde_json::json!([set(&["routing", "max_minutes"], 90.into(), Some(serde_json::Value::Null))]));
+    assert_eq!((r.status, json(&r)["version"].as_u64()), (200, Some(1)));
+    let s = p.status();
+    assert_eq!((s["settings_version"].as_u64(), s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64()), (Some(1), Some(16), Some(90)), "{s}");
+    // Another computer's change lands between this one's read and its write: both kept.
+    let other = std::rc::Rc::new(std::cell::Cell::new(true));
+    let once = other.clone();
+    p.mem.meddling(move |op, k, m| if op == "swap" && k == "settings" && once.replace(false) {
+        let mut v: serde_json::Value = serde_json::from_str(&m["settings"]).unwrap();
+        (v["version"], v["routing"]["monthly_usd"]) = (2.into(), 50.0.into());
+        m.insert("settings".into(), v.to_string());
+    });
+    let r = p.write(serde_json::json!([set(&["routing", "max_cpu"], 8.into(), Some(16.into()))]));
+    assert_eq!((r.status, json(&r)["version"].as_u64(), other.get()), (200, Some(3), false));
+    p.mem.meddling(|_, _, _| {});
+    let s = p.status();
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["monthly_usd"].as_f64(), s["routing"]["max_minutes"].as_u64()), (Some(8), Some(50.0), Some(90)), "{s}");
+    // A write lost to others each time it is made, as long as it is made: said, nothing written.
+    p.mem.meddling(|op, k, m| if op == "swap" && k == "settings" {
+        let mut v: serde_json::Value = serde_json::from_str(&m["settings"]).unwrap();
+        v["version"] = (v["version"].as_u64().unwrap() + 1).into();
+        m.insert("settings".into(), v.to_string());
+    });
+    let r = p.write(serde_json::json!([set(&["routing", "max_cpu"], 4.into(), None)]));
+    assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+    p.mem.meddling(|_, _, _| {});
+    assert_eq!(p.status()["routing"]["max_cpu"].as_u64(), Some(8));
+}
+
+/// A change to a field changed since it was shown is refused, with every such field and what it holds now, and none
+/// of the write is made; one meant as said (a command's: no `from`) is taken whatever is there.
+#[test]
+fn a_setting_changed_since_it_was_shown_is_refused_for_that_field_alone() {
+    let p = Settled::new(|c| { c.routing.max_cpu = Some(16); c.routing.order = vec![Pool::of("aws"), Pool::of("modal")]; });
+    let pool = |cloud: &str, max: Option<u32>| { let mut p = Pool::of(cloud); p.max_jobs = max; serde_json::to_value(p).unwrap() };
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "order", "modal", "max_jobs"], 10.into(), Some(serde_json::Value::Null))])).status, 200);
+    // Shown before that: its change to the same field refused, one to another field with it not made either.
+    let r = p.write(serde_json::json!([
+        set(&["routing", "max_cpu"], 32.into(), Some(16.into())),
+        set(&["routing", "order", "modal", "max_jobs"], 5.into(), Some(serde_json::Value::Null)),
+        set(&["routing", "order", "aws", "monthly_usd"], 30.0.into(), Some(1.0.into())),
+    ]));
+    assert_eq!(r.status, 409);
+    assert_eq!(json(&r)["conflicts"], serde_json::json!([
+        { "path": ["routing", "order", "modal", "max_jobs"], "now": 10 },
+        { "path": ["routing", "order", "aws", "monthly_usd"], "now": null },
+    ]));
+    let s = p.status();
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(1)), "{s}");
+    // Meant as said: taken.
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "order", "modal", "max_jobs"], 5.into(), None)])).status, 200);
+    assert_eq!(p.status()["routing"]["order"], serde_json::json!([pool("aws", None), pool("modal", Some(5))]));
+    // A field of a provider taken out meanwhile: refused, as one that is not there.
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "order", "modal"], serde_json::Value::Null, None)])).status, 200);
+    let r = p.write(serde_json::json!([set(&["routing", "order", "modal", "max_jobs"], 3.into(), None)]));
+    assert_eq!((r.status, &json(&r)["conflicts"]), (409, &serde_json::json!([{ "path": ["routing", "order", "modal", "max_jobs"], "now": null }])));
+}
+
+/// The order put in another one keeps a provider added meanwhile, after those named, and passes over one taken out;
+/// the launchers are kept by cloud, each set or taken out alone; a list of values is added to and taken from.
+#[test]
+fn the_order_launchers_and_lists_change_by_item_and_keep_what_others_changed() {
+    let p = Settled::new(|c| c.routing.order = vec![Pool::of("aws"), Pool::of("cloudflare")]);
+    let modal = serde_json::json!({ "cloud": "modal", "url": "https://acme--superci-runners.modal.run" });
+    // A provider added on one computer while another puts the two it showed the other way round (and one taken out
+    // meanwhile among them).
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "order", "modal"], serde_json::json!({ "cloud": "modal" }), Some(serde_json::Value::Null)), set(&["launchers", "modal"], modal.clone(), None)])).status, 200);
+    assert_eq!(p.write(serde_json::json!([{ "op": "arrange", "path": ["routing", "order"], "keys": ["cloudflare", "gone", "aws"] }])).status, 200);
+    let s = p.status();
+    let order: Vec<&str> = s["routing"]["order"].as_array().unwrap().iter().filter_map(|p| p["cloud"].as_str()).collect();
+    assert_eq!((order, &s["launchers"]), (vec!["cloudflare", "aws", "modal"], &serde_json::json!([modal])));
+    // Public repositories: each added (once) and taken out, others' kept.
+    for (op, repo) in [("add", "acme/site"), ("add", "acme/docs"), ("add", "acme/site"), ("remove", "acme/docs")] {
+        assert_eq!(p.write(serde_json::json!([{ "op": op, "path": ["routing", "public_repos"], "value": repo }])).status, 200);
+    }
+    assert_eq!(p.status()["routing"]["public_repos"], serde_json::json!(["acme/site"]));
+    // A launcher taken out alone; the order is not a launcher's.
+    assert_eq!(p.write(serde_json::json!([set(&["launchers", "modal"], serde_json::Value::Null, Some(modal))])).status, 200);
+    assert_eq!(p.status()["launchers"], serde_json::json!([]));
+}
+
+/// What a write cannot be: not changes, changes that do not make settings, settings past what the record holds, or
+/// not a dashboard's: refused, nothing written.
+#[test]
+fn a_settings_write_that_is_not_one_or_too_long_is_refused() {
+    let p = Settled::new(|_| {});
+    let body = |r: &Response| String::from_utf8_lossy(&r.body).to_string();
+    let r = block_on(p.plane().handle(Request::new("POST", &format!("{PLANE_URL}/settings")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(r#"{"version":0,"routing":{}}"#)));
+    assert_eq!(r.status, 400, "{}", body(&r));
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "max_cpu"], "sixteen".into(), None)])).status, 400);
+    assert_eq!(p.write(serde_json::json!([{ "op": "add", "path": ["routing", "max_cpu", "x"], "value": 1 }])).status, 400);
+    let r = p.write(serde_json::json!([{ "op": "add", "path": ["routing", "public_repos"], "value": "a".repeat(60_000) }]));
+    assert_eq!((r.status, json(&r)["error"].as_str()), (413, Some("a setting longer than 60 kB")));
+    assert_eq!(block_on(p.plane().handle(Request::new("POST", &format!("{PLANE_URL}/settings")).with_body("{}"))).status, 404);
+    assert!(p.mem.0.borrow().get("settings").is_none());
+}
+
+/// An older SuperCI writes the cloud's own copy of the settings, knowing no other way: the control plane takes it,
+/// whole, as a new version. An instance that read the copy before (AWS's read it every 15 seconds) does not take
+/// that one back within the minute; a copy written again after is taken.
+#[test]
+fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back() {
+    let p = Settled::new(|c| c.routing.max_cpu = Some(16));
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "max_minutes"], 90.into(), None)])).status, 200);
+    // (Each instance's configuration: its cloud's copy as it read it.)
+    let instance = |p: &Settled, max_cpu: u32| { let mut config = p.config.clone(); config.routing = Routing { max_cpu: Some(max_cpu), ..Default::default() }; config };
+    let read_by = |p: &Settled, config: &Config| {
+        let cache = Cache::default();
+        let plane = ControlPlane { store: &p.mem, http: &p.clouds, clock: &p.clock, timer: &p.wakes, config, cache: &cache, containers: None };
+        json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))
+    };
+    // As written through it, while its cloud's copy is the one it had.
+    let s = read_by(&p, &p.config);
+    assert_eq!((s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(90), Some(1)), "{s}");
+    // An older SuperCI wrote the copy: taken, whole.
+    p.later(1_000);
+    let s = read_by(&p, &instance(&p, 4));
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(4), None, Some(2)), "{s}");
+    // An instance that has the copy from before: not taken back, within the minute.
+    p.later(10_000);
+    let s = read_by(&p, &p.config);
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(4), Some(2)), "{s}");
+    // Written there again, as it was before, more than a minute on: taken.
+    p.later(61_000);
+    let s = read_by(&p, &p.config);
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(3)), "{s}");
+    // Lost to another write at the same moment: the record as that one left it.
+    p.later(61_000);
+    p.mem.meddling(|op, k, m| if op == "swap" && k == "settings" { let v = m["settings"].replace("\"version\":3", "\"version\":7"); m.insert("settings".into(), v); });
+    let s = read_by(&p, &instance(&p, 2));
+    p.mem.meddling(|_, _, _| {});
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(7)), "{s}");
+    // (Only the last five copies are kept.)
+    for n in 0..6 { p.later(61_000); read_by(&p, &instance(&p, 20 + n)); }
+    let kept: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+    assert_eq!(kept["taken"].as_array().map(|t| t.len()), Some(5));
+}
+
+/// A request within ten seconds of a read goes on with what it read (the status sees a write at once); one after reads
+/// it again. A record that is not one stops each request, the sweep and what was left for after an answer, saying so.
+#[test]
+fn settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said() {
+    let p = Settled::new(|_| {});
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "max_cpu"], 8.into(), None)])).status, 200);
+    let health = || block_on(p.plane().handle(get("/health"))).status;
+    assert_eq!(health(), 200);
+    let kept = p.mem.0.borrow()["settings"].replace("\"max_cpu\":8", "\"max_cpu\":2");
+    p.mem.0.borrow_mut().insert("settings".into(), kept);
+    assert_eq!(p.status()["routing"]["max_cpu"].as_u64(), Some(2));
+    p.later(11_000);
+    assert_eq!(health(), 200);
+    p.mem.0.borrow_mut().insert("settings".into(), "not settings".into());
+    p.later(11_000);
+    let r = block_on(p.plane().handle(get("/health")));
+    assert!(r.status == 500 && String::from_utf8_lossy(&r.body).starts_with("settings:"), "{}", String::from_utf8_lossy(&r.body));
+    assert!(block_on(p.plane().alarm()).unwrap_err().starts_with("settings:"));
+    assert!(block_on(p.plane().later(PLANE_URL, "start job:1")).unwrap_err().starts_with("settings:"));
+    assert_eq!(p.write(serde_json::json!([])).status, 500);
+}
+
+/// The changes a page's edit makes, field by field: only what it changed, each with what was shown; a command's
+/// without. Applied to settings changed meanwhile, they keep the other changes; one whose way is not there, or that
+/// is not of a list, is not made.
+#[test]
+fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
+    use superci_core::settings::{apply, diff, get as at, keyed, Change};
+    let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let before = serde_json::json!({ "routing": { "max_cpu": 16, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }], "public_repos": ["acme/a"], "rules": [] }, "launchers": [] });
+    let after = serde_json::json!({ "routing": { "max_cpu": 16, "monthly_usd": 30.0, "order": [{ "cloud": "modal" }, { "cloud": "aws", "max_jobs": 6 }], "public_repos": ["acme/a", "acme/b"],
+        "rules": [{ "repo": "x", "cloud": "aws" }] }, "launchers": [{ "cloud": "modal", "url": "u" }] });
+    let changes = diff(&before, &after, true);
+    assert_eq!(changes, vec![
+        Change::Set { path: path(&["launchers", "modal"]), value: serde_json::json!({ "cloud": "modal", "url": "u" }), from: Some(serde_json::Value::Null) },
+        Change::Set { path: path(&["routing", "monthly_usd"]), value: 30.0.into(), from: Some(serde_json::Value::Null) },
+        Change::Set { path: path(&["routing", "order", "aws", "max_jobs"]), value: 6.into(), from: Some(5.into()) },
+        Change::Set { path: path(&["routing", "order", "cloudflare"]), value: serde_json::Value::Null, from: Some(serde_json::json!({ "cloud": "cloudflare" })) },
+        Change::Set { path: path(&["routing", "order", "modal"]), value: serde_json::json!({ "cloud": "modal" }), from: Some(serde_json::Value::Null) },
+        Change::Arrange { path: path(&["routing", "order"]), keys: vec!["modal".into(), "aws".into()] },
+        Change::Add { path: path(&["routing", "public_repos"]), value: "acme/b".into() },
+        Change::Add { path: path(&["routing", "rules"]), value: serde_json::json!({ "repo": "x", "cloud": "aws" }) },
+    ]);
+    assert_eq!(apply(&before, &changes), Ok(after.clone()));
+    assert!(diff(&before, &after, false).iter().all(|c| !matches!(c, Change::Set { from: Some(_), .. })));
+    assert!(diff(&after, &after, true).is_empty());
+    // A list put in another order, or a value made another kind: set whole.
+    let regions = |r: &[&str]| serde_json::json!({ "r": r });
+    assert_eq!(diff(&regions(&["a", "b"]), &regions(&["b", "a"]), true), vec![Change::Set { path: path(&["r"]), value: serde_json::json!(["b", "a"]), from: Some(serde_json::json!(["a", "b"])) }]);
+    assert_eq!(diff(&serde_json::json!({ "r": ["a"] }), &serde_json::json!({}), false), vec![Change::Remove { path: path(&["r"]), value: "a".into() }]);
+    assert_eq!(diff(&serde_json::json!({ "r": 1 }), &serde_json::json!({ "r": [1] }), false), vec![Change::Set { path: path(&["r"]), value: serde_json::json!([1]), from: None }]);
+    // (Items without their key are not items of the keyed list: passed over.)
+    assert!(diff(&serde_json::json!({ "launchers": [{ "url": "u" }] }), &serde_json::json!({ "launchers": [{ "url": "v" }] }), true).is_empty());
+    // Applied over others' changes: theirs kept.
+    let meanwhile = serde_json::json!({ "routing": { "max_cpu": 32, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }, { "cloud": "gcp" }], "public_repos": ["acme/a", "acme/c"], "rules": [] }, "launchers": [] });
+    let made = apply(&meanwhile, &changes).unwrap();
+    assert_eq!((&made["routing"]["max_cpu"], &made["routing"]["order"], &made["routing"]["public_repos"]), (&serde_json::json!(32), &serde_json::json!([{ "cloud": "modal" }, { "cloud": "aws", "max_jobs": 6 }, { "cloud": "gcp" }]), &serde_json::json!(["acme/a", "acme/c", "acme/b"])));
+    // Where a change has no way: not made, said as nothing there.
+    let doc = serde_json::json!({ "routing": { "max_cpu": 4, "order": [] }, "launchers": "not a list" });
+    let refused = |c: Change| apply(&doc, &[c]).unwrap_err()[0].now.clone();
+    assert_eq!(refused(Change::Set { path: path(&["routing", "max_cpu", "x"]), value: 1.into(), from: None }), serde_json::Value::Null);
+    assert_eq!(refused(Change::Set { path: path(&["launchers", "modal"]), value: 1.into(), from: None }), serde_json::Value::Null);
+    assert_eq!(refused(Change::Add { path: path(&["routing", "max_cpu"]), value: 1.into() }), serde_json::Value::Null);
+    assert_eq!(refused(Change::Add { path: path(&["routing", "order", "aws", "regions"]), value: 1.into() }), serde_json::Value::Null);
+    assert_eq!(refused(Change::Arrange { path: path(&["routing", "public_repos"]), keys: vec![] }), serde_json::Value::Null);
+    assert_eq!(refused(Change::Arrange { path: path(&["launchers"]), keys: vec![] }), serde_json::Value::Null);
+    // Ways made where nothing is yet; a keyed item set when it is not there, or taken out when it is not.
+    let made = apply(&serde_json::json!({}), &[
+        Change::Set { path: path(&["routing", "account_usd", "aws"]), value: 100.0.into(), from: None },
+        Change::Set { path: path(&["launchers", "modal"]), value: serde_json::json!({ "cloud": "modal", "url": "u" }), from: None },
+        Change::Set { path: path(&["launchers", "cloudflare"]), value: serde_json::Value::Null, from: None },
+        Change::Remove { path: path(&["routing", "public_repos"]), value: "x".into() },
+    ]).unwrap();
+    assert_eq!(made, serde_json::json!({ "routing": { "account_usd": { "aws": 100.0 }, "public_repos": [] }, "launchers": [{ "cloud": "modal", "url": "u" }] }));
+    assert_eq!(apply(&made, &[Change::Set { path: vec![], value: serde_json::json!({}), from: None }]), Ok(serde_json::json!({})));
+    assert_eq!(apply(&serde_json::json!({ "routing": { "account_usd": 1 } }), &[Change::Set { path: path(&["routing", "account_usd", "aws"]), value: 1.into(), from: None }]).unwrap_err().len(), 1);
+    // What is there, and which lists are kept by key.
+    assert_eq!((at(&made, &path(&["launchers", "modal", "url"])), at(&made, &path(&["launchers", "gcp"])), at(&serde_json::json!({ "a": null }), &path(&["a"]))), (Some(&serde_json::json!("u")), None, None));
+    assert_eq!((keyed(&path(&["routing", "order"])), keyed(&path(&["launchers"])), keyed(&path(&["routing"]))), (Some("cloud"), Some("cloud"), None));
+    // As sent and read: `from` of nothing kept apart from no `from`.
+    let sent: Vec<Change> = serde_json::from_str(r#"[{"op":"set","path":["a"],"value":1,"from":null},{"op":"set","path":["a"],"value":1}]"#).unwrap();
+    assert_eq!(sent, vec![Change::Set { path: path(&["a"]), value: 1.into(), from: Some(serde_json::Value::Null) }, Change::Set { path: path(&["a"]), value: 1.into(), from: None }]);
+    assert_eq!(serde_json::to_string(&sent[1]).unwrap(), r#"{"op":"set","path":["a"],"value":1}"#);
 }

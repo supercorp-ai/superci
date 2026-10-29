@@ -18,7 +18,8 @@ use superci_core::crypto::{random_token, safe_eq};
 use superci_core::github::{self, app_manifest, manifest_target, Owner};
 use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
-use superci_core::plane::{AwsBudget, Pool, Routing, Rule, AWS_ON_DEMAND, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
+use superci_core::settings::Conflict;
+use superci_core::plane::{AwsBudget, Launcher, Pool, Routing, Rule, AWS_ON_DEMAND, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
 use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, region_short, REGIONS};
 
@@ -208,7 +209,8 @@ const UPDATE_MODAL: [&str; 3] = ["Building the new version", "Deploying it", "Wa
 enum Deploying {
     Cloudflare { account_id: String, script: String, label: String },
     Aws { creds: superci_core::aws::Credentials, account_id: String, region: String, plane_id: String, label: String },
-    Modal { session: modal::Session, plane_id: String, label: String },
+    /// `recreate`: its old container stopped as the new one starts, where it can be (see `modal::deploy_plane`).
+    Modal { session: modal::Session, plane_id: String, label: String, recreate: bool },
 }
 
 /// A move: to which control plane, the step it is at, and how it ended (with what did not come along).
@@ -413,6 +415,22 @@ fn listen_on(p: u16) -> Vec<TcpListener> {
     let mut bound = vec![];
     let free = [format!("127.0.0.1:{p}"), format!("[::1]:{p}")].iter().all(|addr| match TcpListener::bind(addr) { Ok(l) => { bound.push(l); true } Err(e) => e.kind() != std::io::ErrorKind::AddrInUse });
     if free { bound } else { vec![] }
+}
+
+/// A port the system gives, free, on this computer's addresses as `listen_on` takes them (one the system gave for the
+/// first that another program has on the second: another); its listeners.
+fn listen_anywhere() -> (u16, Vec<TcpListener>) {
+    for _ in 0..20 {
+        let Ok(first) = TcpListener::bind("127.0.0.1:0") else { break };
+        let Ok(port) = first.local_addr().map(|a| a.port()) else { break };
+        match TcpListener::bind(format!("[::1]:{port}")) {
+            Ok(second) => return (port, vec![first, second]),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            // (No IPv6 here.)
+            Err(_) => return (port, vec![first]),
+        }
+    }
+    (0, vec![])
 }
 
 fn write_response(stream: &mut TcpStream, r: &Response) {
@@ -2090,7 +2108,7 @@ impl Dashboard {
     /// every other workspace's behind the switcher. `several`: started with several workspaces and none named, so it
     /// opens on the list of them and this one is not served.
     pub fn serve(mut self, open_browser: bool, several: bool) -> Result<()> {
-        // Port 8976, or the next free one when another SuperCI has it (or the one SUPERCI_PORT names). Only
+        // Port 8976, or the next free one when another SuperCI has it (or the one SUPERCI_PORT names; 0: any free). Only
         // Cloudflare's browser sign-in needs 8976 itself: it comes back to no other.
         let asked: Option<u16> = std::env::var("SUPERCI_PORT").ok().and_then(|p| p.parse().ok());
         let ports: Vec<u16> = match asked {
@@ -2098,8 +2116,11 @@ impl Dashboard {
             None if matches!(self.task, Some(Task::Login(Some("cloudflare")))) => vec![oauth_port()],
             None => (oauth_port()..oauth_port() + 10).collect(),
         };
-        // The first of them free, and what listens there (none free: the last one tried, to say).
-        let (port, bound) = ports.iter().map(|&p| (p, listen_on(p))).find(|(_, bound)| !bound.is_empty()).unwrap_or((ports[ports.len() - 1], vec![]));
+        // The first of them free, and what listens there (none free: the last one tried, to say). Port 0: one the
+        // system gives, free.
+        let (port, bound) = if asked == Some(0) { listen_anywhere() } else {
+            ports.iter().map(|&p| (p, listen_on(p))).find(|(_, bound)| !bound.is_empty()).unwrap_or((ports[ports.len() - 1], vec![]))
+        };
         if bound.is_empty() {
             return Err(if port == oauth_port() && asked.is_none() { format!("Cloudflare's sign-in comes back to port {} only, and another program has it (another SuperCI, or `wrangler login`). Stop that one, or sign in to Cloudflare there.", oauth_port()) }
                 else { format!("port {port} is in use (is another SuperCI running?)") })
@@ -2205,6 +2226,22 @@ impl Dashboard {
     /// Whose the sign-ins kept are (see `Own`).
     fn own(&self) -> Own {
         Own { aws: self.aws.as_ref().map(|a| a.account_id.clone()), cf: self.cf_accounts.iter().map(|(id, _)| id.clone()).collect(), modal: self.modal.as_ref().map(|m| m.workspace.clone()) }
+    }
+
+    /// Writes the control plane's settings that are not secrets (where jobs run, its launchers): what changed from
+    /// `before` to `after` (each a part of the settings, see `settings_doc`), field by field. `seen`: `before` is what
+    /// a page showed, and a field changed since then on another computer is refused (none written), each such one
+    /// returned; without, each change is meant as said. Through the control plane where it keeps them (its status says
+    /// `settings`); into its cloud where it does not (one from before), over `status`'s.
+    fn put_settings(&mut self, plane: &Plane, status: &serde_json::Value, before: serde_json::Value, after: serde_json::Value, seen: bool) -> Result<Option<Vec<Conflict>>> {
+        let changes = superci_core::settings::diff(&before, &after, seen);
+        if changes.is_empty() { return Ok(None) }
+        if status["settings"] == true { return Ok(cloudflare::plane_settings(plane.url(), &self.status_key, &changes)?.err()) }
+        let now = settings_doc(Some(&serde_json::from_value(status["routing"].clone()).unwrap_or_default()), Some(&serde_json::from_value::<Vec<Launcher>>(status["launchers"].clone()).unwrap_or_default()));
+        let written = match superci_core::settings::apply(&now, &changes) { Ok(w) => w, Err(conflicts) => return Ok(Some(conflicts)) };
+        if after.get("routing").is_some() { self.put_secret(plane, "ROUTING", &written["routing"].to_string())? }
+        if after.get("launchers").is_some() { self.put_secret(plane, "LAUNCHERS", &written["launchers"].to_string())? }
+        Ok(None)
     }
 
     /// Writes one of a control plane's secrets through its cloud's API (a Worker secret; an SSM parameter).
@@ -2723,7 +2760,7 @@ impl Dashboard {
                 let again = field("plane");
                 let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { cloudflare::new_plane_id() };
                 self.start_deploy("modal", format!("workspace {}", session.workspace), &modal::DEPLOY_STEPS, vec![("plane", plane_id.clone())], move |step| {
-                    let url = modal::deploy_plane(&session, &plane_id, &label, step)?;
+                    let url = modal::deploy_plane(&session, &plane_id, &label, false, step)?;
                     step(2);
                     wait_online(&url);
                     Ok(Plane::Modal { workspace: session.workspace.clone(), url, plane_id, label })
@@ -2788,24 +2825,28 @@ impl Dashboard {
                 // (Signed in to Modal, above, for its part.)
                 let md = if cloud == "modal" && !only && !own_containers { self.modal.clone() } else { None };
                 // 1. Forgotten: out of the order (and any rule naming it), then its connection.
-                let mut routing: Routing = serde_json::from_value(status["routing"].clone()).unwrap_or_default();
+                let was: Routing = serde_json::from_value(status["routing"].clone()).unwrap_or_default();
+                let mut routing = was.clone();
                 routing.order.retain(|p| p.cloud != cloud && !(cloud == "aws" && p.cloud == AWS_ON_DEMAND));
                 routing.rules.retain(|r| r.cloud != cloud);
                 if routing.default.as_deref() == Some(cloud.as_str()) { routing.default = None }
                 // (AWS's own budget for the account goes with AWS: see below.)
                 let had_budget = cloud == "aws" && routing.aws_budget.take().is_some();
-                self.put_secret(&plane, "ROUTING", &json_text(&routing))?;
+                // (Its launcher, when it has one, out of the launchers in the same write.)
+                let launchers_were: Vec<Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
+                let launchers = (cloud != "aws" && !own_containers).then(|| launchers_were.iter().filter(|a| a.cloud != cloud).cloned().collect::<Vec<_>>());
+                let (before, after) = (settings_doc(Some(&was), launchers.as_ref().map(|_| launchers_were.as_slice())), settings_doc(Some(&routing), launchers.as_deref()));
+                if let Some(conflicts) = self.put_settings(&plane, &status, before, after, false)? { return Ok(changed_meanwhile(&conflicts, None)) }
                 if cloud == "aws" {
                     if matches!(plane, Plane::Aws { .. }) { self.put_secret(&plane, "AWS_RUNNERS", "off")? } else { cloudflare::plane_post(plane.url(), &self.status_key, "/aws/forget", &serde_json::json!({}))?; }
                 } else if own_containers {
                     self.put_secret(&plane, "CONTAINERS", "off")?;
-                } else {
-                    let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
-                    launchers.retain(|a| a.cloud != cloud);
-                    self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
                 }
                 let c = cloud.clone();
                 let forgotten = wait_for(plane.url(), &self.status_key, move |s| !provider_connected(s, &c));
+                // (A launcher deleted only once no instance of the control plane sends it a job: AWS's run several,
+                // each reading the settings at most ten seconds old. A Durable Object or a Modal container is one.)
+                if launchers.is_some() && !only && matches!(plane, Plane::Aws { .. }) { aws::pause(superci_core::plane::SETTINGS_READ_MS) }
                 // 2. Its part in that cloud (its machines go with it).
                 let id = plane.plane_id().to_string();
                 let mut left = vec![];
@@ -3233,7 +3274,9 @@ impl Dashboard {
                 let (steps, deploying): (&'static [&'static str], Deploying) = match (plane.clone(), self.modal.clone()) {
                     (Plane::Cloudflare { account_id, script, label, .. }, _) => (&UPDATE_CLOUDFLARE, Deploying::Cloudflare { account_id, script, label }),
                     (Plane::Aws { account_id, region, plane_id, label, .. }, _) => (&UPDATE_AWS, Deploying::Aws { creds: self.aws_creds()?, account_id, region, plane_id, label }),
-                    (Plane::Modal { plane_id, label, .. }, Some(session)) => (&UPDATE_MODAL, Deploying::Modal { session, plane_id, label }),
+                    // (Its old container stopped as the new one starts, where no job runs in its own app: see
+                    // `modal::deploy_plane`.)
+                    (Plane::Modal { plane_id, label, .. }, Some(session)) => (&UPDATE_MODAL, Deploying::Modal { session, plane_id, label, recreate: true }),
                     _ => return Ok(message(400, "Sign in where this control plane runs to update it", "")),
                 };
                 let cf_account = self.cf_accounts.first().map(|a| a.0.clone());
@@ -3276,7 +3319,7 @@ impl Dashboard {
                         let url = match &deploying {
                             Deploying::Cloudflare { account_id, script, label } => cf.as_ref().ok_or("Sign in with Cloudflare first.")?.deploy_with(account_id, script, label, containers, &step)?.url,
                             Deploying::Aws { creds, account_id, region, plane_id, label } => aws_plane::deploy_with(creds, account_id, region, plane_id, label, aws_runners, &step)?.url,
-                            Deploying::Modal { session, plane_id, label } => modal::deploy_plane(session, plane_id, label, &step)?,
+                            Deploying::Modal { session, plane_id, label, recreate } => modal::deploy_plane(session, plane_id, label, *recreate, &step)?,
                         };
                         // A separate Cloudflare launcher (for a control plane elsewhere) is updated with it.
                         if let (true, Some(cf), Some(account)) = (cf_launcher && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }
@@ -3421,7 +3464,8 @@ impl Dashboard {
             ("POST", "/runners/modal") => {
                 let plane = self.plane()?;
                 let session = self.modal.clone().ok_or("Sign in with Modal first.")?;
-                let Some(mut launchers) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Vec<superci_core::plane::Launcher>>(s["launchers"].clone()).ok()) else {
+                let status = status_soon(plane.url(), &self.status_key).unwrap_or_default();
+                let Some(mut launchers) = serde_json::from_value::<Vec<superci_core::plane::Launcher>>(status["launchers"].clone()).ok().filter(|_| !status.is_null()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
                 let keys = plane_keys(plane.url())?;
@@ -3430,7 +3474,7 @@ impl Dashboard {
                 launcher_up(&url);
                 launchers.retain(|a| a.cloud != "modal");
                 launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
-                self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                if let Some(c) = self.put_settings(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)), false)? { return Ok(changed_meanwhile(&c, None)) }
                 wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
                 Ok(Response::redirect("/?p=runners"))
             }
@@ -3450,7 +3494,7 @@ impl Dashboard {
                         let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
                         if launchers.iter().any(|a| a.cloud == "cloudflare") {
                             launchers.retain(|a| a.cloud != "cloudflare");
-                            self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                            if let Some(c) = self.put_settings(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)), false)? { return Ok(changed_meanwhile(&c, None)) }
                             let _ = cf.delete_runners(account_id, plane.plane_id());
                         }
                         wait_for(plane.url(), &self.status_key, |s| s["containers"] == true && !s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
@@ -3470,7 +3514,7 @@ impl Dashboard {
                         let url = cf.deploy_runners(&account, plane.url(), plane.plane_id())?;
                         launchers.retain(|a| a.cloud != "cloudflare");
                         launchers.push(superci_core::plane::Launcher { cloud: "cloudflare".into(), url });
-                        self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
+                        if let Some(c) = self.put_settings(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)), false)? { return Ok(changed_meanwhile(&c, None)) }
                         wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
                     }
                 }
@@ -3577,9 +3621,14 @@ impl Dashboard {
                 let plane = self.plane()?;
                 // Changed from what the control plane has now; never from a guess (that would drop its other rules).
                 let status = status_soon(plane.url(), &self.status_key);
-                let Some(mut routing) = status.as_ref().and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()) else {
+                let Some(now) = status.as_ref().and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
+                // Changed from what the page showed (`seen`, see `with_seen`): only what this change changes is
+                // written, and refused where another computer changed it since; a command's, from what is there now.
+                let seen = Some(field("seen")).filter(|s| !s.is_empty() && field("seen_plane") == plane.plane_id()).and_then(|s| serde_json::from_str::<Routing>(&s).ok());
+                let was = seen.clone().unwrap_or(now);
+                let mut routing = was.clone();
                 // A dollar amount, or none (empty, `none`, zero).
                 let money = |name: &str| field(name).parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
                 let usd = || money("usd");
@@ -3795,9 +3844,23 @@ impl Dashboard {
                     }
                     _ => return Ok(message(400, "Unknown change", "")),
                 }
-                let want = json_value(&routing);
-                self.put_secret(&plane, "ROUTING", &want.to_string())?;
-                self.shown(&plane, |s| s["routing"] == want)?;
+                let (before, after) = (settings_doc(Some(&was), None), settings_doc(Some(&routing), None));
+                let ours = superci_core::settings::diff(&before, &after, false);
+                if let Some(c) = self.put_settings(&plane, status.as_ref().unwrap_or(&serde_json::Value::Null), before.clone(), after, seen.is_some())? {
+                    // (Set anyway: the same fields, as shown with what the other computer set in those it changed.)
+                    let changes: Vec<superci_core::settings::Change> = c.iter().map(|c| superci_core::settings::Change::Set { path: c.path.clone(), value: c.now.clone(), from: None }).collect();
+                    let again = superci_core::settings::apply(&before, &changes).ok().map(|now| {
+                        form.iter().filter(|(k, _)| k != "seen").cloned().chain([("seen".to_string(), now["routing"].to_string())]).collect::<Vec<_>>()
+                    });
+                    return Ok(changed_meanwhile(&c, again.as_deref()))
+                }
+                // (Shown once the control plane's routing holds these changes: with others' made meanwhile, it is
+                // not this computer's whole.)
+                self.shown(&plane, |s| {
+                    let doc = serde_json::json!({ "routing": s["routing"] });
+                    let read = |d: &serde_json::Value| serde_json::from_value::<Routing>(d["routing"].clone()).ok();
+                    superci_core::settings::apply(&doc, &ours).is_ok_and(|d| read(&d).is_some() && read(&d) == read(&doc))
+                })?;
                 Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
             // A run cancelled (see `superci runs cancel`), then its page again.
@@ -4015,6 +4078,8 @@ mark();load()})();</script>"#;
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
         let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
         let html = format!("{said_once}{}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), Dashboard::cloud_says_notice(&views), d.render(section, &views, last));
+        // (Each routing form with what the page shows of it: see `with_seen`.)
+        let html = match views.get(view::in_use(&views)) { Some(v) => with_seen(&html, v.plane.plane_id(), v.status.as_ref().map(|s| &s["routing"])), None => html };
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
         // A change's note is said once: once a page showed it (a page still loading has no place for it, and keeps it).
         if let Some(f) = d.flash.clone() { if html.contains(&esc(&f)) { d.flash = None } }
@@ -7161,11 +7226,17 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
         }).unwrap_or_else(|| Err(format!("{} did not take its move token", plane.url())))
     };
     let out = call(from, &out_token, "/move/export", serde_json::json!({}))?;
+    // The new one's settings, as written through it (one from before: as its cloud keeps them), from what it has
+    // now: it is on standby, and nothing but this move writes them.
+    let to_status = cloudflare::status(to.url(), key).unwrap_or_default();
+    let mut kept = (to_status["settings"] == true).then(|| serde_json::json!({ "routing": to_status["routing"], "launchers": to_status["launchers"] }));
     [("GITHUB_APP", "app"), ("GITLAB", "gitlab"), ("ROUTING", "routing"), ("MACHINE", "machine")].into_iter().filter(|(_, k)| !out[k].is_null()).try_for_each(|(name, k)| {
         // (A budget in AWS itself is for the old control plane's role: not carried. The new one says there is none,
         // until it is made again; the old one's goes when the old control plane is deleted.)
         let mut carried = out[k].clone();
         if k == "routing" { if let Some(routing) = carried.as_object_mut() { routing.remove("aws_budget"); } }
+        // (Routing that is not one, a control plane's that is not as SuperCI makes it: not carried.)
+        if k == "routing" { return if serde_json::from_value::<Routing>(carried.clone()).is_ok() { carry_settings(w, to, key, &mut kept, Some(carried), None) } else { Ok(()) } }
         w.put(to, name, &carried.to_string())
     })?;
     // Further organizations' Apps, each a secret of its own. One the new control plane has from an earlier move and
@@ -7257,7 +7328,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     }
     for c in plan { if let Carry::Cannot(p, why) = c { left.push(format!("{} runners stayed behind: {why}.", cloud_name(p))) } }
     if launchers.len() != launchers_before || plan.iter().any(|c| matches!(c, Carry::Comes("cloudflare") | Carry::Comes("modal"))) {
-        w.put(to, "LAUNCHERS", &json_text(&launchers))?;
+        carry_settings(w, to, key, &mut kept, None, Some(json_value(&launchers)))?;
     }
     // The new one says each provider it was given is there, before any job is sent to it: a control plane given its
     // containers a moment ago starts again with them, and until it has, a job for them would find none.
@@ -7312,6 +7383,88 @@ fn report_to_plane(plane_url: &str, report: &serde_json::Value) -> Result<()> {
 fn wait_for_version(url: &str, version: &str) { tries(60, 2000, || cloudflare::health(url).filter(|h| h["version"] == version)); }
 
 fn wait_online(url: &str) { tries(30, 2000, || cloudflare::health(url)); }
+
+/// Settings brought to the control plane moved to: through it, as changes from what it has (`kept`, then what they
+/// made), when it keeps them (see `Dashboard::put_settings`); into its cloud when it is one from before that (`None`).
+fn carry_settings(w: &Writer, to: &Plane, key: &str, kept: &mut Option<serde_json::Value>, routing: Option<serde_json::Value>, launchers: Option<serde_json::Value>) -> Result<()> {
+    if let Some(now) = kept {
+        let mut after = now.clone();
+        if let Some(r) = routing { after["routing"] = r }
+        if let Some(l) = launchers { after["launchers"] = l }
+        let changes = superci_core::settings::diff(now, &after, false);
+        if let Err(conflicts) = cloudflare::plane_settings(to.url(), key, &changes)? { return Err(format!("the new control plane's settings changed meanwhile: {conflicts:?}")) }
+        *now = after;
+        return Ok(())
+    }
+    if let Some(r) = routing { w.put(to, "ROUTING", &r.to_string())? }
+    if let Some(l) = launchers { w.put(to, "LAUNCHERS", &l.to_string())? }
+    Ok(())
+}
+
+/// A part of the control plane's settings, as its changes are made of them (see `superci_core::settings`).
+fn settings_doc(routing: Option<&Routing>, launchers: Option<&[Launcher]>) -> serde_json::Value {
+    let mut doc = serde_json::json!({});
+    if let Some(r) = routing { doc["routing"] = json_value(r) }
+    if let Some(l) = launchers { doc["launchers"] = json_value(&l) }
+    doc
+}
+
+/// Each form that changes the routing (`/routing`) given what the page shows of it, and of which control plane: its
+/// change is made from that, so a field the form shows but was not changed is not written back over another
+/// computer's change, and one changed on both is refused (see `Dashboard::put_settings`).
+fn with_seen(page: &str, plane_id: &str, routing: Option<&serde_json::Value>) -> String {
+    let Some(routing) = routing.filter(|r| r.is_object()) else { return page.to_string() };
+    let hidden = format!(r#"<input type="hidden" name="seen" value="{}"><input type="hidden" name="seen_plane" value="{}">"#, esc(&routing.to_string()), esc(plane_id));
+    let mut out = String::with_capacity(page.len());
+    let mut rest = page;
+    while let Some(at) = rest.find("<form ") {
+        let Some(end) = rest[at..].find('>').map(|e| at + e + 1) else { break };
+        out.push_str(&rest[..end]);
+        if rest[at..end].contains(r#"action="/routing""#) { out.push_str(&hidden) }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The launchers a control plane's status says, as a part of its settings (see `settings_doc`).
+fn launchers_in(status: &serde_json::Value) -> serde_json::Value {
+    settings_doc(None, Some(&serde_json::from_value::<Vec<Launcher>>(status["launchers"].clone()).unwrap_or_default()))
+}
+
+/// A change refused because another computer changed those fields since this one's page showed them: each, with what
+/// it holds now. With `again` (the form's fields, its `seen` made what is there now in those fields): Set it anyway,
+/// which makes this change over the other computer's in those fields alone, and is refused once more only if they
+/// change yet again.
+fn changed_meanwhile(conflicts: &[Conflict], again: Option<&[(String, String)]>) -> Response {
+    let each: Vec<String> = conflicts.iter().map(|c| {
+        let now = match &c.now { serde_json::Value::Null => "nothing".to_string(), serde_json::Value::String(s) => s.clone(), v => v.to_string() };
+        format!("{} is {now} now", setting_name(&c.path))
+    }).collect();
+    let heading = "Changed on another computer meanwhile";
+    let Some(fields) = again else { return message(409, heading, &format!("{}. Look again, then make your change once more.", esc(&each.join("; ")))) };
+    let text = format!("{}. Set yours anyway, over that, or go back and look again.", each.join("; "));
+    SAID.with(|s| *s.borrow_mut() = Some((409, heading.to_string(), esc(&text))));
+    let hidden: String = fields.iter().map(|(k, v)| format!(r#"<input type="hidden" name="{}" value="{}">"#, esc(k), esc(v))).collect();
+    superci_core::page::html(409, "superci", &format!(r#"<h1>{heading}</h1><p class="note">{}</p><form method="post" action="/routing" style="margin-top:18px">{hidden}<button class="button">Set it anyway</button> <a class="chip" href="/">Back</a></form>"#, esc(&text)))
+}
+
+/// A setting's name, as the pages say it: the provider it is of, and what it is.
+fn setting_name(path: &[String]) -> String {
+    let what = |field: &str| match field {
+        "max_jobs" => "jobs at once", "monthly_usd" => "monthly limit", "daily_usd" => "daily limit", "regions" => "regions", "off" => "taken out of the order",
+        "max_cpu" => "the largest machine", "max_minutes" => "the longest job", "public_repos" => "public repositories", "aws_budget" => "AWS's budget", "cache" => "the cache", "rules" => "repository rules", "order" => "the order",
+        "launchers" => "the launchers", other => other,
+    }.to_string();
+    match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["routing", "order", cloud, field, ..] => format!("{}'s {}", cloud_name(cloud), what(field)),
+        ["routing", "account_usd", account] => format!("{}'s monthly limit", cloud_name(account)),
+        ["routing", "account_daily_usd", account] => format!("{}'s daily limit", cloud_name(account)),
+        ["routing", "order", cloud] | ["launchers", cloud] => format!("{}'s place", cloud_name(cloud)),
+        ["routing", field, ..] | [field, ..] => what(field),
+        [] => "the settings".into(),
+    }
+}
 
 /// The keys a control plane signs its launchers' requests with (its JWKS), for a launcher to trust.
 fn plane_keys(url: &str) -> Result<serde_json::Value> {
@@ -9855,7 +10008,10 @@ mod rest_tests {
         assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
         // Public repositories: none chosen, or some; providers in an order (one taken out, or one unknown); its own
         // network and its regions in AWS: each stops at writing, without a sign-in to Modal.
-        for fields in [&[("action", "public_set")][..], &[("action", "public_set"), ("repo", "acme/web")], &[("action", "order"), ("out_0", "aws"), ("cloud_x", "")],
+        // (None chosen, where only a pattern is allowed: nothing changes, and nothing is written.)
+        let r = send(&mut d, "/routing", &[("action", "public_set")]).unwrap();
+        assert_eq!(r.status, 303, "{}", words_of(&r));
+        for fields in [&[("action", "public_set"), ("repo", "acme/web")][..], &[("action", "order"), ("out_0", "aws"), ("cloud_x", "")],
             &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0123456789abcdef0 sg-0123456789abcdef0")], &[("action", "pool"), ("cloud", "aws"), ("region_0", "us-west-2"), ("region_1", "us-west-2")]] {
             let said = send(&mut d, "/routing", fields);
             assert!(said.as_ref().err().is_some_and(|e| e == "Sign in with Modal first.") || said.as_ref().is_ok_and(|r| r.status == 400), "{fields:?}: {:?}", said.map(|r| words_of(&r)));

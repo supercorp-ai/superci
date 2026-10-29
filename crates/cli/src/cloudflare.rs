@@ -530,8 +530,27 @@ pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Resul
     let key = &plane_key(key, plane_url);
     let mut r = quick().post(&crate::aws::stand_in(&format!("{plane_url}{path}"))).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")
         .send(body.to_string()).map_err(|e| e.to_string())?;
-    if r.status().as_u16() != 200 { return Err(format!("the control plane answered {}", r.status())) }
+    if r.status().as_u16() != 200 {
+        // What it said of why, when it said it (`{"error": …}`).
+        let why = r.body_mut().read_json::<Value>().ok().and_then(|v| v["error"].as_str().map(|e| format!(": {e}"))).unwrap_or_default();
+        return Err(format!("the control plane answered {}{why}", r.status()))
+    }
     serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+/// A write of the control plane's settings (`POST /settings`, see `superci_core::settings`): taken, or the fields it
+/// found changed since they were shown (409), each with what it holds now.
+pub fn plane_settings(plane_url: &str, key: &str, changes: &[superci_core::settings::Change]) -> Result<std::result::Result<(), Vec<superci_core::settings::Conflict>>> {
+    let key = &plane_key(key, plane_url);
+    let mut r = quick().post(&crate::aws::stand_in(&format!("{plane_url}/settings"))).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")
+        .send(serde_json::json!({ "changes": changes }).to_string()).map_err(|e| e.to_string())?;
+    let status = r.status();
+    let body = r.body_mut().read_json::<Value>().unwrap_or_default();
+    match status.as_u16() {
+        200 => Ok(Ok(())),
+        409 => Ok(Err(serde_json::from_value(body["conflicts"].clone()).unwrap_or_default())),
+        _ => Err(format!("the control plane answered {status}{}", body["error"].as_str().map(|e| format!(": {e}")).unwrap_or_default())),
+    }
 }
 
 /// A step of moving between control planes: with this session's key and the plane's one-time move token. Its status

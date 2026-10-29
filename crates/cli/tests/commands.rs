@@ -93,10 +93,12 @@ fn changes_are_written_where_the_control_plane_reads_them_and_it_answers_with_th
     ok(&["labels", "delete", "recorded"]);
     assert_eq!(json(&home, &["labels", "list"]).1["labels"], serde_json::json!(["superci"]));
     // The largest machine a label may ask for.
+    // (Written through the control plane, with the version read: AWS is not asked.)
+    let before = served.aws.asked.lock().unwrap().len();
     ok(&["limits", "update", "--max-cpu=16"]);
-    let (routing, real) = (asked(1), recorded("05-limits"));
-    assert_eq!((&routing["Name"], &routing["Type"]), (&real["Name"], &real["Type"]));
-    assert_eq!(serde_json::from_str::<serde_json::Value>(routing["Value"].as_str().unwrap()).unwrap()["max_cpu"], 16);
+    assert_eq!(served.aws.asked.lock().unwrap().len(), before);
+    let routing = served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&routing).unwrap()["max_cpu"], 16);
     assert_eq!(json(&home, &["limits", "retrieve"]).1["max_cpu"], 16);
     // The default machine.
     ok(&["machine", "update", "--cpu=8"]);
@@ -2543,8 +2545,8 @@ fn a_control_plane_failing_to_give_a_jobs_log_or_githubs_deliveries_is_said_as_i
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A setting written to a Modal control plane, as Modal's client keeps a string: one of a few hundred bytes is
-/// written and taken; one past what a setting holds there (60 kB) is refused before anything is written.
+/// A setting written to a Modal control plane, whose settings are one record of its store (a Modal Dict's value): one
+/// of a few hundred bytes is written and taken; settings past what the record holds (60 kB) are refused, nothing written.
 #[test]
 fn a_modal_control_planes_long_setting_is_written_and_one_past_what_it_holds_is_refused() {
     let account = superci_testkit::Aws::serve();
@@ -2561,17 +2563,16 @@ fn a_modal_control_planes_long_setting_is_written_and_one_past_what_it_holds_is_
     }).to_string()).unwrap();
     std::fs::write(home.join("aws-at"), &account.url).unwrap();
     account.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
-    account.replaying(&[modal_answered("DictGetOrCreate", &[pb(&[Pb::B(1, b"di-settings".to_vec())])]), modal_answered("DictUpdate", &[pb(&[Pb::N(1, 1)])])].concat(), &[]);
     let long = format!("acme/{}", "a".repeat(300));
     let o = superci(&home, &["public_repos", "create", &long]);
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success() && said.contains("may run here"), "{said}");
-    assert!(account.modal_plane_settings().iter().any(|(k, v)| k == "ROUTING" && v.contains(&long)), "{:?}", account.modal_plane_settings());
+    assert!(md.aws.modal_plane_settings().iter().any(|(k, v)| k == "ROUTING" && v.contains(&long)), "{:?}", md.aws.modal_plane_settings());
     let longest = format!("acme/{}", "b".repeat(60_000));
     let o = superci(&home, &["public_repos", "create", &longest]);
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && said.contains("a setting longer than 60 kB"), "{said}");
-    assert!(!account.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
+    assert!(!md.aws.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
     let _ = std::fs::remove_dir_all(&home);
 }
 
