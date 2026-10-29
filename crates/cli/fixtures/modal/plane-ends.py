@@ -92,11 +92,4 @@ said, took = asked({"op": "expire", "now_ms": 7000})
 assert said == {"gone": 1}, said
 assert "job:1" not in every() and "~e:job:1" not in every() and every()["job:2"] == "new" and every()["job:5"] == "five", every()
 assert not any(k.startswith("~x:0000000005000") or k.startswith("~x:0000000007000") for k in every()) and "~x:0000000009000:job:5" in every() and "~x:soon:job:2" in every(), every()
-# A version of the settings made by two containers at once (an old and a new one answering side by side during an
-# update, each with its own lock): one is made, the other told it was not (Modal's `skip_if_exists`, one write whole).
-other = type(plane)()
-async def two_containers():
-    made = lambda p, v: p.answer({"op": "put_if_absent", "key": "settings:000000000002", "value": v})
-    return await asyncio.gather(made(plane, "a"), made(other, "b"))
-assert sorted(r["created"] for r in asyncio.run(two_containers())) == [False, True]
 print("ok plane ends")

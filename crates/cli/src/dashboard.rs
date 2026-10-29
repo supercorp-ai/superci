@@ -209,7 +209,8 @@ const UPDATE_MODAL: [&str; 3] = ["Building the new version", "Deploying it", "Wa
 enum Deploying {
     Cloudflare { account_id: String, script: String, label: String },
     Aws { creds: superci_core::aws::Credentials, account_id: String, region: String, plane_id: String, label: String },
-    Modal { session: modal::Session, plane_id: String, label: String },
+    /// `recreate`: its old container stopped as the new one starts, where it can be (see `modal::deploy_plane`).
+    Modal { session: modal::Session, plane_id: String, label: String, recreate: bool },
 }
 
 /// A move: to which control plane, the step it is at, and how it ended (with what did not come along).
@@ -2759,7 +2760,7 @@ impl Dashboard {
                 let again = field("plane");
                 let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { cloudflare::new_plane_id() };
                 self.start_deploy("modal", format!("workspace {}", session.workspace), &modal::DEPLOY_STEPS, vec![("plane", plane_id.clone())], move |step| {
-                    let url = modal::deploy_plane(&session, &plane_id, &label, step)?;
+                    let url = modal::deploy_plane(&session, &plane_id, &label, false, step)?;
                     step(2);
                     wait_online(&url);
                     Ok(Plane::Modal { workspace: session.workspace.clone(), url, plane_id, label })
@@ -3273,7 +3274,9 @@ impl Dashboard {
                 let (steps, deploying): (&'static [&'static str], Deploying) = match (plane.clone(), self.modal.clone()) {
                     (Plane::Cloudflare { account_id, script, label, .. }, _) => (&UPDATE_CLOUDFLARE, Deploying::Cloudflare { account_id, script, label }),
                     (Plane::Aws { account_id, region, plane_id, label, .. }, _) => (&UPDATE_AWS, Deploying::Aws { creds: self.aws_creds()?, account_id, region, plane_id, label }),
-                    (Plane::Modal { plane_id, label, .. }, Some(session)) => (&UPDATE_MODAL, Deploying::Modal { session, plane_id, label }),
+                    // (Its old container stopped as the new one starts, where no job runs in its own app: see
+                    // `modal::deploy_plane`.)
+                    (Plane::Modal { plane_id, label, .. }, Some(session)) => (&UPDATE_MODAL, Deploying::Modal { session, plane_id, label, recreate: true }),
                     _ => return Ok(message(400, "Sign in where this control plane runs to update it", "")),
                 };
                 let cf_account = self.cf_accounts.first().map(|a| a.0.clone());
@@ -3316,7 +3319,7 @@ impl Dashboard {
                         let url = match &deploying {
                             Deploying::Cloudflare { account_id, script, label } => cf.as_ref().ok_or("Sign in with Cloudflare first.")?.deploy_with(account_id, script, label, containers, &step)?.url,
                             Deploying::Aws { creds, account_id, region, plane_id, label } => aws_plane::deploy_with(creds, account_id, region, plane_id, label, aws_runners, &step)?.url,
-                            Deploying::Modal { session, plane_id, label } => modal::deploy_plane(session, plane_id, label, &step)?,
+                            Deploying::Modal { session, plane_id, label, recreate } => modal::deploy_plane(session, plane_id, label, *recreate, &step)?,
                         };
                         // A separate Cloudflare launcher (for a control plane elsewhere) is updated with it.
                         if let (true, Some(cf), Some(account)) = (cf_launcher && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }

@@ -308,18 +308,29 @@ const PLANE_BINARY: &[u8] = superci_programs_planes::PLANE_MODAL;
 pub const DEPLOY_STEPS: [&str; 3] = ["Building its images in your workspace", "Deploying it, with its check for waiting jobs and leftover machines every minute", "Waiting for it to answer"];
 
 /// Deploys (or updates) a control plane in this workspace: app `superci-plane-<id>`, its state and settings Dicts,
-/// its schedule. Returns its URL.
-pub fn deploy_plane(session: &Session, plane_id: &str, label: &str, step: &dyn Fn(usize)) -> Result<String> {
+/// its schedule; its jobs' sandboxes go in an app of their own (`jobs_app`). Returns its URL. `recreate` (an update):
+/// its old container is stopped as the new one starts (Modal's `recreate` deploy strategy, requests meanwhile kept
+/// until the new one answers), so two never answer side by side: a Dict has no write over what was read, and the
+/// control plane's one container makes its swaps one at a time. Unless Modal says jobs still run in its own app (one
+/// from before kept them there; they would be stopped with it), or cannot say: then side by side, as before.
+pub fn deploy_plane(session: &Session, plane_id: &str, label: &str, recreate: bool, step: &dyn Fn(usize)) -> Result<String> {
     step(0);
     let name = plane_app(plane_id);
-    let script = include_str!("modal_plane.py").replace("__NAME__", &name).replace("__PLANE_ID__", plane_id).replace("__LABEL__", label).replace("__IMAGE_BUILDER__", IMAGE_BUILDER);
-    let suffix = modal_deploy(session, &script, Some(PLANE_BINARY))?;
+    let script = include_str!("modal_plane.py").replace("__NAME__", &name).replace("__PLANE_ID__", plane_id).replace("__LABEL__", label).replace("__JOBS__", &jobs_app(plane_id)).replace("__IMAGE_BUILDER__", IMAGE_BUILDER);
+    let deploy = if recreate {
+        // (4: Modal said no sandbox runs in its app. Anything else, a failure to ask among it: side by side.)
+        format!(r#"{{ python3 -c "import modal, sys; app = modal.App.lookup('{name}'); sys.exit(3 if any(True for _ in modal.Sandbox.list(app_id=app.app_id)) else 4)"; if [ $? -eq 4 ]; then modal deploy --strategy=recreate app.py; else echo 'Jobs run in its own app still: deployed side by side.'; modal deploy app.py; fi; }}"#)
+    } else { "modal deploy app.py".to_string() };
+    let suffix = modal_run(session, &deploy, &script, Some(PLANE_BINARY))?;
     step(1);
     Ok(format!("https://{}--{name}.{suffix}", session.workspace))
 }
 
 /// A Modal control plane's app name.
 pub fn plane_app(plane_id: &str) -> String { format!("superci-plane-{plane_id}") }
+
+/// The app its jobs' sandboxes run in (not `superci-plane-…`: that names control planes, see `find_planes`).
+pub fn jobs_app(plane_id: &str) -> String { format!("superci-jobs-{plane_id}") }
 
 /// How it is said that Modal no longer takes a kept token (deleted in Modal, or expired): Modal's own words follow.
 pub const ENDED: &str = "the Modal sign-in is no longer accepted: sign in again";
@@ -393,11 +404,11 @@ fn pickle_str(s: &str) -> Result<Vec<u8>> {
 
 /// Runs Modal's own `modal deploy` on `script` in a short-lived sandbox in the workspace (with `file`, if any, at
 /// /tmp/superci-plane); returns the workspace's web address suffix.
-/// Deletes a Modal control plane (its app and its two Dicts) and the launcher made for a control plane, with
+/// Deletes a Modal control plane (its app, its jobs' app and its two Dicts) and the launcher made for a control plane, with
 /// Modal's own client in a sandbox. Safe to repeat.
 pub fn delete_plane(session: &Session, plane_id: &str) -> Result<()> {
     let app = plane_app(plane_id);
-    modal_run(session, &format!("modal app stop --yes {app} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; modal app stop --yes superci-runners-{plane_id} || true"), "", None).map(|_| ())
+    modal_run(session, &format!("modal app stop --yes {app} || true; modal app stop --yes {} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; modal app stop --yes superci-runners-{plane_id} || true", jobs_app(plane_id)), "", None).map(|_| ())
 }
 
 /// Deletes the launcher made for a control plane elsewhere.

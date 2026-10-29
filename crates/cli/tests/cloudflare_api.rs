@@ -199,8 +199,13 @@ fn a_cloudflare_control_planes_containers_are_set_and_cloudflare_and_modal_contr
     };
     step("01-deploy-cf");
     assert!(run("cfplane00003", &["planes", "create", "cloudflare"]).0);
+    // (What each Modal step had Modal's own client do, in its sandbox: the last such command.)
+    let last_command = || served.aws.asked.lock().unwrap().iter().rev().find(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxCreate")))
+        .map(|a| { use base64::Engine; String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(a["asked"].as_str().unwrap_or_default()).unwrap_or_default()).into_owned() }).unwrap_or_default();
     step("02-deploy-modal");
     assert!(run("mdplane00003", &["planes", "create", "modal"]).0);
+    // (A new one: nothing of it runs yet to stop.)
+    assert!(last_command().contains("modal deploy app.py") && !last_command().contains("recreate"), "{}", last_command());
     step("03-cf-containers");
     assert!(run("", &["runners", "create", "cloudflare", "--plane=cfplane00003"]).0);
     // Its containers: where they start, GitHub's full image, how many at once (each a secret of its Worker).
@@ -216,10 +221,13 @@ fn a_cloudflare_control_planes_containers_are_set_and_cloudflare_and_modal_contr
     step("06-update-md");
     let (ok, said) = run("", &["planes", "update", "mdplane00003", "--plane=mdplane00003"]);
     assert!(ok && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}");
+    // (Its old container stopped as the new one starts, unless Modal says jobs still run in its own app.)
+    assert!(last_command().contains("modal.Sandbox.list(app_id=app.app_id)") && last_command().contains("modal deploy --strategy=recreate app.py") && last_command().contains("superci-plane-mdplane00003"), "{}", last_command());
     step("07-delete-cf");
     assert!(run("", &["planes", "delete", "cfplane00003", "--confirm"]).0);
     step("08-delete-md");
     assert!(run("", &["planes", "delete", "mdplane00003", "--confirm"]).0);
+    assert!(last_command().contains("modal app stop --yes superci-jobs-mdplane00003"), "{}", last_command());
     assert!(served.aws.unanswered.lock().unwrap().iter().all(|u| !(u.contains("cloudflare.com") || u.contains("modal.com")) || u.ends_with("/workers/scripts/superci/secrets")), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
