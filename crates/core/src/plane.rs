@@ -2725,9 +2725,8 @@ impl<'a> ControlPlane<'a> {
     /// A new job among the newest (see `NEWEST`), written over what was read (a request made another meanwhile: read
     /// again).
     async fn note_newest(&self, at_ms: u64, id: &str) -> Result<()> {
-        let mut tries = 0;
-        while tries < 8 {
-            tries += 1;
+        let mut lost = 0;
+        loop {
             let (was, mut newest) = self.newest().await?;
             // (One made from the index has it already: kept, then.)
             let has = newest.iter().any(|(_, i)| i == id);
@@ -2736,8 +2735,9 @@ impl<'a> ControlPlane<'a> {
             newest.sort();
             let newest = newest.split_off(newest.len().saturating_sub(NEWEST_KEPT));
             if self.store.swap(NEWEST, was.as_deref(), crate::io::json(&newest)).await? { return Ok(()) }
+            lost += 1;
+            if lost == 8 { return Err("the newest jobs' record kept being written by other requests".into()) }
         }
-        Err("the newest jobs' record kept being written by other requests".into())
     }
 
     /// Each hour's totals over the last `days` days and today, from each day's (jobs still going counted as they
