@@ -60,6 +60,11 @@ target/release/superci
 
 The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release; then it publishes the crates (`scripts/crates-publish.sh`), writes the Homebrew formula into the tap (`scripts/brew-formula.sh`), and tries `install.sh`, all three from npm's files or the same source. Every push and pull request is built and tested by `.github/workflows/test.yml`.
 
+## Contributors
+
+- [Domas Bitvinskas](https://github.com/Nedomas)
+- [Taras Kornichuk](https://github.com/artile): Modal deploys in a new workspace and Modal sign-ins ([#2](https://github.com/supercorp-ai/superci/pull/2))
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

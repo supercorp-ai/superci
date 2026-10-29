@@ -3,8 +3,8 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.22
-- A Modal control plane or launcher deploys in a Modal workspace that has nothing of SuperCI's yet. Modal had begun to refuse to create an app for a client whose version it could not read ("Could not determine the SDK version for client type CLIENT_TYPE_LIBMODAL_GO"), and SuperCI said its own: it now says Modal's Go SDK's, as that SDK does. Thanks to Taras Kornichuk.
-- A Modal sign-in ends once it is approved in Modal's tab, whatever the dashboard's tab does meanwhile. Modal hands the token only to a call waiting at that moment: one now waits all the time. Thanks to Taras Kornichuk.
+- A Modal control plane or launcher deploys in a Modal workspace that has nothing of SuperCI's yet. Modal had begun to refuse to create an app for a client whose version it could not read ("Could not determine the SDK version for client type CLIENT_TYPE_LIBMODAL_GO"), and SuperCI said its own: it now says Modal's Go SDK's, as that SDK does. By Taras Kornichuk (github.com/artile).
+- A Modal sign-in ends once it is approved in Modal's tab, whatever the dashboard's tab does meanwhile. Modal hands the token only to a call waiting at that moment: one now waits all the time. By Taras Kornichuk (github.com/artile).
 - What Modal says of a client release it will stop taking is said: by `superci` when it asks Modal, above the dashboard's pages, and in `superci status` from the control plane, which keeps what its launchers and its own client heard. Update your control plane for it.
 - Updating the control plane updates its Modal launcher too (as it did a Cloudflare one), with a Modal sign-in to the workspace it is in: it kept the Modal client it was deployed with.
 - A run from a computer whose workflow names `actions/checkout` by its commit (`actions/checkout@3d3c42e…`, as security guides advise) checks out the working tree as with a version (`@v4`). GitHub's runner took its own copy of GitHub's checkout, kept on the machine by that commit, which failed asking for a token. Update your control plane for it.
