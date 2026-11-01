@@ -148,7 +148,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 58] = ["label", "input", "event-payload", "docker-cache", "branch", "environment", "value-env", "images", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 59] = ["label", "input", "event-payload", "docker-cache", "branch", "environment", "value-env", "images", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "name", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {

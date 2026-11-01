@@ -2030,7 +2030,7 @@ impl Dashboard {
         match plane {
             Plane::Aws { account_id, .. } => self.aws.iter().chain(self.aws_others.iter()).any(|a| &a.account_id == account_id),
             Plane::Cloudflare { .. } => self.cf.is_some(),
-            Plane::Modal { workspace, .. } => self.modal_for(workspace).is_some() || (self.modal.is_some() && workspace.is_empty()),
+            Plane::Modal { .. } => self.modal.is_some(),
             Plane::Seen { .. } => false,
         }
     }
