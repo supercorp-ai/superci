@@ -1131,6 +1131,13 @@ fn a_key_given_by_name_only_reads_and_what_the_control_plane_refuses_or_has_not_
     let o = superci(&home, &["caches", "delete", "--repo=gh7", "--confirm"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("gh7's cache entries are out."), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     assert!(served.store.under("cache:gh7:").is_empty());
+    // (What the control plane refuses: said.)
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = superci_testkit::front(&served.url, |_, target, status, body| if target.starts_with("/caches/delete") { (500, b"store down".to_vec()) } else { (status, body) }).into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (code, v) = json(&home, &["caches", "delete", "--repo=gh7", "--confirm"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.contains("the control plane answered 500")), "{v}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
