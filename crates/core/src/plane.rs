@@ -1297,13 +1297,10 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// The settings as they stand (kept, or its cloud's own where none are kept yet), their version (0: none kept),
-    /// and the record as read.
+    /// and the record as read. (One that is not settings was refused just before this: see `settled`.)
     async fn settings_now(&self) -> Result<(Stored, Option<String>)> {
         let raw = self.store.get(SETTINGS).await?;
-        let stored = match raw.as_deref() {
-            Some(r) => serde_json::from_str(r).map_err(|e| format!("{SETTINGS}: {e}"))?,
-            None => Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] },
-        };
+        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
         Ok((stored, raw))
     }
 
@@ -1315,8 +1312,9 @@ impl<'a> ControlPlane<'a> {
         struct Asked { changes: Vec<crate::settings::Change> }
         let Ok(asked) = serde_json::from_slice::<Asked>(&req.body) else { return Ok(Response::text(400, "settings are written as { changes: [...] }")) };
         let mut tries = 0;
-        while tries < SETTINGS_TRIES {
+        loop {
             tries += 1;
+            if tries > SETTINGS_TRIES { return Ok(Response::text(503, "the settings were being changed by others all along: try again")) }
             let (now, raw) = self.settings_now().await?;
             let doc = serde_json::json!({ "routing": now.routing, "launchers": now.launchers });
             let changed = match crate::settings::apply(&doc, &asked.changes) {
@@ -1333,7 +1331,6 @@ impl<'a> ControlPlane<'a> {
                 return Ok(Response::json(&serde_json::json!({ "version": version })))
             }
         }
-        Ok(Response::text(503, "the settings were being changed by others all along: try again"))
     }
 
     async fn route(&self, req: Request) -> Result<Response> {

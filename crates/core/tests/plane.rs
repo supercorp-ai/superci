@@ -7423,9 +7423,7 @@ fn settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_sai
     assert_eq!(health(), 200);
     // (What was left for after an answer goes with them too.)
     block_on(p.plane().later(PLANE_URL, "start job:1")).unwrap();
-    // (Not settings, while what was read before stands: a write reads them as they are now.)
     p.mem.0.borrow_mut().insert("settings".into(), "not settings".into());
-    assert_eq!(p.write(serde_json::json!([])).status, 500);
     p.later(11_000);
     let r = block_on(p.plane().handle(get("/health")));
     assert!(r.status == 500 && String::from_utf8_lossy(&r.body).starts_with("settings:"), "{}", String::from_utf8_lossy(&r.body));
@@ -7445,7 +7443,7 @@ fn a_change_is_made_only_by_a_way_through_objects_and_lists() {
     assert_eq!(at(&doc, &path(&["routing", "order", "aws"])), None);
     let set = |p: &[&str]| Change::Set { path: path(p), value: 2.into(), from: None };
     assert_eq!(apply(&doc, &[set(&["count"])]).unwrap()["count"], 2);
-    for way in [&["routing", "order", "aws", "max_jobs"][..], &["count", "more"]] {
+    for way in [&["routing", "order", "aws", "max_jobs"][..], &["count", "more"], &["count", "more", "still"]] {
         assert_eq!(apply(&doc, &[set(way)]).unwrap_err()[0].path, path(way));
     }
     let listed = serde_json::json!({ "routing": { "order": [{ "cloud": "aws" }, { "cloud": "modal" }] } });

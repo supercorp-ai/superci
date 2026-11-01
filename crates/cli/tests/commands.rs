@@ -2153,6 +2153,13 @@ fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_pr
     // (Its applications looked at for the one from before, which has no id to delete it by: left.)
     assert!(asked.iter().filter(|a| a.starts_with("GET") && a.ends_with("/containers/applications")).count() == 2 && !asked.iter().any(|a| a.starts_with("DELETE") && a.contains("/containers/applications/")), "{asked:?}");
     assert!(asked.iter().any(|a| a.contains("/manifests/sha256:660f7b9d")) && !asked.iter().any(|a| a.contains("/manifests/sha256:1111") || a.contains("/manifests/sha256:2222")), "{asked:?}");
+    // The launcher made, its place refused: another computer changed it meanwhile.
+    served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), "[]");
+    let mut refusing = kept.clone();
+    refusing["plane"]["Aws"]["url"] = superci_testkit::front(&served.url, |_, target, status, body| if target.starts_with("/settings") { (409, br#"{"conflicts":[{"path":["launchers","cloudflare"],"now":null}]}"#.to_vec()) } else { (status, body) }).into();
+    std::fs::write(&file, refusing.to_string()).unwrap();
+    let (ok, said) = run(&[]);
+    assert!(!ok && said.contains("Changed on another computer meanwhile") && said.contains("Cloudflare's place is nothing now"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

@@ -9640,6 +9640,7 @@ mod rest_tests {
         assert_eq!(name(&["launchers"]), "the launchers");
         assert_eq!(name(&[]), "the settings");
         let routing = serde_json::json!({});
+        assert_eq!(fields_now(&[Conflict { path: vec!["launchers".into()], now: "here".into() }]), "the launchers is here now");
         let cut = with_seen(r#"<p>one<form action="/routing""#, "p", Some(&routing));
         assert!(cut.starts_with(r#"<p>one<form action="/routing""#) && cut.contains(r#"name="seen_plane" value="p""#), "{cut}");
     }
