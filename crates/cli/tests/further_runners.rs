@@ -1,5 +1,6 @@
-//! A further Modal runner from the CLI and the dashboard: a second Modal workspace signed in to, its launcher deployed
-//! as Modal answered a deploy of one, and everything after it under its own word.
+//! A further runner from the CLI and the dashboard: a second Modal workspace signed in to, its launcher deployed as Modal
+//! answered a real one (`fixtures/modal/further`, recorded 2026-11-02 with a Modal control plane in one workspace and a
+//! further runner in another, all deleted after), and everything after it under its own word.
 mod common;
 use common::{part, words};
 use superci_testkit::{serve, PLANE};
@@ -24,8 +25,10 @@ fn two_workspaces() -> (superci_testkit::Served, std::path::PathBuf) {
 
 /// Modal answering one deploy of a launcher, as it answered a real one.
 fn deploy_answers(served: &superci_testkit::Served) {
-    let deployed: Vec<&str> = include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().filter(|l| ["/AuthTokenGet\"", "/AppList\"", "/EnvironmentGetOrCreate\"", "/AppGetOrCreate\"", "/ImageGetOrCreate\"", "/SandboxCreate\"", "/SandboxWait\""].iter().any(|m| l.contains(m))).collect();
-    served.aws.replaying(&deployed.join("\n"), &[("awsplane0001", PLANE)]);
+    // (No app of its control plane's listed: this one is served here.)
+    let deployed: Vec<&str> = include_str!("../fixtures/modal/further/01-add.jsonl").lines().filter(|l| !l.contains("/AppList\"")).collect();
+    served.aws.replaying(include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    served.aws.replaying(&deployed.join("\n"), &[("mdplane00002", PLANE)]);
 }
 
 fn stored(served: &superci_testkit::Served) -> serde_json::Value {
@@ -77,9 +80,9 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     // Asked for again under another word, or its word asked for by another workspace: a word is for good.
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two", "--name=modal-staging"]);
     assert!(!ok && said.contains("runs jobs as modal-acme-two"), "{said}");
-    // Updating the control plane deploys both, each in its own workspace; one not signed in to is named.
     // Deleted: out of the order and the launchers, its record kept, marked gone.
-    served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/modal/06-remove.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let removed: Vec<&str> = include_str!("../fixtures/modal/further/03-delete.jsonl").lines().filter(|l| !l.contains("/AppList\"")).collect();
+    served.aws.replaying(&removed.join("\n"), &[("mdplane00002", PLANE)]);
     let (ok, said) = run(&["runners", "delete", "modal-acme-two", "--confirm"]);
     assert!(ok && said.contains("Removed modal-acme-two."), "{said}");
     let kept = stored(&served);
