@@ -6817,13 +6817,18 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     refused(serde_json::json!([account("modal", "aws")]), "that provider's first account");
     refused(serde_json::json!([runner("aws-on-demand", "aws")]), "needs no record");
     refused(serde_json::json!([runner("modal-three", "modal-prod")]), "no account called modal-prod");
-    refused(serde_json::json!([set(&["accounts", "modal-staging"], serde_json::Value::Null, None)]), "no account called modal-staging");
+    refused(serde_json::json!([set(&["accounts", "modal-staging"], serde_json::Value::Null, None)]), "its runners' records need it");
+    refused(serde_json::json!([set(&["runners", "modal-staging"], serde_json::Value::Null, None)]), "a runner's record stays");
+    refused(serde_json::json!([set(&["runners", "modal-staging", "account"], "modal".into(), None)]), "stays in the account it was in");
+    refused(serde_json::json!([set(&["accounts", "modal-staging", "provider"], "cloudflare".into(), None)]), "stays the account it was");
+    assert_eq!(write(serde_json::json!([set(&["accounts", "modal-staging", "cloud_id"], "acme-staging".into(), None)])).status, 200, "what its cloud calls it is filled in once");
+    refused(serde_json::json!([set(&["accounts", "modal-staging", "cloud_id"], "globex".into(), None)]), "stays the account it was");
     let two = serde_json::json!({ "name": "modal-two", "provider": "modal" });
     refused(serde_json::json!([set(&["accounts"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
     let two = serde_json::json!({ "name": "modal-two", "account": "modal" });
     refused(serde_json::json!([set(&["runners"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
     assert_eq!(write(serde_json::json!([account("modal", "modal")])).status, 200, "a provider's first account may have a record");
-    assert_eq!(write(serde_json::json!([set(&["accounts", "modal"], serde_json::Value::Null, None), set(&["routing", "account_usd", "modal"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], serde_json::Value::Null, None)])).status, 200);
+    assert_eq!(write(serde_json::json!([set(&["routing", "account_usd", "modal"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], serde_json::Value::Null, None)])).status, 200);
 
     // A provider's other runner not added here, first in the order: passed over, said as not connected only if nothing runs it.
     assert_eq!(write(serde_json::json!([
