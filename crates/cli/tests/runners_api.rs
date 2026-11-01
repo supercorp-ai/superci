@@ -64,7 +64,8 @@ fn an_aws_control_plane_gets_every_providers_runners_then_moves_to_cloudflare_as
     step("04-modal-agent");
     let (ok, said) = run("", &["runners", "create", "modal", "--plane=awsplane0001"]);
     assert!(ok && said.contains("modal runs jobs now."), "{said}");
-    let agents = served.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
+    // (Written through the control plane served for it: kept in its store.)
+    let agents = second.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
     assert!(agents.contains("\"cloud\":\"cloudflare\"") && agents.contains("\"cloud\":\"modal\""), "{agents}");
     let (ok, said) = run("", &["runners", "list", "--plane=awsplane0001"]);
     assert!(ok && said.contains("aws ") && said.contains("cloudflare") && said.contains("modal"), "{said}");

@@ -35,7 +35,7 @@ fn asked_at(served: &superci_testkit::Served, part: &str) -> usize { served.aws.
 /// A dashboard on Cloudflare's own port (its sign-in comes back to no other), with these settings of its own: what it
 /// answers to a GET as a page asks (its cookie on that port the usual one), and the dashboard.
 fn on_cloudflares_port(home: &std::path::Path, envs: &[(&str, &str)]) -> (common::Dashboard, impl Fn(&str) -> (u16, String, String)) {
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string();
+    let port = superci_testkit::free_port().to_string();
     let (child, link) = common::dashboard_with(home, &[&[("SUPERCI_OAUTH_PORT", port.as_str()), ("SUPERCI_PORT", port.as_str())][..], envs].concat());
     let key = link.split_once("/?k=").unwrap().1.to_string();
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();

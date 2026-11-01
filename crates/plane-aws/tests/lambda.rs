@@ -304,7 +304,7 @@ fn its_settings_are_read_page_after_page_and_its_requests_as_lambda_gives_them()
 fn the_program_waits_for_lambdas_runtime_to_be_there() {
     let aws = aws();
     for env in [vec![("PLANE_ID", PLANE), ("TABLE", TABLE)], vec![("SUPERCI_CONVERTER", "1")]] {
-        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let _f = start(&format!("127.0.0.1:{port}"), &aws.url, &env);
         std::thread::sleep(Duration::from_millis(1500));
         let (runtime, _) = Runtime::serve_on(TcpListener::bind(("127.0.0.1", port)).unwrap());

@@ -93,10 +93,12 @@ fn changes_are_written_where_the_control_plane_reads_them_and_it_answers_with_th
     ok(&["labels", "delete", "recorded"]);
     assert_eq!(json(&home, &["labels", "list"]).1["labels"], serde_json::json!(["superci"]));
     // The largest machine a label may ask for.
+    // (Written through the control plane, with the version read: AWS is not asked.)
+    let before = served.aws.asked.lock().unwrap().len();
     ok(&["limits", "update", "--max-cpu=16"]);
-    let (routing, real) = (asked(1), recorded("05-limits"));
-    assert_eq!((&routing["Name"], &routing["Type"]), (&real["Name"], &real["Type"]));
-    assert_eq!(serde_json::from_str::<serde_json::Value>(routing["Value"].as_str().unwrap()).unwrap()["max_cpu"], 16);
+    assert_eq!(served.aws.asked.lock().unwrap().len(), before);
+    let routing = served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&routing).unwrap()["max_cpu"], 16);
     assert_eq!(json(&home, &["limits", "retrieve"]).1["max_cpu"], 16);
     // The default machine.
     ok(&["machine", "update", "--cpu=8"]);
@@ -1129,6 +1131,13 @@ fn a_key_given_by_name_only_reads_and_what_the_control_plane_refuses_or_has_not_
     let o = superci(&home, &["caches", "delete", "--repo=gh7", "--confirm"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("gh7's cache entries are out."), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     assert!(served.store.under("cache:gh7:").is_empty());
+    // (What the control plane refuses: said.)
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = superci_testkit::front(&served.url, |_, target, status, body| if target.starts_with("/caches/delete") { (500, b"store down".to_vec()) } else { (status, body) }).into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (code, v) = json(&home, &["caches", "delete", "--repo=gh7", "--confirm"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.contains("the control plane answered 500")), "{v}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -1401,7 +1410,7 @@ fn the_runner_service_here_leaves_what_is_no_request_alone_and_serves_the_job() 
     let dir = common::temp("runner-service-odd");
     let workflow = dir.join("ci.yml");
     std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ok\n").unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let root = format!("http://127.0.0.1:{port}/runner/rig");
     let jit = dir.join("jit");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
@@ -1463,7 +1472,7 @@ fn another_aws_account_and_githubs_app_are_begun_from_the_terminal_with_a_link_t
     let served = serve(|_| {});
     let home = common::signed_in(&served);
     for args in [&["login", "aws", "--add", "--no-browser"][..], &["connections", "create", "github", "acme", "--no-browser"]] {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(&home).args(args).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
         let mut said = vec![];
@@ -2151,6 +2160,13 @@ fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_pr
     // (Its applications looked at for the one from before, which has no id to delete it by: left.)
     assert!(asked.iter().filter(|a| a.starts_with("GET") && a.ends_with("/containers/applications")).count() == 2 && !asked.iter().any(|a| a.starts_with("DELETE") && a.contains("/containers/applications/")), "{asked:?}");
     assert!(asked.iter().any(|a| a.contains("/manifests/sha256:660f7b9d")) && !asked.iter().any(|a| a.contains("/manifests/sha256:1111") || a.contains("/manifests/sha256:2222")), "{asked:?}");
+    // The launcher made, its place refused: another computer changed it meanwhile.
+    served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), "[]");
+    let mut refusing = kept.clone();
+    refusing["plane"]["Aws"]["url"] = superci_testkit::front(&served.url, |_, target, status, body| if target.starts_with("/settings") { (409, br#"{"conflicts":[{"path":["launchers","cloudflare"],"now":null}]}"#.to_vec()) } else { (status, body) }).into();
+    std::fs::write(&file, refusing.to_string()).unwrap();
+    let (ok, said) = run(&[]);
+    assert!(!ok && said.contains("Changed on another computer meanwhile") && said.contains("Cloudflare's place is nothing now"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2543,8 +2559,8 @@ fn a_control_plane_failing_to_give_a_jobs_log_or_githubs_deliveries_is_said_as_i
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A setting written to a Modal control plane, as Modal's client keeps a string: one of a few hundred bytes is
-/// written and taken; one past what a setting holds there (60 kB) is refused before anything is written.
+/// A setting written to a Modal control plane, whose settings are one record of its store (a Modal Dict's value): one
+/// of a few hundred bytes is written and taken; settings past what the record holds (60 kB) are refused, nothing written.
 #[test]
 fn a_modal_control_planes_long_setting_is_written_and_one_past_what_it_holds_is_refused() {
     let account = superci_testkit::Aws::serve();
@@ -2561,17 +2577,22 @@ fn a_modal_control_planes_long_setting_is_written_and_one_past_what_it_holds_is_
     }).to_string()).unwrap();
     std::fs::write(home.join("aws-at"), &account.url).unwrap();
     account.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
-    account.replaying(&[modal_answered("DictGetOrCreate", &[pb(&[Pb::B(1, b"di-settings".to_vec())])]), modal_answered("DictUpdate", &[pb(&[Pb::N(1, 1)])])].concat(), &[]);
     let long = format!("acme/{}", "a".repeat(300));
     let o = superci(&home, &["public_repos", "create", &long]);
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success() && said.contains("may run here"), "{said}");
-    assert!(account.modal_plane_settings().iter().any(|(k, v)| k == "ROUTING" && v.contains(&long)), "{:?}", account.modal_plane_settings());
+    assert!(md.aws.modal_plane_settings().iter().any(|(k, v)| k == "ROUTING" && v.contains(&long)), "{:?}", md.aws.modal_plane_settings());
     let longest = format!("acme/{}", "b".repeat(60_000));
     let o = superci(&home, &["public_repos", "create", &longest]);
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && said.contains("a setting longer than 60 kB"), "{said}");
-    assert!(!account.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
+    assert!(!md.aws.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
+    // (One from before settings were written through it: refused here, before its Dict is written.)
+    md.answer_as("0.19.21", &["settings", "settings_version"]);
+    let o = superci(&home, &["public_repos", "create", &longest]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("a setting longer than 60 kB"), "{said}");
+    assert!(!md.aws.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2583,7 +2604,7 @@ fn a_runner_asking_for_a_message_while_its_job_runs_here_is_held_then_told_there
     let dir = common::temp("debug-runner-held");
     let workflow = dir.join("ci.yml");
     std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let root = format!("http://127.0.0.1:{port}/runner/rig");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
         .args(["debug", "runner-service", workflow.to_str().unwrap(), "tests", &root, &port.to_string(), dir.join("jit").to_str().unwrap(), "--json"])

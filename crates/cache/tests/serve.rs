@@ -94,7 +94,7 @@ fn started() -> (u16, Ends, Arc<Mutex<HashMap<String, Vec<u8>>>>, std::path::Pat
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!("superci-cache-serve-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
     std::fs::create_dir_all(&dir).unwrap();
-    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
         .env("SUPERCI_CACHE_PLANE", format!("http://127.0.0.1:{plane}/cache/t")).env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).spawn().unwrap();
     for _ in 0..100 { if TcpStream::connect(("127.0.0.1", port)).is_ok() { break } std::thread::sleep(std::time::Duration::from_millis(20)) }
@@ -175,11 +175,11 @@ fn turbo_nx_and_bazel_keep_their_outputs_and_a_save_in_blocks_comes_back_whole_o
 fn artifacts_the_control_plane_refuses_are_said_as_twirp_errors() {
     let (status_of, why) = (|what: &str| match what { "artifact-begin" => 409, "artifact-get" | "artifact-delete" => 404, _ => 400 }, "the store refused");
     let plane = server(move |_, path, _| { let what = path.rsplit('/').next().unwrap(); (status_of(what), serde_json::json!({ "why": why }).to_string().into_bytes()) });
-    let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let gone = superci_testkit::free_port();
     for (plane_port, reached) in [(plane, true), (gone, false)] {
         let dir = std::env::temp_dir().join(format!("superci-cache-refused-{}-{plane_port}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let _ends = Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
             .env("SUPERCI_CACHE_PLANE", format!("http://127.0.0.1:{plane_port}/cache/t")).env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).spawn().unwrap());
         for _ in 0..100 { if TcpStream::connect(("127.0.0.1", port)).is_ok() { break } std::thread::sleep(std::time::Duration::from_millis(20)) }

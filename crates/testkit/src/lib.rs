@@ -20,6 +20,8 @@ pub use sweep::{sweep, sweep_with_outages, Fault, Faults, Outcome};
 mod browser;
 #[cfg(unix)]
 pub use browser::Browser;
+#[cfg(all(test, unix))]
+mod tests;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -32,6 +34,25 @@ use serde_json::{json, Value};
 use superci_core::io::{self, Clock, Containers, Request, Store, Timer, Work};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
+/// A port free now, for a program a test starts to listen on: below the ports the system gives out (from 32768 on
+/// Linux, 49152 on macOS), so that no other test's listener and no connection is given it meanwhile, and another each
+/// time in this program.
+pub fn free_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    std::iter::repeat_with(|| 20_000 + (std::process::id().wrapping_mul(131).wrapping_add(NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) % 12_000) as u16)
+        .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok()).expect("it goes on until one is free")
+}
+
+/// Whether `holds` comes to hold within `time`, looked at every tenth of a second.
+pub(crate) fn within(time: std::time::Duration, mut holds: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + time;
+    loop {
+        if holds() { return true }
+        if std::time::Instant::now() >= until { return false }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// A store in memory, shared with the test; with what other requests write meanwhile (`Served::written_meanwhile`),
 /// the records it refuses to write (`Served::store_refuses`), and its operations counted, one of them failing when a
 /// sweep says so (`Faults`).
@@ -39,6 +60,15 @@ use superci_core::plane::{Cache, Config, ControlPlane};
 pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(String, u32, Change)>>>, pub Arc<Mutex<Vec<String>>>, pub Faults,
     /// How long each round trip to it takes, in milliseconds (none unless set: see `Served::store_takes`).
     pub Arc<std::sync::atomic::AtomicU64>);
+
+thread_local! {
+    /// On a served control plane's own thread: the settings views (`Aws::settings`, …) are its cloud's copy there,
+    /// what a control plane builds its configuration from; elsewhere (a test's) they are what it reads, its record's.
+    static AS_PLANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Each control plane served, by its address: its store (where what was written through it is kept).
+static SERVED: Mutex<BTreeMap<String, Arc<Mutex<BTreeMap<String, String>>>>> = Mutex::new(BTreeMap::new());
 
 /// What another request writes over a record (`None`: takes it out), from what is there.
 pub type Change = Arc<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
@@ -141,8 +171,8 @@ impl Ends {
 
 impl Drop for Ends {
     fn drop(&mut self) {
-        for s in &self.stops { s.store(true, std::sync::atomic::Ordering::SeqCst) }
-        for a in &self.at { let _ = TcpStream::connect(a); }
+        self.stops.iter().for_each(|s| s.store(true, std::sync::atomic::Ordering::SeqCst));
+        self.at.iter().for_each(|a| { let _ = TcpStream::connect(a); });
         // (AWS's stand-in and GitHub's hold each other: let go, or neither is ever freed, with all the answers each
         // kept.)
         if let Some(g) = self.github.lock().unwrap().take() { g.aws.lock().unwrap().take(); }
@@ -225,18 +255,6 @@ impl Served {
     /// Counting starts now, with `fault` armed (a scenario of a `sweep` calls this once set up).
     pub fn arm(&self, fault: Fault) { self.aws.faults.arm(fault) }
 
-    /// The calls answered since `arm` (AWS's, GitHub's, GitLab's, Cloudflare's, Modal's, its machines').
-    pub fn calls(&self) -> Vec<String> { self.aws.faults.calls() }
-
-    /// Its store's operations since `arm`.
-    pub fn store_ops(&self) -> Vec<String> { self.aws.faults.store_ops() }
-
-    /// The k-th call from now answered with its service's error.
-    pub fn fail_call(&self, k: usize) { self.aws.faults.fail_call(k) }
-
-    /// The k-th store operation from now not answered.
-    pub fn fail_store_op(&self, k: usize) { self.aws.faults.fail_store_op(k) }
-
     /// Its upkeep, as `upkeep`, whatever it answers: its status and what it said.
     pub fn try_upkeep(&self) -> (u16, String) {
         let host = self.url.trim_start_matches("http://");
@@ -266,6 +284,8 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     let aws = Aws::serve();
     let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
+    *aws.plane_store.lock().unwrap() = Some(store.0.clone());
+    SERVED.lock().unwrap().insert(url.clone(), store.0.clone());
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
     *github.aws.lock().unwrap() = Some(aws.clone());
@@ -282,10 +302,10 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     // (Written before it answers anything: before a sweep's counting starts.)
     block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
+        AS_PLANE.with(|p| p.set(true));
         let cache = Cache::default();
-        for stream in listener.incoming().flatten() {
-            if st.load(std::sync::atomic::Ordering::SeqCst) { break }
-            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
+        listener.incoming().flatten().take_while(|_| !st.load(std::sync::atomic::Ordering::SeqCst)).for_each(|stream| {
+            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(id.clone());
             let mut settings = a.settings(&id);
             // (One from before reads its launchers and its devices' keys under their old names, and not the new ones.)
@@ -302,7 +322,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
             // (A panic is kept, the connection closed unanswered, and the next request answered.)
             if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| answer(&plane, &base, stream, old, &a))) { a.faults.panicked(p) }
-        }
+        });
     });
     let gitlab = github.gitlab.clone();
     let ends = Ends::of(&stop, &url, &aws);
@@ -311,7 +331,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
 
 /// A request as it arrived: method, target, headers, body.
 fn read(stream: &TcpStream) -> std::io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
-    let mut r = BufReader::new(stream.try_clone()?);
+    let mut r = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     r.read_line(&mut line)?;
     let mut p = line.split_whitespace();
@@ -334,8 +354,7 @@ fn read(stream: &TcpStream) -> std::io::Result<(String, String, Vec<(String, Str
 fn write(mut out: TcpStream, status: u16, headers: &[(String, String)], body: &[u8]) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
     for (k, v) in headers { if !k.eq_ignore_ascii_case("content-length") { head.push_str(&format!("{k}: {v}\r\n")) } }
-    out.write_all(format!("{head}\r\n").as_bytes())?;
-    out.write_all(body)
+    out.write_all(&[format!("{head}\r\n").as_bytes(), body].concat())
 }
 
 /// One request on its connection, answered by the control plane, then the connection closed.
@@ -354,14 +373,13 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
     let body = match (old, target.split('?').next().unwrap_or_default(), serde_json::from_slice::<Value>(&res.body)) {
         (Some(version), "/health", Ok(mut v)) => { v["version"] = json!(version); v.to_string().into_bytes() }
         (Some(version), "/status", Ok(mut v)) => {
-            if let Some(o) = v.as_object_mut() {
-                let l = o.remove("launchers").unwrap_or_default();
-                o.insert("agents".into(), l);
-                // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0.)
-                let older = |than: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(&version) < n(than) };
-                if older("0.15.0") { o.remove("account_limits"); }
-                if older("0.16.0") { o.remove("daily_limits"); }
-            }
+            let o = v.as_object_mut().expect("a status is an object");
+            let l = o.remove("launchers").unwrap_or_default();
+            o.insert("agents".into(), l);
+            // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0.)
+            let older = |than: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(&version) < n(than) };
+            if older("0.15.0") { o.remove("account_limits"); }
+            if older("0.16.0") { o.remove("daily_limits"); }
             v.to_string().into_bytes()
         }
         _ => res.body,
@@ -387,10 +405,12 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
     write(stream, res.status, &res.headers, &body)
 }
 
+/// A protobuf varint at `i`, which it moves past it.
+fn varint(b: &[u8], i: &mut usize) -> Option<u64> { let (mut n, mut shift) = (0u64, 0); loop { let c = *b.get(*i)?; *i += 1; n |= ((c & 0x7f) as u64) << shift; shift += 7; if c < 0x80 { return Some(n) } } }
+
 /// A DictUpdateRequest's entries (`updates`, field 2: each a key, field 1, and a value, field 2), each pickled as
 /// Modal's client pickles a string (protocol 4), as text.
 fn modal_entries(b: &[u8]) -> Vec<(String, String)> {
-    fn varint(b: &[u8], i: &mut usize) -> Option<u64> { let (mut n, mut shift) = (0u64, 0); loop { let c = *b.get(*i)?; *i += 1; n |= ((c & 0x7f) as u64) << shift; shift += 7; if c < 0x80 { return Some(n) } } }
     fn fields(b: &[u8]) -> Vec<(u64, Vec<u8>)> {
         let (mut i, mut out) = (0, vec![]);
         while i < b.len() {
@@ -468,6 +488,8 @@ pub struct Aws {
     /// The control plane answering as an older version does, its key taken as now (see `Served::answer_as`): the
     /// version its health says (none: as it is), and what its status leaves out.
     pub answers_as: Arc<Mutex<Option<(String, Vec<String>)>>>,
+    /// The store of the control plane served beside it: where the settings written through it are kept (`settings`).
+    pub plane_store: Arc<Mutex<Option<Arc<Mutex<BTreeMap<String, String>>>>>>,
     /// Answers given once each without some of their fields, once a request to a path was answered (see
     /// `Served::then_answer`): that path (none: from now on), and each answer's path and the fields it leaves out.
     pub answers_next: Arc<Mutex<(Option<String>, Vec<(String, Vec<String>)>)>>,
@@ -491,19 +513,14 @@ pub struct ModalFlow {
 
 /// A protobuf message's fields, as far as the test kit reads them: each number with its varint, or its bytes (a
 /// fixed32 as its four).
-fn proto_fields(mut b: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
-    fn varint(b: &mut &[u8]) -> Option<u64> {
-        let mut v = 0;
-        for shift in (0..64).step_by(7) { let (&x, rest) = b.split_first()?; *b = rest; v |= u64::from(x & 0x7F) << shift; if x & 0x80 == 0 { return Some(v) } }
-        None
-    }
-    let mut out = vec![];
-    while let Some(key) = varint(&mut b) {
+fn proto_fields(b: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
+    let (mut i, mut out) = (0, vec![]);
+    while let Some(key) = varint(b, &mut i) {
         let (no, wire) = (key >> 3, key & 7);
         let field = match wire {
-            0 => (no, varint(&mut b).unwrap_or_default(), vec![]),
-            5 if b.len() >= 4 => { let (f, rest) = b.split_at(4); b = rest; (no, 0, f.to_vec()) }
-            2 => { let n = varint(&mut b).unwrap_or_default() as usize; let (f, rest) = b.split_at(n.min(b.len())); b = rest; (no, 0, f.to_vec()) }
+            0 => (no, varint(b, &mut i).unwrap_or_default(), vec![]),
+            5 if b.len() - i >= 4 => { i += 4; (no, 0, b[i - 4..i].to_vec()) }
+            2 => { let n = varint(b, &mut i).unwrap_or_default() as usize; let end = (i + n).min(b.len()); let f = b[i..end].to_vec(); i = end; (no, 0, f) }
             _ => break,
         };
         out.push(field);
@@ -583,7 +600,7 @@ impl Aws {
             return (vec![], Some((code, message)))
         }
         // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
-        if method == "DictUpdate" { for (k, v) in modal_entries(message) { self.modal_settings.lock().unwrap().insert(k, v); } }
+        if method == "DictUpdate" { self.modal_settings.lock().unwrap().extend(modal_entries(message)) }
         // (What a sandbox is given on its input, taken as Modal takes it: nothing answered but that it was, a recording
         // having it or not.)
         let written = (method == "SandboxStdinWrite").then(|| (200, vec![], json!({ "answers": [""] }).to_string()));
@@ -617,7 +634,7 @@ impl Aws {
     fn modal_sent_differs(&self, url: &str, headers: &http::HeaderMap) -> Option<String> {
         let recorded = self.recorded.lock().unwrap();
         let sent = recorded.iter().filter(|r| r["url"] == url && r["sent"].is_object()).max_by_key(|r| r["recording"].as_u64().unwrap_or(0))?["sent"].clone();
-        sent.as_object()?.iter().find_map(|(k, was)| {
+        sent.as_object().expect("those whose `sent` is an object").iter().find_map(|(k, was)| {
             let now = headers.get(k).and_then(|h| h.to_str().ok());
             let kind = |v: Option<&str>| v.map(|v| if k == "x-modal-libmodal-version" { v.split('/').next().unwrap_or_default().to_string() } else { v.to_string() });
             (kind(now) != kind(was.as_str())).then(|| format!("the test kit's Modal: {k} was {was} when this was recorded, and is {} now", now.unwrap_or("not said")))
@@ -662,12 +679,11 @@ impl Aws {
     /// One HTTP/2 connection, each request a gRPC call to Modal (`modal_answer`): its message out of gRPC's frame, each
     /// answer framed, then its status in the trailers.
     fn serve_grpc(&self, stream: TcpStream) {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let a = self.clone();
         rt.block_on(async move {
-            if stream.set_nonblocking(true).is_err() { return }
-            let Ok(s) = tokio::net::TcpStream::from_std(stream) else { return };
-            let Ok(mut conn) = h2::server::handshake(s).await else { return };
+            stream.set_nonblocking(true).unwrap();
+            let Ok(mut conn) = h2::server::handshake(tokio::net::TcpStream::from_std(stream).unwrap()).await else { return };
             while let Some(Ok((req, mut respond))) = conn.accept().await {
                 let a = a.clone();
                 tokio::spawn(async move {
@@ -678,7 +694,7 @@ impl Aws {
                     while let Some(Ok(chunk)) = body.data().await { let _ = body.flow_control().release_capacity(chunk.len()); data.extend_from_slice(&chunk); }
                     // (gRPC's frame: a flag, four bytes of length, the message. Answered apart: a sign-in's wait waits.)
                     let asked = a.clone();
-                    let Ok((answers, refused)) = tokio::task::spawn_blocking(move || asked.modal_answer(&method, &headers, data.get(5..).unwrap_or_default())).await else { return };
+                    let (answers, refused) = tokio::task::spawn_blocking(move || asked.modal_answer(&method, &headers, data.get(5..).unwrap_or_default())).await.unwrap();
                     // (Its message percent-encoded where gRPC asks it to be.)
                     let encode = |message: &str| -> String { message.bytes().map(|b| if (0x20..0x7f).contains(&b) && b != b'%' { (b as char).to_string() } else { format!("%{b:02X}") }).collect() };
                     // (What Modal says beside it, in the trailers, as it does.)
@@ -690,7 +706,7 @@ impl Aws {
                         let _ = respond.send_response(r.body(()).unwrap(), true);
                         return;
                     }
-                    let Ok(mut send) = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap(), false) else { return };
+                    let mut send = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap(), false).unwrap();
                     for m in &answers {
                         let mut f = vec![0u8];
                         f.extend((m.len() as u32).to_be_bytes());
@@ -700,7 +716,7 @@ impl Aws {
                     let mut trailers = http::HeaderMap::new();
                     let (code, message) = refused.unwrap_or((0, String::new()));
                     trailers.insert("grpc-status", code.to_string().parse().unwrap());
-                    if code != 0 { if let Ok(v) = encode(&message).parse() { trailers.insert("grpc-message", v); } }
+                    if code != 0 { trailers.insert("grpc-message", encode(&message).parse().unwrap()); }
                     if let Some(w) = warning.and_then(|w| w.parse().ok()) { trailers.insert("x-modal-warning", w); }
                     let _ = send.send_trailers(trailers);
                 });
@@ -713,12 +729,11 @@ impl Aws {
         let recorded = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(Mutex::new(recorded)), ..Default::default() };
         let a = aws.clone();
-        std::thread::spawn(move || for stream in listener.incoming().flatten() {
-            if a.stop.load(std::sync::atomic::Ordering::SeqCst) { break }
+        std::thread::spawn(move || listener.incoming().flatten().take_while(|_| !a.stop.load(std::sync::atomic::Ordering::SeqCst)).for_each(|stream| {
             // HTTP/2 (its preface first): Modal's API over gRPC, as the CLI calls it.
             let mut first = [0u8; 3];
-            if stream.peek(&mut first).is_ok_and(|n| n == 3) && &first == b"PRI" { let a = a.clone(); std::thread::spawn(move || a.serve_grpc(stream)); continue }
-            let Ok((method, target, headers, body)) = read(&stream) else { continue };
+            if stream.peek(&mut first).is_ok_and(|n| n == 3) && &first == b"PRI" { let a = a.clone(); std::thread::spawn(move || a.serve_grpc(stream)); return }
+            let Ok((method, target, headers, body)) = read(&stream) else { return };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
             // (Counted here, but what goes on to GitHub's stand-in, which counts it.)
@@ -729,8 +744,8 @@ impl Aws {
                 let url = format!("https:/{target}");
                 let doing = action(&header("x-amz-target"), &String::from_utf8_lossy(&body));
                 match a.faults.call(format!("{method} {url} {doing}").trim_end().to_string()) {
-                    Some(true) => { drop(stream); continue }
-                    Some(false) => { let (status, said, answer) = sweep::failed_answer(&url, &header("x-amz-target")); let _ = write(stream, status, &said, answer.as_bytes()); continue }
+                    Some(true) => { drop(stream); return }
+                    Some(false) => { let (status, said, answer) = sweep::failed_answer(&url, &header("x-amz-target")); let _ = write(stream, status, &said, answer.as_bytes()); return }
                     None => {}
                 }
             }
@@ -761,10 +776,11 @@ impl Aws {
                 let mut said = said;
                 if !said.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { said.push(("content-type".into(), "application/json".into())) }
                 let _ = write(stream, status, &said, answer.as_bytes());
-                continue;
+                return;
             }
             // A Worker on workers.dev: the control plane on this computer it stands for.
-            if let Some(to) = a.workers.lock().unwrap().get(&host).cloned() {
+            let worker = a.workers.lock().unwrap().get(&host).cloned();
+            if let Some(to) = worker {
                 let rest = target.splitn(3, '/').nth(2).unwrap_or_default();
                 let u = to.trim_start_matches("http://");
                 let (h, _) = u.split_once('/').unwrap_or((u, ""));
@@ -777,7 +793,7 @@ impl Aws {
                 }
                 let mut stream = stream;
                 let _ = stream.write_all(&out);
-                continue;
+                return;
             }
             // (S3's objects are kept by GitHub's stand-in, which the control plane reaches AWS through; a call to S3 a
             // recording has, at that very address, is answered as recorded.)
@@ -787,7 +803,7 @@ impl Aws {
                 if let Some((status, said, answer)) = a.replay(&method, &url, "", &String::from_utf8_lossy(&body)).filter(|_| a.recorded.lock().unwrap().iter().any(|r| r["url"] == url.as_str() && r["method"] == method.as_str())) {
                     a.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": "", "asked": String::from_utf8_lossy(&body), "status": status, "answer": answer }));
                     let _ = write(stream, status, &said, answer.as_bytes());
-                    continue;
+                    return;
                 }
             }
             // (So is a control plane assuming the role it was given: GitHub's stand-in answers it as AWS documents it.)
@@ -797,14 +813,14 @@ impl Aws {
                 let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
                 for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }
                 // (A call GitHub's stand-in drops is dropped here too.)
-                let Ok(res) = block_on(superci_core::io::Http::send(&gh, req)) else { drop(stream); continue };
+                let Ok(res) = block_on(superci_core::io::Http::send(&gh, req)) else { drop(stream); return };
                 let _ = write(stream, res.status, &res.headers, &res.body);
-                continue;
+                return;
             }
             let (status, mut said, answer) = a.handle_full(&method, &format!("https:/{target}"), &header("x-amz-target"), &String::from_utf8_lossy(&body));
             if !said.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { said.push(("content-type".into(), if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" }.into())) }
             let _ = write(stream, status, &said, answer.as_bytes());
-        });
+        }));
         aws
     }
 
@@ -823,10 +839,10 @@ impl Aws {
 
     /// What Modal's settings Dicts were given, as a Modal control plane reads them (its settings; an empty value is
     /// one taken out).
-    pub fn modal_plane_settings(&self) -> Vec<(String, String)> { self.modal_settings.lock().unwrap().iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect() }
+    pub fn modal_plane_settings(&self) -> Vec<(String, String)> { self.overlaid(self.served_at(|h| h.ends_with(".modal.run")), self.modal_settings.lock().unwrap().iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect()) }
 
     /// A Worker's secrets, as a control plane there reads them (its settings).
-    pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default() }
+    pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.overlaid(self.served_at(|h| h.starts_with(&format!("{script}."))), self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()) }
 
     /// The answer `fail` set for this call, if one was (counted once more).
     fn failed(&self, url: &str, target: &str, asked: &str) -> Option<(u16, Vec<(String, String)>, String)> {
@@ -855,8 +871,24 @@ impl Aws {
         self.fail(action, status, answer, times)
     }
 
-    /// A parameter written as the dashboard writes one.
+    /// A parameter written as the dashboard writes one: the routing and launchers of a control plane that keeps its
+    /// settings (once written through it) into that record, as a write through it would (its version one more).
     pub fn put(&self, name: &str, value: &str) {
+        let field = [("ROUTING", "routing"), ("LAUNCHERS", "launchers")].into_iter().find(|(k, _)| name.starts_with("/superci/") && name.ends_with(&format!("/{k}"))).map(|(_, f)| f);
+        if let (Some(field), Some(store)) = (field, self.plane_store.lock().unwrap().clone()) {
+            let mut kept = store.lock().unwrap();
+            if let Some(mut stored) = kept.get(superci_core::plane::SETTINGS).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                stored[field] = serde_json::from_str(value).unwrap();
+                stored["version"] = (stored["version"].as_u64().unwrap() + 1).into();
+                kept.insert(superci_core::plane::SETTINGS.into(), stored.to_string());
+                return
+            }
+        }
+        self.put_param(name, value)
+    }
+
+    /// A parameter written as SSM's `PutParameter` writes one.
+    pub fn put_param(&self, name: &str, value: &str) {
         let mut p = self.params.lock().unwrap();
         let version = p.get(name).map(|(_, v, _)| v + 1).unwrap_or(1);
         p.insert(name.to_string(), (value.to_string(), version, system_ms()));
@@ -865,7 +897,28 @@ impl Aws {
     /// A control plane's settings, by name, as it reads them (`/superci/<id>/<NAME>`).
     pub fn settings(&self, plane: &str) -> Vec<(String, String)> {
         let prefix = format!("/superci/{plane}/");
-        self.params.lock().unwrap().iter().filter_map(|(k, (v, _, _))| Some((k.strip_prefix(&prefix)?.to_string(), v.clone()))).filter(|(k, _)| !k.contains('/')).collect()
+        self.overlaid(self.plane_store.lock().unwrap().clone(), self.params.lock().unwrap().iter().filter_map(|(k, (v, _, _))| Some((k.strip_prefix(&prefix)?.to_string(), v.clone()))).filter(|(k, _)| !k.contains('/')).collect())
+    }
+
+    /// Settings as a deploy left them, with what was written through the control plane over them: what it reads.
+    fn overlaid(&self, store: Option<Arc<Mutex<BTreeMap<String, String>>>>, mut kept: Vec<(String, String)>) -> Vec<(String, String)> {
+        // (A control plane served here reads its cloud's copy, as a real one does: see `AS_PLANE`.)
+        if AS_PLANE.with(|p| p.get()) { return kept }
+        let stored = store.and_then(|s| s.lock().unwrap().get(superci_core::plane::SETTINGS).cloned());
+        if let Some(stored) = stored.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+            [("ROUTING", "routing"), ("LAUNCHERS", "launchers")].into_iter().for_each(|(key, name)| {
+                kept.retain(|(k, _)| k != key);
+                kept.push((key.into(), stored[name].to_string()));
+            });
+        }
+        kept
+    }
+
+    /// The store of the control plane served for a host (a Worker, a Modal app) this stands in for, as `workers` maps
+    /// it; none mapped: the one served beside it.
+    fn served_at(&self, host: impl Fn(&str) -> bool) -> Option<Arc<Mutex<BTreeMap<String, String>>>> {
+        let url = self.workers.lock().unwrap().iter().find(|(h, _)| host(h)).map(|(_, u)| u.clone());
+        match url { Some(url) => SERVED.lock().unwrap().get(&url).cloned(), None => self.plane_store.lock().unwrap().clone() }
     }
 
     /// One exchange: `url` is AWS's own (`https://ssm.us-east-1.amazonaws.com/`).
@@ -952,7 +1005,7 @@ impl Aws {
         match target {
             "AmazonSSM.PutParameter" => {
                 if self.params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }
-                self.put(&name, a["Value"].as_str().unwrap_or_default());
+                self.put_param(&name, a["Value"].as_str().unwrap_or_default());
                 (200, json!({ "Tier": "Standard", "Version": self.params.lock().unwrap()[&name].1 }))
             }
             "AmazonSSM.GetParameter" => match self.params.lock().unwrap().get(&name) {
@@ -962,14 +1015,14 @@ impl Aws {
             "AmazonSSM.GetParameters" => {
                 let p = self.params.lock().unwrap();
                 let (mut found, mut not) = (vec![], vec![]);
-                for n in a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { match p.get(n) { Some(v) => found.push(one(n, v, a["WithDecryption"] == true)), None => not.push(n) } }
+                a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).for_each(|n| match p.get(n) { Some(v) => found.push(one(n, v, a["WithDecryption"] == true)), None => not.push(n) });
                 (200, json!({ "Parameters": found, "InvalidParameters": not }))
             }
             "AmazonSSM.DeleteParameter" => match self.params.lock().unwrap().remove(&name) { Some(_) => (200, json!({})), None => not_found() },
             "AmazonSSM.DeleteParameters" => {
                 let mut p = self.params.lock().unwrap();
                 let (mut gone, mut not) = (vec![], vec![]);
-                for n in a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { if p.remove(n).is_some() { gone.push(n) } else { not.push(n) } }
+                a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).for_each(|n| if p.remove(n).is_some() { gone.push(n) } else { not.push(n) });
                 (200, json!({ "DeletedParameters": gone, "InvalidParameters": not }))
             }
             "AmazonSSM.GetParametersByPath" => {
@@ -1025,10 +1078,10 @@ impl Aws {
             }
             "BatchGetItem" => {
                 let mut responses = serde_json::Map::new();
-                for (t, ask) in a["RequestItems"].as_object().into_iter().flatten() {
+                a["RequestItems"].as_object().into_iter().flatten().for_each(|(t, ask)| {
                     let found: Vec<Value> = ask["Keys"].as_array().into_iter().flatten().filter_map(|k| items.get(&key(t, k)).cloned()).collect();
                     responses.insert(t.clone(), Value::Array(found));
-                }
+                });
                 (200, json!({ "Responses": responses, "UnprocessedKeys": {} }))
             }
             _ => return None,
@@ -1093,7 +1146,7 @@ impl Runner {
     /// The runner of the job of run `run` shown as `name` (`build / compile`, `test (2)`), once it is started.
     pub fn of_job(served: &Served, run: &str, name: &str) -> Option<Runner> {
         let r = served.store.under(&format!("run:{run}")).into_iter().next()?.1;
-        let token = r["jobs"].as_array()?.iter().find(|j| j["name"] == name && j["token"].is_string())?["token"].as_str()?.to_string();
+        let token = r["jobs"].as_array()?.iter().find(|j| j["name"] == name && j["token"].is_string())?["token"].as_str().unwrap().to_string();
         Some(Runner { at: format!("{}/runner/{token}/_apis/v1", served.url) })
     }
 
@@ -1113,6 +1166,8 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let aws = Aws::serve();
     let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
+    *aws.plane_store.lock().unwrap() = Some(store.0.clone());
+    SERVED.lock().unwrap().insert(url.clone(), store.0.clone());
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
     *github.aws.lock().unwrap() = Some(aws.clone());
@@ -1127,11 +1182,11 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let (s, m, a, u, c, g, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone(), stop.clone());
     block_on(io::Ending(store.clone()).put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
+        AS_PLANE.with(|p| p.set(true));
         let cache = Cache::default();
         let ending = io::Ending(s);
-        for stream in listener.incoming().flatten() {
-            if st.load(std::sync::atomic::Ordering::SeqCst) { break }
-            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
+        listener.incoming().flatten().take_while(|_| !st.load(std::sync::atomic::Ordering::SeqCst)).for_each(|stream| {
+            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
             config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
@@ -1140,7 +1195,7 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             let plane = ControlPlane { store: &ending, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
             if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| answer(&plane, &base, stream, None, &a))) { a.faults.panicked(p) }
-        }
+        });
     });
     let gitlab = github.gitlab.clone();
     let ends = Ends::of(&stop, &url, &aws);
@@ -1154,7 +1209,7 @@ pub fn front(to: &str, answer: impl Fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (to, answer) = (to.trim_start_matches("http://").to_string(), Arc::new(answer));
-    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+    std::thread::spawn(move || listener.incoming().flatten().for_each(|stream| {
         let (to, answer) = (to.clone(), answer.clone());
         std::thread::spawn(move || {
             let Ok((method, target, headers, body)) = read(&stream) else { return };
@@ -1170,7 +1225,7 @@ pub fn front(to: &str, answer: impl Fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8
             let (status, body) = answer(&method, &target, status, out[at..].to_vec());
             let _ = write(stream, status, &[("content-type".into(), "application/json".into())], &body);
         });
-    });
+    }));
     url
 }
 
@@ -1193,6 +1248,8 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let aws = Aws::serve();
     let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone(), Default::default()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
+    *aws.plane_store.lock().unwrap() = Some(store.0.clone());
+    SERVED.lock().unwrap().insert(url.clone(), store.0.clone());
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
     *github.aws.lock().unwrap() = Some(aws.clone());
@@ -1207,10 +1264,10 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let (s, m, a, u, c, g, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone(), stop.clone());
     block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
+        AS_PLANE.with(|p| p.set(true));
         let (cache, left) = (Cache::default(), Deferring::default());
-        for stream in listener.incoming().flatten() {
-            if st.load(std::sync::atomic::Ordering::SeqCst) { break }
-            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
+        listener.incoming().flatten().take_while(|_| !st.load(std::sync::atomic::Ordering::SeqCst)).for_each(|stream| {
+            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
             config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
@@ -1218,7 +1275,7 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &left, config: &config, cache: &cache, containers: Some(&m) };
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
-            let Ok((method, target, headers, body)) = read(&stream) else { continue };
+            let Ok((method, target, headers, body)) = read(&stream) else { return };
             if target == "/__testkit/later" {
                 // (One thing done may leave another: each in its turn, with the address of what left it.)
                 let mut done = vec![];
@@ -1227,22 +1284,21 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
                     let Some((from, what)) = next else { break };
                     let from = from.unwrap_or_default();
                     let said = block_on(plane.later(&from, &what)).err();
-                    for item in left.0.lock().unwrap().iter_mut() { if item.0.is_none() { item.0 = Some(from.clone()) } }
+                    left.0.lock().unwrap().iter_mut().filter(|item| item.0.is_none()).for_each(|item| item.0 = Some(from.clone()));
                     done.push(json!({ "what": what, "error": said }));
                 }
                 let _ = write(stream, 200, &[], Value::Array(done).to_string().as_bytes());
-                continue
+                return
             }
             let (from, res) = if target == "/__testkit/upkeep" {
                 (String::new(), match block_on(plane.alarm()) { Ok(()) => io::Response::new(200, "text/plain", "ok"), Err(e) => io::Response::new(500, "text/plain", e) })
             } else {
-                let mut req = Request::new(&method, &format!("{base}{target}")).with_body(body);
-                for (k, v) in headers { req = req.with_header(&k, &v) }
+                let req = headers.into_iter().fold(Request::new(&method, &format!("{base}{target}")).with_body(body), |req, (k, v)| req.with_header(&k, &v));
                 (format!("{base}{target}"), block_on(plane.handle(req)))
             };
-            for item in left.0.lock().unwrap().iter_mut() { if item.0.is_none() { item.0 = Some(from.clone()) } }
+            left.0.lock().unwrap().iter_mut().filter(|item| item.0.is_none()).for_each(|item| item.0 = Some(from.clone()));
             let _ = write(stream, res.status, &res.headers, &res.body);
-        }
+        });
     });
     let gitlab = github.gitlab.clone();
     let ends = Ends::of(&stop, &url, &aws);
@@ -1274,7 +1330,7 @@ pub fn without_routes(url: &str, missing: &[&str]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let at = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (to, missing) = (url.trim_start_matches("http://").to_string(), missing.iter().map(|m| m.to_string()).collect::<Vec<_>>());
-    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+    std::thread::spawn(move || listener.incoming().flatten().for_each(|stream| {
         let (to, missing) = (to.clone(), missing.clone());
         std::thread::spawn(move || {
             let Ok((method, target, headers, body)) = read(&stream) else { return };
@@ -1289,7 +1345,7 @@ pub fn without_routes(url: &str, missing: &[&str]) -> String {
             let mut stream = stream;
             let _ = stream.write_all(&out);
         });
-    });
+    }));
     at
 }
 
@@ -1326,7 +1382,7 @@ pub fn busy_for(url: &str, busy: &str, times: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let at = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (to, busy, left) = (url.trim_start_matches("http://").to_string(), busy.to_string(), Arc::new(Mutex::new(times)));
-    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+    std::thread::spawn(move || listener.incoming().flatten().for_each(|stream| {
         let (to, busy, left) = (to.clone(), busy.clone(), left.clone());
         std::thread::spawn(move || {
             let Ok((method, target, headers, body)) = read(&stream) else { return };
@@ -1344,6 +1400,6 @@ pub fn busy_for(url: &str, busy: &str, times: usize) -> String {
             let mut stream = stream;
             let _ = stream.write_all(&out);
         });
-    });
+    }));
     at
 }

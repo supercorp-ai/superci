@@ -179,7 +179,7 @@ fn sign_ins_that_modal_does_not_start_or_cloudflare_does_not_finish_say_why() {
     let served = serve(|_| {});
     let home = common::signed_in(&served);
     // (On Cloudflare's own port: its sign-in comes back to no other.)
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string();
+    let port = superci_testkit::free_port().to_string();
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_OAUTH_PORT", port.as_str()), ("SUPERCI_PORT", port.as_str())]);
     // (Its key's cookie on that port is the usual one.)
     let key = link.split_once("/?k=").unwrap().1.to_string();
@@ -246,6 +246,11 @@ fn a_change_the_control_plane_does_not_show_is_said_as_not_taken() {
         let (status, said) = sent(&link, "/routing", fields);
         assert!(status >= 400 && said.contains("did not show it within twenty seconds"), "{fields:?}: {status} {said}");
     }
+    // (One from before settings were written through it, the same of a setting of where jobs run.)
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert!(status >= 400 && said.contains("did not show it within twenty seconds"), "{status} {said}");
+    served.answer_as("", &[]);
     served.aws.fail("/secrets|\"CONTAINERS\"", 500, CF_FAILED, None);
     let (status, said) = sent(&link, "/runners/remove", &[("cloud", "cloudflare"), ("stop", "on")]);
     assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
@@ -340,7 +345,7 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
         std::fs::write(bin.join(name), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
         std::fs::set_permissions(bin.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     }
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string();
+    let port = superci_testkit::free_port().to_string();
     let mut c = common::command(&home).args(["dashboard", "--workspace=default"]).env("SUPERCI_PORT", &port).env("SUPERCI_BROWSER", bin.join("open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
     let mut said = String::new();
@@ -350,7 +355,7 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
     let _ = c.wait();
     assert!(said.contains("It is opening in your browser"), "{said}");
     // A task (connecting GitHub) opens its page too.
-    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default"]).env("SUPERCI_PORT", { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string()).env("SUPERCI_BROWSER", bin.join("open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default"]).env("SUPERCI_PORT", superci_testkit::free_port().to_string()).env("SUPERCI_BROWSER", bin.join("open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
     let mut said = String::new();
     while !said.contains("Create the GitHub App") { let mut l = String::new(); if std::io::BufRead::read_line(&mut out, &mut l).unwrap_or(0) == 0 { break } said.push_str(&l) }
@@ -484,6 +489,58 @@ fn a_move_says_a_new_control_plane_that_refuses_it_never_takes_it_or_could_not_m
     };
     let page = moving(Some(partly)).moved();
     assert!(page.contains("GitHub would not point an App here (globex: Not Found)"), "{page}");
+}
+
+/// What a new control plane answers when another computer took out a field meanwhile.
+const TAKEN_OUT: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |_, target, status, body| {
+    if target.starts_with("/settings") { (409, br#"{"error":"changed meanwhile","conflicts":[{"path":["launchers","modal"],"now":null}]}"#.to_vec()) } else { (status, body) }
+};
+
+/// A move whose settings the new control plane refuses, as changed there meanwhile, stops and says so; one to a control
+/// plane from before settings were written through it writes them into its cloud, and stops where that fails.
+#[test]
+fn a_move_stops_where_the_new_control_plane_does_not_take_its_settings() {
+    let page = moving(Some(TAKEN_OUT)).moved();
+    assert!(page.contains("Changed on another computer meanwhile") && page.contains("Modal's place is nothing now") && page.contains("Try again"), "{page}");
+    let m = moving(None);
+    m.new.answer_as("0.19.21", &["settings", "settings_version"]);
+    m.served.aws.fail("AmazonSSM.PutParameter|/superci/testplane0002/ROUTING", 500, &superci_testkit::json_error("InternalServerError", "An internal error occurred. Try again."), None);
+    let page = m.moved();
+    assert!(page.contains("An internal error occurred") && page.contains("Try again"), "{page}");
+}
+
+/// A change meant as said (no page's, a provider taken out here) whose field another computer took out meanwhile: said,
+/// nothing more done.
+#[test]
+fn a_provider_taken_out_while_another_computer_changed_it_says_so() {
+    let m = moving_with(Some(TAKEN_OUT), |_, home| kept_as(home, |k| { k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }) }));
+    let teammate = serde_json::json!({ "changes": [{ "op": "set", "path": ["routing", "order", "modal"], "value": { "cloud": "modal" } }] });
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let r = agent.post(&format!("{}/settings", m.new.url)).header("authorization", &format!("Bearer {}", m.new.key)).send(teammate.to_string()).unwrap();
+    assert_eq!(r.status(), 200);
+    let (status, _, said) = common::post(&m.link, "/runners/remove?c=testplane0002", &[("cloud", "modal")]);
+    let said = common::words(&said);
+    assert!(status >= 400 && said.contains("Changed on another computer meanwhile") && said.contains("Modal's place is nothing now"), "{status} {said}");
+}
+
+/// A control plane from before settings were written through it: a change of where jobs run goes into its cloud, its
+/// launchers left alone, and a field the page showed that it no longer holds is refused there too.
+#[test]
+fn a_control_plane_from_before_keeps_a_change_in_its_cloud_and_refuses_what_changed_meanwhile() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
+    let kept = |name: &str| served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let launchers = kept("LAUNCHERS");
+    let (status, said) = sent(&link, "/routing", &[("action", "max_hours"), ("max_hours", "3"), ("seen", r#"{"max_cpu":4}"#), ("seen_plane", superci_testkit::PLANE)]);
+    assert_eq!(status, 303, "{said}");
+    assert!(kept("ROUTING").is_some_and(|r| r.contains(r#""max_minutes":180"#)), "{:?}", kept("ROUTING"));
+    assert_eq!(kept("LAUNCHERS"), launchers);
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16"), ("seen", r#"{"max_cpu":4}"#), ("seen_plane", superci_testkit::PLANE)]);
+    assert_eq!(status, 409, "{said}");
+    assert!(said.contains("the largest machine is nothing now") && said.contains("Set it anyway"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// A move that brings a launcher in Cloudflare while no Cloudflare account is known to put it in, and one that brings
@@ -824,7 +881,9 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
         k["cloudflare"] = cloudflare_signed_in();
     });
     served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl"), &[]);
-    // (Its launchers' setting refused; the deploy's upload, which names them too, taken.)
+    // (One from before settings were written through it: its launchers' setting refused by Cloudflare; the deploy's
+    // upload, which names them too, taken.)
+    cf.answer_as("0.19.21", &["settings", "settings_version"]);
     served.aws.fail("scripts/superci/secrets|LAUNCHERS", 500, CF_FAILED, None);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     // (Its key handed as a page is first read.)
@@ -833,6 +892,14 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
     assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
     // (Refused at the launcher's place given up: its containers were switched on before it.)
     assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "CONTAINERS" && v == "on"), "{said}");
+    // One that keeps its settings, its store refusing them (the launcher listed again): refused the same, the launcher
+    // still listed.
+    cf.answer_as("", &[]);
+    served.aws.worker_secrets.lock().unwrap().entry("superci".into()).or_default().insert("LAUNCHERS".into(), r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00002.acme.workers.dev"}]"#.into());
+    cf.store_refuses(Some(superci_core::plane::SETTINGS));
+    let (status, said) = sent(&link, "/runners/cloudflare", &[]);
+    assert!(status >= 400 && said.contains("the control plane answered 500"), "{status} {said}");
+    assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "LAUNCHERS" && v.contains("cloudflare")));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -857,5 +924,40 @@ fn an_aws_role_and_account_are_read_while_the_control_plane_or_aws_do_not_answer
     served.aws.fail("signin.aws.amazon.com/v1/token", 500, r#"{"error":"server_error"}"#, None);
     let (ok, said) = common::superci_in_time(&home, &["accounts", "retrieve", "aws"], &[("SUPERCI_PAUSE_MS", "1")], 60);
     assert!(!ok && said.contains("server_error"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A page drawn, then a teammate changing a setting on another computer, then the page's change: a field the page
+/// showed and the teammate changed is refused, saying what it is now; another field is taken beside the teammate's;
+/// a command, which showed nothing, is meant as said.
+#[test]
+fn a_setting_changed_on_another_computer_since_the_page_showed_it_is_refused_and_another_is_kept() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    // What the page showed, as each of its routing forms carries it.
+    let page = common::part(&link, "/?p=settings&fragment=1").1;
+    let form = &page[page.find(r#"action="/routing""#).expect("a routing form")..];
+    let value = |name: &str| form.split(&format!(r#"name="{name}" value=""#)).nth(1).and_then(|v| v.split('"').next()).unwrap_or_default()
+        .replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    let (seen, plane) = (value("seen"), value("seen_plane"));
+    assert!(seen.starts_with('{') && plane == superci_testkit::PLANE, "{seen} {plane}");
+    // The teammate's change, through the control plane.
+    let teammate = serde_json::json!({ "changes": [{ "op": "set", "path": ["routing", "max_cpu"], "value": 4 }] });
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let r = agent.post(&format!("{}/settings", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(teammate.to_string()).unwrap();
+    assert_eq!(r.status(), 200);
+    let routing = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).unwrap()).unwrap();
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16"), ("seen", &seen), ("seen_plane", &plane)]);
+    assert_eq!(status, 409, "{said}");
+    assert!(said.contains("Changed on another computer meanwhile") && said.contains("the largest machine is 4 now"), "{said}");
+    assert_eq!(routing()["max_cpu"], 4);
+    let (status, said) = sent(&link, "/routing", &[("action", "max_hours"), ("max_hours", "3"), ("seen", &seen), ("seen_plane", &plane)]);
+    assert_eq!(status, 303, "{said}");
+    assert_eq!((&routing()["max_cpu"], &routing()["max_minutes"]), (&serde_json::json!(4), &serde_json::json!(180)));
+    // What another control plane's page showed is not taken for this one's: the change is meant as said.
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16"), ("seen", &seen), ("seen_plane", "otherplane01")]);
+    assert_eq!(status, 303, "{said}");
+    assert_eq!(routing()["max_cpu"], 16);
     let _ = std::fs::remove_dir_all(&home);
 }

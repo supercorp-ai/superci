@@ -183,13 +183,13 @@ impl GitHub {
 
     /// Cancelled before any runner took it: its webhook.
     pub fn cancel(&self, id: u64, now_ms: u64) -> (Vec<u8>, String) {
-        if let Some(j) = self.hub.lock().unwrap().jobs.get_mut(&id) { for (k, v) in [("status", json!("completed")), ("conclusion", json!("cancelled")), ("completed_at", json!(iso(now_ms)))] { j[k] = v } }
+        if let Some(j) = self.hub.lock().unwrap().jobs.get_mut(&id) { [("status", json!("completed")), ("conclusion", json!("cancelled")), ("completed_at", json!(iso(now_ms)))].into_iter().for_each(|(k, v)| j[k] = v); }
         self.event("completed", id)
     }
 
     /// Ended at GitHub without the webhook arriving (taken by another runner and done, as far as GitHub says).
     pub fn ended_untold(&self, id: u64) {
-        if let Some(j) = self.hub.lock().unwrap().jobs.get_mut(&id) { for (k, v) in [("status", json!("completed")), ("conclusion", json!("success")), ("runner_name", json!("someone-else")), ("runner_id", json!(7))] { j[k] = v } }
+        if let Some(j) = self.hub.lock().unwrap().jobs.get_mut(&id) { [("status", json!("completed")), ("conclusion", json!("success")), ("runner_name", json!("someone-else")), ("runner_id", json!(7))].into_iter().for_each(|(k, v)| j[k] = v); }
     }
 
     /// The App as the dashboard keeps it in the control plane's settings (`GITHUB_APP`), with a key made for this
@@ -247,11 +247,11 @@ impl GitHub {
             h.next += 1;
             let (id, run) = (90_000_000_000 + h.next, 30_000_000_000 + h.next);
             let mut j = fixture("job");
-            for (k, v) in [("id", json!(id)), ("run_id", json!(run)), ("name", json!(name)), ("labels", json!([label])), ("status", json!("queued")), ("conclusion", Value::Null),
+            [("id", json!(id)), ("run_id", json!(run)), ("name", json!(name)), ("labels", json!([label])), ("status", json!("queued")), ("conclusion", Value::Null),
                 ("created_at", json!(iso(now_ms))), ("started_at", json!(iso(now_ms))), ("completed_at", Value::Null), ("runner_id", Value::Null), ("runner_name", Value::Null),
                 ("runner_group_id", Value::Null), ("runner_group_name", Value::Null), ("steps", json!([])), ("workflow_name", json!("Build and Test")), ("run_attempt", json!(1)),
                 ("url", json!(format!("https://api.github.com/repos/{REPO}/actions/jobs/{id}"))), ("html_url", json!(format!("https://github.com/{REPO}/actions/runs/{run}/job/{id}"))),
-                ("run_url", json!(format!("https://api.github.com/repos/{REPO}/actions/runs/{run}")))] { j[k] = v }
+                ("run_url", json!(format!("https://api.github.com/repos/{REPO}/actions/runs/{run}")))].into_iter().for_each(|(k, v)| j[k] = v);
             h.jobs.insert(id, j);
             id
         };
@@ -264,7 +264,7 @@ impl GitHub {
             let mut h = self.hub.lock().unwrap();
             let (rid, name) = h.runners.iter().next_back().map(|(i, n)| (*i, n.clone())).expect("a runner registered for it");
             let j = h.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!("in_progress")), ("runner_id", json!(rid)), ("runner_name", json!(name)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))] { j[k] = v }
+            [("status", json!("in_progress")), ("runner_id", json!(rid)), ("runner_name", json!(name)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))].into_iter().for_each(|(k, v)| j[k] = v);
         }
         self.event("in_progress", id)
     }
@@ -284,7 +284,7 @@ impl GitHub {
             let mut h = self.hub.lock().unwrap();
             let rid = h.runners.iter().find(|(_, n)| n.as_str() == runner).map(|(i, _)| *i).expect("that runner registered");
             let j = h.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!("in_progress")), ("runner_id", json!(rid)), ("runner_name", json!(runner)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))] { j[k] = v }
+            [("status", json!("in_progress")), ("runner_id", json!(rid)), ("runner_name", json!(runner)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))].into_iter().for_each(|(k, v)| j[k] = v);
         }
         self.event("in_progress", id)
     }
@@ -294,7 +294,7 @@ impl GitHub {
         {
             let mut h = self.hub.lock().unwrap();
             let j = h.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!("in_progress")), ("runner_id", json!(999_999)), ("runner_name", json!(runner)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))] { j[k] = v }
+            [("status", json!("in_progress")), ("runner_id", json!(999_999)), ("runner_name", json!(runner)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))].into_iter().for_each(|(k, v)| j[k] = v);
         }
         self.event("in_progress", id)
     }
@@ -304,9 +304,9 @@ impl GitHub {
         {
             let mut h = self.hub.lock().unwrap();
             let j = h.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!("completed")), ("conclusion", json!(conclusion)), ("completed_at", json!(iso(now_ms))),
+            [("status", json!("completed")), ("conclusion", json!(conclusion)), ("completed_at", json!(iso(now_ms))),
                 ("steps", json!([{ "name": "Set up job", "status": "completed", "conclusion": "success", "number": 1, "started_at": j["started_at"], "completed_at": iso(now_ms) },
-                    { "name": "Run make test", "status": "completed", "conclusion": conclusion, "number": 2, "started_at": j["started_at"], "completed_at": iso(now_ms) }]))] { j[k] = v }
+                    { "name": "Run make test", "status": "completed", "conclusion": conclusion, "number": 2, "started_at": j["started_at"], "completed_at": iso(now_ms) }]))].into_iter().for_each(|(k, v)| j[k] = v);
             h.logs.insert(id, log.to_string());
         }
         self.event("completed", id)
@@ -337,8 +337,8 @@ impl GitHub {
         let path = url.path().to_string();
         let ok = |status: u16, v: Value| Some(Response::new(status, "application/json; charset=utf-8", v.to_string()));
         if r.url.starts_with(LOGS_AT) {
-            if let Some(run) = path.rsplit('/').next()?.strip_prefix("run-") { return self.hub.lock().unwrap().run_logs.get(&run.parse().ok()?).map(|z| Response::new(200, "application/zip", z.clone())) }
-            let id: u64 = path.rsplit('/').next()?.parse().ok()?;
+            if let Some(run) = path.rsplit('/').next().unwrap().strip_prefix("run-") { return self.hub.lock().unwrap().run_logs.get(&run.parse().ok()?).map(|z| Response::new(200, "application/zip", z.clone())) }
+            let id: u64 = path.rsplit('/').next().unwrap().parse().ok()?;
             return self.hub.lock().unwrap().logs.get(&id).map(|l| Response::new(200, "text/plain", l.clone()));
         }
         // S3, at `<bucket>.s3.<region>.amazonaws.com` (a link signed or a call signed alike): put, read, and asked of.
@@ -355,7 +355,7 @@ impl GitHub {
             if root && r.method == "HEAD" { return Some(Response::new(200, "application/xml", "")) }
             if root && r.method == "GET" {
                 let prefix = url.query_pairs().find(|(k, _)| k == "prefix").map(|(_, v)| v.into_owned()).unwrap_or_default();
-                let keys: Vec<String> = h.objects.keys().filter_map(|k| k.strip_prefix(&format!("{bucket}/"))).filter(|k| k.starts_with(&prefix) && !k.is_empty()).map(str::to_string).collect();
+                let keys: Vec<String> = h.objects.keys().filter_map(|k| k.strip_prefix(&format!("{bucket}/"))).filter(|k| k.starts_with(&prefix)).map(str::to_string).collect();
                 let contents: String = keys.iter().map(|k| format!("<Contents><Key>{k}</Key><Size>{}</Size><LastModified>2026-10-15T10:00:00.000Z</LastModified></Contents>", h.objects[&format!("{bucket}/{k}")].len())).collect();
                 return Some(Response::new(200, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult><Name>{bucket}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>", keys.len())))
             }
@@ -440,13 +440,13 @@ impl GitHub {
             // The App uninstalled (docs.github.com/rest/apps/apps#delete-an-installation-for-the-authenticated-app).
             ("DELETE", ["app", "installations", id]) if *id == INSTALLATION.to_string() => { h.uninstalled = true; Some(Response::new(204, "text/plain", "")) }
             // The App's deliveries: newest first, each without what was sent and answered; one whole; sent again.
-            ("GET", ["app", "hook", "deliveries"]) => ok(200, Value::Array(h.deliveries.iter().rev().map(|d| { let mut d = d.clone(); if let Some(o) = d.as_object_mut() { o.remove("request"); o.remove("response"); } d }).collect())),
+            ("GET", ["app", "hook", "deliveries"]) => ok(200, Value::Array(h.deliveries.iter().rev().map(|d| { let mut d = d.clone(); let o = d.as_object_mut().unwrap(); o.remove("request"); o.remove("response"); d }).collect())),
             ("GET", ["app", "hook", "deliveries", id]) => match h.deliveries.iter().find(|d| d["id"].to_string() == *id) { Some(d) => ok(200, d.clone()), None => ok(404, json!({ "message": "Not Found", "status": "404" })) },
             ("POST", ["app", "hook", "deliveries", id, "attempts"]) => { let id: u64 = id.parse().ok()?; h.attempts.push(id); ok(202, json!({})) }
             // The runner image maker's public list of builds, as GitHub served it (`fixtures/aws/public/image-list.jsonl`).
             ("GET", ["repos", "runs-on", "runner-images-for-aws", "releases"]) => {
-                let recorded: Value = serde_json::from_str(include_str!("../../cli/fixtures/aws/public/image-list.jsonl").lines().next()?).ok()?;
-                Some(Response::new(recorded["status"].as_u64()? as u16, "application/json; charset=utf-8", recorded["answer"].as_str()?.to_string()))
+                let recorded: Value = serde_json::from_str(include_str!("../../cli/fixtures/aws/public/image-list.jsonl").lines().next().unwrap()).unwrap();
+                Some(Response::new(recorded["status"].as_u64().unwrap() as u16, "application/json; charset=utf-8", recorded["answer"].as_str().unwrap().to_string()))
             }
             // Who a name is, and the App made from the dashboard's manifest (docs.github.com/rest/apps/apps#create-a-github-app-from-a-manifest).
             ("GET", ["users", OWNER]) => ok(200, fixture("org")),
@@ -514,9 +514,9 @@ impl GitHub {
                 let mut run = fixture("run");
                 let status = if jobs.iter().all(|j| j["status"] == "completed") { "completed" } else if jobs.iter().any(|j| j["status"] == "in_progress") { "in_progress" } else { "queued" };
                 if first.get("workflow_id").is_some() { run["workflow_id"] = first["workflow_id"].clone() }
-                for (k, v) in [("id", json!(id)), ("status", json!(status)), ("conclusion", if status == "completed" { first["conclusion"].clone() } else { Value::Null }),
+                [("id", json!(id)), ("status", json!(status)), ("conclusion", if status == "completed" { first["conclusion"].clone() } else { Value::Null }),
                     ("head_sha", first["head_sha"].clone()), ("head_branch", first["head_branch"].clone()),
-                    ("run_attempt", json!(1)), ("created_at", first["created_at"].clone()), ("run_started_at", first["created_at"].clone()), ("updated_at", first["created_at"].clone())] { run[k] = v }
+                    ("run_attempt", json!(1)), ("created_at", first["created_at"].clone()), ("run_started_at", first["created_at"].clone()), ("updated_at", first["created_at"].clone())].into_iter().for_each(|(k, v)| run[k] = v);
                 ok(200, run)
             }
             ("GET", ["repos", o, n, "actions", "runs", id, "jobs"]) if format!("{o}/{n}") == REPO => {
@@ -561,7 +561,7 @@ impl Http for GitHub {
                     let (status, headers, body) = crate::sweep::failed_answer(&r.url, &target);
                     let mut res = Response::new(status, "application/json", body);
                     res.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
-                    for (k, v) in headers { res = res.with_header(&k, &v) }
+                    res = headers.into_iter().fold(res, |res, (k, v)| res.with_header(&k, &v));
                     return Ok(res)
                 }
                 None => {}
@@ -578,7 +578,7 @@ impl Http for GitHub {
         let scripted = self.hub.lock().unwrap().scripted.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).cloned();
         if let Some((_, _, status, headers, body)) = scripted {
             let mut res = Response::new(status, "application/json", body);
-            for (k, v) in &headers { res = res.with_header(k, v) }
+            res = headers.iter().fold(res, |res, (k, v)| res.with_header(k, v));
             return Ok(res)
         }
         if let Some(answer) = launcher(&r, self.asked.lock().unwrap().len()) { return Ok(answer) }
@@ -615,7 +615,7 @@ fn local(r: &Request) -> Response {
     let Ok(mut s) = std::net::TcpStream::connect(&host) else { return Response::new(502, "text/plain", "nothing answers there") };
     let path = format!("{}{}", url.path(), url.query().map(|q| format!("?{q}")).unwrap_or_default());
     let mut head = format!("{} {path} HTTP/1.1\r\nhost: {host}\r\ncontent-length: {}\r\nconnection: close\r\n", r.method, r.body.len());
-    for (k, v) in &r.headers { head.push_str(&format!("{k}: {v}\r\n")) }
+    r.headers.iter().for_each(|(k, v)| head.push_str(&format!("{k}: {v}\r\n")));
     head.push_str("\r\n");
     let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(&r.body));
     let mut out = vec![];

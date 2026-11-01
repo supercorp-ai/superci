@@ -134,8 +134,7 @@ impl Store for DoStore<'_> {
     }
     /// A Durable Object runs one event at a time between storage calls, so read-then-write is atomic here.
     async fn put_if_absent(&self, key: &str, value: String) -> io::Result<bool> {
-        if self.get(key).await?.is_some() { return Ok(false); }
-        self.put(key, value).await.map(|_| true)
+        match self.get(key).await { Ok(None) => self.put(key, value).await.map(|_| true), read => read.map(|_| false) }
     }
     async fn delete(&self, key: &str) -> io::Result<()> {
         self.0.storage().delete(key).await.map(|_| ()).map_err(|e| e.to_string())

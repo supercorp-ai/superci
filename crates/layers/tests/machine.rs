@@ -331,8 +331,7 @@ fn setup_holds_with_each_call_and_store_operation_failing() {
         ("no Docker settings", vec![], none_args.to_vec(), "cp -a /etc/docker/daemon.json /var/tmp/daemon.json 2>/dev/null; rm -f /etc/docker/daemon.json", "[ ! -e /var/tmp/daemon.json ] || cp -a /var/tmp/daemon.json /etc/docker/daemon.json"),
     ];
     let after = |clean: &str| { m.back(&stock); if !clean.is_empty() { m.sh(clean); } };
-    // How many steps `setup` takes each way, and `setup-finish` and `off`. (`setup-finish` counts in the same file once
-    // it is started, a restart later: what `setup` counted is read as it ends.)
+    // How many steps `setup` takes each way, and `setup-finish` (in a file of its own) and `off`.
     let mut counts = vec![];
     for (way, env, args, before, clean) in &ways {
         if !before.is_empty() { m.sh(before); }
@@ -347,7 +346,7 @@ fn setup_holds_with_each_call_and_store_operation_failing() {
         after(clean);
     }
     // (Docker waited for answers in as many tries as it takes to start: the steps after are counted a few more.)
-    let finish: usize = m.sh("cat /var/tmp/count").parse::<usize>().unwrap() + 8;
+    let finish: usize = m.sh("cat /var/tmp/count-finish").parse::<usize>().unwrap() + 8;
     let mut e = measured_env();
     e.extend(fault(None, "count-off"));
     assert!(m.exec(&e, &["/usr/local/bin/superci-layers", "off"]).status.success());

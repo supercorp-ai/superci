@@ -5,10 +5,13 @@
 # Modal's client can do. Deployed by the SuperCI dashboard with Modal's own `modal deploy`.
 import asyncio
 import base64
+import hmac
 import json
 import os
 import subprocess
+import secrets
 import time
+import urllib.request
 import warnings
 
 # The image builder version every image here is built with (the runner's too), whatever the workspace's own is: the one
@@ -47,6 +50,17 @@ PLANE_ID = "__PLANE_ID__"
 LABEL = "__LABEL__"
 
 app = modal.App(NAME)
+# Its jobs' sandboxes, in an app of their own: an update stops this app's old container as the new one starts (see the
+# dashboard's `modal::deploy_plane`), and running jobs are not stopped with it.
+JOBS = "__JOBS__"
+jobs_app = []
+
+
+async def jobs():
+    if not jobs_app:
+        jobs_app.append(await modal.App.lookup.aio(JOBS, create_if_missing=True))
+    return jobs_app[0]
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("fastapi[standard]==0.118.0")
@@ -96,6 +110,12 @@ class Plane:
         self.free = []
         self.slots = asyncio.Semaphore(SIDE_BY_SIDE)
         self.cached = ({}, 0.0)
+        # A swap is a read then a write (a Dict has no write over what was read): one at a time, so two programs
+        # answering side by side never both take what one read (a job claimed twice, a write of settings lost). This
+        # is the one container that writes: at most one runs (`max_containers=1`), the schedule has the sweep run in
+        # it (see `sweep`), and an update stops the old one as the new one starts (Modal's `recreate` deploy
+        # strategy: see the dashboard's `modal::deploy_plane`).
+        self.swapping = asyncio.Lock()
 
     def process(self):
         """A program not answering anything now, or a new one."""
@@ -158,11 +178,12 @@ class Plane:
                 await self.end(q["key"], None)
             return {"created": created}
         if op == "swap":
-            # Read, then written (a Dict has no write over what was read; the program answers one request at a time).
-            if await self.get(q["key"]) != q.get("was"):
-                return {"swapped": False}
-            await asyncio.gather(kind_of(q["key"]).put.aio(q["key"], q["value"]), self.end(q["key"], q.get("until")))
-            return {"swapped": True}
+            # Read, then written, one swap at a time in this container (see `swapping`).
+            async with self.swapping:
+                if await self.get(q["key"]) != q.get("was"):
+                    return {"swapped": False}
+                await asyncio.gather(kind_of(q["key"]).put.aio(q["key"], q["value"]), self.end(q["key"], q.get("until")))
+                return {"swapped": True}
         if op == "delete":
             await asyncio.gather(self.drop(q["key"]), self.drop(f"~e:{q['key']}"))
             return {}
@@ -221,7 +242,7 @@ class Plane:
             try:
                 sandbox = await modal.Sandbox.create.aio(
                     *runner_command(q["jit"], q.get("fail")),
-                    app=app, image=runner_image, workdir="/home/runner",
+                    app=await jobs(), image=runner_image, workdir="/home/runner",
                     # CPUs as GitHub counts them (vCPUs); Modal's are physical cores of two each. Held to what it asks
                     # for, so it is billed exactly that (Modal bills the higher of reserved and used).
                     cpu=(float(q["cpu"]) / 2,) * 2, memory=(int(q["ram_gb"]) * 1024,) * 2, timeout=int(q["max_minutes"]) * 60,
@@ -285,6 +306,20 @@ async def after(url, what):
     await tell()
 
 
+async def sweep_key():
+    """What the schedule shows the web container to have it run the sweep there (see `sweep`): made once, in the state
+    Dict only this app reads."""
+    await state.put.aio("__sweep_key", secrets.token_hex(24), skip_if_exists=True)
+    return await state.get.aio("__sweep_key")
+
+
+async def run_sweep():
+    m = await plane.run({"kind": "alarm"})
+    await tell()
+    if m.get("error"):
+        print(f"superci: {m['error']}")
+
+
 async def tell():
     """Keeps what Modal said that the status does not have yet, as the control plane keeps a launcher's (`cloud:says`:
     once each, the newest ten)."""
@@ -308,6 +343,15 @@ def web():
     from starlette.background import BackgroundTask
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    # The sweep, asked by the schedule (see `sweep`): run here, beside the requests, so its swaps and theirs are made
+    # one at a time (see `Plane.swapping`). Not the control plane's own: answered here, and only with the key.
+    @api.post("/.superci/sweep")
+    async def sweep_here(request: Request):
+        if not hmac.compare_digest(request.headers.get("x-superci-sweep", ""), await sweep_key()):
+            return Response(status_code=404)
+        await run_sweep()
+        return Response(status_code=204)
 
     @api.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"])
     async def handle(request: Request, path: str):
@@ -335,7 +379,9 @@ def web():
 # around the clock, a standing cost of about $5 a month.
 @app.function(image=image, schedule=modal.Period(minutes=1), timeout=600, scaledown_window=2)
 async def sweep():
-    """Runs the control plane's sweep when one is due (it asks for the next one itself)."""
+    """Has the control plane's sweep run when one is due (it asks for the next one itself): in the web container, where
+    every request is answered, so the sweep's writes and the requests' are never made side by side by two containers
+    (a Dict has no write over what was read). Not answered there: asked again at the next minute."""
     due = await state.get.aio("__wake_at")
     if due is None or due > time.time() * 1000:
         return
@@ -343,7 +389,10 @@ async def sweep():
         await state.pop.aio("__wake_at")
     except KeyError:
         pass
-    m = await plane.run({"kind": "alarm"})
-    await tell()
-    if m.get("error"):
-        print(f"superci: {m['error']}")
+    url, key = await web.get_web_url.aio(), await sweep_key()
+    asked = urllib.request.Request(f"{url}/.superci/sweep", method="POST", headers={"x-superci-sweep": key})
+    try:
+        await asyncio.to_thread(lambda: urllib.request.urlopen(asked, timeout=590).close())
+    except Exception as e:
+        print(f"superci: the sweep was not run ({e}): asked again in a minute")
+        await state.put.aio("__wake_at", int(time.time() * 1000))

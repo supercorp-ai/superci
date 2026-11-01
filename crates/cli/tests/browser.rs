@@ -204,7 +204,7 @@ fn requests_ended_otherwise_than_browsers_end_them_are_answered_and_a_job_asked_
 fn a_sign_in_started_in_the_terminal_shows_its_own_page_at_each_step_until_it_is_done() {
     use std::io::BufRead;
     let started = |home: &std::path::Path, args: &[&str]| -> (std::process::Child, std::sync::mpsc::Receiver<String>, String) {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(home).args(args).args(["--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let out = child.stdout.take().unwrap();
@@ -271,7 +271,7 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
     let opened = bin.join("opened");
     std::fs::write(bin.join("xdg-open"), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
     std::fs::set_permissions(bin.join("xdg-open"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let free = || { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let free = || superci_testkit::free_port();
     // What it says up to the line with `upto`, read for half a minute at most (not said: the test fails saying what
     // came, it does not wait on).
     let first = |c: &mut std::process::Child, upto: &str| -> Vec<String> {
@@ -952,7 +952,7 @@ fn cloudflare_signed_in_again_after_its_sign_in_ended_is_taken_as_signed_in() {
     let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     k["cloudflare_ended"] = true.into();
     std::fs::write(&file, k.to_string()).unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_OAUTH_PORT", &port.to_string()), ("SUPERCI_PORT", &port.to_string())]);
     // (On Cloudflare's own port its cookie is the usual one.)
     let key = link.split_once("/?k=").unwrap().1.to_string();
@@ -1581,7 +1581,7 @@ fn a_github_connection_made_in_its_own_tab_says_it_is_connected_there_and_in_the
     use std::io::BufRead;
     let served = serve(|_| {});
     let home = signed_in(&served);
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default", "--no-browser"]).env("SUPERCI_PORT", port.to_string())
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
     // (What it says, read for half a minute at most.)
@@ -2197,7 +2197,7 @@ fn a_key_written_meanwhile_that_ends_within_a_day_is_not_taken_and_a_new_one_is_
 fn a_sign_in_from_the_terminal_says_the_cloud_it_was_for_or_none_when_two_came() {
     use std::io::BufRead;
     let started = |home: &std::path::Path, args: &[&str]| -> (std::process::Child, String) {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(home).args(args).args(["--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let out = child.stdout.take().unwrap();
@@ -4993,7 +4993,8 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
     step("04-modal-agent");
     let (ok, said) = run("", &["runners", "create", "modal", "--plane=awsplane0001"]);
     assert!(ok && said.contains("modal runs jobs now."), "{said}");
-    let agents = served.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
+    // (Written through the control plane served for it: kept in its store.)
+    let agents = second.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
     assert!(agents.contains("\"cloud\":\"cloudflare\"") && agents.contains("\"cloud\":\"modal\""), "{agents}");
     let (ok, said) = run("", &["runners", "list", "--plane=awsplane0001"]);
     assert!(ok && said.contains("aws ") && said.contains("cloudflare") && said.contains("modal"), "{said}");
@@ -6584,9 +6585,10 @@ fn removing_aws_deletes_its_budget_in_aws_as_aws_answered_and_a_launcher_the_con
     assert!(page.contains("Removed AWS.") && !page.contains("its budget in AWS"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
-    // A launcher in Modal removed while the control plane does not take the change (its settings written, not read):
-    // its part in Modal is left until it has, and said so.
+    // A launcher in Modal removed while the control plane does not take the change (one from before settings were
+    // written through it: its settings written, not read): its part in Modal is left until it has, and said so.
     let served = serve(|_| {});
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
     served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
     served.aws.fail("AmazonSSM.PutParameter|/LAUNCHERS", 200, r#"{"Tier":"Standard","Version":2}"#, None);
     let home = signed_in(&served);
@@ -9922,7 +9924,7 @@ fn workspaces_are_made_renamed_and_forgotten_beside_others_and_what_is_there_alr
     assert!(!home.join("workspaces/beta").exists() && home.join("workspaces/default").is_dir() && home.join("workspaces/acme2").is_dir());
     let _ = child.kill();
     // Started again with none named: one made from there all the same.
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let mut started = common::command(&home).args(["dashboard", "--no-browser"]).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     use std::io::BufRead;
     let mut lines = std::io::BufReader::new(started.stdout.take().unwrap()).lines().map_while(Result::ok);
@@ -15176,7 +15178,7 @@ mod dashboard_suite_in_browser {
         served.aws.replaying(&[include_str!("../fixtures/cloudflare/sign-in/sign-in.jsonl"), include_str!("../fixtures/cloudflare/sign-in/renew.jsonl"), include_str!("../fixtures/cloudflare/sign-in/sign-out.jsonl")].concat(), &[]);
         let home = home(&served);
         std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).env("SUPERCI_OAUTH_PORT", port.to_string())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
@@ -15229,7 +15231,7 @@ mod dashboard_suite_in_browser {
             served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
             let home = home(&served);
             std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
-            let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+            let port = superci_testkit::free_port();
             let mut child = common::command(&home).args(["login", "modal", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
                 .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
             let out = child.stdout.take().unwrap();
@@ -19736,7 +19738,7 @@ fn a_dashboard_with_several_workspaces_and_none_named_opens_on_the_last_shown_an
     std::fs::create_dir_all(&acme).unwrap();
     std::fs::copy(home.join("workspaces/default/sign-ins.json"), acme.join("sign-ins.json")).unwrap();
     let start = || {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(&home).args(["dashboard", "--no-browser"]).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         use std::io::BufRead;
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
@@ -19976,6 +19978,66 @@ fn what_modal_says_beside_its_answers_is_a_line_above_the_pages() {
     until("the control plane's word", || page().contains("Modal says: “modal 1.6 is deprecated”"));
     let page = page();
     assert!(page.matches("modal-go 0.11 is deprecated").count() == 1 && page.contains(r#"href="/?p=planes">Control plane</a>"#), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A change a teammate makes on another computer, through the control plane (as their dashboard makes it).
+fn teammate_changes(served: &superci_testkit::Served, changes: serde_json::Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let r = agent.post(&format!("{}/settings", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(serde_json::json!({ "changes": changes }).to_string()).unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// A provider's dialog left open while a teammate changes one of its fields on another computer: saved with another of
+/// its fields changed, the teammate's change stays; saved with that same field changed, refused, saying what it is now,
+/// and Set it anyway sets that field alone (refused again if it changed yet again).
+#[test]
+fn a_dialog_saved_after_a_teammate_changed_one_of_its_fields_keeps_theirs_or_says_it_changed() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare","max_jobs":3}]}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let pool = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, r)| serde_json::from_str::<serde_json::Value>(&r).ok()).map(|r| r["order"][0].clone()).unwrap_or_default();
+    let open = |b: &mut Browser| {
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(r#"document.querySelector('button[aria-label="Cloudflare settings"]') !== null && !document.body.classList.contains('busy')"#);
+        b.click(r#"button[aria-label="Cloudflare settings"]"#, "");
+        b.wait("document.getElementById('pool-0').open");
+    };
+    // Its budget set while the teammate made it 7 at once: theirs stays, the budget is taken.
+    open(&mut b);
+    assert_eq!(b.eval("document.querySelector('#pool-0 input[name=max]').value"), serde_json::json!("3"));
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 7 }]));
+    b.fill("#pool-0 input[name=usd]", "30");
+    b.click("#pool-0 button.primary", "Save");
+    until("the budget", || pool()["monthly_usd"] == 30.0);
+    assert_eq!(pool()["max_jobs"], 7, "{}", pool());
+    // Jobs at once set by both: refused, saying the teammate's.
+    open(&mut b);
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 9 }]));
+    b.fill("#pool-0 input[name=max]", "5");
+    b.click("#pool-0 button.primary", "Save");
+    b.wait(&page_shows("Changed on another computer meanwhile"));
+    assert!(b.eval("document.body.innerText").as_str().unwrap().contains("Cloudflare's jobs at once is 9 now"));
+    assert_eq!(pool()["max_jobs"], 9);
+    // Set anyway, after the teammate also changed the budget the dialog showed: theirs stays, the jobs at once are
+    // this computer's.
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "monthly_usd"], "value": 40.0 }]));
+    b.click("button.button", "Set it anyway");
+    until("set anyway", || pool()["max_jobs"] == 5);
+    assert_eq!(pool()["monthly_usd"], 40.0, "{}", pool());
+    // Refused once more where the teammate changed it yet again before Set anyway.
+    open(&mut b);
+    b.fill("#pool-0 input[name=max]", "6");
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 8 }]));
+    b.click("#pool-0 button.primary", "Save");
+    b.wait(&page_shows("Cloudflare's jobs at once is 8 now"));
+    teammate_changes(&served, serde_json::json!([{ "op": "set", "path": ["routing", "order", "cloudflare", "max_jobs"], "value": 2 }]));
+    b.click("button.button", "Set it anyway");
+    b.wait(&page_shows("Cloudflare's jobs at once is 2 now"));
+    assert_eq!(pool()["max_jobs"], 2);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
