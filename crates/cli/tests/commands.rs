@@ -3001,14 +3001,17 @@ fn a_control_plane_with_a_store_as_slow_as_modals_has_its_status_read_in_time() 
     let (code, status) = json(&home, &["status"]);
     let read = asked.elapsed();
     assert!(code == 0 && status["status"]["jobs"].as_array().is_some_and(|j| j.len() == 50) && read < std::time::Duration::from_secs(10), "{read:?}: {status}");
+}
 
 #[test]
 fn an_image_of_ones_own_moves_to_a_new_tag_in_one_write_and_an_unknown_name_is_refused() {
     let served = serve(|_| {});
     let home = common::signed_in(&served);
     let ok = |args: &[&str]| { let (code, v) = json(&home, args); assert_eq!(code, 0, "{args:?}: {v}"); v };
-    let images = || serde_json::from_str::<serde_json::Value>(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or("{}".into())).unwrap()["images"].clone();
-    let writes = || served.aws.asked.lock().unwrap().len();
+    // (Kept by the control plane, each change a version of its settings.)
+    let kept = || serde_json::from_str::<serde_json::Value>(served.store.0.lock().unwrap().get("settings").map_or("{}", String::as_str)).unwrap();
+    let images = || kept()["routing"]["images"].clone();
+    let writes = || kept()["version"].as_u64().unwrap_or(0);
 
     ok(&["runner_images", "create", "rust-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=ghcr-read"]);
     assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:1", "modal_secret": "ghcr-read" } }));
@@ -3016,7 +3019,7 @@ fn an_image_of_ones_own_moves_to_a_new_tag_in_one_write_and_an_unknown_name_is_r
     let before = writes();
     let said = ok(&["runner_images", "update", "rust-ci", "--reference=ghcr.io/acme/ci:2"]);
     assert_eq!(said["said"], "Jobs on Modal start from ghcr.io/acme/ci:2 (Modal Secret ghcr-read) when their label says image=rust-ci (runs-on: superci/image=rust-ci).");
-    assert_eq!(writes() - before, 1, "{:?}", &served.aws.asked.lock().unwrap()[before..]);
+    assert_eq!(writes() - before, 1);
     assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2", "modal_secret": "ghcr-read" } }));
     // The Secret taken off (a public image now); the address kept.
     ok(&["runner_images", "update", "rust-ci", "--modal-secret="]);

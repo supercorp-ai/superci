@@ -28,6 +28,10 @@ kind, source = sys.argv[1], sys.stdin.read()
 ns = {"__name__": "superci_" + kind}
 exec(compile(source, kind, "exec"), ns)
 job_image, image_refused, NO_RUNNER = ns["job_image"], ns["image_refused"], ns["NO_RUNNER"]
+# (A control plane's jobs' own app: found by Modal's client, here a stand-in.)
+if "jobs" in ns:
+    async def jobs(): return modal.App.lookup.return_value
+    ns["jobs"] = jobs
 
 # GitHub's runner image unless one is named; one named is from its registry, with its Secret, checked for the runner.
 assert job_image() is ns["runner_image"] and job_image(None, "s") is ns["runner_image"]
