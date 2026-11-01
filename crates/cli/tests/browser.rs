@@ -3995,7 +3995,6 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
         (&[("action", "account_usd"), ("account", "aws"), ("usd", "10"), ("budget", "lift")], "There is no budget in AWS to lift"),
         (&[("action", "account_usd"), ("account", "aws"), ("usd", ""), ("budget", "emails")], "A budget in AWS needs the monthly limit"),
         (&[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "not an address")], "That is no email address"),
-        (&[("action", "add"), ("repo", "not a repository"), ("cloud", "aws")], "A repository is owner/name, owner/* or *"),
         (&[("action", "max_hours"), ("max_hours", "0")], "From 1 to 120 hours"),
         (&[("action", "max_hours"), ("max_hours", "121")], "From 1 to 120 hours"),
         (&[("action", "public_add"), ("repo", "acme")], "A repository is owner/name or owner/*"),
@@ -8116,7 +8115,7 @@ fn the_upkeep_forgets_what_is_past_waits_a_job_tried_again_for_room_and_says_why
     let job = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
     assert!(job(a)["state"] == "running" && job(b)["state"] == "launched", "{} {}", job(a), job(b));
     // One at once on Cloudflare from now on.
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
     served.later(4 * 60_000);
     served.upkeep();
     assert!(served.store.under("live:81").is_empty() && served.store.under("live:82").is_empty(), "past caring for");
@@ -8280,7 +8279,7 @@ fn runs_from_a_computer_cancelled_or_failed_on_their_machines_are_ended_by_the_u
     let served = serve(|c| {
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare"}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}]}"#);
     served.github.put_object(&format!("{}/{}", superci_core::cache::bucket(PLANE, "us-east-1"), superci_core::cache::program_key("x86_64")), b"program");
     let key = format!("superci_run_{}", "02".repeat(16));
     served.aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_bot+x"), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
@@ -8396,7 +8395,7 @@ fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events
     assert!(job(i)["state"] == "done" && job(i)["conclusion"] == "failure", "{}", job(i));
 
     // Kept waiting: one with no label, nowhere to run it now (the containers off); a GitLab one of a connection gone.
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare","off":true}]}"#);
     let waiting = |id: u64, provider: &str, gitlab: &str, label: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "waiting", "provider": provider, "gitlab": gitlab, "label": label,
         "project_id": superci_testkit::gitlab::PROJECT, "at_ms": now, "installation_id": 42, "cloud": "", "seen_in_progress": false }).to_string();
     // A machine whose GitHub job ended untold, its runner's name not kept; a GitLab job's, the same.
@@ -8448,7 +8447,7 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
-    let routing = |order: &str| served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"default":null,"rules":[],"order":{order}}}"#));
+    let routing = |order: &str| served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"order":{order}}}"#));
     let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
     let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut j = state(id); f(&mut j); served.store.0.lock().unwrap().insert(format!("job:{id}"), j.to_string()); };
     let fresh = || { served.aws.fail_none(); served.aws.during.lock().unwrap().clear(); served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:") && !k.starts_with("spot:")); served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string()); };
@@ -8567,7 +8566,7 @@ fn aws_networks_refused_to_the_role_or_by_the_organization_and_traffic_refused_a
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -8726,14 +8725,8 @@ fn jobs_named_for_aws_where_it_is_not_connected_say_so_and_account_limits_with_r
         served.store.under(&format!("job:{id}"))[0].1.clone()
     };
     let not_here = |j: &serde_json::Value| j["machine_id"].is_null() && j["state"] != "launched";
-    // By its label; by a rule for its repository; by the default.
+    // By its label.
     let j = job("superci/provider=aws");
-    assert!(not_here(&j), "{j}");
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"rules":[{"repo":"acme/*","cloud":"aws"}]}"#);
-    let j = job("superci");
-    assert!(not_here(&j), "{j}");
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":"aws"}"#);
-    let j = job("superci");
     assert!(not_here(&j), "{j}");
     // Limits on its own account, with room left: started.
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"cloudflare":500},"account_daily_usd":{"cloudflare":50}}"#);
@@ -10486,7 +10479,7 @@ fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given
     let served = serve(|_| {});
     served.connect_github();
     served.connect_gitlab();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
     let (a, q) = served.github.queue("first", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(a));
     let (_, q) = served.github.queue("waits", "superci", served.now_ms()); served.webhook(q);
     let (_, p) = served.gitlab.pending("gl-waits", &["superci"], served.now_ms()); served.gitlab_webhook(p);
@@ -10670,7 +10663,7 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
     });
     served.connect_github();
     // AWS only (its containers off in the order): a refusal is not passed on to Cloudflare.
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     // What AWS answers that is not refused: as it answered Test (its images, network, a machine started).
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let refusal = |code: &str| match code {
@@ -10689,11 +10682,11 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
     let (mut said, mut later): (std::collections::BTreeMap<String, usize>, std::collections::BTreeMap<String, usize>) = Default::default();
     // Each kind of job, and three setups beside: on-demand turned off, Cloudflare after AWS (a refusal passes the job
     // on), and a second region (the first refusing, the second as answered).
-    let only_aws = r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#;
+    let only_aws = r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#;
     let kinds: Vec<(&str, &str, Option<&str>)> = vec![("superci", only_aws, None), ("superci/spot=false", only_aws, None), ("superci/gpu=any", only_aws, None), ("superci/gpu=any/spot=false", only_aws, None),
         ("superci/cpu=2/arch=arm64", only_aws, None),
-        ("superci", r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#, None),
-        ("superci", r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#, None),
+        ("superci", r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#, None),
+        ("superci", r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#, None),
         ("superci", only_aws, Some(r#"["us-east-1","us-east-2"]"#))];
     for (label, routing, regions) in kinds {
         served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
@@ -10801,7 +10794,7 @@ fn each_kind_of_label_gets_its_aws_machine_and_its_page_says_which() {
     served.connect_gitlab();
     // (Behind its public address: its machines get their own links, Linux's and Windows'.)
     *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let labels = ["superci", "superci/cpu=8", "superci/cpu=2/ram=16", "superci/arch=arm64", "superci/os=windows", "superci/scratch=ramdisk", "superci/scratch=localdisk", "superci/family=c8id",
         "superci/family=m7gd/scratch=localdisk", "superci/disk=200/disk-speed=500", "superci/disk-iops=6000", "superci/gpu=any", "superci/image=ubuntu26", "superci/image=ubuntu26/docker-cache=true",
@@ -14556,7 +14549,7 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
         served.aws.replaying(include_str!("../fixtures/aws/launch/at-limits.jsonl"), &[("mixplane0001", superci_testkit::PLANE)]);
         // (Only AWS: Cloudflare off in the order, nowhere else to go.)
-        served.aws.put(&format!("/superci/{}/ROUTING", superci_testkit::PLANE), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+        served.aws.put(&format!("/superci/{}/ROUTING", superci_testkit::PLANE), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2\n    steps:\n      - run: make test\n")]);
         let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -15376,14 +15369,6 @@ mod dashboard_suite_in_browser {
         let (mut child, link) = common::dashboard(&home);
         let routing = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default();
         let post = |path: &str, fields: &[(&str, &str)]| common::post(&link, path, fields);
-        assert!(post("/routing", &[("action", "default"), ("cloud", "aws")]).0 < 400);
-        assert_eq!(routing()["default"], "aws");
-        assert!(post("/routing", &[("action", "add"), ("repo", "acme/*"), ("cloud", "cloudflare")]).0 < 400);
-        assert_eq!(routing()["rules"], serde_json::json!([{ "repo": "acme/*", "cloud": "cloudflare" }]));
-        let (status, _, said) = post("/routing", &[("action", "add"), ("repo", "not a repository"), ("cloud", "aws")]);
-        assert!(status == 400 && common::words(&said).contains("A repository is owner/name, owner/* or *"), "{status} {}", common::words(&said));
-        assert!(post("/routing", &[("action", "remove"), ("repo", "acme/*")]).0 < 400);
-        assert_eq!(routing()["rules"], serde_json::json!([]));
         assert_eq!(post("/routing", &[("action", "nothing-like-it")]).0, 400);
         let (status, _, said) = post("/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "maybe")]);
         assert!(status == 400 && common::words(&said).contains("What AWS does at the limit is none, emails or stops"), "{status} {}", common::words(&said));
@@ -15509,7 +15494,7 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     // (Behind its public address, as a deployed one is: its machines get links of their own.)
     *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -15625,7 +15610,6 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
             vec![("superci", "Starting"), ("superci", "Cloudflare runs 1 at once")]),
         ("a job too large for Cloudflare goes to AWS", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/cpu=8", "m8a.2xlarge · 8 CPU"), ("superci", "4 CPU · 12 GB")]),
         ("a job only Cloudflare may run, too large for it", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/provider=cloudflare/cpu=16", "Cloudflare")]),
-        ("a rule sends the repository to Cloudflare", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare"}],"rules":[{"repo":"acme/*","cloud":"cloudflare"}]}"#, false, vec![("superci", "4 CPU · 12 GB")]),
         ("AWS spot past its month's limit: on-demand", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "c8a.xlarge · 4 CPU Spot or on-demand On-demand")]),
         ("past its limit with on-demand off: nowhere", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "Nowhere to run the default machine: AWS reached its $1 a month")]),
         ("the whole CI past its month's limit", r#"{"order":[{"cloud":"aws"}],"monthly_usd":1.0}"#, true, vec![("superci", "reached its limit")]),
@@ -15640,12 +15624,8 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
     let more: Vec<(&'static str, &'static str, bool, Vec<(&'static str, &'static str)>, Vec<(&str, &str)>)> = vec![
         ("the AWS account past its month's limit", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare","off":true}],"account_usd":{"aws":1.0}}"#, true, vec![("superci", "the AWS account reached its $1 a month")], vec![]),
         ("the AWS account past its day's limit", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare","off":true}],"account_daily_usd":{"aws":1.0}}"#, true, vec![("superci", "the AWS account reached its $1 a day")], vec![]),
-        ("a default and no order", r#"{"default":"aws"}"#, false, vec![("superci", "c8a.xlarge")], vec![]),
-        ("a default not added here", r#"{"default":"modal"}"#, false, vec![("superci", "Modal is not connected")], vec![]),
-        ("a rule naming a provider not added here", r#"{"rules":[{"repo":"acme/*","cloud":"modal"}]}"#, false, vec![("superci", "Modal is not connected")], vec![]),
         ("a label naming a provider not added here", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/provider=modal", "Its label needs Modal runners")], vec![]),
         ("a label naming AWS, which the order leaves out", r#"{"order":[{"cloud":"cloudflare"}]}"#, false, vec![("superci/provider=aws", "c8a.xlarge")], vec![]),
-        ("a rule naming AWS, which the order leaves out", r#"{"order":[{"cloud":"cloudflare"}],"rules":[{"repo":"acme/*","cloud":"aws"}]}"#, false, vec![("superci", "c8a.xlarge")], vec![]),
         ("nothing connected", r#"{}"#, false, vec![("superci", "No cloud connected for jobs")], vec![("CONTAINERS", "off"), ("-aws", "")]),
         ("Cloudflare through a launcher", r#"{}"#, false, vec![("superci", "Status")], vec![("CONTAINERS", "off"), ("LAUNCHERS", launcher), ("-aws", "")]),
         ("Cloudflare's own containers and a launcher beside", r#"{}"#, false, vec![("superci", "Status")], vec![("LAUNCHERS", launcher), ("-aws", "")]),
@@ -16331,7 +16311,7 @@ fn the_sweep_places_a_cut_off_start_again_settles_what_a_machine_sent_and_takes_
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -16386,7 +16366,7 @@ fn the_sweep_finds_out_what_became_of_jobs_whose_events_were_lost_and_says_it_on
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -16648,7 +16628,7 @@ fn a_runner_taking_another_jobs_work_swaps_machines_for_each_way_the_two_jobs_st
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -16736,7 +16716,7 @@ fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -16827,7 +16807,7 @@ fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -17233,7 +17213,7 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     });
     *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
     served.connect_gitlab();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -17510,7 +17490,7 @@ fn a_gitlab_jobs_cache_is_kept_as_its_projects_once_its_job_began_and_settings_l
     served.connect_gitlab();
     // (Behind its public address: machines reach the cache at it.)
     *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();

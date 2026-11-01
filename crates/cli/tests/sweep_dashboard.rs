@@ -224,7 +224,6 @@ fn anything(_: &Served) -> bool { true }
 forms! {
     the_longest_job_set_holds_with_each_call_and_store_operation_failing: "the longest job", none, "/routing", &[("action", "max_hours"), ("max_hours", "3")], |s| setting(s, "ROUTING").is_some_and(|r| r.contains("180"));
     a_monthly_limit_set_holds_with_each_call_and_store_operation_failing: "a monthly limit", none, "/routing", &[("action", "monthly_usd"), ("usd", "5")], |s| setting(s, "ROUTING").is_some_and(|r| r.contains("monthly_usd"));
-    a_repository_rule_added_holds_with_each_call_and_store_operation_failing: "a repository rule", none, "/routing", &[("action", "add"), ("repo", "acme/app"), ("cloud", "aws")], |s| setting(s, "ROUTING").is_some_and(|r| r.contains("acme/app"));
     a_provider_taken_out_holds_with_each_call_and_store_operation_failing: "a provider taken out", none, "/routing", &[("action", "take_out"), ("cloud", "aws"), ("current", "aws,aws-on-demand,cloudflare")], anything;
     a_public_repository_allowed_holds_with_each_call_and_store_operation_failing: "a public repository", none, "/routing", &[("action", "public_add"), ("repo", "acme/site")], anything;
     a_secret_added_holds_with_each_call_and_store_operation_failing: "a secret added", none, "/secrets/add", &[("name", "NPM_TOKEN"), ("value", "abc")], anything;
