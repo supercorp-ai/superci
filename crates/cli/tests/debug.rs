@@ -90,7 +90,7 @@ fn a_job_is_served_to_a_runner_here_as_the_control_plane_serves_it() {
     std::fs::create_dir_all(&dir).unwrap();
     let workflow = dir.join("ci.yml");
     std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.TOKEN }} ${{ vars.WHERE }}\n").unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let root = format!("http://127.0.0.1:{port}/runner/rig");
     let jit = dir.join("jit");
     let home = common::temp("debug-runner-home");

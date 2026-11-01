@@ -84,9 +84,9 @@ impl GitLab {
             lab.next += 1;
             let id = 17_000_000_000 + lab.next;
             let mut j = fixture("job");
-            for (k, v) in [("id", json!(id)), ("name", json!(name)), ("stage", json!("test")), ("tag_list", json!(tags)), ("status", json!("pending")), ("created_at", json!(iso(now_ms))),
+            [("id", json!(id)), ("name", json!(name)), ("stage", json!("test")), ("tag_list", json!(tags)), ("status", json!("pending")), ("created_at", json!(iso(now_ms))),
                 ("started_at", Value::Null), ("finished_at", Value::Null), ("duration", Value::Null), ("queued_duration", Value::Null), ("failure_reason", Value::Null), ("runner", Value::Null),
-                ("web_url", json!(format!("{URL}/{PATH}/-/jobs/{id}")))] { j[k] = v }
+                ("web_url", json!(format!("{URL}/{PATH}/-/jobs/{id}")))].into_iter().for_each(|(k, v)| j[k] = v);
             lab.jobs.insert(id, j);
             id
         };
@@ -99,7 +99,7 @@ impl GitLab {
             let mut lab = self.lab.lock().unwrap();
             let runner = *lab.runners.keys().next_back().expect("a runner made for it");
             let j = lab.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!("running")), ("started_at", json!(iso(now_ms))), ("queued_duration", json!(1.2)), ("runner", json!({ "id": runner, "description": format!("runner {runner}"), "active": true, "paused": false, "is_shared": false, "runner_type": "project_type", "name": "gitlab-runner", "online": true, "status": "online" }))] { j[k] = v }
+            [("status", json!("running")), ("started_at", json!(iso(now_ms))), ("queued_duration", json!(1.2)), ("runner", json!({ "id": runner, "description": format!("runner {runner}"), "active": true, "paused": false, "is_shared": false, "runner_type": "project_type", "name": "gitlab-runner", "online": true, "status": "online" }))].into_iter().for_each(|(k, v)| j[k] = v);
         }
         self.event(id)
     }
@@ -109,7 +109,7 @@ impl GitLab {
         {
             let mut lab = self.lab.lock().unwrap();
             let j = lab.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!("running")), ("started_at", json!(iso(now_ms))), ("queued_duration", json!(1.2)), ("runner", json!({ "id": runner, "description": format!("runner {runner}"), "active": true, "paused": false, "is_shared": false, "runner_type": "project_type", "name": "gitlab-runner", "online": true, "status": "online" }))] { j[k] = v }
+            [("status", json!("running")), ("started_at", json!(iso(now_ms))), ("queued_duration", json!(1.2)), ("runner", json!({ "id": runner, "description": format!("runner {runner}"), "active": true, "paused": false, "is_shared": false, "runner_type": "project_type", "name": "gitlab-runner", "online": true, "status": "online" }))].into_iter().for_each(|(k, v)| j[k] = v);
         }
         self.event(id)
     }
@@ -122,7 +122,7 @@ impl GitLab {
         {
             let mut lab = self.lab.lock().unwrap();
             let j = lab.jobs.get_mut(&id).unwrap();
-            for (k, v) in [("status", json!(status)), ("finished_at", json!(iso(now_ms))), ("duration", json!(7.5)), ("failure_reason", if status == "failed" { json!("script_failure") } else { Value::Null })] { j[k] = v }
+            [("status", json!(status)), ("finished_at", json!(iso(now_ms))), ("duration", json!(7.5)), ("failure_reason", if status == "failed" { json!("script_failure") } else { Value::Null })].into_iter().for_each(|(k, v)| j[k] = v);
             lab.logs.insert(id, log.to_string());
         }
         self.event(id)

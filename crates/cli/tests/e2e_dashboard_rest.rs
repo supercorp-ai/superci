@@ -179,7 +179,7 @@ fn sign_ins_that_modal_does_not_start_or_cloudflare_does_not_finish_say_why() {
     let served = serve(|_| {});
     let home = common::signed_in(&served);
     // (On Cloudflare's own port: its sign-in comes back to no other.)
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string();
+    let port = superci_testkit::free_port().to_string();
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_OAUTH_PORT", port.as_str()), ("SUPERCI_PORT", port.as_str())]);
     // (Its key's cookie on that port is the usual one.)
     let key = link.split_once("/?k=").unwrap().1.to_string();
@@ -345,7 +345,7 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
         std::fs::write(bin.join(name), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
         std::fs::set_permissions(bin.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     }
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string();
+    let port = superci_testkit::free_port().to_string();
     let mut c = common::command(&home).args(["dashboard", "--workspace=default"]).env("SUPERCI_PORT", &port).env("SUPERCI_BROWSER", bin.join("open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
     let mut said = String::new();
@@ -355,7 +355,7 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
     let _ = c.wait();
     assert!(said.contains("It is opening in your browser"), "{said}");
     // A task (connecting GitHub) opens its page too.
-    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default"]).env("SUPERCI_PORT", { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string()).env("SUPERCI_BROWSER", bin.join("open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default"]).env("SUPERCI_PORT", superci_testkit::free_port().to_string()).env("SUPERCI_BROWSER", bin.join("open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
     let mut said = String::new();
     while !said.contains("Create the GitHub App") { let mut l = String::new(); if std::io::BufRead::read_line(&mut out, &mut l).unwrap_or(0) == 0 { break } said.push_str(&l) }

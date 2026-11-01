@@ -1410,7 +1410,7 @@ fn the_runner_service_here_leaves_what_is_no_request_alone_and_serves_the_job() 
     let dir = common::temp("runner-service-odd");
     let workflow = dir.join("ci.yml");
     std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ok\n").unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let root = format!("http://127.0.0.1:{port}/runner/rig");
     let jit = dir.join("jit");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
@@ -1472,7 +1472,7 @@ fn another_aws_account_and_githubs_app_are_begun_from_the_terminal_with_a_link_t
     let served = serve(|_| {});
     let home = common::signed_in(&served);
     for args in [&["login", "aws", "--add", "--no-browser"][..], &["connections", "create", "github", "acme", "--no-browser"]] {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(&home).args(args).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
         let mut said = vec![];
@@ -2604,7 +2604,7 @@ fn a_runner_asking_for_a_message_while_its_job_runs_here_is_held_then_told_there
     let dir = common::temp("debug-runner-held");
     let workflow = dir.join("ci.yml");
     std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let root = format!("http://127.0.0.1:{port}/runner/rig");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
         .args(["debug", "runner-service", workflow.to_str().unwrap(), "tests", &root, &port.to_string(), dir.join("jit").to_str().unwrap(), "--json"])

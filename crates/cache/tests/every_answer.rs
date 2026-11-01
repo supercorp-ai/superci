@@ -139,7 +139,7 @@ fn command() -> std::process::Command {
 /// `superci-cache serve` against the stand-in (GitHub's service and Vercel's too), with `env` besides: its port.
 fn serve(stand: &Stand, env: &[(&str, &str)]) -> (u16, Ends) {
     let dir = folder("serve");
-    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let mut c = command();
     c.args(["serve", dir.to_str().unwrap()]).env("SUPERCI_CACHE_PLANE", format!("{}/cache/t", stand.url())).env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string())
         .env("SUPERCI_CACHE_GITHUB", format!("{}/github", stand.url())).env("SUPERCI_CACHE_VERCEL", format!("{}/vercel", stand.url()));
@@ -452,7 +452,7 @@ fn a_download_says_each_answer_of_the_bucket() {
     assert!(broken(Answer::Raw(b"HTTP/1.1 206 X\r\ncontent-length: 2\r\n\r\nab".to_vec()), None) < 10);
     assert!(broken(Answer::Raw(b"HTTP/1.1 206 X\r\ncontent-length: 10\r\n\r\nab".to_vec()), None) < 10);
     assert!(broken(Answer::Drop, None) < 10);
-    let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let gone = superci_testkit::free_port();
     let away = hit(json!([{ "url": format!("http://127.0.0.1:{gone}/o/x"), "size": 10 }]), 10);
     assert!(call(port, "GET", &away, &[], b"").2.len() < 10);
     // Refused once: asked again, and given.
@@ -520,7 +520,7 @@ fn requests_sent_amiss_are_answered_or_let_go() {
     s.write_all(format!("POST /twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts HTTP/1.1\r\nauthorization: {token}\r\ncontent-length: 2\r\n\r\n{{}}").as_bytes()).unwrap();
     drop(s);
     std::thread::sleep(Duration::from_millis(500));
-    let (gone_port, _g) = { let stand = Stand::start(); let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }; serve(&stand, &[("SUPERCI_CACHE_GITHUB", &format!("http://127.0.0.1:{gone}"))]) };
+    let (gone_port, _g) = { let stand = Stand::start(); let gone = superci_testkit::free_port(); serve(&stand, &[("SUPERCI_CACHE_GITHUB", &format!("http://127.0.0.1:{gone}"))]) };
     assert_eq!(call(gone_port, "POST", "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts", &[("authorization", &token)], b"{}").0, 500);
 }
 

@@ -62,7 +62,7 @@ fn githubs_cache_client_and_turbo_save_and_restore_through_the_control_plane_and
     let (github, forwarded) = githubs_results();
     let dir = std::env::temp_dir().join(format!("superci-cache-plane-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let _ends = Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
         .env("SUPERCI_CACHE_PLANE", format!("{}/cache/{link}", served.url)).env("SUPERCI_STAND_IN", &served.aws.url).env("SUPERCI_CACHE_GITHUB", &github).env("SUPERCI_CACHE_VERCEL", &github)
         .env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).stderr(std::process::Stdio::null()).spawn().unwrap());
@@ -139,7 +139,7 @@ fn a_run_from_a_computers_artifacts_and_nx_and_bazels_outputs_go_through_the_con
     served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": runner }).to_string());
     let dir = std::env::temp_dir().join(format!("superci-cache-plane-local-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let _ends = Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
         .env("SUPERCI_CACHE_PLANE", format!("{}/cache/{link}", served.url)).env("SUPERCI_STAND_IN", &served.aws.url)
         .env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).stderr(std::process::Stdio::null()).spawn().unwrap());
@@ -194,7 +194,7 @@ fn gitlabs_runner_cache_is_kept_for_the_job_its_runner_runs_and_read_by_its_bran
     // A GitLab job of acme/app, its runner made for it, running (as GitLab told).
     let (id, pending) = served.gitlab.pending("test", &["superci"], served.now_ms());
     assert!(served.gitlab_webhook(pending) < 300);
-    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let dir = std::env::temp_dir().join(format!("superci-cache-plane-gl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let start = |link: &str| Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])

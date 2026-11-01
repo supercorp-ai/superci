@@ -887,7 +887,7 @@ async fn a_layers_file_is_fetched_whatever_the_bucket_and_the_control_plane_answ
     let ahead = start("aheadnolink", Some(&serde_json::json!({ "layers": { &digests[1]: { "size": 1, "erofs": { "url": "", "size": erofs.len() }, "blob": {}, "ahead": true } }, "refresh": { "url": format!("{at}/links"), "token": "" } })));
     let until = Instant::now() + Duration::from_secs(20);
     while !ahead.log().contains("fetched ahead in") { assert!(Instant::now() < until, "{}", ahead.log()); tokio::time::sleep(Duration::from_millis(100)).await }
-    let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let gone = 1u16;
     for (name, refresh) in [("norefresh", serde_json::Value::Null), ("faraway", serde_json::json!({ "url": format!("http://127.0.0.1:{gone}/links"), "token": "" }))] {
         let index = serde_json::json!({ "layers": { &digests[0]: { "size": 1, "erofs": { "url": link(0, "expired/"), "size": erofs.len() }, "blob": {} }, &digests[1]: { "size": 1, "erofs": { "url": "", "size": erofs.len() }, "blob": {} } }, "refresh": refresh });
         let s = start(name, Some(&index));

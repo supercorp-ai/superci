@@ -204,7 +204,7 @@ fn requests_ended_otherwise_than_browsers_end_them_are_answered_and_a_job_asked_
 fn a_sign_in_started_in_the_terminal_shows_its_own_page_at_each_step_until_it_is_done() {
     use std::io::BufRead;
     let started = |home: &std::path::Path, args: &[&str]| -> (std::process::Child, std::sync::mpsc::Receiver<String>, String) {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(home).args(args).args(["--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let out = child.stdout.take().unwrap();
@@ -271,7 +271,7 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
     let opened = bin.join("opened");
     std::fs::write(bin.join("xdg-open"), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
     std::fs::set_permissions(bin.join("xdg-open"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let free = || { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let free = || superci_testkit::free_port();
     // What it says up to the line with `upto`, read for half a minute at most (not said: the test fails saying what
     // came, it does not wait on).
     let first = |c: &mut std::process::Child, upto: &str| -> Vec<String> {
@@ -952,7 +952,7 @@ fn cloudflare_signed_in_again_after_its_sign_in_ended_is_taken_as_signed_in() {
     let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     k["cloudflare_ended"] = true.into();
     std::fs::write(&file, k.to_string()).unwrap();
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_OAUTH_PORT", &port.to_string()), ("SUPERCI_PORT", &port.to_string())]);
     // (On Cloudflare's own port its cookie is the usual one.)
     let key = link.split_once("/?k=").unwrap().1.to_string();
@@ -1581,7 +1581,7 @@ fn a_github_connection_made_in_its_own_tab_says_it_is_connected_there_and_in_the
     use std::io::BufRead;
     let served = serve(|_| {});
     let home = signed_in(&served);
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default", "--no-browser"]).env("SUPERCI_PORT", port.to_string())
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
     // (What it says, read for half a minute at most.)
@@ -2197,7 +2197,7 @@ fn a_key_written_meanwhile_that_ends_within_a_day_is_not_taken_and_a_new_one_is_
 fn a_sign_in_from_the_terminal_says_the_cloud_it_was_for_or_none_when_two_came() {
     use std::io::BufRead;
     let started = |home: &std::path::Path, args: &[&str]| -> (std::process::Child, String) {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(home).args(args).args(["--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let out = child.stdout.take().unwrap();
@@ -9924,7 +9924,7 @@ fn workspaces_are_made_renamed_and_forgotten_beside_others_and_what_is_there_alr
     assert!(!home.join("workspaces/beta").exists() && home.join("workspaces/default").is_dir() && home.join("workspaces/acme2").is_dir());
     let _ = child.kill();
     // Started again with none named: one made from there all the same.
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let port = superci_testkit::free_port();
     let mut started = common::command(&home).args(["dashboard", "--no-browser"]).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     use std::io::BufRead;
     let mut lines = std::io::BufReader::new(started.stdout.take().unwrap()).lines().map_while(Result::ok);
@@ -15178,7 +15178,7 @@ mod dashboard_suite_in_browser {
         served.aws.replaying(&[include_str!("../fixtures/cloudflare/sign-in/sign-in.jsonl"), include_str!("../fixtures/cloudflare/sign-in/renew.jsonl"), include_str!("../fixtures/cloudflare/sign-in/sign-out.jsonl")].concat(), &[]);
         let home = home(&served);
         std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).env("SUPERCI_OAUTH_PORT", port.to_string())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
@@ -15231,7 +15231,7 @@ mod dashboard_suite_in_browser {
             served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
             let home = home(&served);
             std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
-            let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+            let port = superci_testkit::free_port();
             let mut child = common::command(&home).args(["login", "modal", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
                 .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
             let out = child.stdout.take().unwrap();
@@ -19738,7 +19738,7 @@ fn a_dashboard_with_several_workspaces_and_none_named_opens_on_the_last_shown_an
     std::fs::create_dir_all(&acme).unwrap();
     std::fs::copy(home.join("workspaces/default/sign-ins.json"), acme.join("sign-ins.json")).unwrap();
     let start = || {
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let port = superci_testkit::free_port();
         let mut child = common::command(&home).args(["dashboard", "--no-browser"]).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         use std::io::BufRead;
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);

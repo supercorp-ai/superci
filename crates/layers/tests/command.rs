@@ -275,7 +275,7 @@ async fn keep_says_what_was_kept_whatever_the_control_plane_answers() {
     std::fs::write(dir4.join("state"), "off: the kernel does not mount an EROFS file").unwrap();
     let s4 = serve(&dir4, &[], &[]);
     pulled(&s4.socket(), &blobs, &[]).await;
-    let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let gone = 1u16;
     let answers: serde_json::Map<String, serde_json::Value> = blobs[1..].iter().map(|b| (digest(b), serde_json::json!({ "do": "upload", "url": format!("http://127.0.0.1:{gone}/up"), "id": 1 }))).collect();
     for propose in [serde_json::json!({ "layers": {}, "uploaded": format!("{at}/uploaded") }), serde_json::json!({ "layers": answers, "uploaded": format!("{at}/uploaded") })] {
         p.lock().unwrap().propose = Some(Answer::Json(200, propose));

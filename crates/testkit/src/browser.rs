@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 pub struct Browser { child: std::process::Child, to: std::fs::File, from: Receiver<Value>, id: u64, session: String, _profile: TempDir }
@@ -14,10 +14,8 @@ pub struct Browser { child: std::process::Child, to: std::fs::File, from: Receiv
 struct TempDir(std::path::PathBuf);
 impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
 
-fn chrome() -> Option<&'static str> {
-    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
-        .into_iter().find(|p| std::path::Path::new(p).exists())
-}
+/// Where Chrome may be.
+const CHROMES: [&str; 5] = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
 
 fn pipe() -> (i32, i32) {
     let mut fds = [0; 2];
@@ -27,38 +25,32 @@ fn pipe() -> (i32, i32) {
 
 impl Browser {
     /// A fresh Chrome (a profile of its own) with one tab, `width` × `height`.
-    pub fn open(width: u32, height: u32) -> Option<Browser> {
-        let chrome = chrome()?;
+    pub fn open(width: u32, height: u32) -> Option<Browser> { Browser::open_among(&CHROMES, width, height) }
+
+    /// The same, with the first of these that is there; `None` where none is. (One that is there and does not start
+    /// is no test passed: it panics.)
+    fn open_among(chromes: &[&str], width: u32, height: u32) -> Option<Browser> {
+        let chrome = chromes.iter().find(|p| std::path::Path::new(p).exists())?;
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let profile = TempDir(std::env::temp_dir().join(format!("superci-chrome-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst))));
         let ((their_in, our_out), (our_in, their_out)) = (pipe(), pipe());
         // (Ours are not handed on to Chrome; its two become its 3 and 4.)
         unsafe { libc::fcntl(our_out, libc::F_SETFD, libc::FD_CLOEXEC); libc::fcntl(our_in, libc::F_SETFD, libc::FD_CLOEXEC); }
-        let mut cmd = std::process::Command::new(chrome);
+        let mut cmd = std::process::Command::new(*chrome);
         cmd.args(["--headless=new", "--remote-debugging-pipe", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--hide-scrollbars", "--mute-audio",
             &format!("--window-size={width},{height}"), &format!("--user-data-dir={}", profile.0.display()), "about:blank"])
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        unsafe { cmd.pre_exec(move || { if libc::dup2(their_in, 3) < 0 || libc::dup2(their_out, 4) < 0 { return Err(std::io::Error::last_os_error()) } Ok(()) }); }
-        let child = cmd.spawn().ok()?;
+        unsafe { cmd.pre_exec(move || { libc::dup2(their_in, 3); libc::dup2(their_out, 4); Ok(()) }); }
+        let child = cmd.spawn().expect("Chrome, which is there, starting");
         unsafe { libc::close(their_in); libc::close(their_out); }
-        let (to, mut from_chrome) = unsafe { (std::fs::File::from_raw_fd(our_out), std::fs::File::from_raw_fd(our_in)) };
+        let (to, from_chrome) = unsafe { (std::fs::File::from_raw_fd(our_out), std::fs::File::from_raw_fd(our_in)) };
         let (tx, from) = channel();
-        std::thread::spawn(move || {
-            let (mut buf, mut chunk) = (Vec::new(), [0u8; 65536]);
-            while let Ok(n) = from_chrome.read(&mut chunk) {
-                if n == 0 { break }
-                buf.extend_from_slice(&chunk[..n]);
-                while let Some(end) = buf.iter().position(|b| *b == 0) {
-                    let msg: Vec<u8> = buf.drain(..=end).collect();
-                    if let Ok(v) = serde_json::from_slice::<Value>(&msg[..msg.len() - 1]) { if tx.send(v).is_err() { return } }
-                }
-            }
-        });
+        std::thread::spawn(move || messages(from_chrome, tx));
         let mut b = Browser { child, to, from, id: 0, session: String::new(), _profile: profile };
-        let target = b.call("Target.createTarget", json!({ "url": "about:blank" })).ok()?["targetId"].clone();
-        b.session = b.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true })).ok()?["sessionId"].as_str()?.to_string();
-        b.call("Page.enable", json!({})).ok()?;
-        b.call("Runtime.enable", json!({})).ok()?;
+        let target = b.call("Target.createTarget", json!({ "url": "about:blank" })).unwrap()["targetId"].clone();
+        b.session = b.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true })).unwrap()["sessionId"].as_str().unwrap().to_string();
+        b.call("Page.enable", json!({})).unwrap();
+        b.call("Runtime.enable", json!({})).unwrap();
         Some(b)
     }
 
@@ -95,11 +87,11 @@ impl Browser {
     /// Waits, up to 30 seconds (a page among many tests at once, on a busy machine; `SUPERCI_BROWSER_WAIT_S` for
     /// longer, as under a coverage run), for `js` to hold in the page.
     pub fn wait(&mut self, js: &str) {
-        let until = Instant::now() + Duration::from_secs(std::env::var("SUPERCI_BROWSER_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(30));
-        while Instant::now() < until {
-            if self.call("Runtime.evaluate", json!({ "expression": format!("!!({js})"), "returnByValue": true })).is_ok_and(|r| r["result"]["value"] == true) { return }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.wait_within(js, Duration::from_secs(std::env::var("SUPERCI_BROWSER_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(30)))
+    }
+
+    fn wait_within(&mut self, js: &str, time: Duration) {
+        if crate::within(time, || self.call("Runtime.evaluate", json!({ "expression": format!("!!({js})"), "returnByValue": true })).is_ok_and(|r| r["result"]["value"] == true)) { return }
         let shown = self.text("main");
         panic!("waited for {js}; the page shows: {}", shown.chars().take(2000).collect::<String>());
     }
@@ -113,13 +105,15 @@ impl Browser {
     /// its middle, with the mouse.
     /// (Once it is there, holds still and is what is at that point: a page still laying itself out, a card coming in
     /// above, would take the click somewhere else.)
-    pub fn click(&mut self, selector: &str, words: &str) {
+    pub fn click(&mut self, selector: &str, words: &str) { self.click_within(selector, words, Duration::from_secs(30)) }
+
+    fn click_within(&mut self, selector: &str, words: &str, time: Duration) {
         let find = format!("(() => {{ const e = [...document.querySelectorAll({})].find(e => e.innerText.includes({}) || e.value === {1}); if (!e) return null;
             e.scrollIntoView({{block: 'center'}}); const r = e.getBoundingClientRect(); const x = r.x + r.width / 2, y = r.y + r.height / 2; const at = document.elementFromPoint(x, y);
             return [x, y, !!at && (at === e || e.contains(at) || at.contains(e))]; }})()", json!(selector), json!(words));
         let mut last: Option<[f64; 2]> = None;
         // (Up to 15 seconds, as `wait`: a page loading under a slow, measured build comes late.)
-        let until = Instant::now() + Duration::from_secs(30);
+        let until = Instant::now() + time;
         let (x, y) = loop {
             let at = self.eval(&find);
             let Some(a) = at.as_array() else {
@@ -133,7 +127,7 @@ impl Browser {
             last = Some(here);
             std::thread::sleep(Duration::from_millis(100));
         };
-        for kind in ["mousePressed", "mouseReleased"] { self.call("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 })).unwrap(); }
+        ["mousePressed", "mouseReleased"].into_iter().for_each(|kind| { self.call("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 })).unwrap(); });
     }
 
     /// Types `text` into the field `selector` names, what was there before taken out first.
@@ -147,7 +141,7 @@ impl Browser {
     /// The page as a PNG, at full size (for a person to look at).
     pub fn screenshot(&mut self, path: &std::path::Path) {
         let shot = self.call("Page.captureScreenshot", json!({ "format": "png", "captureBeyondViewport": false })).unwrap();
-        std::fs::write(path, base64_decode(shot["data"].as_str().unwrap_or_default())).unwrap();
+        std::fs::write(path, base64::Engine::decode(&base64::engine::general_purpose::STANDARD, shot["data"].as_str().unwrap()).unwrap()).unwrap();
     }
 }
 
@@ -155,13 +149,92 @@ impl Drop for Browser {
     fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
 }
 
-fn base64_decode(s: &str) -> Vec<u8> {
-    let val = |c: u8| match c { b'A'..=b'Z' => c - b'A', b'a'..=b'z' => c - b'a' + 26, b'0'..=b'9' => c - b'0' + 52, b'+' => 62, _ => 63 };
-    let bytes: Vec<u8> = s.bytes().filter(|c| *c != b'=' && !c.is_ascii_whitespace()).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, c)| n | (val(*c) as u32) << (18 - 6 * i));
-        for i in 0..chunk.len().saturating_sub(1) { out.push((n >> (16 - 8 * i)) as u8) }
+/// What Chrome says on its pipe, a message each ending in a NUL, passed on until it ends or no one listens.
+fn messages(mut from: impl Read, tx: Sender<Value>) {
+    let (mut buf, mut chunk) = (Vec::new(), [0u8; 65536]);
+    while let Ok(n) = from.read(&mut chunk) {
+        if n == 0 { break }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some(end) = buf.iter().position(|b| *b == 0) {
+            let msg: Vec<u8> = buf.drain(..=end).collect();
+            if let Ok(v) = serde_json::from_slice::<Value>(&msg[..msg.len() - 1]) { if tx.send(v).is_err() { return } }
+        }
     }
-    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// A Browser with no Chrome behind it: `to` where its commands go, `from` where its answers come from.
+    fn standing(to: std::fs::File, from: Receiver<Value>) -> Browser {
+        let child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        Browser { child, to, from, id: 0, session: "s".into(), _profile: TempDir(std::env::temp_dir().join(format!("superci-no-chrome-{}", std::process::id()))) }
+    }
+
+    fn sink() -> std::fs::File { std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap() }
+
+    #[test]
+    fn where_no_chrome_is_it_opens_none() {
+        assert!(Browser::open_among(&[], 800, 600).is_none());
+        assert!(Browser::open_among(&["/no/such/chrome"], 800, 600).is_none());
+    }
+
+    #[test]
+    fn a_command_not_sent_or_not_answered_or_refused_is_said() {
+        let (tx, from) = channel();
+        drop(tx);
+        // (Its pipe open for reading only: nothing can be written.)
+        let mut b = standing(std::fs::File::open("/dev/null").unwrap(), from);
+        assert!(b.call("Page.enable", json!({})).is_err());
+        let (tx, from) = channel();
+        drop(tx);
+        let mut b = standing(sink(), from);
+        assert_eq!(b.call("Page.enable", json!({})), Err("Chrome did not answer Page.enable".to_string()));
+        let (tx, from) = channel();
+        tx.send(json!({ "method": "an event, no answer" })).unwrap();
+        tx.send(json!({ "id": 1, "error": { "message": "no" } })).unwrap();
+        let mut b = standing(sink(), from);
+        assert!(b.call("Page.enable", json!({})).is_err_and(|e| e.contains("no")));
+    }
+
+    #[test]
+    fn what_comes_down_the_pipe_is_passed_on_until_it_ends() {
+        struct Broken;
+        impl Read for Broken { fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { Err(std::io::Error::other("broken")) } }
+        let (tx, rx) = channel();
+        messages(Broken, tx);
+        assert!(rx.recv().is_err());
+        let (tx, rx) = channel();
+        messages(&b""[..], tx);
+        assert!(rx.recv().is_err());
+        let (tx, rx) = channel();
+        messages(&b"not json\0{\"a\":1}\0"[..], tx);
+        assert_eq!(rx.recv().unwrap(), json!({ "a": 1 }));
+        assert!(rx.recv().is_err());
+        // (No one listening: it ends at the first message.)
+        let (tx, rx) = channel();
+        drop(rx);
+        messages(&b"{}\0{}\0"[..], tx);
+    }
+
+    #[test]
+    fn a_page_that_does_not_do_what_is_asked_says_so() {
+        let Some(mut b) = Browser::open(800, 600) else { return };
+        b.goto("data:text/html,<main>the words</main><div id=under style='position:fixed;left:0;top:50px;width:90px;height:90px'>under</div><div style='position:fixed;left:0;top:50px;width:90px;height:90px;background:red'>over</div>");
+        let said = |p: Box<dyn std::any::Any + Send>| p.downcast_ref::<String>().cloned().unwrap_or_default();
+        let e = catch_unwind(AssertUnwindSafe(|| b.wait_within("false", Duration::from_millis(1)))).unwrap_err();
+        assert!(said(e).contains("the page shows: the words"));
+        let e = catch_unwind(AssertUnwindSafe(|| b.eval("throw new Error('thrown')"))).unwrap_err();
+        assert!(said(e).contains("thrown"));
+        let e = catch_unwind(AssertUnwindSafe(|| b.click_within("nav", "", Duration::ZERO))).unwrap_err();
+        assert!(said(e).contains("nothing to click"));
+        let e = catch_unwind(AssertUnwindSafe(|| b.click_within("#under", "", Duration::ZERO))).unwrap_err();
+        assert!(said(e).contains("not clickable"));
+        let shot = std::env::temp_dir().join(format!("superci-shot-{}.png", std::process::id()));
+        b.screenshot(&shot);
+        assert!(std::fs::read(&shot).unwrap().starts_with(b"\x89PNG"));
+        let _ = std::fs::remove_file(&shot);
+    }
 }
