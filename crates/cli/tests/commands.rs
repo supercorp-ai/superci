@@ -2573,6 +2573,12 @@ fn a_modal_control_planes_long_setting_is_written_and_one_past_what_it_holds_is_
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && said.contains("a setting longer than 60 kB"), "{said}");
     assert!(!md.aws.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
+    // (One from before settings were written through it: refused here, before its Dict is written.)
+    md.answer_as("0.19.21", &["settings", "settings_version"]);
+    let o = superci(&home, &["public_repos", "create", &longest]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("a setting longer than 60 kB"), "{said}");
+    assert!(!md.aws.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
     let _ = std::fs::remove_dir_all(&home);
 }
 

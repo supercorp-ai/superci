@@ -246,6 +246,11 @@ fn a_change_the_control_plane_does_not_show_is_said_as_not_taken() {
         let (status, said) = sent(&link, "/routing", fields);
         assert!(status >= 400 && said.contains("did not show it within twenty seconds"), "{fields:?}: {status} {said}");
     }
+    // (One from before settings were written through it, the same of a setting of where jobs run.)
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert!(status >= 400 && said.contains("did not show it within twenty seconds"), "{status} {said}");
+    served.answer_as("", &[]);
     served.aws.fail("/secrets|\"CONTAINERS\"", 500, CF_FAILED, None);
     let (status, said) = sent(&link, "/runners/remove", &[("cloud", "cloudflare"), ("stop", "on")]);
     assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
@@ -484,6 +489,58 @@ fn a_move_says_a_new_control_plane_that_refuses_it_never_takes_it_or_could_not_m
     };
     let page = moving(Some(partly)).moved();
     assert!(page.contains("GitHub would not point an App here (globex: Not Found)"), "{page}");
+}
+
+/// What a new control plane answers when another computer took out a field meanwhile.
+const TAKEN_OUT: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |_, target, status, body| {
+    if target.starts_with("/settings") { (409, br#"{"error":"changed meanwhile","conflicts":[{"path":["launchers","modal"],"now":null}]}"#.to_vec()) } else { (status, body) }
+};
+
+/// A move whose settings the new control plane refuses, as changed there meanwhile, stops and says so; one to a control
+/// plane from before settings were written through it writes them into its cloud, and stops where that fails.
+#[test]
+fn a_move_stops_where_the_new_control_plane_does_not_take_its_settings() {
+    let page = moving(Some(TAKEN_OUT)).moved();
+    assert!(page.contains("Changed on another computer meanwhile") && page.contains("Modal's place is nothing now") && page.contains("Try again"), "{page}");
+    let m = moving(None);
+    m.new.answer_as("0.19.21", &["settings", "settings_version"]);
+    m.served.aws.fail("AmazonSSM.PutParameter|/superci/testplane0002/ROUTING", 500, &superci_testkit::json_error("InternalServerError", "An internal error occurred. Try again."), None);
+    let page = m.moved();
+    assert!(page.contains("An internal error occurred") && page.contains("Try again"), "{page}");
+}
+
+/// A change meant as said (no page's, a provider taken out here) whose field another computer took out meanwhile: said,
+/// nothing more done.
+#[test]
+fn a_provider_taken_out_while_another_computer_changed_it_says_so() {
+    let m = moving_with(Some(TAKEN_OUT), |_, home| kept_as(home, |k| { k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }) }));
+    let teammate = serde_json::json!({ "changes": [{ "op": "set", "path": ["routing", "order", "modal"], "value": { "cloud": "modal" } }] });
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let r = agent.post(&format!("{}/settings", m.new.url)).header("authorization", &format!("Bearer {}", m.new.key)).send(teammate.to_string()).unwrap();
+    assert_eq!(r.status(), 200);
+    let (status, _, said) = common::post(&m.link, "/runners/remove?c=testplane0002", &[("cloud", "modal")]);
+    let said = common::words(&said);
+    assert!(status >= 400 && said.contains("Changed on another computer meanwhile") && said.contains("Modal's place is nothing now"), "{status} {said}");
+}
+
+/// A control plane from before settings were written through it: a change of where jobs run goes into its cloud, its
+/// launchers left alone, and a field the page showed that it no longer holds is refused there too.
+#[test]
+fn a_control_plane_from_before_keeps_a_change_in_its_cloud_and_refuses_what_changed_meanwhile() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
+    let kept = |name: &str| served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let launchers = kept("LAUNCHERS");
+    let (status, said) = sent(&link, "/routing", &[("action", "max_hours"), ("max_hours", "3"), ("seen", r#"{"max_cpu":4}"#), ("seen_plane", superci_testkit::PLANE)]);
+    assert_eq!(status, 303, "{said}");
+    assert!(kept("ROUTING").is_some_and(|r| r.contains(r#""max_minutes":180"#)), "{:?}", kept("ROUTING"));
+    assert_eq!(kept("LAUNCHERS"), launchers);
+    let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16"), ("seen", r#"{"max_cpu":4}"#), ("seen_plane", superci_testkit::PLANE)]);
+    assert_eq!(status, 409, "{said}");
+    assert!(said.contains("the largest machine is nothing now") && said.contains("Set it anyway"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// A move that brings a launcher in Cloudflare while no Cloudflare account is known to put it in, and one that brings

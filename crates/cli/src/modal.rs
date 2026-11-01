@@ -382,9 +382,11 @@ pub fn find_planes(session: &Session) -> Result<Vec<(String, String)>> {
 
 /// Writes one of a Modal control plane's settings (its settings Dict; the control plane reads it within 10 seconds).
 pub fn put_setting(session: &Session, plane_id: &str, name: &str, value: &str) -> Result<()> {
+    // (One too long is refused before anything is asked of Modal.)
+    let entry = pb::DictEntry { key: pickle_str(name)?, value: pickle_str(value)? };
     let mut c = Client::new(Some(session.clone()))?;
     let d: pb::DictGetOrCreateResponse = c.unary("DictGetOrCreate", pb::DictGetOrCreateRequest { deployment_name: format!("{}-settings", plane_app(plane_id)), environment_name: String::new(), object_creation_type: 1 })?;
-    let _: pb::DictUpdateResponse = c.unary("DictUpdate", pb::DictUpdateRequest { dict_id: d.dict_id, updates: vec![pb::DictEntry { key: pickle_str(name)?, value: pickle_str(value)? }], if_not_exists: false })?;
+    let _: pb::DictUpdateResponse = c.unary("DictUpdate", pb::DictUpdateRequest { dict_id: d.dict_id, updates: vec![entry], if_not_exists: false })?;
     Ok(())
 }
 

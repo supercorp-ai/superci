@@ -6994,6 +6994,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_settings_write_that_is_not_one_or_too_long_is_refused,
         settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
+        a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
@@ -7420,13 +7421,35 @@ fn settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_sai
     assert_eq!(p.status()["routing"]["max_cpu"].as_u64(), Some(2));
     p.later(11_000);
     assert_eq!(health(), 200);
+    // (What was left for after an answer goes with them too.)
+    block_on(p.plane().later(PLANE_URL, "start job:1")).unwrap();
+    // (Not settings, while what was read before stands: a write reads them as they are now.)
     p.mem.0.borrow_mut().insert("settings".into(), "not settings".into());
+    assert_eq!(p.write(serde_json::json!([])).status, 500);
     p.later(11_000);
     let r = block_on(p.plane().handle(get("/health")));
     assert!(r.status == 500 && String::from_utf8_lossy(&r.body).starts_with("settings:"), "{}", String::from_utf8_lossy(&r.body));
     assert!(block_on(p.plane().alarm()).unwrap_err().starts_with("settings:"));
     assert!(block_on(p.plane().later(PLANE_URL, "start job:1")).unwrap_err().starts_with("settings:"));
     assert_eq!(p.write(serde_json::json!([])).status, 500);
+}
+
+/// A field by a way that is none (no steps: the whole; one step: at the top) and one through what is not an object or
+/// the list it should be: read as not there, and not made. An order arranged by nothing stays as it is.
+#[test]
+fn a_change_is_made_only_by_a_way_through_objects_and_lists() {
+    use superci_core::settings::{apply, get as at, Change};
+    let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let doc = serde_json::json!({ "routing": { "order": {} }, "count": 1 });
+    assert_eq!(at(&doc, &[]), Some(&doc));
+    assert_eq!(at(&doc, &path(&["routing", "order", "aws"])), None);
+    let set = |p: &[&str]| Change::Set { path: path(p), value: 2.into(), from: None };
+    assert_eq!(apply(&doc, &[set(&["count"])]).unwrap()["count"], 2);
+    for way in [&["routing", "order", "aws", "max_jobs"][..], &["count", "more"]] {
+        assert_eq!(apply(&doc, &[set(way)]).unwrap_err()[0].path, path(way));
+    }
+    let listed = serde_json::json!({ "routing": { "order": [{ "cloud": "aws" }, { "cloud": "modal" }] } });
+    assert_eq!(apply(&listed, &[Change::Arrange { path: path(&["routing", "order"]), keys: vec![] }]).unwrap(), listed);
 }
 
 /// The changes a page's edit makes, field by field: only what it changed, each with what was shown; a command's

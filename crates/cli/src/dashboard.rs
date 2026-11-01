@@ -417,21 +417,8 @@ fn listen_on(p: u16) -> Vec<TcpListener> {
     if free { bound } else { vec![] }
 }
 
-/// A port the system gives, free, on this computer's addresses as `listen_on` takes them (one the system gave for the
-/// first that another program has on the second: another); its listeners.
-fn listen_anywhere() -> (u16, Vec<TcpListener>) {
-    for _ in 0..20 {
-        let Ok(first) = TcpListener::bind("127.0.0.1:0") else { break };
-        let Ok(port) = first.local_addr().map(|a| a.port()) else { break };
-        match TcpListener::bind(format!("[::1]:{port}")) {
-            Ok(second) => return (port, vec![first, second]),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            // (No IPv6 here.)
-            Err(_) => return (port, vec![first]),
-        }
-    }
-    (0, vec![])
-}
+/// A port the system says is free now (none: 0, which `listen_on` finds nothing on).
+fn system_port() -> u16 { TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_or(0, |a| a.port()) }
 
 fn write_response(stream: &mut TcpStream, r: &Response) {
     let mut head = format!("HTTP/1.1 {} X\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n", r.status, r.body.len());
@@ -1263,13 +1250,10 @@ impl Dashboard {
     /// What the task's tab shows at the dashboard's address, in the dashboard's place.
     fn task_page(&mut self) -> Option<Response> {
         if self.task_done().is_some() { return Some(self.done_page()) }
-        // Modal's page does not come back with the sign-in: it is asked for here until it is approved there.
+        // Modal's page does not come back with the sign-in: this says so until it is approved there (see `serve`, which
+        // asks Modal, and `task_done` above).
         if matches!(self.task, Some(Task::Login(Some("modal")))) {
-            if let Some(pending) = self.modal_pending.clone() {
-                if let Ok(Some(session)) = modal::wait(&pending, 1.0) {
-                    (self.modal, self.modal_pending, self.looked_modal) = (Some(session), None, false);
-                    return Some(self.done_page())
-                }
+            if self.modal_pending.is_some() {
                 return Some(back_to("Approve it in Modal's tab", "This tab goes on by itself once you have.", &self.back_url("")))
             }
         }
@@ -2112,15 +2096,14 @@ impl Dashboard {
         // Cloudflare's browser sign-in needs 8976 itself: it comes back to no other.
         let asked: Option<u16> = std::env::var("SUPERCI_PORT").ok().and_then(|p| p.parse().ok());
         let ports: Vec<u16> = match asked {
+            // (0: from one the system gives. Another program may take it first: the next.)
+            Some(0) => { let from = system_port(); (from..from.saturating_add(10)).collect() }
             Some(p) => vec![p],
             None if matches!(self.task, Some(Task::Login(Some("cloudflare")))) => vec![oauth_port()],
             None => (oauth_port()..oauth_port() + 10).collect(),
         };
-        // The first of them free, and what listens there (none free: the last one tried, to say). Port 0: one the
-        // system gives, free.
-        let (port, bound) = if asked == Some(0) { listen_anywhere() } else {
-            ports.iter().map(|&p| (p, listen_on(p))).find(|(_, bound)| !bound.is_empty()).unwrap_or((ports[ports.len() - 1], vec![]))
-        };
+        // The first of them free, and what listens there (none free: the last one tried, to say).
+        let (port, bound) = ports.iter().map(|&p| (p, listen_on(p))).find(|(_, bound)| !bound.is_empty()).unwrap_or((ports[ports.len() - 1], vec![]));
         if bound.is_empty() {
             return Err(if port == oauth_port() && asked.is_none() { format!("Cloudflare's sign-in comes back to port {} only, and another program has it (another SuperCI, or `wrangler login`). Stop that one, or sign in to Cloudflare there.", oauth_port()) }
                 else { format!("port {port} is in use (is another SuperCI running?)") })
@@ -2242,6 +2225,12 @@ impl Dashboard {
         if after.get("routing").is_some() { self.put_secret(plane, "ROUTING", &written["routing"].to_string())? }
         if after.get("launchers").is_some() { self.put_secret(plane, "LAUNCHERS", &written["launchers"].to_string())? }
         Ok(None)
+    }
+
+    /// `put_settings` of changes meant as said, not made from what a page showed: one whose way is gone (an item another
+    /// computer took out meanwhile) stops what was asked here, saying so.
+    fn put_as_said(&mut self, plane: &Plane, status: &serde_json::Value, before: serde_json::Value, after: serde_json::Value) -> Result<()> {
+        match self.put_settings(plane, status, before, after, false)? { Some(conflicts) => Err(meanwhile(&conflicts)), None => Ok(()) }
     }
 
     /// Writes one of a control plane's secrets through its cloud's API (a Worker secret; an SSM parameter).
@@ -2836,7 +2825,7 @@ impl Dashboard {
                 let launchers_were: Vec<Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
                 let launchers = (cloud != "aws" && !own_containers).then(|| launchers_were.iter().filter(|a| a.cloud != cloud).cloned().collect::<Vec<_>>());
                 let (before, after) = (settings_doc(Some(&was), launchers.as_ref().map(|_| launchers_were.as_slice())), settings_doc(Some(&routing), launchers.as_deref()));
-                if let Some(conflicts) = self.put_settings(&plane, &status, before, after, false)? { return Ok(changed_meanwhile(&conflicts, None)) }
+                self.put_as_said(&plane, &status, before, after)?;
                 if cloud == "aws" {
                     if matches!(plane, Plane::Aws { .. }) { self.put_secret(&plane, "AWS_RUNNERS", "off")? } else { cloudflare::plane_post(plane.url(), &self.status_key, "/aws/forget", &serde_json::json!({}))?; }
                 } else if own_containers {
@@ -3474,7 +3463,7 @@ impl Dashboard {
                 launcher_up(&url);
                 launchers.retain(|a| a.cloud != "modal");
                 launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
-                if let Some(c) = self.put_settings(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)), false)? { return Ok(changed_meanwhile(&c, None)) }
+                self.put_as_said(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)))?;
                 wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
                 Ok(Response::redirect("/?p=runners"))
             }
@@ -3494,7 +3483,7 @@ impl Dashboard {
                         let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
                         if launchers.iter().any(|a| a.cloud == "cloudflare") {
                             launchers.retain(|a| a.cloud != "cloudflare");
-                            if let Some(c) = self.put_settings(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)), false)? { return Ok(changed_meanwhile(&c, None)) }
+                            self.put_as_said(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)))?;
                             let _ = cf.delete_runners(account_id, plane.plane_id());
                         }
                         wait_for(plane.url(), &self.status_key, |s| s["containers"] == true && !s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
@@ -3514,7 +3503,7 @@ impl Dashboard {
                         let url = cf.deploy_runners(&account, plane.url(), plane.plane_id())?;
                         launchers.retain(|a| a.cloud != "cloudflare");
                         launchers.push(superci_core::plane::Launcher { cloud: "cloudflare".into(), url });
-                        if let Some(c) = self.put_settings(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)), false)? { return Ok(changed_meanwhile(&c, None)) }
+                        self.put_as_said(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)))?;
                         wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
                     }
                 }
@@ -3849,17 +3838,17 @@ impl Dashboard {
                 if let Some(c) = self.put_settings(&plane, status.as_ref().unwrap_or(&serde_json::Value::Null), before.clone(), after, seen.is_some())? {
                     // (Set anyway: the same fields, as shown with what the other computer set in those it changed.)
                     let changes: Vec<superci_core::settings::Change> = c.iter().map(|c| superci_core::settings::Change::Set { path: c.path.clone(), value: c.now.clone(), from: None }).collect();
-                    let again = superci_core::settings::apply(&before, &changes).ok().map(|now| {
-                        form.iter().filter(|(k, _)| k != "seen").cloned().chain([("seen".to_string(), now["routing"].to_string())]).collect::<Vec<_>>()
-                    });
-                    return Ok(changed_meanwhile(&c, again.as_deref()))
+                    // (Each way there is in what was shown: each change refused was made of that.)
+                    let now = superci_core::settings::apply(&before, &changes).unwrap_or(before);
+                    let again: Vec<_> = form.iter().filter(|(k, _)| k != "seen").cloned().chain([("seen".to_string(), now["routing"].to_string())]).collect();
+                    return Ok(changed_meanwhile(&c, &again))
                 }
                 // (Shown once the control plane's routing holds these changes: with others' made meanwhile, it is
                 // not this computer's whole.)
                 self.shown(&plane, |s| {
                     let doc = serde_json::json!({ "routing": s["routing"] });
                     let read = |d: &serde_json::Value| serde_json::from_value::<Routing>(d["routing"].clone()).ok();
-                    superci_core::settings::apply(&doc, &ours).is_ok_and(|d| read(&d).is_some() && read(&d) == read(&doc))
+                    superci_core::settings::apply(&doc, &ours).is_ok_and(|d| read(&d) == read(&doc))
                 })?;
                 Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
@@ -7392,13 +7381,11 @@ fn carry_settings(w: &Writer, to: &Plane, key: &str, kept: &mut Option<serde_jso
         if let Some(r) = routing { after["routing"] = r }
         if let Some(l) = launchers { after["launchers"] = l }
         let changes = superci_core::settings::diff(now, &after, false);
-        if let Err(conflicts) = cloudflare::plane_settings(to.url(), key, &changes)? { return Err(format!("the new control plane's settings changed meanwhile: {conflicts:?}")) }
+        if let Err(conflicts) = cloudflare::plane_settings(to.url(), key, &changes)? { return Err(meanwhile(&conflicts)) }
         *now = after;
         return Ok(())
     }
-    if let Some(r) = routing { w.put(to, "ROUTING", &r.to_string())? }
-    if let Some(l) = launchers { w.put(to, "LAUNCHERS", &l.to_string())? }
-    Ok(())
+    [("ROUTING", routing), ("LAUNCHERS", launchers)].into_iter().filter_map(|(name, v)| Some((name, v?))).try_for_each(|(name, v)| w.put(to, name, &v.to_string()))
 }
 
 /// A part of the control plane's settings, as its changes are made of them (see `superci_core::settings`).
@@ -7418,7 +7405,7 @@ fn with_seen(page: &str, plane_id: &str, routing: Option<&serde_json::Value>) ->
     let mut out = String::with_capacity(page.len());
     let mut rest = page;
     while let Some(at) = rest.find("<form ") {
-        let Some(end) = rest[at..].find('>').map(|e| at + e + 1) else { break };
+        let end = rest[at..].find('>').map_or(rest.len(), |e| at + e + 1);
         out.push_str(&rest[..end]);
         if rest[at..end].contains(r#"action="/routing""#) { out.push_str(&hidden) }
         rest = &rest[end..];
@@ -7432,18 +7419,23 @@ fn launchers_in(status: &serde_json::Value) -> serde_json::Value {
     settings_doc(None, Some(&serde_json::from_value::<Vec<Launcher>>(status["launchers"].clone()).unwrap_or_default()))
 }
 
-/// A change refused because another computer changed those fields since this one's page showed them: each, with what
-/// it holds now. With `again` (the form's fields, its `seen` made what is there now in those fields): Set it anyway,
-/// which makes this change over the other computer's in those fields alone, and is refused once more only if they
-/// change yet again.
-fn changed_meanwhile(conflicts: &[Conflict], again: Option<&[(String, String)]>) -> Response {
-    let each: Vec<String> = conflicts.iter().map(|c| {
+/// Fields another computer changed: each, with what it holds now.
+fn fields_now(conflicts: &[Conflict]) -> String {
+    conflicts.iter().map(|c| {
         let now = match &c.now { serde_json::Value::Null => "nothing".to_string(), serde_json::Value::String(s) => s.clone(), v => v.to_string() };
         format!("{} is {now} now", setting_name(&c.path))
-    }).collect();
+    }).collect::<Vec<_>>().join("; ")
+}
+
+/// Changes meant as said, stopped by another computer's (see `Dashboard::put_as_said`), in words.
+fn meanwhile(conflicts: &[Conflict]) -> String { format!("Changed on another computer meanwhile: {}. Look again, then make your change once more.", fields_now(conflicts)) }
+
+/// A change refused because another computer changed those fields since this one's page showed them. `fields`: the
+/// form's, its `seen` made what is there now in those fields, for Set it anyway, which makes this change over the other
+/// computer's in those fields alone, and is refused once more only if they change yet again.
+fn changed_meanwhile(conflicts: &[Conflict], fields: &[(String, String)]) -> Response {
     let heading = "Changed on another computer meanwhile";
-    let Some(fields) = again else { return message(409, heading, &format!("{}. Look again, then make your change once more.", esc(&each.join("; ")))) };
-    let text = format!("{}. Set yours anyway, over that, or go back and look again.", each.join("; "));
+    let text = format!("{}. Set yours anyway, over that, or go back and look again.", fields_now(conflicts));
     SAID.with(|s| *s.borrow_mut() = Some((409, heading.to_string(), esc(&text))));
     let hidden: String = fields.iter().map(|(k, v)| format!(r#"<input type="hidden" name="{}" value="{}">"#, esc(k), esc(v))).collect();
     superci_core::page::html(409, "superci", &format!(r#"<h1>{heading}</h1><p class="note">{}</p><form method="post" action="/routing" style="margin-top:18px">{hidden}<button class="button">Set it anyway</button> <a class="chip" href="/">Back</a></form>"#, esc(&text)))
@@ -9630,6 +9622,27 @@ mod name_tests {
 #[cfg(test)]
 mod rest_tests {
     use super::*;
+
+    /// Each setting a change can be refused on, as the pages say it; a form cut short is left as it is.
+    #[test]
+    fn a_setting_refused_is_said_by_its_name() {
+        let name = |path: &[&str]| setting_name(&path.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for (field, said) in [("max_jobs", "jobs at once"), ("monthly_usd", "monthly limit"), ("daily_usd", "daily limit"), ("regions", "regions"), ("off", "taken out of the order"), ("other", "other")] {
+            assert_eq!(name(&["routing", "order", "modal", field]), format!("Modal's {said}"));
+        }
+        for (field, said) in [("max_cpu", "the largest machine"), ("max_minutes", "the longest job"), ("public_repos", "public repositories"), ("aws_budget", "AWS's budget"), ("cache", "the cache"), ("rules", "repository rules"), ("order", "the order")] {
+            assert_eq!(name(&["routing", field]), said);
+        }
+        assert_eq!(name(&["routing", "account_usd", "aws"]), "AWS's monthly limit");
+        assert_eq!(name(&["routing", "account_daily_usd", "aws"]), "AWS's daily limit");
+        assert_eq!(name(&["routing", "order", "modal"]), "Modal's place");
+        assert_eq!(name(&["launchers", "modal"]), "Modal's place");
+        assert_eq!(name(&["launchers"]), "the launchers");
+        assert_eq!(name(&[]), "the settings");
+        let routing = serde_json::json!({});
+        let cut = with_seen(r#"<p>one<form action="/routing""#, "p", Some(&routing));
+        assert!(cut.starts_with(r#"<p>one<form action="/routing""#) && cut.contains(r#"name="seen_plane" value="p""#), "{cut}");
+    }
 
     /// Where nothing answers (the discard port: refused at once).
     const NOWHERE: &str = "http://127.0.0.1:9";

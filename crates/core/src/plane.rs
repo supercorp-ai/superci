@@ -223,7 +223,7 @@ pub struct Cache {
     plane_url: RefCell<Option<String>>,
     /// Its settings record (see `SETTINGS`) as last read, and when (ms): read again ten seconds on, or at once by what
     /// must see a write just made (the status, a write).
-    settings: RefCell<Option<(u64, Option<String>)>>,
+    settings: RefCell<Option<(u64, Option<Stored>)>>,
     /// Whether the jobs' indexes are complete (once they are, they stay so).
     indexed: std::cell::Cell<bool>,
     /// Runners' links known to be a job's (`rjob:<token>`), until when; and a count for posts of lines in one
@@ -749,7 +749,7 @@ pub struct Stored {
 }
 
 /// The settings as the changes see them (see `settings`).
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct Document { #[serde(default)] routing: Routing, #[serde(default)] launchers: Vec<Launcher> }
 
 /// How long a read of the settings record stands for a request that need not see a write just made.
@@ -1263,17 +1263,16 @@ impl<'a> ControlPlane<'a> {
     async fn settled(&self, fresh: bool) -> Result<Option<Config>> {
         let now = self.clock.now_ms();
         let kept = self.cache.settings.borrow().clone().filter(|(at, _)| !fresh && now.saturating_sub(*at) < SETTINGS_READ_MS);
-        let raw = match kept {
-            Some((_, raw)) => raw,
+        let stored = match kept {
+            Some((_, stored)) => stored,
             None => {
                 let raw = self.store.get(SETTINGS).await?;
-                let raw = match raw { Some(raw) => Some(self.take_cloud_copy(raw).await?), None => None };
-                *self.cache.settings.borrow_mut() = Some((now, raw.clone()));
-                raw
+                let stored = match raw { Some(raw) => Some(self.take_cloud_copy(raw).await?), None => None };
+                *self.cache.settings.borrow_mut() = Some((now, stored.clone()));
+                stored
             }
         };
-        let Some(raw) = raw else { return Ok(None) };
-        let stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
+        let Some(stored) = stored else { return Ok(None) };
         Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, ..self.config.clone() }))
     }
 
@@ -1281,19 +1280,20 @@ impl<'a> ControlPlane<'a> {
     fn cloud_copy(&self) -> String { crate::crypto::sha256_hex(crate::io::json(&(&self.config.routing, &self.config.launchers)).as_bytes()) }
 
     /// The record, with its cloud's copy taken over it when an older SuperCI wrote that copy (one not taken before,
-    /// nor in the last minute: see `Stored::taken`). Lost to another write at the same moment: the record as it is.
-    async fn take_cloud_copy(&self, raw: String) -> Result<String> {
-        let mut stored: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
+    /// nor in the last minute: see `Stored::taken`). Lost to another write at the same moment: the record as it was
+    /// read, for the ten seconds until it is read again.
+    async fn take_cloud_copy(&self, raw: String) -> Result<Stored> {
+        let read: Stored = serde_json::from_str(&raw).map_err(|e| format!("{SETTINGS}: {e}"))?;
+        let mut stored = read.clone();
         let (copy, now) = (self.cloud_copy(), self.clock.now_ms());
         let newest = stored.taken.last().is_some_and(|(f, _)| *f == copy);
-        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) { return Ok(raw) }
+        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) { return Ok(read) }
         stored.version += 1;
         (stored.routing, stored.launchers) = (self.config.routing.clone(), self.config.launchers.clone());
         stored.taken.push((copy, now));
         let n = stored.taken.len();
         stored.taken.drain(..n.saturating_sub(5));
-        let written = crate::io::json(&stored);
-        Ok(if self.store.swap(SETTINGS, Some(&raw), written.clone()).await? { written } else { self.store.get(SETTINGS).await?.unwrap_or(raw) })
+        Ok(if self.store.swap(SETTINGS, Some(&raw), crate::io::json(&stored)).await? { stored } else { read })
     }
 
     /// The settings as they stand (kept, or its cloud's own where none are kept yet), their version (0: none kept),
@@ -1314,9 +1314,11 @@ impl<'a> ControlPlane<'a> {
         #[derive(Deserialize)]
         struct Asked { changes: Vec<crate::settings::Change> }
         let Ok(asked) = serde_json::from_slice::<Asked>(&req.body) else { return Ok(Response::text(400, "settings are written as { changes: [...] }")) };
-        for _ in 0..SETTINGS_TRIES {
+        let mut tries = 0;
+        while tries < SETTINGS_TRIES {
+            tries += 1;
             let (now, raw) = self.settings_now().await?;
-            let doc = serde_json::to_value(Document { routing: now.routing, launchers: now.launchers }).map_err(|e| e.to_string())?;
+            let doc = serde_json::json!({ "routing": now.routing, "launchers": now.launchers });
             let changed = match crate::settings::apply(&doc, &asked.changes) {
                 Ok(changed) => changed,
                 Err(conflicts) => return Ok(Response::json(&serde_json::json!({ "error": "changed meanwhile", "conflicts": conflicts, "version": now.version })).with_status(409)),
@@ -1326,8 +1328,9 @@ impl<'a> ControlPlane<'a> {
             let written = crate::io::json(&next);
             if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
             if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
-                *self.cache.settings.borrow_mut() = Some((self.clock.now_ms(), Some(written)));
-                return Ok(Response::json(&serde_json::json!({ "version": next.version })))
+                let version = next.version;
+                *self.cache.settings.borrow_mut() = Some((self.clock.now_ms(), Some(next)));
+                return Ok(Response::json(&serde_json::json!({ "version": version })))
             }
         }
         Ok(Response::text(503, "the settings were being changed by others all along: try again"))

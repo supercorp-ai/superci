@@ -154,11 +154,11 @@ fn walk(out: &mut Vec<Change>, path: &mut Vec<String>, before: &Value, after: &V
     match (before, after, keyed(path)) {
         (Value::Object(b), Value::Object(a), _) => {
             let keys: std::collections::BTreeSet<&String> = b.keys().chain(a.keys()).collect();
-            for k in keys {
+            keys.into_iter().for_each(|k| {
                 path.push(k.clone());
                 walk(out, path, b.get(k).unwrap_or(&Value::Null), a.get(k).unwrap_or(&Value::Null));
                 path.pop();
-            }
+            });
         }
         // (A keyed list not there yet is an empty one.)
         (Value::Array(_) | Value::Null, Value::Array(_) | Value::Null, Some(by)) => {
