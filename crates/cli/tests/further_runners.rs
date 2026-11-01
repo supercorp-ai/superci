@@ -155,3 +155,73 @@ fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A second Cloudflare account the sign-in reaches: its launcher there under a word of its own, deleted with only that
+/// account's Worker gone (each account's launcher has the same name).
+#[test]
+fn a_second_cloudflare_account_gets_a_runner_of_its_own_and_only_its_launcher_is_deleted() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let (first, second) = ("1111111111111111111111111111111a", "2222222222222222222222222222222b");
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &format!(r#"[{{"cloud":"cloudflare","url":"https://superci-runners-{PLANE}.acme.workers.dev"}}]"#));
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let cf_calls: Vec<String> = include_str!("../fixtures/runners/03-cf-agent.jsonl").lines().filter(|l| !l.contains("/accounts?per_page") && !l.contains("iam.amazonaws.com") && !l.contains("api.modal.com")).map(str::to_string).collect();
+    served.aws.replaying(&cf_calls.join("\n"), &[(first, second), ("awsplane0001", PLANE), ("subdomain\\\":\\\"acme", "subdomain\\\":\\\"globex")]);
+    served.aws.replaying(&cf_calls.join("\n"), &[("awsplane0001", PLANE)]);
+    served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{first}","name":"Acme","type":"standard"}},{{"id":"{second}","name":"Globex Inc","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
+    { let mut w = served.aws.workers.lock().unwrap(); w.insert(format!("superci-runners-{PLANE}.globex.workers.dev"), served.url.clone()); }
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // The first's own account asked for again: its word stays.
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={first}"), "--name=cloudflare-two"]);
+    assert!(!ok && said.contains("runs jobs as cloudflare"), "{said}");
+    // The other: its own word, from the account's name.
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}")]);
+    assert!(ok && said.contains("cloudflare-globex-inc runs jobs now."), "{said}");
+    let record: serde_json::Value = serde_json::from_str(&served.store.0.lock().unwrap()["settings"]).unwrap();
+    assert_eq!(record["accounts"], serde_json::json!([{ "name": "cloudflare-globex-inc", "provider": "cloudflare", "cloud_id": second }]), "{record}");
+    assert!(record["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "cloudflare-globex-inc" && a["url"].as_str().unwrap().contains(".globex.workers.dev")), "{record}");
+    // Updated: each launcher in its own account, the first's found by its address.
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.replaying(&cf_calls.join("\n"), &[(first, second), ("awsplane0001", PLANE), ("subdomain\\\":\\\"acme", "subdomain\\\":\\\"globex")]);
+    served.aws.replaying(&cf_calls.join("\n"), &[("awsplane0001", PLANE)]);
+    served.aws.asked.lock().unwrap().clear();
+    let (ok, said) = run(&["planes", "update"]);
+    assert!(ok && said.contains("Updated to") && !said.contains("was not updated") && !said.contains("were not updated"), "{said}");
+    let put_in = |id: &str| served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == "PUT" && a["url"].as_str().is_some_and(|u| u.contains(id) && u.contains(&format!("/workers/scripts/superci-runners-{PLANE}"))));
+    assert!(put_in(first) && put_in(second), "both accounts' launchers");
+    // Deleted: its account's Worker, not the first's.
+    served.aws.asked.lock().unwrap().clear();
+    served.aws.fail("/workers/scripts/superci-runners", 200, r#"{"result":null,"success":true,"errors":[],"messages":[]}"#, None);
+    let (ok, said) = run(&["runners", "delete", "cloudflare-globex-inc", "--confirm"]);
+    assert!(ok && said.contains("Removed cloudflare-globex-inc."), "{said}");
+    let deleted: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "DELETE" && a["url"].as_str().is_some_and(|u| u.contains("/workers/scripts/"))).map(|a| a["url"].as_str().unwrap().to_string()).collect();
+    assert!(!deleted.is_empty() && deleted.iter().all(|u| u.contains(second)), "{deleted:?}");
+    // Back, then the first deleted: a further one's account, whose launcher has the same name, left alone.
+    served.aws.replaying(&cf_calls.join("\n"), &[(first, second), ("awsplane0001", PLANE), ("subdomain\\\":\\\"acme", "subdomain\\\":\\\"globex")]);
+    served.aws.fail_none();
+    served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{first}","name":"Acme","type":"standard"}},{{"id":"{second}","name":"Globex Inc","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}")]);
+    assert!(ok && said.contains("cloudflare-globex-inc runs jobs now."), "{said}");
+    served.aws.asked.lock().unwrap().clear();
+    served.aws.fail("/workers/scripts/superci-runners", 200, r#"{"result":null,"success":true,"errors":[],"messages":[]}"#, None);
+    let (ok, said) = run(&["runners", "delete", "cloudflare", "--confirm"]);
+    assert!(ok && said.contains("Removed Cloudflare."), "{said}");
+    let deleted: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "DELETE" && a["url"].as_str().is_some_and(|u| u.contains("/workers/scripts/"))).map(|a| a["url"].as_str().unwrap().to_string()).collect();
+    assert!(!deleted.is_empty() && deleted.iter().all(|u| u.contains(first)), "{deleted:?}");
+    // Its account out of this sign-in's reach: an update says so, and a delete asks to sign in.
+    served.aws.fail_none();
+    served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{first}","name":"Acme","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
+    let (ok, said) = run(&["runners", "delete", "cloudflare-globex-inc", "--confirm"]);
+    assert!(!ok && said.contains("Sign in"), "{said}");
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", PLANE), ("http://new-plane.test", &served.url)]);
+    let (ok, said) = run(&["planes", "update"]);
+    assert!(ok && said.contains("Its Cloudflare launchers cloudflare-globex-inc were not updated: this sign-in does not reach their accounts."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
