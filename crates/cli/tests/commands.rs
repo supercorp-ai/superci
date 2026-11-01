@@ -353,7 +353,7 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
         (&["keys", "create", "agent", "--days=many"], "--days is a number of days"),
         (&["keys", "create", "agent", "--runs", "--max-cpu=8"], "A key has no limits of its own"),
         (&["keys", "delete"], "Say which: `superci keys delete NAME`"),
-        (&["accounts", "update", "gcp", "--monthly-usd=5"], "Say which cloud's"),
+        (&["accounts", "update", "gcp", "--monthly-usd=5"], "gcp is not an account of this CI"),
         (&["accounts", "update", "aws"], "Say what to change: `superci accounts update aws"),
         (&["accounts", "update", "aws", "--aws-budget=maybe"], "--aws-budget is none, emails, stops or lift"),
         (&["deliveries", "retrieve", "x1"], "Say which: `superci deliveries retrieve ID`"),

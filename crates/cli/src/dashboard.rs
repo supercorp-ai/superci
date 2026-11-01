@@ -3764,10 +3764,13 @@ impl Dashboard {
                     "monthly_usd" => { routing.monthly_usd = usd(); if newer { routing.daily_usd = money("daily") } }
                     "account_usd" => {
                         let account = field("account");
-                        if account != "aws" { return Ok(message(400, "Which account?", "An account's limit is for a cloud with several providers: aws (its spot and on-demand machines). Another provider's limit is its own: its settings on Runners.")) }
+                        // (Every provider's first account, and each further one; AWS's own budget is AWS's.)
+                        if !["aws", "cloudflare", "modal"].contains(&account.as_str()) && !records.accounts.iter().any(|a| a.name == account) { return Ok(message(400, "Which account?", "An account's limit is for one of its accounts: aws, cloudflare, modal, or a further one by its word. Nothing has changed.")) }
                         let (was, limit) = (routing.account_usd.get(&account).copied(), usd());
                         match limit { Some(n) => { routing.account_usd.insert(account.clone(), n); } None => { routing.account_usd.remove(&account); } }
                         if newer { match money("daily") { Some(n) => { routing.account_daily_usd.insert(account.clone(), n); } None => { routing.account_daily_usd.remove(&account); } } }
+                        if account != "aws" && !["", "none"].contains(&field("budget").as_str()) { return Ok(message(400, "A budget in the account itself is AWS's", "")) }
+                        if account == "aws" {
                         // The account's own budget in AWS, for the same monthly limit: nothing, AWS's emails, or its
                         // emails and the rule that stops new machines at the limit (`lift` takes that rule off the
                         // role). Not said: as it is, kept in step with the limit. It is made, changed and removed
@@ -3794,6 +3797,7 @@ impl Dashboard {
                             self.budget_lifted.insert(plane.plane_id().to_string(), now_ms());
                         }
                         routing.aws_budget = want;
+                        }
                     }
                     // Limits: the largest machine a label may ask for; public repositories allowed to run here.
                     "max_cpu" => routing.max_cpu = field("max_cpu").parse().ok().filter(|n: &u32| *n >= 1 && *n <= 192 && *n != MAX_CPU),
@@ -6296,13 +6300,23 @@ fn spending_card(v: &PlaneView, lifted_ms: u64) -> String {
     let routing = v.routing();
     let daily = v.daily_limits();
     let estimate = "Limits count the machines jobs ran on, as estimated here. A cloud's bill also has storage and small fees, and jobs already running finish.";
-    struct Row { id: &'static str, action: &'static str, account: &'static str, mark: String, name: String, what: &'static str, month: (f64, Option<f64>), day: (f64, Option<f64>), at_limit: &'static str }
-    let mut rows = vec![Row { id: "all", action: "monthly_usd", account: "", mark: brand_logo(32), name: "Everything".into(), what: "All providers together. At a limit no job starts until it is over.",
+    struct Row { id: String, action: &'static str, account: String, mark: String, name: String, what: &'static str, month: (f64, Option<f64>), day: (f64, Option<f64>), at_limit: &'static str }
+    let mut rows = vec![Row { id: "all".into(), action: "monthly_usd", account: String::new(), mark: brand_logo(32), name: "Everything".into(), what: "All providers together. At a limit no job starts until it is over.",
         month: (v.spend_total(), routing.monthly_usd), day: (v.spend_today_total(), routing.daily_usd), at_limit: "At a limit no job starts, until the month (or the day, UTC) is over or the limit is raised." }];
     let aws = aws_account(v).filter(|_| v.order().iter().any(|p| p.cloud == "aws"));
     if let Some(account) = &aws {
-        rows.push(Row { id: "aws", action: "account_usd", account: "aws", mark: logo("aws", 32), name: format!("AWS account {account}"), what: "Its spot and on-demand machines together. At a limit, jobs go to other providers.",
+        rows.push(Row { id: "aws".into(), action: "account_usd", account: "aws".into(), mark: logo("aws", 32), name: format!("AWS account {account}"), what: "Its spot and on-demand machines together. At a limit, jobs go to other providers.",
             month: (v.spend_account("aws"), routing.account_usd.get("aws").copied()), day: (v.spend_today_account("aws"), routing.account_daily_usd.get("aws").copied()),
+            at_limit: "At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so." });
+    }
+    // Every other account that runs jobs: its runners together.
+    let records = v.records();
+    let mut others: Vec<String> = vec![];
+    v.order().iter().map(|p| records.account_of(&p.cloud).to_string()).filter(|a| a != "aws").for_each(|a| if !others.contains(&a) { others.push(a) });
+    for account in others {
+        let provider = records.accounts.iter().find(|a| a.name == account).map_or(account.as_str(), |a| a.provider.as_str()).to_string();
+        rows.push(Row { id: account.clone(), action: "account_usd", account: account.clone(), mark: logo(&provider, 32), name: if account == provider { format!("{} account", cloud_name(&provider)) } else { account.clone() }, what: "Its runners together. At a limit, jobs go to other providers.",
+            month: (v.spend_account(&account), routing.account_usd.get(&account).copied()), day: (v.spend_today_account(&account), routing.account_daily_usd.get(&account).copied()),
             at_limit: "At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so." });
     }
     // AWS's own budget for the account (see `aws_budget`), and whether its rule is on the control plane's role now:

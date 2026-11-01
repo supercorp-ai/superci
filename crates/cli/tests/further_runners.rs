@@ -71,10 +71,29 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     assert!(order.as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two" && p["max_jobs"] == 3 && p["monthly_usd"] == 25.0), "{order}");
     let (ok, said) = run(&["runners", "order", "modal-acme-two", "modal"]);
     assert!(ok && said.contains("Order: modal-acme-two, modal."), "{said}");
+    // Its account's limits, by the account's word; AWS's own budget is AWS's alone.
+    let (ok, said) = run(&["accounts", "update", "modal-acme-two", "--monthly-usd=100", "--daily-usd=10"]);
+    assert!(ok && said.contains("modal-acme-two spent $0.00 on machines this month, of $100 allowed.") && said.contains("$10 allowed"), "{said}");
+    let (ok, said) = run(&["accounts", "update", "modal", "--monthly-usd=50"]);
+    assert!(ok && said.contains("The Modal account spent $0.00 on machines this month, of $50 allowed."), "{said}");
+    let (ok, said) = run(&["limits", "retrieve"]);
+    assert!(ok && said.contains("The account modal-acme-two spent $0.00") && said.contains("superci accounts update modal-acme-two"), "{said}");
+    let kept = stored(&served);
+    assert_eq!((&kept["routing"]["account_usd"]["modal-acme-two"], &kept["routing"]["account_daily_usd"]["modal-acme-two"]), (&serde_json::json!(100.0), &serde_json::json!(10.0)), "{kept}");
+    for (args, why) in [(&["accounts", "update", "modal-acme-two", "--aws-budget=emails"][..], "a budget in the account itself is AWS's"), (&["accounts", "update", "globex", "--monthly-usd=5"], "globex is not an account of this CI"), (&["accounts", "update"], "Say which")] {
+        let (ok, said) = run(args);
+        assert!(!ok && said.contains(why), "{args:?}: {said}");
+    }
     // The dashboard: its row, under its word, with Modal's logo and its workspace; nothing left to add.
     let (mut child, link) = common::dashboard(&home);
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=runners&fragment=1").1) }).find(|p| p.contains("modal-acme-two")).unwrap_or_default();
     assert!(page.contains("Sandboxes in the Modal workspace acme-two"), "{page}");
+    let settings = words(&part(&link, "/?p=runners&fragment=1").1);
+    assert!(settings.contains("Its runners together") && settings.contains("Modal account"), "{settings}");
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "globex"), ("usd", "5")]);
+    assert!(status == 400 && words(&said).contains("Which account?"), "{status}");
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "modal"), ("usd", "5"), ("budget", "emails")]);
+    assert!(status == 400 && words(&said).contains("A budget in the account itself is AWS's"), "{status}");
     assert!(!words(&part(&link, "/?p=add-runners&fragment=1").1).contains("as the runner"));
     let _ = child.kill();
     // Asked for again under another word, or its word asked for by another workspace: a word is for good.

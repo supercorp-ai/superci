@@ -50,8 +50,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "What GitHub says of the events it sent your control plane lately: for a job that never got a machine.\n\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
     ("projects", "  superci projects list [--gitlab=ID]\n  superci projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci projects update --all --enabled=true [--gitlab=ID]",
         "The projects a GitLab connection's token reaches (on GitHub, repositories are chosen where the App is installed).\n\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
-    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update aws [--monthly-usd=N|none] [--daily-usd=N|none]\n                              [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
-        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month and in a day (UTC), its spot and on-demand\n          machines together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
+    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update ACCOUNT [--monthly-usd=N|none] [--daily-usd=N|none]\n                                  [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
+        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most an account (aws, cloudflare, modal, or a further one by its word) may spend on machines in a month\n          and in a day (UTC), its runners together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
     ("usage", "  superci usage retrieve [--period=day|week|month]",
         "What jobs used in the last 24 hours (day, unless given), 7 days or 30 days: how many ran, their machines' minutes and\nthe minutes GitHub or GitLab would bill (each job rounded up to a minute), what they cost, and what the code host's\nown runners of the same sizes would have charged."),
     ("artifacts", "  superci artifacts list --run=ID\n  superci artifacts retrieve NAME --run=ID [--out=DIR]",
@@ -995,23 +995,32 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         // An account's limit for a month, its providers together (AWS: spot and on-demand machines).
         ("accounts", "update") => {
-            if w(2) != "aws" { return usage("Say which cloud's: `superci accounts update aws --monthly-usd=200`. Another provider's limit is its own: `superci runners update CLOUD --monthly-usd=N`.") }
+            let account = w(2);
+            if account.is_empty() { return usage("Say which: `superci accounts update aws --monthly-usd=200` (or cloudflare, modal, or a further account's word).") }
             if !["monthly-usd", "daily-usd", "aws-budget"].iter().any(|f| args.has(f)) { return usage("Say what to change: `superci accounts update aws --monthly-usd=200` (see `superci help accounts`).") }
             let budget = args.get("aws-budget");
+            if account != "aws" && (budget.is_some() || args.has("email")) { return usage("--aws-budget and --email are for aws: a budget in the account itself is AWS's.") }
             if budget.is_some_and(|b| !["none", "emails", "stops", "lift"].contains(&b)) { return usage("--aws-budget is none, emails, stops or lift (see `superci help accounts`).") }
             let mut d = signed_in();
             to_set(&mut d)?;
             in_use(&d)?;
-            let now = view(&mut d)?.routing();
-            let (month, day) = (given_dollars(args, "monthly-usd", now.account_usd.get("aws").copied())?, given_dollars(args, "daily-usd", now.account_daily_usd.get("aws").copied())?);
-            let mut fields = vec![field("action", "account_usd"), field("account", "aws"), field("usd", month.clone()), field("daily", day.clone())];
+            let seen = view(&mut d)?;
+            if account != "aws" && !CLOUDS.contains(&account) && !seen.records().accounts.iter().any(|a| a.name == account) { return usage(format!("{account} is not an account of this CI.")) }
+            let now = seen.routing();
+            let (month, day) = (given_dollars(args, "monthly-usd", now.account_usd.get(account).copied())?, given_dollars(args, "daily-usd", now.account_daily_usd.get(account).copied())?);
+            let mut fields = vec![field("action", "account_usd"), field("account", account), field("usd", month.clone()), field("daily", day.clone())];
             if let Some(b) = budget { fields.push(field("budget", b)) }
             if let Some(email) = args.get("email") { fields.push(field("email", email)) }
             let in_aws = match budget { Some("none") => "; no budget in AWS itself", Some("emails") => "; AWS emails at 80% and 100% of it", Some("stops") => "; AWS emails, and stops new machines at 100% of it", Some("lift") => "; AWS's rule taken off the control plane's role", _ => "" };
-            apply!(d, args, format!("let the AWS account spend on machines {} a month and {} a day (spot and on-demand together){in_aws}", or_no_limit(&month), or_no_limit(&day)), "/routing", &fields);
+            let whose = if account == "aws" { "The AWS account".to_string() } else if CLOUDS.contains(&account) { format!("The {} account", superci_core::plane::cloud_name(account)) } else { account.to_string() };
+            let together = if account == "aws" { "spot and on-demand together" } else { "its runners together" };
+            apply!(d, args, format!("let {} spend on machines {} a month and {} a day ({together}){in_aws}", whose.replacen("The", "the", 1), or_no_limit(&month), or_no_limit(&day)), "/routing", &fields);
             let v = view(&mut d)?;
             let routing = v.routing();
-            let (spent, cap, today, day_cap) = (v.spend_account("aws"), routing.account_usd.get("aws").copied(), v.spend_today_account("aws"), routing.account_daily_usd.get("aws").copied());
+            let (spent, cap, today, day_cap) = (v.spend_account(account), routing.account_usd.get(account).copied(), v.spend_today_account(account), routing.account_daily_usd.get(account).copied());
+            if account != "aws" {
+                return Ok(Done { said: vec![month_line(&whose, spent, cap), day_line(today, day_cap)], data: json!({ "ok": true, "cloud": account, "monthly_usd": cap, "spent_usd": spent, "daily_usd": day_cap, "spent_today_usd": today }) })
+            }
             let said_budget = match &routing.aws_budget { None => "No budget in AWS itself.", Some(b) if b.stop => "In AWS itself: emails at 80% and 100% of the month's limit, and no new machines at 100%.", Some(_) => "In AWS itself: emails at 80% and 100% of the month's limit." };
             Ok(Done { said: vec![month_line("The AWS account", spent, cap), day_line(today, day_cap), said_budget.to_string()],
                 data: json!({ "ok": true, "cloud": "aws", "monthly_usd": cap, "spent_usd": spent, "daily_usd": day_cap, "spent_today_usd": today, "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) }) })
@@ -1474,12 +1483,19 @@ fn other_limits(v: &crate::view::PlaneView) -> (Vec<String>, Value) {
             Some(_) => "In AWS itself: a budget that emails at 80% and 100% of the account's monthly limit.".to_string(),
         });
     }
+    // Every other account with a limit.
+    let accounts: Vec<Value> = routing.account_usd.keys().chain(routing.account_daily_usd.keys()).filter(|a| *a != "aws").collect::<std::collections::BTreeSet<_>>().into_iter().map(|a| {
+        let (month, day) = (routing.account_usd.get(a).copied(), routing.account_daily_usd.get(a).copied());
+        said.push(format!("{} (`superci accounts update {a} --monthly-usd=N --daily-usd=N`)", month_line(&format!("The account {a}"), v.spend_account(a), month).trim_end_matches('.')));
+        if day.is_some() { said.push(format!("  {}", day_line(v.spend_today_account(a), day))) }
+        json!({ "account": a, "monthly_usd": month, "daily_usd": day, "spent_usd": v.spend_account(a), "spent_today_usd": v.spend_today_account(a) })
+    }).collect();
     let pools: Vec<Value> = routing.order.iter().filter_map(|p| p.monthly_usd.map(|cap| {
         said.push(format!("{} spent ${:.2} this month, of {} allowed (`superci runners update {} --monthly-usd=N`).", superci_core::plane::cloud_name(&p.cloud), v.spend(&p.cloud), superci_core::plane::dollars(cap), p.cloud));
         json!({ "cloud": p.cloud, "monthly_usd": cap, "spent_usd": v.spend(&p.cloud) })
     })).collect();
     let data = json!({ "aws_account": aws.then(|| json!({ "monthly_usd": month, "daily_usd": day, "spent_usd": v.spend_account("aws"), "spent_today_usd": v.spend_today_account("aws"),
-        "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) })), "providers": pools });
+        "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) })), "accounts": accounts, "providers": pools });
     (said, data)
 }
 
