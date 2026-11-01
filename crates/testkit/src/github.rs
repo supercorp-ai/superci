@@ -337,8 +337,8 @@ impl GitHub {
         let path = url.path().to_string();
         let ok = |status: u16, v: Value| Some(Response::new(status, "application/json; charset=utf-8", v.to_string()));
         if r.url.starts_with(LOGS_AT) {
-            if let Some(run) = path.rsplit('/').next()?.strip_prefix("run-") { return self.hub.lock().unwrap().run_logs.get(&run.parse().ok()?).map(|z| Response::new(200, "application/zip", z.clone())) }
-            let id: u64 = path.rsplit('/').next()?.parse().ok()?;
+            if let Some(run) = path.rsplit('/').next().unwrap().strip_prefix("run-") { return self.hub.lock().unwrap().run_logs.get(&run.parse().ok()?).map(|z| Response::new(200, "application/zip", z.clone())) }
+            let id: u64 = path.rsplit('/').next().unwrap().parse().ok()?;
             return self.hub.lock().unwrap().logs.get(&id).map(|l| Response::new(200, "text/plain", l.clone()));
         }
         // S3, at `<bucket>.s3.<region>.amazonaws.com` (a link signed or a call signed alike): put, read, and asked of.
@@ -561,7 +561,7 @@ impl Http for GitHub {
                     let (status, headers, body) = crate::sweep::failed_answer(&r.url, &target);
                     let mut res = Response::new(status, "application/json", body);
                     res.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
-                    for (k, v) in headers { res = res.with_header(&k, &v) }
+                    res = headers.into_iter().fold(res, |res, (k, v)| res.with_header(&k, &v));
                     return Ok(res)
                 }
                 None => {}

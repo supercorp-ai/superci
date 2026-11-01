@@ -230,7 +230,7 @@ mod tests {
         assert!(said(e).contains("thrown"));
         let e = catch_unwind(AssertUnwindSafe(|| b.click_within("nav", "", Duration::ZERO))).unwrap_err();
         assert!(said(e).contains("nothing to click"));
-        let e = catch_unwind(AssertUnwindSafe(|| b.click_within("#under", "", Duration::ZERO))).unwrap_err();
+        let e = catch_unwind(AssertUnwindSafe(|| b.click_within("#under", "", Duration::from_millis(300)))).unwrap_err();
         assert!(said(e).contains("not clickable"));
         let shot = std::env::temp_dir().join(format!("superci-shot-{}.png", std::process::id()));
         b.screenshot(&shot);

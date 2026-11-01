@@ -97,7 +97,8 @@ fn a_control_plane_that_panics_is_kept_and_answers_the_next_request() {
         served.github.during("POST", "", || panic!("in a call to GitHub"));
         let (_, webhook) = served.github.queue("build", "superci", served.now_ms());
         served.webhook(webhook);
-        assert!(served.faults().panics().iter().any(|p| p.contains("in a call to GitHub")), "{:?}", served.faults().panics());
+        // (Kept once it has unwound, and its connection, which the webhook's answer ended with, closed before that.)
+        assert!(within(std::time::Duration::from_secs(5), || served.faults().panics().iter().any(|p| p.contains("in a call to GitHub"))), "{:?}", served.faults().panics());
         assert!(raw(&served.url, b"GET /health HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 200"));
     }
 }
@@ -568,6 +569,7 @@ fn a_launcher_answers_what_it_can_and_a_control_plane_here_is_asked_as_it_is() {
     assert_eq!(ask(&g, "POST", &format!("{workers}/other"), b"").0, 404);
     assert_eq!(ask(&g, "GET", &format!("{workers}/launch"), b"").0, 404);
     assert_eq!(ask(&g, "POST", "https://other.example/launch", b"").0, 404);
+    assert_eq!(ask(&g, "POST", "mailto:a@example.com", b"").0, 404);
     // Nothing there; and there, with a query, its headers as they were.
     assert_eq!(ask(&g, "GET", "http://127.0.0.1:1/x", b"").0, 502);
     let served = serve(|_| {});

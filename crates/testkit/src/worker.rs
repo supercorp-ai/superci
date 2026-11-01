@@ -225,10 +225,11 @@ fn broke(w: &Worker) -> Vec<String> {
 /// hold whatever fails (nothing panics; and the scenario's own checks: what it returns). The clean run alone unless
 /// `SUPERCI_SWEEP_FAULTS=1`, and this run's slice of the faults (`SUPERCI_SWEEP_SLICE`), as every sweep.
 pub fn sweep(name: &str, start: impl Fn() -> Option<Worker>, scenario: impl Fn(&Worker) -> Vec<String>) {
-    sweep_as(name, std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() == Some("1"), start, scenario)
+    sweep_as(name, (std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() == Some("1")).then(crate::sweep::slice), start, scenario)
 }
 
-fn sweep_as(name: &str, faulted: bool, start: impl Fn() -> Option<Worker>, scenario: impl Fn(&Worker) -> Vec<String>) {
+/// (`slice`: this run's slice of its faults, when it makes them.)
+fn sweep_as(name: &str, slice: Option<(usize, usize)>, start: impl Fn() -> Option<Worker>, scenario: impl Fn(&Worker) -> Vec<String>) {
     let run = |fault: Fault| -> Option<(Vec<String>, usize)> {
         let w = start()?;
         w.aws.faults.arm(fault);
@@ -238,8 +239,7 @@ fn sweep_as(name: &str, faulted: bool, start: impl Fn() -> Option<Worker>, scena
     };
     let Some((problems, calls)) = run(Fault::None) else { return };
     assert!(problems.is_empty(), "{name}, clean: {}", problems.join("\n  "));
-    if !faulted { return }
-    let (k0, n) = crate::sweep::slice();
+    let Some((k0, n)) = slice else { return };
     let faults: Vec<Fault> = (1..=calls).flat_map(|k| [Fault::Call(k), Fault::Dropped(k)]).enumerate().filter(|(i, _)| i % n == k0 - 1).map(|(_, f)| f).collect();
     let broken: Vec<String> = faults.into_iter().map_while(|f| run(f).map(|(problems, _)| (f, problems))).filter(|(_, problems)| !problems.is_empty()).map(|(f, problems)| format!("{f}: {}", problems.join("\n    "))).collect();
     assert!(broken.is_empty(), "{name}: {} of the faults broke it:\n  {}", broken.len(), broken.join("\n  "));
@@ -428,22 +428,23 @@ mod tests {
 
     #[test]
     fn a_workers_sweep_runs_each_fault_and_says_what_broke() {
+        const ALL: Option<(usize, usize)> = Some((1, 1));
         let n = std::sync::atomic::AtomicUsize::new(0);
         let start = || Some(standing(&format!("sweep-{}", n.fetch_add(1, std::sync::atomic::Ordering::SeqCst)), "exit 0", ""));
         let one_call = |w: &Worker| { w.aws.faults.call("a call".into()); vec![] };
         // No Worker here: nothing done.
-        sweep_as("none", true, || None, one_call);
+        sweep_as("none", ALL, || None, one_call);
         sweep("clean", start, |_| vec![]);
-        sweep_as("not faulted", false, start, one_call);
-        sweep_as("no call", true, start, |_| vec![]);
-        sweep_as("each", true, start, one_call);
+        sweep_as("not faulted", None, start, one_call);
+        sweep_as("no call", ALL, start, |_| vec![]);
+        sweep_as("each", ALL, start, one_call);
         // None by the second start: no more.
         let first = std::sync::atomic::AtomicBool::new(true);
-        sweep_as("gone", true, || first.swap(false, std::sync::atomic::Ordering::SeqCst).then(|| standing("sweep-gone", "exit 0", "")), one_call);
+        sweep_as("gone", ALL, || first.swap(false, std::sync::atomic::Ordering::SeqCst).then(|| standing("sweep-gone", "exit 0", "")), one_call);
         let said = |p: Box<dyn std::any::Any + Send>| p.downcast_ref::<String>().cloned().unwrap_or_default();
-        let e = catch_unwind(AssertUnwindSafe(|| sweep_as("clean breaks", true, start, |_| vec!["it broke".to_string()]))).unwrap_err();
+        let e = catch_unwind(AssertUnwindSafe(|| sweep_as("clean breaks", ALL, start, |_| vec!["it broke".to_string()]))).unwrap_err();
         assert!(said(e).contains("clean breaks, clean: it broke"));
-        let e = catch_unwind(AssertUnwindSafe(|| sweep_as("a fault breaks", true, start, |w| { w.aws.faults.call("a call".into()); if w.aws.faults.fired().is_empty() { vec![] } else { vec!["it broke".to_string()] } }))).unwrap_err();
+        let e = catch_unwind(AssertUnwindSafe(|| sweep_as("a fault breaks", ALL, start, |w| { w.aws.faults.call("a call".into()); if w.aws.faults.fired().is_empty() { vec![] } else { vec!["it broke".to_string()] } }))).unwrap_err();
         assert!(said(e).contains("a fault breaks: 2 of the faults broke it"));
     }
 }
