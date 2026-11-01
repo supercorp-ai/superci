@@ -111,6 +111,8 @@ impl PlaneView {
     pub fn clouds(&self) -> Vec<String> {
         let own = self.status.as_ref().and_then(|s| s["own_cloud"].as_str().map(str::to_string)).unwrap_or_else(|| "cloudflare".into());
         let mut c: Vec<String> = self.aws.then(|| "aws".to_string()).into_iter().chain(self.own_containers().then_some(own)).chain(self.launchers().into_iter().map(|a| a.cloud)).collect();
+        // (A further AWS account by its word; its on-demand machines come with the order, as AWS's first's.)
+        c.extend(self.status.as_ref().and_then(|s| s["aws_further"].as_array().cloned()).unwrap_or_default().iter().filter(|a| a["connected"] == true).filter_map(|a| a["name"].as_str().map(str::to_string)));
         c.dedup();
         c
     }
@@ -121,18 +123,24 @@ impl PlaneView {
         let routing = self.routing();
         let mut places = self.clouds();
         if let Some(at) = places.iter().position(|c| c == "aws") { places.insert(at + 1, AWS_ON_DEMAND.to_string()) }
+        let records = self.records();
+        let further: Vec<String> = places.iter().filter(|c| records.provider_of(c) == "aws" && *c != "aws" && *c != AWS_ON_DEMAND).cloned().collect();
+        for word in further { if let Some(at) = places.iter().position(|c| *c == word) { places.insert(at + 1, format!("{word}-on-demand")) } }
         let mut order: Vec<_> = routing.order.into_iter().filter(|p| places.contains(&p.cloud)).collect();
         for c in places {
             if order.iter().any(|p| p.cloud == c) { continue }
             let new = Pool { regions: vec![], off: false, cloud: c.clone(), max_jobs: None, monthly_usd: None };
-            match order.iter().position(|p| p.cloud == "aws") { Some(at) if c == AWS_ON_DEMAND => order.insert(at + 1, new), _ => order.push(new) }
+            match c.strip_suffix("-on-demand").and_then(|spot| order.iter().position(|p| p.cloud == spot)) { Some(at) => order.insert(at + 1, new), None => order.push(new) }
         }
         order
     }
     /// The regions a place of AWS's starts its machines in, in order: its own, of those the control plane is set up
     /// in; else all of those.
     pub fn pool_regions(&self, pool: &superci_core::plane::Pool) -> Vec<String> {
-        let all = self.aws_regions();
+        // (A further account's, as its connection has them.)
+        let account = self.records().account_of(&pool.cloud).to_string();
+        let further = self.status.as_ref().and_then(|s| s["aws_further"].as_array().cloned()).unwrap_or_default().into_iter().find(|a| a["name"] == account.as_str()).map(|a| a["regions"].as_array().cloned().unwrap_or_default().iter().filter_map(|r| r.as_str().map(str::to_string)).collect::<Vec<String>>());
+        let all = further.unwrap_or_else(|| self.aws_regions());
         let own: Vec<String> = pool.regions.iter().filter(|r| all.contains(r)).cloned().collect();
         if own.is_empty() { all } else { own }
     }
