@@ -6772,12 +6772,21 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     let first = queued(1, "superci");
     assert_eq!((first["cloud"].as_str(), first["machine_id"].as_str()), (Some("modal-staging"), Some("sb-second")), "{first}");
     let launch = clouds.0.calls.borrow().iter().find(|c| c.1 == "https://second.modal.example/launch").map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap()).expect("its launcher");
+    // (Woken first: a launcher starting from nothing would cut a launch off.)
+    let asked: Vec<String> = clouds.0.calls.borrow().iter().map(|c| c.1.clone()).filter(|u| u.starts_with("https://second.modal.example")).collect();
+    assert_eq!(asked[..2], ["https://second.modal.example/health".to_string(), "https://second.modal.example/launch".to_string()]);
     assert_eq!(launch["max_minutes"], 1440, "what Modal lets a machine live, not a longer one");
     // At its own limit of jobs at once: the next runner, priced alike. A label naming the provider means either.
     let second = queued(2, "superci");
     assert_eq!((second["cloud"].as_str(), second["machine_id"].as_str()), (Some("modal"), Some("sb-first")), "{second}");
     assert_eq!(first["usd_per_hour"], second["usd_per_hour"]);
     assert_eq!(queued(3, "superci/provider=modal")["cloud"], "modal");
+    // A note of waiting goes when its job runs: whatever it waited for is over.
+    let mut waited = job(&store, 2);
+    (waited["error"], waited["runner"]) = ("waiting: starting its machine failed, trying again".into(), format!("superci-{PLANE_ID}-2").into());
+    store.0.borrow_mut().insert("job:2".into(), waited.to_string());
+    block_on(plane.handle(job_event("in_progress", 2, "acme/app", Some(&format!("superci-{PLANE_ID}-2")))));
+    assert_eq!(job(&store, 2)["error"], serde_json::Value::Null, "{}", job(&store, 2));
     // A provider with no runner here is said as that.
     assert!(queued(4, "superci/provider=cloudflare")["error"].as_str().is_some_and(|e| e.contains("its label needs Cloudflare runners")), "{}", job(&store, 4));
 
@@ -6828,6 +6837,7 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     let two = serde_json::json!({ "name": "modal-two", "account": "modal" });
     refused(serde_json::json!([set(&["runners"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
     assert_eq!(write(serde_json::json!([account("modal", "modal")])).status, 200, "a provider's first account may have a record");
+    assert_eq!(write(serde_json::json!([account("modal-2", "modal")])).status, 200, "digits in a word");
     assert_eq!(write(serde_json::json!([set(&["routing", "account_usd", "modal"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], serde_json::Value::Null, None)])).status, 200);
 
     // A provider's other runner not added here, first in the order: passed over, said as not connected only if nothing runs it.

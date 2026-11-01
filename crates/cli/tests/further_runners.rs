@@ -301,3 +301,87 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     assert!(record["runners"].as_array().unwrap().iter().all(|r| r["gone"] == true) && !record["routing"]["order"].as_array().is_some_and(|o| o.iter().any(|p| p["cloud"].as_str().is_some_and(|c| c.starts_with("aws-acme")))), "{record}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// An AWS control plane with further AWS accounts already connected: `words`, each `(word, account)`.
+fn with_further_aws(served: &superci_testkit::Served, words: &[(&str, &str)]) {
+    let record = serde_json::json!({ "version": 1, "routing": {}, "launchers": [],
+        "accounts": words.iter().map(|(w, id)| serde_json::json!({ "name": w, "provider": "aws", "cloud_id": id })).collect::<Vec<_>>(),
+        "runners": words.iter().flat_map(|(w, _)| [serde_json::json!({ "name": w, "account": w }), serde_json::json!({ "name": format!("{w}-on-demand"), "account": w, "on_demand": true })]).collect::<Vec<_>>() });
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+    for (w, id) in words {
+        served.store.0.lock().unwrap().insert(format!("aws:connection:{w}"), serde_json::json!({ "account_id": id, "region": "eu-west-1", "role_arn": format!("arn:aws:iam::{id}:role/superci-plane-{PLANE}"), "connected": true, "error": null, "name": w, "regions": ["eu-west-1"] }).to_string());
+    }
+}
+
+fn own_aws(c: &mut superci_core::plane::Config) {
+    (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+}
+
+/// Signed in to the first AWS account and to 222222222222.
+fn signed_in_two_aws(served: &superci_testkit::Served) -> std::path::PathBuf {
+    let home = common::signed_in(served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut other = kept["aws"].clone();
+    other["account_id"] = "222222222222".into();
+    kept["aws_more"] = serde_json::json!([other]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    home
+}
+
+/// Updating gives each further AWS account's role what this version asks for, with its own sign-in, and names the rest.
+#[test]
+fn an_update_gives_each_further_aws_role_its_permissions_and_names_those_it_cannot() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    with_further_aws(&served, &[("aws-acme", "222222222222"), ("aws-globex", "333333333333")]);
+    let home = signed_in_two_aws(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", "ec2.eu-west-1"), &[]);
+    let o = common::command(&home).args(["planes", "update"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("The roles of aws-globex were not updated: sign in to their AWS accounts"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move brings a further AWS account along: a role for the new control plane there, its connection in the new one;
+/// one not signed in to stays behind, said. Deleting the old one then takes its part in the account signed in to.
+#[test]
+fn a_move_brings_further_aws_accounts_and_deleting_the_old_control_plane_cleans_up() {
+    let served = serve(own_aws);
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    with_further_aws(&served, &[("aws-acme", "222222222222"), ("aws-globex", "333333333333")]);
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| { c.read_settings(&aws.settings("testplane0002")); own_aws(c) });
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/CONTAINERS", "off");
+    let home = signed_in_two_aws(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", "ec2.eu-west-1"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
+    let theirs: serde_json::Value = serde_json::from_str(&new.store.0.lock().unwrap()["settings"]).unwrap();
+    assert_eq!(theirs["runners"].as_array().unwrap().len(), 4, "{theirs}");
+    assert!(new.store.0.lock().unwrap().contains_key("aws:connection:aws-acme"), "its connection, in the new one");
+    assert!(!new.store.0.lock().unwrap().contains_key("aws:connection:aws-globex"), "not signed in to");
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("aws-globex stayed behind")).unwrap_or_default();
+    assert!(page.contains("sign in to AWS account 333333333333"), "{page}");
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
+    assert!(status == 303, "{status} {to} {}", words(&said));
+    let page = (0..80).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("Its role in AWS account 333333333333")).unwrap_or_default();
+    assert!(page.contains("sign in with AWS to remove it"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

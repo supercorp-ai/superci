@@ -3604,6 +3604,10 @@ impl<'a> ControlPlane<'a> {
                         job.cpu = Some(size.cpu);
                         // (Priced as its capacity is had: Cloudflare's, else Modal's, see `capacity_of`.)
                         let provider = self.config.records.provider_of(&a.cloud);
+                        // A Modal launcher not asked for a while starts from nothing, longer than a call waits with
+                        // a machine to start on top: a launch cut off that way still starts one nothing knows of.
+                        // Woken first, whatever it answers.
+                        if provider == "modal" { let _ = self.http.send(Request::new("GET", &format!("{}/health", a.url))).await; }
                         job.usd_per_hour = Some(if provider == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) });
                         if provider == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
@@ -4021,6 +4025,8 @@ impl<'a> ControlPlane<'a> {
             }
             j.for_job = None;
             j.seen_in_progress = true;
+            // (Whatever it waited for is over.)
+            if j.error.as_deref().is_some_and(|e| e.starts_with("waiting")) { j.error = None }
             // A machine left idle by a cancelled job (an orphan) that took a job before the sweep came is busy too.
             if j.state == "launched" || j.state == "orphan" { j.state = "running".into(); }
             j.started_ms.get_or_insert(self.clock.now_ms());
