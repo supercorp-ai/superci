@@ -51,7 +51,7 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     // Its launcher in its own workspace, under the provider and the workspace's name.
     deploy_answers(&served);
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
-    assert!(ok && said.contains("modal runs jobs now."), "{said}");
+    assert!(ok && said.contains("modal-acme-two runs jobs now."), "{said}");
     let kept = stored(&served);
     assert_eq!(kept["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two" }]), "{kept}");
     assert_eq!(kept["accounts"], serde_json::json!([{ "name": "modal-acme-two", "provider": "modal", "cloud_id": "acme-two" }]), "{kept}");
@@ -87,5 +87,66 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
     assert!(ok, "{said}");
     assert_eq!(stored(&served)["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two" }]));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Further runners already on the control plane: `words`, each in a workspace named after the word.
+fn with_further(served: &superci_testkit::Served, plane: &str, words: &[&str]) {
+    let launcher = |word: &str, workspace: &str| serde_json::json!({ "cloud": word, "url": format!("https://{workspace}--superci-runners-{plane}.modal.run") });
+    let mut launchers = vec![launcher("modal", "acmeorg")];
+    launchers.extend(words.iter().map(|w| launcher(w, w.trim_start_matches("modal-"))));
+    served.aws.put(&format!("/superci/{plane}/LAUNCHERS"), &serde_json::Value::Array(launchers.clone()).to_string());
+    let record = serde_json::json!({ "version": 1, "routing": {}, "launchers": launchers,
+        "accounts": words.iter().map(|w| serde_json::json!({ "name": w, "provider": "modal", "cloud_id": w.trim_start_matches("modal-") })).collect::<Vec<_>>(),
+        "runners": words.iter().map(|w| serde_json::json!({ "name": w, "account": w })).collect::<Vec<_>>() });
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+}
+
+fn sandboxes_made(served: &superci_testkit::Served) -> usize { served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxCreate"))).count() }
+
+/// Updating deploys each Modal launcher in its own workspace, and says which it could not reach.
+#[test]
+fn an_update_deploys_each_modal_launcher_with_its_own_workspaces_sign_in_and_names_those_it_cannot() {
+    let (served, home) = two_workspaces();
+    with_further(&served, PLANE, &["modal-acme-two", "modal-globex"]);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", PLANE), ("http://new-plane.test", &served.url)]);
+    deploy_answers(&served);
+    let o = common::command(&home).args(["planes", "update"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Its Modal launchers modal-globex were not updated: sign in to their workspaces (`superci login modal --add`)"), "{said}");
+    assert_eq!(sandboxes_made(&served), 2, "one in each workspace signed in to");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move brings the further runners along: each launcher deployed again for the new control plane in its own workspace,
+/// the records with them; one whose workspace is not signed in to stays behind, said.
+#[test]
+fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind() {
+    let (served, home) = two_workspaces();
+    with_further(&served, PLANE, &["modal-acme-two", "modal-globex"]);
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/CONTAINERS", "off");
+    { let mut w = served.aws.workers.lock().unwrap(); for workspace in ["acmeorg", "acme-two"] { w.insert(format!("{workspace}--superci-runners-testplane0002.modal.run"), new.url.clone()); } }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    deploy_answers(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
+    let theirs: serde_json::Value = serde_json::from_str(&new.store.0.lock().unwrap()["settings"]).unwrap();
+    assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two" && a["url"].as_str().unwrap().contains("acme-two--superci-runners-testplane0002")), "{theirs}");
+    assert!(!theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-globex"), "{theirs}");
+    assert_eq!(theirs["runners"].as_array().unwrap().len(), 2, "{theirs}");
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("modal-globex stayed behind")).unwrap_or_default();
+    assert!(page.contains("sign in to the Modal workspace globex"), "{page}");
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

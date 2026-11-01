@@ -2868,7 +2868,7 @@ impl Dashboard {
                         _ => self.cf.is_some(),
                     };
                     if !signed_in {
-                        let whom = if cloud == "aws" { format!(" to account {}", account.as_deref().unwrap_or("")) } else if is_modal { format!(" to the Modal workspace {}", launcher_workspace(&launcher_url)) } else { String::new() };
+                        let whom = if cloud == "aws" { format!(" to account {}", account.as_deref().unwrap_or("")) } else if is_modal && !launcher_url.is_empty() { format!(" to the Modal workspace {}", launcher_workspace(&launcher_url)) } else { String::new() };
                         return Ok(message(403, &format!("Sign in with {name} first"), &format!("Sign in{} to delete what SuperCI made there, or remove it from SuperCI only.", esc(&whom))))
                     }
                 }
@@ -5123,7 +5123,7 @@ mark();load()})();</script>"#;
         let records = view::records_in(&status);
         for a in status["launchers"].as_array().into_iter().flatten().filter(|a| a["cloud"].as_str().is_some_and(|c| records.provider_of(c) == "modal" && !(c == "modal" && matches!(plane, Plane::Modal { .. })))) {
             let url = a["url"].as_str().unwrap_or_default();
-            match self.modal_of_launcher(url) { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None => left.push(format!("Its launcher in the Modal workspace {} (sign in there to remove it).", launcher_workspace(url))) }
+            match self.modal_of_launcher(url) { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None if a["cloud"] == "modal" => left.push("Its Modal launcher (sign in with Modal to remove it).".into()), None => left.push(format!("Its launcher in the Modal workspace {} (sign in there to remove it).", launcher_workspace(url))) }
         }
         if let (Some(account), false) = (status["aws"]["account_id"].as_str(), matches!(plane, Plane::Aws { .. })) {
             match (&mut self.aws, account) {
@@ -10472,6 +10472,83 @@ mod rest_tests {
         // With its key: read as it answers (here not at all).
         d.keyed.insert("p0".into());
         assert!(d.current().unwrap().is_some_and(|v| !v.online));
+    }
+
+    /// `superci login modal --add`: another Modal workspace goes beside those signed in to, is kept with them, and the
+    /// one in hand follows the control plane in use. By #6, Taras Kornichuk.
+    #[test]
+    fn modal_workspaces_are_kept_beside_each_other_and_the_control_planes_is_in_hand() {
+        let f = Folder::new("modal-more");
+        let store = Store::at(f.0.join("workspaces/default"));
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.modal = Some(modal_session("acme"));
+        // Signed in again with --add: not done until one comes back.
+        (d.adding, d.task) = (true, Some(Task::Login(Some("modal"))));
+        assert!(d.task_done().is_none());
+        d.came_modal(modal_session("acme-two"));
+        d.came_modal(modal_session("acme-three"));
+        // The same workspace again: its token is renewed, not listed twice.
+        d.came_modal(modal::Session { token_id: "ak-new".into(), ..modal_session("acme-two") });
+        let workspaces = |d: &Dashboard| d.modal_accounts().iter().map(|m| m.workspace.clone()).collect::<Vec<_>>();
+        assert_eq!(workspaces(&d), ["acme", "acme-three", "acme-two"]);
+        assert!(d.task_done().is_some_and(|t| t.contains("Modal workspace acme, Modal workspace acme-three, Modal workspace acme-two")), "{:?}", d.task_done());
+        assert_eq!(d.other_accounts_signed_in().iter().filter(|(c, _)| *c == "modal").count(), 3);
+        assert_eq!((d.modal_for("acme-two").map(|m| m.token_id.as_str()), d.modal_for("globex").is_none()), (Some("ak-new"), true));
+        assert_eq!(d.modal_of_launcher("https://acme-three--superci-runners-p1.modal.run").map(|m| m.workspace.as_str()), Some("acme-three"));
+        assert!(d.modal_of_launcher("https://globex--superci-runners-p1.modal.run").is_none());
+        // Kept, and read back as they were, the kept control plane's in hand.
+        d.planes = vec![modal_plane("p1", NOWHERE)];
+        d.select(0);
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        d.keep();
+        let again = Dashboard::signed_in(Some(store.clone()));
+        assert_eq!((again.modal.as_ref().map(|m| m.workspace.clone()), workspaces(&again)), (Some("acme".into()), vec!["acme".to_string(), "acme-three".into(), "acme-two".into()]));
+        // Written by another process: taken in, in hand as it was.
+        let mut other = Dashboard::signed_in(Some(store.clone()));
+        other.came_modal(modal_session("acme-four"));
+        other.keep();
+        d.take_in();
+        assert_eq!(d.modal_accounts().len(), 4);
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        // A control plane in a workspace kept: its sign-in in hand; in one not kept: as it was.
+        d.hold_workspace("globex");
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        d.hold_workspace("acme-two");
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme-two"));
+        // Signed out: every one of them.
+        let said = d.sign_out().unwrap();
+        assert!(said.iter().any(|s| s.contains("SuperCI's Modal token is removed here")) && d.modal_accounts().is_empty(), "{said:?}");
+        d.modal_others = vec![modal_session("acme")];
+        assert!(d.sign_out().unwrap().iter().any(|s| s.contains("SuperCI's Modal token is removed here")));
+    }
+
+    /// A Modal workspace's word for its runner, and what cannot be one (see `Records`).
+    #[test]
+    fn a_modal_runners_word_stays_with_its_workspace() {
+        let launcher = |word: &str, workspace: &str| Launcher { cloud: word.into(), url: format!("https://{workspace}--superci-runners-p1.modal.run") };
+        let none = Records::default();
+        let first = [launcher("modal", "acme")];
+        // The first of a control plane elsewhere; its own again; one asked for as `modal`.
+        assert_eq!(modal_word(&[], &none, false, "acme", ""), Ok("modal".to_string()));
+        assert_eq!(modal_word(&[], &none, false, "acme", "modal"), Ok("modal".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "acme", ""), Ok("modal".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "acme", "modal"), Ok("modal".to_string()));
+        assert!(modal_word(&first, &none, false, "acme", "other").is_err_and(|e| e.contains("runs jobs as modal")));
+        // A further one: from its name, made safe; or as asked. In a Modal control plane, even the first.
+        assert_eq!(modal_word(&first, &none, false, "Acme_Two-", ""), Ok("modal-acme-two".to_string()));
+        assert_eq!(modal_word(&[], &none, true, "acme", ""), Ok("modal-acme".to_string()));
+        assert_eq!(modal_word(&[], &none, false, "acme", "staging"), Ok("staging".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "two", "staging"), Ok("staging".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "a-very-long-workspace-name-that-goes-on", "").map(|w| w.len()), Ok(31));
+        assert!(modal_word(&first, &none, false, "two", "No Way").is_err_and(|e| e.contains("a word is")));
+        // Another's: said when asked for; a few characters more when it was only the default. Its own, deleted: back.
+        let records = Records { accounts: vec![Account { name: "modal-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![RunnerRecord { name: "modal-two".into(), account: "modal-two".into(), gone: true }] };
+        assert!(modal_word(&first, &records, false, "other", "modal-two").is_err_and(|e| e.contains("another runner's word")));
+        assert!(modal_word(&first, &records, false, "other", "cloudflare").is_err_and(|e| e.contains("another runner's word")));
+        assert!(modal_word(&first, &records, false, "two", "").is_ok_and(|w| w.starts_with("modal-two-") && w.len() == 14));
+        assert_eq!(modal_word(&first, &records, false, "acme-two", ""), Ok("modal-two".to_string()));
+        assert_eq!(launcher_workspace("https://acme--x.modal.run"), "acme");
+        assert_eq!((launcher_workspace("https://nothing.modal.run"), launcher_workspace("nothing")), ("", ""));
     }
 
     #[test]
