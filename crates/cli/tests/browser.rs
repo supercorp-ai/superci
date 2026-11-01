@@ -15367,7 +15367,6 @@ mod dashboard_suite_in_browser {
         let served = superci_testkit::serve(|_| {});
         let home = common::signed_in(&served);
         let (mut child, link) = common::dashboard(&home);
-        let routing = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default();
         let post = |path: &str, fields: &[(&str, &str)]| common::post(&link, path, fields);
         assert_eq!(post("/routing", &[("action", "nothing-like-it")]).0, 400);
         let (status, _, said) = post("/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "maybe")]);

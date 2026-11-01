@@ -7568,9 +7568,9 @@ fn a_change_is_made_only_by_a_way_through_objects_and_lists() {
 fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     use superci_core::settings::{apply, diff, get as at, keyed, Change};
     let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let before = serde_json::json!({ "routing": { "max_cpu": 16, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }], "public_repos": ["acme/a"], "names": [] }, "launchers": [] });
+    let before = serde_json::json!({ "routing": { "max_cpu": 16, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }], "public_repos": ["acme/a"], "zones": [] }, "launchers": [] });
     let after = serde_json::json!({ "routing": { "max_cpu": 16, "monthly_usd": 30.0, "order": [{ "cloud": "modal" }, { "cloud": "aws", "max_jobs": 6 }], "public_repos": ["acme/a", "acme/b"],
-        "names": [{ "repo": "x", "cloud": "aws" }] }, "launchers": [{ "cloud": "modal", "url": "u" }] });
+        "zones": [{ "repo": "x", "cloud": "aws" }] }, "launchers": [{ "cloud": "modal", "url": "u" }] });
     let changes = diff(&before, &after, true);
     assert_eq!(changes, vec![
         Change::Set { path: path(&["launchers", "modal"]), value: serde_json::json!({ "cloud": "modal", "url": "u" }), from: Some(serde_json::Value::Null) },
@@ -7580,7 +7580,7 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
         Change::Set { path: path(&["routing", "order", "modal"]), value: serde_json::json!({ "cloud": "modal" }), from: Some(serde_json::Value::Null) },
         Change::Arrange { path: path(&["routing", "order"]), keys: vec!["modal".into(), "aws".into()] },
         Change::Add { path: path(&["routing", "public_repos"]), value: "acme/b".into() },
-        Change::Add { path: path(&["routing", "names"]), value: serde_json::json!({ "repo": "x", "cloud": "aws" }) },
+        Change::Add { path: path(&["routing", "zones"]), value: serde_json::json!({ "repo": "x", "cloud": "aws" }) },
     ]);
     assert_eq!(apply(&before, &changes), Ok(after.clone()));
     assert!(diff(&before, &after, false).iter().all(|c| !matches!(c, Change::Set { from: Some(_), .. })));
@@ -7593,7 +7593,7 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     // (Items without their key are not items of the keyed list: passed over.)
     assert!(diff(&serde_json::json!({ "launchers": [{ "url": "u" }] }), &serde_json::json!({ "launchers": [{ "url": "v" }] }), true).is_empty());
     // Applied over others' changes: theirs kept.
-    let meanwhile = serde_json::json!({ "routing": { "max_cpu": 32, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }, { "cloud": "gcp" }], "public_repos": ["acme/a", "acme/c"], "names": [] }, "launchers": [] });
+    let meanwhile = serde_json::json!({ "routing": { "max_cpu": 32, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }, { "cloud": "gcp" }], "public_repos": ["acme/a", "acme/c"], "zones": [] }, "launchers": [] });
     let made = apply(&meanwhile, &changes).unwrap();
     assert_eq!((&made["routing"]["max_cpu"], &made["routing"]["order"], &made["routing"]["public_repos"]), (&serde_json::json!(32), &serde_json::json!([{ "cloud": "modal" }, { "cloud": "aws", "max_jobs": 6 }, { "cloud": "gcp" }]), &serde_json::json!(["acme/a", "acme/c", "acme/b"])));
     // Where a change has no way: not made, said as nothing there.
