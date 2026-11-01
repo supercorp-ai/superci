@@ -1755,7 +1755,7 @@ fn runners_of(d: &mut Dashboard) -> Result<Done> {
     let st = view.status.clone().unwrap_or_default();
     let pools = view.order();
     let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "monthly_usd": p.monthly_usd,
-        "regions": if superci_core::plane::account_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
+        "regions": if view.records().provider_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
         "running": st["active"][&p.cloud].as_u64().unwrap_or(0), "spent_usd": st["spend"][&p.cloud].as_f64().unwrap_or(0.0) })).collect();
     let line = |p: &Value| [p["regions"].as_array().map(|r| format!("in {}", r.iter().filter_map(|r| r.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default(),
         p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]

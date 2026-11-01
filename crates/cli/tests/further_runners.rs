@@ -247,3 +247,57 @@ fn a_second_cloudflare_account_gets_a_runner_of_its_own_and_only_its_launcher_is
     assert!(ok && said.contains("Its Cloudflare launchers cloudflare-globex-inc were not updated: this sign-in does not reach their accounts"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A second AWS account signed in to: its role and networks made with its own sign-in, its two runners under its word,
+/// and only that account's part removed.
+#[test]
+fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
+    let served = serve(|c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })));
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut other = kept["aws"].clone();
+    other["account_id"] = "222222222222".into();
+    kept["aws_more"] = serde_json::json!([other]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // Not signed in to, the first's own, no region, a word with no room for its on-demand one.
+    for (args, why) in [(&["runners", "create", "aws", "--account=333333333333", "--region=eu-west-1"][..], "Sign in to account 333333333333"), (&["runners", "create", "aws", "--account=222222222222"], "Say where its machines start"),
+        (&["runners", "create", "aws", "--account=111111111111", "--region=eu-west-1"], "runs jobs as aws"), (&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=a-word-of-twenty-three-c"], "no room for -on-demand"), (&["runners", "create", "aws", "--account=222222222222", "--region=nowhere"], "Choose a region")] {
+        let (ok, said) = run(args);
+        assert!(!ok && said.contains(why), "{args:?}: {said}");
+    }
+    // AWS answering as it answered a real connection: its identity provider, its role, the machines' networks.
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) }
+    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
+    assert!(ok && said.contains("aws-acme runs jobs now."), "{said}");
+    let record = stored(&served);
+    assert_eq!(record["accounts"], serde_json::json!([{ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }]), "{record}");
+    assert_eq!(record["runners"], serde_json::json!([{ "name": "aws-acme", "account": "aws-acme" }, { "name": "aws-acme-on-demand", "account": "aws-acme", "on_demand": true }]), "{record}");
+    let (ok, said) = run(&["runners", "list"]);
+    assert!(ok && said.contains("aws-acme") && said.contains("aws-acme-on-demand") && said.contains("eu-west-1"), "{said}");
+    let (ok, said) = run(&["runners", "update", "aws-acme", "--max-jobs=3"]);
+    assert!(ok, "{said}");
+    // Its regions, its own: its connection says them, and the first's stay.
+    let (ok, said) = run(&["runners", "update", "aws-acme", "--regions=eu-west-2,eu-west-1"]);
+    assert!(ok && said.contains("eu-west-2"), "{said}");
+    let connection: serde_json::Value = serde_json::from_str(&served.store.0.lock().unwrap()["aws:connection:aws-acme"]).unwrap();
+    assert!(connection["regions"].as_array().unwrap().iter().any(|r| r == "eu-west-2") && connection["account_id"] == "222222222222", "{connection}");
+    let (mut child, link) = common::dashboard(&home);
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=runners&fragment=1").1) }).find(|p| p.contains("AWS account 222222222222")).unwrap_or_default();
+    assert!(page.contains("aws-acme-on-demand"), "{page}");
+    let _ = child.kill();
+    // Removed by its word, its on-demand one with it; its record kept.
+    let (ok, said) = run(&["runners", "delete", "aws-acme-on-demand", "--confirm"]);
+    assert!(!ok && said.contains("goes with aws-acme"), "{said}");
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
+    assert!(ok && said.contains("Removed aws-acme."), "{said}");
+    let record = stored(&served);
+    assert!(record["runners"].as_array().unwrap().iter().all(|r| r["gone"] == true) && !record["routing"]["order"].as_array().is_some_and(|o| o.iter().any(|p| p["cloud"].as_str().is_some_and(|c| c.starts_with("aws-acme")))), "{record}");
+    let _ = std::fs::remove_dir_all(&home);
+}

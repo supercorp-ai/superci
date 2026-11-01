@@ -4035,6 +4035,26 @@ impl Dashboard {
                                 self.shown(&plane, |s| s["aws_regions"] == want)?;
                             }
                         }
+                        // A further AWS account's: its connection says them, its own network in each new one first.
+                        if field("action") == "pool" && account != "aws" && records.provider_of(&cloud) == "aws" && !field("region_0").is_empty() {
+                            let asked: Vec<String> = (0..REGIONS.len()).map(|i| field(&format!("region_{i}"))).filter(|r| !r.is_empty()).collect();
+                            if asked.iter().any(|r| !REGIONS.contains(&r.as_str())) { return Ok(message(400, "Choose a region from the list", "")) }
+                            let mut regions: Vec<String> = vec![];
+                            asked.into_iter().for_each(|r| if !regions.contains(&r) { regions.push(r) });
+                            let st = status.clone().unwrap_or_default();
+                            let Some(kept) = st["aws_further"].as_array().and_then(|f| f.iter().find(|a| a["name"] == account.as_str())).cloned() else { return Ok(message(400, "Unknown provider", "")) };
+                            let have: Vec<String> = kept["regions"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+                            order.iter_mut().filter(|p| records.account_of(&p.cloud) == account).for_each(|p| { if p.cloud == cloud { p.regions = regions.clone() } else if p.regions.is_empty() { p.regions = have.clone() } });
+                            let mut all: Vec<String> = vec![];
+                            order.iter().filter(|p| records.account_of(&p.cloud) == account).flat_map(|p| &p.regions).for_each(|r| if !all.contains(r) { all.push(r.clone()) });
+                            if all != have {
+                                let id = kept["account_id"].as_str().unwrap_or_default().to_string();
+                                if !self.hold_account(&id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} to set up its new regions.", esc(&id)))) }
+                                let new: Vec<String> = all.iter().filter(|r| !have.contains(r)).cloned().collect();
+                                if !new.is_empty() { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &new)?; }
+                                cloudflare::plane_post(plane.url(), &self.status_key, "/aws/accounts", &serde_json::json!({ "name": account, "accountId": id, "region": all.first().cloned().unwrap_or_default(), "regions": all }))?;
+                            }
+                        }
                         // Cloudflare's location (where its containers start).
                         let location = field("location");
                         if field("action") == "pool" && cloud == "cloudflare" && CF_LOCATIONS.iter().any(|(k, _)| *k == location) {
@@ -6338,7 +6358,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         let value = |n: Option<String>| n.map(|n| format!(r#" value="{n}""#)).unwrap_or_default();
         let budget = format!(r#"<label class="field"><span>Monthly budget</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{}></span><small>{} this month. At the budget, jobs go to the next provider.</small></label>"#,
             value(p.monthly_usd.map(|n| format!("{n:.0}"))), usd(spent));
-        let place = if superci_core::plane::account_of(&p.cloud) == "aws" && v.status.as_ref().is_some_and(|s| s.get("aws_regions").is_some()) { regions_field(v, p, quotas, look) }
+        let place = if v.records().provider_of(&p.cloud) == "aws" && v.status.as_ref().is_some_and(|s| s.get("aws_regions").is_some()) { regions_field(v, p, quotas, look) }
             else if p.cloud == "cloudflare" && v.status.as_ref().is_some_and(|s| s.get("cloudflare_location").is_some()) {
                 // Cloudflare: where its containers start.
                 let current = v.status.as_ref().and_then(|s| s["cloudflare_location"].as_str().map(str::to_string)).unwrap_or_else(|| "enam".into());

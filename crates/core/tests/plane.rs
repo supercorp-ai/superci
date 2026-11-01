@@ -6875,6 +6875,71 @@ fn bills_are_kept_as_a_computer_read_them_and_said_for_this_month() {
     assert_eq!(p.status()["bills"], serde_json::json!({}), "last month's");
 }
 
+/// A further AWS account: connected with the role made there, its two runners under its word, a job's machine started
+/// and stopped with that account's role. The first account's notes are not its; the first's connection stays as it was.
+#[test]
+fn a_further_aws_account_runs_jobs_with_its_own_role_and_notes() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true, "error": null }).to_string());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let post = |path: &str, body: serde_json::Value| block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}{path}")).with_body(body.to_string()))));
+    // Refused: what is no word, no account or no region; and the first's word.
+    for body in [serde_json::json!({ "name": "Bad", "accountId": "222222222222", "region": "us-east-1" }), serde_json::json!({ "name": "aws", "accountId": "222222222222", "region": "us-east-1" }), serde_json::json!({ "name": "aws-acme", "accountId": "2222", "region": "eu-west-1" }), serde_json::json!({ "name": "aws-acme", "accountId": "22222222222x", "region": "eu-west-1" }), serde_json::json!({ "name": "aws-acme", "accountId": "222222222222" })] {
+        assert_eq!(post("/aws/accounts", body.clone()).status, 400, "{body}");
+    }
+    // Its records, then its connection; connected with the role in that account, its regions as said.
+    let record = |name: &str, on_demand: bool| serde_json::json!({ "name": name, "account": "aws-acme", "on_demand": on_demand });
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [
+        set(&["accounts", "aws-acme"], serde_json::json!({ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }), None),
+        set(&["runners", "aws-acme"], record("aws-acme", false), None),
+        set(&["runners", "aws-acme-on-demand"], record("aws-acme-on-demand", true), None),
+        set(&["routing", "order", "aws-acme"], serde_json::json!({ "cloud": "aws-acme" }), None),
+        set(&["routing", "order", "aws-acme-on-demand"], serde_json::json!({ "cloud": "aws-acme-on-demand" }), None),
+        set(&["routing", "order", "aws"], serde_json::json!({ "cloud": "aws", "off": true }), None),
+        set(&["routing", "order", "aws-on-demand"], serde_json::json!({ "cloud": "aws-on-demand", "off": true }), None),
+    ] })).status, 200);
+    let connected = post("/aws/accounts", serde_json::json!({ "name": "aws-acme", "accountId": "222222222222", "region": "us-east-1", "regions": ["us-east-1"] }));
+    assert_eq!((connected.status, json(&connected)["connected"].as_bool()), (200, Some(true)), "{}", String::from_utf8_lossy(&connected.body));
+    let status = json(&block_on(plane.handle(key(get("/status")))));
+    assert_eq!((&status["aws_further"][0]["name"], &status["aws_further"][0]["regions"], &status["aws"]["account_id"]), (&serde_json::json!("aws-acme"), &serde_json::json!(["us-east-1"]), &serde_json::json!("123456789012")), "{status}");
+    let assumed = |account: &str| clouds.calls.borrow().iter().any(|c| c.1.contains("sts.") && c.1.contains(account));
+    assert!(assumed("222222222222"));
+    // A job: on the further account's spot machines, in its region, by its word; its spend under that word.
+    clouds.calls.borrow_mut().clear();
+    block_on(plane.handle(job_event("queued", 1, "acme/app", None)));
+    let first = job(&store, 1);
+    assert_eq!((first["cloud"].as_str(), first["region"].as_str(), first["on_demand"].as_bool().unwrap_or(false)), (Some("aws-acme"), Some("us-east-1"), false), "{first}");
+    assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=RunInstances")));
+    // A label asking for an on-demand machine: its on-demand runner.
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/spot=false")));
+    let second = job(&store, 2);
+    assert_eq!((second["cloud"].as_str(), second["on_demand"].as_bool()), (Some("aws-acme-on-demand"), Some(true)), "{second}");
+    // A label naming AWS means its runners too, the first's being taken out.
+    // (With nothing kept from before: only its own role is asked for. A cache's bucket is the first's, reached by links.)
+    let fresh = Cache::default();
+    clouds.calls.borrow_mut().clear();
+    block_on(ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &fresh, containers: None }.handle(labelled("queued", 3, "acme/app", None, "superci/provider=aws")));
+    assert_eq!(job(&store, 3)["cloud"], "aws-acme");
+    assert!(assumed("222222222222"), "with its own role");
+    // Stopped with its own role, in its own region.
+    clouds.calls.borrow_mut().clear();
+    block_on(plane.handle(job_event("completed", 1, "acme/app", Some(&format!("superci-{PLANE_ID}-1")))));
+    assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=TerminateInstances")), "{:?}", clouds.calls.borrow().iter().map(|c| c.1.clone()).collect::<Vec<_>>());
+    // A note of AWS's on it is its own account's: the first's keys stay empty.
+    assert!(store.0.borrow().keys().all(|k| !k.starts_with("aws:pool:") && !k.starts_with("aws:unoffered:")));
+    // Forgotten: no job goes there; the first's connection stays.
+    assert_eq!(post("/aws/forget", serde_json::json!({ "account": "aws-acme" })).status, 200);
+    assert!(store.0.borrow().contains_key("aws") && !store.0.borrow().contains_key("aws:connection:aws-acme"));
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci")));
+    assert!(job(&store, 4)["cloud"] != "aws-acme", "{}", job(&store, 4));
+    assert_eq!(post("/aws/forget", serde_json::json!({})).status, 200);
+    assert!(!store.0.borrow().contains_key("aws"), "with no account named: the first's");
+}
+
 /// In the order and connected to nothing: said as that, the job failing rather than running elsewhere.
 #[test]
 fn a_provider_in_the_order_that_is_not_connected_is_said() {
@@ -6982,6 +7047,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account,
         a_provider_in_the_order_that_is_not_connected_is_said,
         bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
+        a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
         aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
         routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_token_for_it_alone,
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,
