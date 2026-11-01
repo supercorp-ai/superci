@@ -15410,9 +15410,9 @@ mod dashboard_suite_in_browser {
     fn changes_to_a_control_plane_that_does_not_answer_say_to_try_again() {
         let served = serve(|_| {});
         let home = common::signed_in(&served);
-        let silent = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); format!("http://127.0.0.1:{}", l.local_addr().unwrap().port()) };
+        let silent = "http://127.0.0.1:1";
         let file = home.join("workspaces/default/sign-ins.json");
-        std::fs::write(&file, std::fs::read_to_string(&file).unwrap().replace(&served.url, &silent)).unwrap();
+        std::fs::write(&file, std::fs::read_to_string(&file).unwrap().replace(&served.url, silent)).unwrap();
         let (mut child, link) = dashboard(&home);
         for (path, fields) in [("/routing", &[("action", "default"), ("cloud", "aws")][..]), ("/plane/update", &[("plane", "")]), ("/labels", &[("label", "superci-gpu")]),
             ("/runners/remove", &[("cloud", "cloudflare")])] {

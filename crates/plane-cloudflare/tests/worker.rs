@@ -373,7 +373,7 @@ fn gitlab_failing_to_answer_is_said() {
         let _ = s.read(&mut [0; 8192]);
         let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"id\":");
     });
-    let closed = format!("http://{}", std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    let closed = "http://127.0.0.1:1".to_string();
     for (url, token) in [(closed.as_str(), None), ("http://[::1", None), (superci_testkit::gitlab::URL, Some("glpat-a\nb")), (cut_at.as_str(), None)] {
         let mut conn = superci_testkit::GitLab::connection();
         conn["url"] = json!(url);

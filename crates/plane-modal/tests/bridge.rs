@@ -259,7 +259,7 @@ fn odd_server() -> String {
 #[test]
 fn github_out_of_reach_leaves_the_job_unstarted() {
     let secrets = json!({ "CONTAINERS": "on", "GITHUB_APP": GitHub::app().to_string() });
-    let closed = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); format!("http://{}", l.local_addr().unwrap()) };
+    let closed = "http://127.0.0.1:1".to_string();
     for at in [odd_server(), closed, "http://not a host".to_string()] {
         let gh = GitHub::default();
         let mut py = PlanePy::start_with(&at, None);
