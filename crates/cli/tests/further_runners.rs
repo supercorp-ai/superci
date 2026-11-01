@@ -385,3 +385,39 @@ fn a_move_brings_further_aws_accounts_and_deleting_the_old_control_plane_cleans_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A control plane as 0.19.21 left it, its settings in its cloud with repository rules and a default provider, no record
+/// of its own: updated, what it had stands (the order, limits, launchers), the rules and default gone; the first change
+/// makes its record without losing any of it; an older SuperCI's later write is taken, and leaves further runners be.
+#[test]
+fn settings_as_0_19_21_left_them_stand_after_an_update_and_an_older_write_leaves_further_runners() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &format!(r#"[{{"cloud":"modal","url":"https://acmeorg--superci-runners-{PLANE}.modal.run"}}]"#));
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":"modal","rules":[{"repo":"acme/*","cloud":"modal"}],"order":[{"cloud":"modal","max_jobs":3,"monthly_usd":40.0}],"monthly_usd":100.0,"account_usd":{"aws":50.0},"public_repos":["acme/site"],"max_cpu":16}"#);
+    let home = common::signed_in(&served);
+    let (code, status) = common::json(&home, &["status"]);
+    let routing = &status["status"]["routing"];
+    assert_eq!(code, 0, "{status}");
+    assert_eq!((&routing["order"][0]["max_jobs"], &routing["monthly_usd"], &routing["account_usd"]["aws"], &routing["public_repos"][0], &routing["max_cpu"]), (&serde_json::json!(3), &serde_json::json!(100.0), &serde_json::json!(50.0), &serde_json::json!("acme/site"), &serde_json::json!(16)), "{routing}");
+    assert!(routing.get("rules").is_none() && routing.get("default").is_none(), "{routing}");
+    // The first change: its record, with everything it had.
+    let o = common::command(&home).args(["runners", "update", "modal", "--max-jobs=5"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let kept = stored(&served);
+    assert_eq!((&kept["routing"]["order"][0]["max_jobs"], &kept["routing"]["order"][0]["monthly_usd"], &kept["routing"]["monthly_usd"], &kept["routing"]["max_cpu"], &kept["launchers"][0]["cloud"]), (&serde_json::json!(5), &serde_json::json!(40.0), &serde_json::json!(100.0), &serde_json::json!(16), &serde_json::json!("modal")), "{kept}");
+    // A further runner, then an older SuperCI's whole write of what it knows: taken, the records left.
+    let mut record = kept.clone();
+    (record["accounts"], record["runners"]) = (serde_json::json!([{ "name": "modal-two", "provider": "modal", "cloud_id": "two" }]), serde_json::json!([{ "name": "modal-two", "account": "modal-two" }]));
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"modal","max_jobs":9}],"default":null,"rules":[]}"#);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, status) = common::json(&home, &["status"]);
+        if status["status"]["routing"]["order"][0]["max_jobs"] == 9 { assert_eq!(status["status"]["runners"][0]["name"], "modal-two", "{status}"); break }
+        assert!(std::time::Instant::now() < end, "{status}");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}

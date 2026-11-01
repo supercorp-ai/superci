@@ -1288,8 +1288,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let cloud = w(2);
             // Modal's jobs as Functions (preemptible, a third of a sandbox's price) or as sandboxes.
             if let Some(mode) = args.get("mode") {
-                if ["aws", "aws-on-demand", "cloudflare"].contains(&cloud) || view(&mut signed_in())?.records().provider_of(cloud) != "modal" { return usage("--mode is for a Modal runner.") }
                 if !["function", "sandbox"].contains(&mode) { return usage("--mode is function or sandbox.") }
+                if ["aws", "aws-on-demand", "cloudflare"].contains(&cloud) || (cloud != "modal" && view(&mut signed_in())?.records().provider_of(cloud) != "modal") { return usage("--mode is for a Modal runner.") }
             }
             let mut d = signed_in();
             let order = view(&mut d)?.order();
