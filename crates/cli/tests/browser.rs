@@ -10548,7 +10548,7 @@ fn a_cloud_that_answers_nothing_is_a_note_on_the_pages_which_keep_working() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane in AWS with a Modal launcher; Modal signed in, and answering nothing at all.
     let served = serve(|_| {});
-    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners.modal.run"}]"#);
     let home = signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();

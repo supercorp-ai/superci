@@ -1239,7 +1239,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("runners", "delete") => {
             let cloud = w(2);
-            if cloud.is_empty() { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal, or a further runner's word).") }
+            let further = |word: &str| view(&mut signed_in()).is_ok_and(|v| v.records().runners.iter().any(|r| r.name == word && !r.gone));
+            if !CLOUDS.contains(&cloud) && !further(cloud) { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal, or a further runner's word).") }
             let would = format!("remove {cloud} as a runner provider{}", if args.has("only-here") { ", leaving what SuperCI made for it there" } else { " and delete what SuperCI made for it there" });
             confirmed(args, &would)?;
             let mut d = ready()?;

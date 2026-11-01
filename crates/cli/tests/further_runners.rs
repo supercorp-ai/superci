@@ -89,7 +89,7 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     assert_eq!(kept["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two", "gone": true }]), "{kept}");
     assert!(!kept["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two") && !kept["routing"]["order"].as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two"), "{kept}");
     let (ok, said) = run(&["runners", "delete", "modal-acme-two", "--confirm"]);
-    assert!(!ok && said.contains("Unknown provider"), "{said}");
+    assert!(!ok && said.contains("Say which"), "{said}");
     // Its word comes back for its account, with its account as it was.
     deploy_answers(&served);
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
@@ -225,6 +225,6 @@ fn a_second_cloudflare_account_gets_a_runner_of_its_own_and_only_its_launcher_is
     assert!(!ok && said.contains("Sign in"), "{said}");
     served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", PLANE), ("http://new-plane.test", &served.url)]);
     let (ok, said) = run(&["planes", "update"]);
-    assert!(ok && said.contains("Its Cloudflare launchers cloudflare-globex-inc were not updated: this sign-in does not reach their accounts."), "{said}");
+    assert!(ok && said.contains("Its Cloudflare launchers cloudflare-globex-inc were not updated: this sign-in does not reach their accounts"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }

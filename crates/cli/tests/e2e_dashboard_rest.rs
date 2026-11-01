@@ -786,6 +786,7 @@ fn cloudflare_runners_go_into_the_account_named_and_an_update_says_a_launcher_cl
     kept_as(&home, |k| k["cloudflare"] = cloudflare_signed_in());
     served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
     served.aws.fail("/client/v4/accounts?per_page", 200, r#"{"success":true,"errors":[],"messages":[],"result":[{"id":"1111111111111111111111111111111a","name":"Acme"},{"id":"2222222222222222222222222222222b","name":"Globex"}]}"#, None);
+    served.aws.fail("/workers/subdomain", 200, r#"{"success":true,"errors":[],"messages":[],"result":{"subdomain":"acme"}}"#, None);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     // (The accounts the sign-in reaches, read as one is set up in an account it does not.)
     let (status, said) = sent(&link, "/plane/cloudflare", &[("account", "3333333333333333333333333333333c")]);

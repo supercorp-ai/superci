@@ -2883,6 +2883,8 @@ impl Dashboard {
                     let signed_in = match cloud.as_str() {
                         "aws" => account.as_ref().is_some_and(|a| self.hold_account(a)),
                         _ if own_containers => true,
+                        // (No launcher to find a workspace by: nothing of its own to delete.)
+                        _ if is_modal && launcher_url.is_empty() => self.modal.is_some(),
                         _ if is_modal => self.modal_of_launcher(&launcher_url).is_some(),
                         // (A further one's account within this sign-in's reach.)
                         _ if further => self.cf.is_some() && records.accounts.iter().find(|a| a.name == records.account_of(&cloud)).and_then(|a| a.cloud_id.as_ref()).is_some_and(|id| self.cf_accounts.iter().any(|c| c.0 == *id)),
@@ -2897,7 +2899,7 @@ impl Dashboard {
                 let aws_creds = if cloud == "aws" && !only { Some(self.aws_creds()?) } else { None };
                 let cf = if records.provider_of(&cloud) == "cloudflare" && !only && !own_containers { Some(self.cloudflare()?) } else { None };
                 // (Signed in to Modal, above, for its part.)
-                let md = if is_modal && !only && !own_containers { self.modal_of_launcher(&launcher_url).cloned() } else { None };
+                let md = if is_modal && !only && !own_containers { if launcher_url.is_empty() { self.modal.clone() } else { self.modal_of_launcher(&launcher_url).cloned() } } else { None };
                 // 1. Forgotten: out of the order, then its connection.
                 let was: Routing = serde_json::from_value(status["routing"].clone()).unwrap_or_default();
                 let mut routing = was.clone();
@@ -3396,7 +3398,7 @@ impl Dashboard {
                 };
                 let note = if cf_launcher && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare launcher was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
                 let gone = steered_before(&status);
-                let cf_note = if cf_missing.is_empty() { String::new() } else { format!("Its Cloudflare launchers {} were not updated: this sign-in does not reach their accounts.", cf_missing.join(", ")) };
+                let cf_note = if cf_missing.is_empty() { String::new() } else { format!("Its Cloudflare launchers {} were not updated: this sign-in does not reach their accounts, or Cloudflare did not say which they are in.", cf_missing.join(", ")) };
                 let note = [note.as_str(), cf_note.as_str(), modal_note.as_str(), gone.as_str()].iter().filter(|n| !n.is_empty()).copied().collect::<Vec<_>>().join(" ");
                 *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
