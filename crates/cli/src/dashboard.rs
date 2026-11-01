@@ -708,6 +708,29 @@ fn github_cost(j: &serde_json::Value) -> Option<f64> {
     Some((end.saturating_sub(start) as f64 / 60_000.0).ceil().max(1.0) * superci_core::plane::github_usd_per_minute(cpu, arm64))
 }
 
+/// Each account's bill a computer read, by the word this control plane has for it. Cloudflare's accounts with no record
+/// of their own are the first's, together.
+fn bills_of(v: &PlaneView, status: &serde_json::Value, modal_months: &[(String, modal::Month)], cf_months: &[(String, (f64, f64))]) -> serde_json::Map<String, serde_json::Value> {
+    let records = view::records_in(status);
+    let mut bills = serde_json::Map::new();
+    let own = status["containers"] == true;
+    for (workspace, m) in modal_months {
+        let word = v.launchers().into_iter().find(|a| launcher_workspace(&a.url) == workspace && records.provider_of(&a.cloud) == "modal").map(|a| records.account_of(&a.cloud).to_string())
+            .or_else(|| (own && v.plane.workspace() == Some(workspace.as_str()) && status["own_cloud"] == "modal").then(|| "modal".to_string()));
+        if let Some(word) = word { bills.insert(word, serde_json::json!({ "metered": m.metered, "billed": m.billed, "superci": m.superci })); }
+    }
+    let first = v.launchers().iter().any(|a| a.cloud == "cloudflare") || (own && status["own_cloud"] == "cloudflare");
+    let mut rest = (0.0, 0.0);
+    for (id, m) in cf_months {
+        match records.accounts.iter().find(|a| a.provider == "cloudflare" && a.cloud_id.as_deref() == Some(id.as_str())) {
+            Some(a) => { bills.insert(a.name.clone(), serde_json::json!({ "metered": m.0, "billed": m.1 })); }
+            None => rest = (rest.0 + m.0, rest.1 + m.1),
+        }
+    }
+    if first && !cf_months.is_empty() { bills.insert("cloudflare".into(), serde_json::json!({ "metered": rest.0, "billed": rest.1 })); }
+    bills
+}
+
 /// A provider's month, as its cloud bills it when that is known: what SuperCI's jobs cost there, and what is
 /// billed after the cloud's included usage or credits (Cloudflare's Workers Paid allowance, Modal's plan credits).
 /// With a budget set, its figure ("$a of $b") already says the spend: only what is billed is added.
@@ -5096,15 +5119,15 @@ mark();load()})();</script>"#;
         d.measuring = true;
         std::thread::spawn(move || {
             let mut costs = std::collections::HashMap::new();
-            let mut cf_month = None;
+            let (mut cf_month, mut cf_months): (Option<(f64, f64)>, Vec<(String, (f64, f64))>) = (None, vec![]);
             if let Some(cf) = &cf {
                 for chunk in todo.chunks(100) {
                     let ids: Vec<String> = chunk.iter().map(|t| t.2.clone()).collect();
                     let (from, to) = (chunk.iter().map(|t| t.3).min().unwrap_or(now) - 60_000, chunk.iter().map(|t| t.4).max().unwrap_or(now) + 600_000);
                     costs.extend(accounts.iter().filter_map(|a| cf.container_costs(a, &ids, from, to).ok()).flatten());
                 }
-                let months: Vec<(f64, f64)> = accounts.iter().filter_map(|a| cf.containers_month(a, now).ok()).collect();
-                if !months.is_empty() { cf_month = Some(months.iter().fold((0.0, 0.0), |s, m| (s.0 + m.0, s.1 + m.1))) }
+                cf_months = accounts.iter().filter_map(|a| Some((a.clone(), cf.containers_month(a, now).ok()?))).collect();
+                if !cf_months.is_empty() { cf_month = Some(cf_months.iter().fold((0.0, 0.0), |s, (_, m)| (s.0 + m.0, s.1 + m.1))) }
             }
             let modal_months: Vec<(String, modal::Month)> = modals.iter().filter_map(|m| Some((m.workspace.clone(), modal::month(m).ok()?))).collect();
             // Per control plane: its jobs' measured costs.
@@ -5113,6 +5136,12 @@ mark();load()})();</script>"#;
                 if let Some((usd, gib_s)) = costs.get(id).filter(|(_, gib_s)| *gib_s >= *least && *gib_s > 0.0) { let _ = gib_s; by_plane.entry(url.clone()).or_default().insert(job.clone(), (*usd).into()); }
             }
             for (url, measured) in &by_plane { let _ = cloudflare::plane_post(url, &key, "/costs", &serde_json::json!({ "measured": measured })); }
+            // Each account's bill, for the other computers of its CI: only the figures.
+            for v in &views {
+                let Some(status) = v.status.as_ref().filter(|s| s["settings"] == true) else { continue };
+                let bills = bills_of(v, status, &modal_months, &cf_months);
+                if !bills.is_empty() { let _ = cloudflare::plane_post(v.plane.url(), &key, "/bills", &serde_json::json!({ "bills": bills })); }
+            }
             let mut d = lock(&shared);
             d.measuring = false;
             d.measured_at = now_ms();
@@ -6188,7 +6217,12 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         let provider = v.records().provider_of(&p.cloud).to_string();
         let launcher = v.launchers().into_iter().find(|a| a.cloud == p.cloud).map(|a| a.url).unwrap_or_default();
         let workspace = if launcher.is_empty() { v.plane.workspace().unwrap_or_default() } else { launcher_workspace(&launcher) };
-        limits.push_str(&month_text(&provider, spent, p.monthly_usd.is_none(), cf_month, modal_months.get(workspace)));
+        // (As a computer of this CI last read it; else as this one has.)
+        let bill = &v.status.as_ref().map(|s| s["bills"][v.records().account_of(&p.cloud)].clone()).unwrap_or_default();
+        let figure = |name: &str| bill[name].as_f64();
+        let kept_cf = figure("metered").zip(figure("billed")).filter(|_| provider == "cloudflare");
+        let kept_modal = figure("metered").zip(figure("billed")).zip(figure("superci")).filter(|_| provider == "modal").map(|((metered, billed), superci)| modal::Month { metered, billed, superci });
+        limits.push_str(&month_text(&provider, spent, p.monthly_usd.is_none(), kept_cf.or(cf_month), kept_modal.as_ref().or(modal_months.get(workspace))));
         rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
             esc(&p.cloud), logo(&logo_key, 32), esc(&name), esc(&what), esc(&name)));
         // Its settings, alike for every row: jobs at once, a monthly budget, and where it starts machines.

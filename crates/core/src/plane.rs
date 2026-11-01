@@ -890,6 +890,12 @@ pub const BUDGET_STOPPED: &str = "AWS's budget for this account reached its limi
 /// Where the control plane notes when AWS last refused a machine by the budget's rule (the dashboard says so).
 const BUDGET_STOPPED_KEY: &str = "aws:budget-stopped";
 
+/// Where the control plane keeps each account's bill as a computer last read it (see `/bills`): an observation, written
+/// by whoever read it, last one standing.
+const BILLS: &str = "bills";
+/// The most accounts one write of bills is taken for.
+const BILLS_AT_ONCE: usize = 64;
+
 /// Where the control plane keeps what a cloud said beside its answers (Modal's warning of a client release it will
 /// stop taking, heard by a launcher or by a Modal control plane's own client): `[{"cloud", "said"}]`, the newest ten,
 /// each once. Its status says them, so the dashboard does, before the cloud stops taking it.
@@ -1602,6 +1608,25 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::json(&serde_json::json!({ "cleared": cleared })))
             }
             // Costs the dashboard read from a cloud's own metering (Cloudflare's usage analytics), kept with the jobs.
+            // A cloud's bill for an account, read by a computer signed in there: only the figures come here, each with
+            // when and from which device, for every computer of this CI to show.
+            ("POST", "/bills") if self.dashboard(&req) => {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let device = match self.device_key_name(&req) {
+                    Some(name) => get_json::<serde_json::Value>(self.store, &format!("dkey:{name}")).await?.and_then(|k| k["device"].as_str().map(str::to_string)).unwrap_or_default(),
+                    None => String::new(),
+                };
+                let mut bills: serde_json::Map<String, serde_json::Value> = get_json(self.store, BILLS).await?.unwrap_or_default();
+                for (account, bill) in body["bills"].as_object().into_iter().flatten().filter(|(a, _)| valid_word(a)).take(BILLS_AT_ONCE) {
+                    let figure = |name: &str| bill[name].as_f64().filter(|n| (0.0..1e9).contains(n));
+                    let (Some(metered), Some(billed)) = (figure("metered"), figure("billed")) else { continue };
+                    let mut kept = serde_json::json!({ "metered": metered, "billed": billed, "at_ms": self.clock.now_ms(), "device": device });
+                    if let Some(superci) = figure("superci") { kept["superci"] = superci.into() }
+                    bills.insert(account.clone(), kept);
+                }
+                put_json(self.store, BILLS, &bills).await?;
+                Ok(Response::json(&serde_json::json!({ "ok": true })))
+            }
             ("POST", "/costs") if self.dashboard(&req) => {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let mut kept = 0;
@@ -2004,6 +2029,8 @@ impl<'a> ControlPlane<'a> {
             }).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
             "spend": month_spend,
+            // (Each account's bill as a signed-in computer read it this month.)
+            "bills": get_json::<serde_json::Map<String, serde_json::Value>>(self.store, BILLS).await?.unwrap_or_default().into_iter().filter(|(_, b)| b["at_ms"].as_u64().is_some_and(|at| at >= month_start_ms(now))).collect::<serde_json::Map<_, _>>(),
             // (It keeps the CI's and a cloud account's limit for the month: one from before would drop them unsaid.)
             "account_limits": true,
             // (And for a day; and what the AWS account's own budget does.)

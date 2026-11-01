@@ -6846,6 +6846,35 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     assert_eq!((&status["routing"]["max_cpu"], &status["runners"][0]["name"], &status["accounts"][0]["name"]), (&serde_json::json!(4), &serde_json::json!("modal-staging"), &serde_json::json!("modal-staging")), "{status}");
 }
 
+/// A cloud's bill, as a signed-in computer read it: the figures kept with when and which device, for the status to say;
+/// what is no figure or no account's word left out; last month's said no more; refused without a device's key.
+#[test]
+fn bills_are_kept_as_a_computer_read_them_and_said_for_this_month() {
+    let p = Settled::new(|c| c.device_key_names = vec![("DEVICE_KEY_X".into(), "dashboard-session-key-1".into())]);
+    let post = |body: serde_json::Value, key: Option<&str>| {
+        let r = Request::new("POST", &format!("{PLANE_URL}/bills")).with_body(body.to_string());
+        block_on(p.plane().handle(match key { Some(k) => r.with_header("authorization", &format!("Bearer {k}")), None => r }))
+    };
+    assert_eq!(post(serde_json::json!({ "bills": { "modal": { "metered": 1.0, "billed": 0.0 } } }), None).status, 404);
+    p.mem.0.borrow_mut().insert("dkey:DEVICE_KEY_X".into(), serde_json::json!({ "device": "A laptop" }).to_string());
+    assert_eq!(post(serde_json::json!({ "bills": {
+        "modal": { "metered": 3.0, "billed": 1.0, "superci": 1.5 }, "modal-two": { "metered": 2.0, "billed": 0.0 },
+        "No Word": { "metered": 1.0, "billed": 1.0 }, "cloudflare": { "metered": -1.0, "billed": 1.0 }, "aws": { "metered": 1.0 }, "aws-on-demand": { "metered": 1.0, "billed": 1e10 },
+    } }), Some("dashboard-session-key-1")).status, 200);
+    let bills = p.status()["bills"].clone();
+    assert_eq!(bills.as_object().unwrap().keys().collect::<Vec<_>>(), ["modal", "modal-two"], "{bills}");
+    assert_eq!((&bills["modal"]["superci"], &bills["modal"]["device"], bills["modal-two"].get("superci")), (&serde_json::json!(1.5), &serde_json::json!("A laptop"), None), "{bills}");
+    assert_eq!(bills["modal"]["at_ms"], 1_790_000_000_000u64);
+    // Another's write of one account leaves the other's.
+    assert_eq!(post(serde_json::json!({ "bills": { "modal": { "metered": 4.0, "billed": 2.0 } } }), Some("dashboard-session-key-1")).status, 200);
+    let bills = p.status()["bills"].clone();
+    assert_eq!((&bills["modal"]["metered"], &bills["modal-two"]["metered"]), (&serde_json::json!(4.0), &serde_json::json!(2.0)));
+    // A key that is no device's, and nothing at all to keep.
+    assert_eq!(post(serde_json::json!({}), Some("dashboard-session-key-1")).status, 200);
+    p.later(40 * 86_400_000);
+    assert_eq!(p.status()["bills"], serde_json::json!({}), "last month's");
+}
+
 /// In the order and connected to nothing: said as that, the job failing rather than running elsewhere.
 #[test]
 fn a_provider_in_the_order_that_is_not_connected_is_said() {
@@ -6952,6 +6981,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         online_only_public_documents_and_a_yes_no_health,
         a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account,
         a_provider_in_the_order_that_is_not_connected_is_said,
+        bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
         aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
         routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_token_for_it_alone,
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,

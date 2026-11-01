@@ -2280,7 +2280,14 @@ fn modal_runners_month_with_nothing_metered_but_something_billed_says_no_share_b
         modal_answered("WorkspaceBillingReport", &[pb(&[Pb::B(1, b"ap-1".to_vec()), Pb::B(2, b"superci-runners-testplane0001".to_vec()), Pb::B(5, b"1.25".to_vec())])])].concat(), &[]);
     let (mut child, link) = dashboard(&home);
     until("its month", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("$1.25 this month · $0.00 billed"));
+    // Kept in the control plane: the figures alone, and another computer of this CI, signed in to no Modal, shows them.
+    until("its bill kept", || served.store.0.lock().unwrap().get("bills").is_some_and(|b| b.contains("\"superci\":1.25")));
     let _ = child.kill();
+    let elsewhere = signed_in(&served);
+    let (mut child, link) = dashboard(&elsewhere);
+    until("its month elsewhere", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("$1.25 this month · $0.00 billed"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&elsewhere);
     let _ = std::fs::remove_dir_all(&home);
 }
 
