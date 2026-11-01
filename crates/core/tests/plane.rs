@@ -1849,8 +1849,9 @@ fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.launchers = vec![Launcher { cloud: "modal:acme-two".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = vec![Pool { function: true, ..Pool::of("modal:acme-two") }];
+    config.launchers = vec![Launcher { cloud: "modal-acme-two".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.routing.order = vec![Pool { function: true, ..Pool::of("modal-acme-two") }];
+    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false }] };
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let calls = |url: &str| clouds.0.calls.borrow().iter().filter(|c| c.1 == url).map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap_or_default()).collect::<Vec<_>>();
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/cpu=4")));
@@ -1862,7 +1863,7 @@ fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
     block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=4")));
     assert_eq!(calls("https://runners.acme.workers.dev/stop"), vec![serde_json::json!({ "id": "sb-7" })]);
     let e = job(&store, 2)["error"].as_str().unwrap_or_default().to_string();
-    assert!(e.contains("the modal:acme-two launcher is from before Function mode, and would start a sandbox: update it (`superci runners create modal --account=acme-two`)"), "{e}");
+    assert!(e.contains("the modal-acme-two launcher is from before Function mode, and would start a sandbox: update it (`superci runners create modal --account=acme-two`)"), "{e}");
 }
 
 #[test]

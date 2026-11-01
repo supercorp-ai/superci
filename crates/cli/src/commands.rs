@@ -1288,7 +1288,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let cloud = w(2);
             // Modal's jobs as Functions (preemptible, a third of a sandbox's price) or as sandboxes.
             if let Some(mode) = args.get("mode") {
-                if view(&mut signed_in())?.records().provider_of(cloud) != "modal" { return usage("--mode is for a Modal runner.") }
+                if ["aws", "aws-on-demand", "cloudflare"].contains(&cloud) || view(&mut signed_in())?.records().provider_of(cloud) != "modal" { return usage("--mode is for a Modal runner.") }
                 if !["function", "sandbox"].contains(&mode) { return usage("--mode is function or sandbox.") }
             }
             let mut d = signed_in();
@@ -1987,7 +1987,7 @@ mod tests {
             assert_eq!(run(&format!("{line} --dry-run")), signed_out, "{line}: a dry run checks the sign-in too");
         }
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
-            ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("runners update aws --mode=function", "--mode is for modal"), ("runners update modal --mode=fast", "--mode is function or sandbox"), ("runner_images create rust-ci", "Say which and where:"), ("runner_images create --reference=ghcr.io/acme/ci:1", "Say which and where:"), ("runner_images delete", "Say which:"), ("runner_images update rust-ci", "Say which and what:"), ("runner_images update --reference=ghcr.io/acme/ci:2", "Say which and what:"),
+            ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("runners update aws --mode=function", "--mode is for a Modal runner"), ("runners update modal --mode=fast", "--mode is function or sandbox"), ("runner_images create rust-ci", "Say which and where:"), ("runner_images create --reference=ghcr.io/acme/ci:1", "Say which and where:"), ("runner_images delete", "Say which:"), ("runner_images update rust-ci", "Say which and what:"), ("runner_images update --reference=ghcr.io/acme/ci:2", "Say which and what:"),
             ("runner_images update rust-ci --reference=https://ghcr.io/acme/ci", "Check the image's address:"), ("runner_images update rust-ci --modal-secret=a!secret", "Check the Modal Secret's name:"), ("connections create gitlab", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("connections create gitlab --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
             ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("runs retrieve", "Say which: `superci runs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
             ("projects update 7", "Say which way:"), ("projects update --all --enabled=false", "Projects are switched off one at a time"),

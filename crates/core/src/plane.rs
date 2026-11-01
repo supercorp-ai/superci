@@ -3723,7 +3723,8 @@ impl<'a> ControlPlane<'a> {
                         // Nor one from before Function mode, which starts a sandbox whatever it is told (it says so).
                         if function && v["kind"] != "function" {
                             let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
-                            let again = a.cloud.split_once(':').map_or(a.cloud.clone(), |(kind, w)| format!("{kind} --account={w}"));
+                            let records = &self.config.records;
+                            let again = records.accounts.iter().find(|c| c.name == records.account_of(&a.cloud)).and_then(|c| c.cloud_id.as_ref()).map_or(a.cloud.clone(), |w| format!("modal --account={w}"));
                             return Err(format!("the {} launcher is from before Function mode, and would start a sandbox: update it (`superci runners create {again}`)", cloud_name(&a.cloud)))
                         }
                         Ok(Tried::Started(id, v["kind"].as_str().unwrap_or_default().to_string()))

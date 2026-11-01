@@ -3040,7 +3040,7 @@ impl Dashboard {
             ("POST", "/runners/modal-own") => {
                 let plane = self.plane()?;
                 // (In Function mode: its Functions again, for the images there are now.)
-                if let Some(r) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()).filter(|r| r.pool("modal").is_some_and(|p| p.function)) { self.deploy_jobs(&plane, "modal", &r.images)? }
+                if let Some(r) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()).filter(|r| r.pool("modal").is_some_and(|p| p.function)) { self.deploy_jobs(&plane, plane.url(), &r.images)? }
                 self.put_secret(&plane, "CONTAINERS", "on")?;
                 wait_for(plane.url(), &self.status_key, |s| s["containers"] == true);
                 Ok(Response::redirect("/?p=runners"))
@@ -4112,7 +4112,10 @@ impl Dashboard {
                             if records.provider_of(&cloud) != "modal" { return Ok(message(400, "Only Modal has a mode", "Modal's jobs run as sandboxes or as Functions.")) }
                             if function && !status.as_ref().is_some_and(|s| s["function_mode"] == true) { return Ok(message(409, "Update the control plane first", "Function mode needs a newer control plane: update it on the Control plane page (or `superci planes update`), then set it.")) }
                             // (Deployed when it is switched on; after that, when images change, see below.)
-                            if function && !order.iter().any(|p| p.cloud == cloud && p.function) { self.deploy_jobs(&plane, &cloud, &routing.images)? }
+                            if function && !order.iter().any(|p| p.cloud == cloud && p.function) {
+                                let launcher = status.as_ref().and_then(|s| s["launchers"].as_array()).into_iter().flatten().find(|a| a["cloud"] == cloud.as_str()).and_then(|a| a["url"].as_str()).unwrap_or(plane.url()).to_string();
+                                self.deploy_jobs(&plane, &launcher, &routing.images)?
+                            }
                             order.iter_mut().filter(|p| p.cloud == cloud).for_each(|p| p.function = function);
                         }
                         if field("action") == "pool" {
@@ -10520,6 +10523,7 @@ mod rest_tests {
         for (reference, secret) in [("ghcr.io/acme/ci:1", ""), ("ghcr.io/acme/ci@sha256:0f1e", "ghcr-read"), ("acme/node-ci:22", "")] {
             assert_eq!(add(&mut d, "rust-ci", reference, secret).err().as_deref(), Some("Sign in with Modal first."), "{reference}");
         }
+        let mut d = modal_answering(serde_json::json!({ "routing": { "images": { "rust-ci": { "reference": "ghcr.io/acme/ci:1" } } }, "runner_images": true }));
         assert_eq!(send(&mut d, "/routing", &[("action", "image_remove"), ("name", "rust-ci")]).err().as_deref(), Some("Sign in with Modal first."));
     }
 
@@ -10531,17 +10535,21 @@ mod rest_tests {
         let mut d = modal_answering(serde_json::json!({ "routing": {} }));
         let r = mode(&mut d, "modal", "function").unwrap();
         assert!(r.status == 409 && words_of(&r).contains("Function mode needs a newer control plane"), "{}", words_of(&r));
-        let mut d = modal_answering(serde_json::json!({ "routing": {}, "function_mode": true }));
+        let further = serde_json::json!({ "accounts": [{ "name": "modal-initech", "provider": "modal", "cloud_id": "initech" }], "runners": [{ "name": "modal-initech", "account": "modal-initech" }],
+            "launchers": [{ "cloud": "modal-initech", "url": "https://initech--superci-runners-p2.modal.run" }, { "cloud": "modal", "url": "https://acme--superci-runners-p2.modal.run" }] });
+        let with = |more: serde_json::Value| { let mut status = further.clone(); more.as_object().unwrap().iter().for_each(|(k, v)| status[k] = v.clone()); status };
+        let mut d = modal_answering(with(serde_json::json!({ "routing": {}, "function_mode": true })));
         for (cloud, m, says) in [("aws", "function", "Only Modal has a mode"), ("modal", "fast", "A mode is function or sandbox")] {
             let r = mode(&mut d, cloud, m).unwrap();
             assert!(r.status == 400 && words_of(&r).contains(says), "{cloud} {m}: {}", words_of(&r));
         }
         // Its Functions first, with that workspace's sign-in; sandboxes: straight to the one write.
-        assert_eq!(mode(&mut d, "modal:initech", "function").err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
-        assert_eq!(mode(&mut d, "modal", "function").err().as_deref(), Some("Sign in with Modal first."));
-        assert_eq!(mode(&mut d, "modal:initech", "sandbox").err().as_deref(), Some("Sign in with Modal first."));
+        assert_eq!(mode(&mut d, "modal-initech", "function").err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
+        assert_eq!(mode(&mut d, "modal", "function").err().as_deref(), Some("Sign in with Modal to the workspace acme first: `superci login modal --add`."));
+        let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech", "function": true }] }, "function_mode": true })));
+        assert_eq!(mode(&mut d, "modal-initech", "sandbox").err().as_deref(), Some("Sign in with Modal first."));
         // An image added while a workspace runs Functions: its Function there first.
-        let mut d = modal_answering(serde_json::json!({ "routing": { "order": [{ "cloud": "modal:initech", "function": true }] }, "runner_images": true, "function_mode": true }));
+        let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech", "function": true }] }, "runner_images": true, "function_mode": true })));
         let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
         assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
     }
