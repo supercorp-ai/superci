@@ -48,6 +48,11 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
         let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two", &format!("--name={name}")]);
         assert!(!ok && said.contains(why), "{name}: {said}");
     }
+    // Offered on the dashboard's Add page, with the word it would have.
+    let (mut child, link) = common::dashboard(&home);
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=add-runners&fragment=1").1) }).find(|p| p.contains("as the runner")).unwrap_or_default();
+    assert!(page.contains("in the Modal workspace acme-two, as the runner modal-acme-two"), "{page}");
+    let _ = child.kill();
     // Its launcher in its own workspace, under the provider and the workspace's name.
     deploy_answers(&served);
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
