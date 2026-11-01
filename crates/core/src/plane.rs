@@ -791,7 +791,7 @@ impl Records {
 }
 
 /// A word for an account or a runner: lowercase letters, digits and dashes, 2 to 32, a dash at neither end.
-fn valid_word(word: &str) -> bool {
+pub fn valid_word(word: &str) -> bool {
     (2..=32).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !word.starts_with('-') && !word.ends_with('-')
 }
 
@@ -819,7 +819,7 @@ fn records_refused(records: &Records, before: &Records) -> Option<String> {
     None
 }
 
-const WORD_RULE: &str = "a word is 2 to 32 lowercase letters, digits and dashes, a dash at neither end";
+pub const WORD_RULE: &str = "a word is 2 to 32 lowercase letters, digits and dashes, a dash at neither end";
 
 /// How long a read of the settings record stands for a request that need not see a write just made.
 pub const SETTINGS_READ_MS: u64 = 10_000;

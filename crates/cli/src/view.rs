@@ -75,6 +75,8 @@ impl PlaneView {
     pub fn routing(&self) -> superci_core::plane::Routing {
         self.status.as_ref().and_then(|s| serde_json::from_value(s["routing"].clone()).ok()).unwrap_or_default()
     }
+    /// The further accounts and runners.
+    pub fn records(&self) -> superci_core::plane::Records { records_in(self.status.as_ref().unwrap_or(&Value::Null)) }
     /// The default machine (for `runs-on: superci` alone), as set in the dashboard.
     pub fn machine(&self) -> superci_core::spec::Spec {
         self.status.as_ref().and_then(|s| serde_json::from_value(s["machine"].clone()).ok()).unwrap_or_default()
@@ -84,12 +86,12 @@ impl PlaneView {
     /// This month's estimated machine spend in all clouds together, and in one cloud account (its providers together).
     pub fn spend_total(&self) -> f64 { self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| m.values().filter_map(|v| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0) }
     pub fn spend_account(&self, account: &str) -> f64 {
-        self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| m.iter().filter(|(c, _)| superci_core::plane::account_of(c) == account).filter_map(|(_, v)| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0)
+        self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| self.records().account_spend(m.iter().filter_map(|(c, v)| Some((c.as_str(), v.as_f64()?))), account))).unwrap_or(0.0)
     }
     /// Today's (UTC), likewise.
     pub fn spend_today_total(&self) -> f64 { self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| m.values().filter_map(|v| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0) }
     pub fn spend_today_account(&self, account: &str) -> f64 {
-        self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| m.iter().filter(|(c, _)| superci_core::plane::account_of(c) == account).filter_map(|(_, v)| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0)
+        self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| self.records().account_spend(m.iter().filter_map(|(c, v)| Some((c.as_str(), v.as_f64()?))), account))).unwrap_or(0.0)
     }
     /// Whether this control plane keeps limits for a day and what the AWS account's own budget does.
     pub fn daily_limits(&self) -> bool { self.status.as_ref().is_some_and(|s| s["daily_limits"] == true) }
@@ -275,4 +277,9 @@ mod tests {
         assert_eq!((v.aws_account(), v.aws_regions()), (None, Vec::<String>::new()));
         assert_eq!(v.label(), "superci");
     }
+}
+
+/// The further accounts and runners a control plane's status says (one from before them: none).
+pub fn records_in(status: &Value) -> superci_core::plane::Records {
+    serde_json::from_value(serde_json::json!({ "accounts": status["accounts"], "runners": status["runners"] })).unwrap_or_default()
 }

@@ -28,6 +28,9 @@ impl Plane {
     }
 
     /// The cloud it runs in (one known only by its address: from the address).
+    /// The Modal workspace it runs in, if that is where.
+    pub fn workspace(&self) -> Option<&str> { match self { Plane::Modal { workspace, .. } => Some(workspace), _ => None } }
+
     pub fn cloud(&self) -> &'static str {
         match self {
             Plane::Cloudflare { .. } => "cloudflare",

@@ -27,6 +27,9 @@ pub struct Kept {
     pub aws_more: Vec<aws::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modal: Option<modal::Session>,
+    /// Further Modal workspaces signed in to (`superci login modal --add`). By #6, Taras Kornichuk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modal_more: Vec<modal::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,7 +70,7 @@ pub struct About {
 pub struct Key { pub name: String, pub value: String, pub planes: Vec<String> }
 
 impl Kept {
-    pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() }
+    pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() || !self.modal_more.is_empty() }
     /// Worth keeping: a sign-in, or what is left of one that ended (the control plane, and the key it is read with:
     /// what the dashboard keeps always has one).
     pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended) && self.plane.is_some()) }

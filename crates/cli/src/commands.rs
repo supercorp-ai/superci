@@ -1223,8 +1223,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let (path, fields) = match (cloud, &plane) {
                 ("aws", Plane::Aws { .. }) => ("/runners/aws-own", vec![]),
                 ("aws", _) => match args.get("region") { Some(r) => ("/aws/connect", vec![field("region", r)]), None => return usage("Say where its machines start: `superci runners create aws --region=us-east-1`.") },
-                ("modal", Plane::Modal { .. }) => ("/runners/modal-own", vec![]),
-                ("modal", _) => ("/runners/modal", vec![]),
+                ("modal", Plane::Modal { workspace, .. }) if args.get("account").is_none_or(|a| a == workspace) => ("/runners/modal-own", vec![]),
+                ("modal", _) => ("/runners/modal", [args.get("account").map(|a| field("account", a)), args.get("name").map(|n| field("name", n))].into_iter().flatten().collect()),
                 _ => ("/runners/cloudflare", args.get("account").map(|a| vec![field("account", a)]).unwrap_or_default()),
             };
             // (Done, it says nothing of its own.)
@@ -1233,7 +1233,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("runners", "delete") => {
             let cloud = w(2);
-            if !CLOUDS.contains(&cloud) { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal).") }
+            if cloud.is_empty() { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal, or a further runner's word).") }
             let would = format!("remove {cloud} as a runner provider{}", if args.has("only-here") { ", leaving what SuperCI made for it there" } else { " and delete what SuperCI made for it there" });
             confirmed(args, &would)?;
             let mut d = ready()?;
@@ -1507,11 +1507,11 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
                 c => match CLOUDS.iter().find(|k| **k == c) { Some(k) => Some(*k), None => return Some(usage("Say which: `superci login aws`, `cloudflare` or `modal`.")) },
             };
             let mut d = signed_in();
-            // `--add`: one more AWS account beside those signed in to (a sign-in adds an account; it replaces none).
-            let add = args.has("add") && cloud == Some("aws");
+            // `--add`: one more AWS account or Modal workspace beside those signed in to (it replaces none).
+            let add = args.has("add") && matches!(cloud, Some("aws" | "modal"));
             let there = match cloud { Some(c) => d.signed_in_as().is_some_and(|s| s.to_lowercase().contains(c)), None => d.signed_in_as().is_some() };
             if there && !add {
-                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), if cloud == Some("aws") { " `superci login aws --add` signs in to another AWS account beside it." } else { "" });
+                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), match cloud { Some("aws") => " `superci login aws --add` signs in to another AWS account beside it.", Some("modal") => " `superci login modal --add` signs in to another Modal workspace beside it.", _ => "" });
                 return Some(Ok(()))
             }
             d.adding = add;
