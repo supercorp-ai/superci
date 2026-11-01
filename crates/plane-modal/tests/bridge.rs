@@ -305,7 +305,7 @@ fn a_job_on_aws_is_asked_again_after_a_wait_when_aws_refuses_it_for_its_rate() {
     let gh = aws.github.lock().unwrap().clone().unwrap();
     aws.replaying(include_str!("../../cli/fixtures/aws/launch/spot.jsonl"), &[]);
     aws.fail("RunInstances", 503, &superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded."), Some(1));
-    let routing = json!({ "default": null, "rules": [], "order": [{ "cloud": "aws", "max_jobs": 100 }] });
+    let routing = json!({ "order": [{ "cloud": "aws", "max_jobs": 100 }] });
     let secrets = json!({ "GITHUB_APP": GitHub::app().to_string(), "ROUTING": routing.to_string() });
     let mut py = PlanePy::start(&aws);
     py.dict.insert("aws".into(), json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": true }).to_string());

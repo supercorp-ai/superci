@@ -4039,11 +4039,7 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
     }
     post(&mut b, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
     until("the largest machine", || routing()["max_cpu"] == 16);
-    // A rule for every repository, and taken out; a public repository added once however often it is asked.
-    post(&mut b, "/routing", &[("action", "add"), ("repo", "*"), ("cloud", "aws")]);
-    until("the rule", || routing()["rules"].as_array().is_some_and(|r| r.iter().any(|r| r["repo"] == "*")));
-    post(&mut b, "/routing", &[("action", "remove"), ("repo", "*")]);
-    until("the rule gone", || !routing()["rules"].as_array().is_some_and(|r| r.iter().any(|r| r["repo"] == "*")));
+    // A public repository added once however often it is asked.
     // A provider's settings: what is no number left out, a region named twice once, Cloudflare's location.
     let said = post(&mut b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("max", "0"), ("usd", "-1"), ("region_0", "us-east-1"), ("region_1", ""), ("region_2", "us-east-1")]);
     assert_eq!(said.1, "redirected", "{said:?}");
@@ -6847,7 +6843,7 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     let served = serve(|c| {
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"aws":100.0},"aws_budget":{"stop":false},"default":"aws","rules":[{"repo":"acme/*","cloud":"aws"}],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"aws":100.0},"aws_budget":{"stop":false},"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#);
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     // (Runners is not opened in the browser: while AWS is asked about the account it reads itself again every few
@@ -6857,10 +6853,10 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
     let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "aws")]);
     assert!(got < 400, "{got} {text}");
-    // Forgotten: out of the order (on-demand with it), its rule and default gone, its budget too.
+    // Forgotten: out of the order (on-demand with it), its budget too.
     until("forgotten", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_RUNNERS" && v == "off"));
     let routing: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").unwrap().1).unwrap();
-    assert!(routing["order"].as_array().unwrap().iter().all(|p| p["cloud"] != "aws" && p["cloud"] != "aws-on-demand") && routing["rules"].as_array().unwrap().is_empty() && routing["aws_budget"].is_null(), "{routing}");
+    assert!(routing["order"].as_array().unwrap().iter().all(|p| p["cloud"] != "aws" && p["cloud"] != "aws-on-demand") && routing["aws_budget"].is_null(), "{routing}");
     // Said on the next page, with what could not be deleted there (AWS answering nothing): its role, its budget.
     // (Read by this test alone, as the page's own look reads it: kept until a read takes it, and set only once what
     // the removal tried in AWS has ended, which with AWS answering nothing takes its time on a slow runner.)
@@ -7207,17 +7203,17 @@ fn repositories_on_a_control_plane_too_old_for_more_organizations_or_gitlabs_say
 }
 
 #[test]
-fn providers_in_the_order_that_this_control_plane_has_not_added_are_said_and_rules_from_before_shown() {
+fn providers_in_the_order_that_this_control_plane_has_not_added_are_said() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare's containers added; the order (as after a move) names Modal too, then AWS's on-demand machines.
     let served = serve(|_| {});
     let home = home(&served);
     for (order, said) in [(r#"[{"cloud":"cloudflare"},{"cloud":"modal"}]"#, "Modal is not added to this control plane yet · Add it"),
         (r#"[{"cloud":"cloudflare"},{"cloud":"modal"},{"cloud":"aws-on-demand"}]"#, "are not added to this control plane yet · Add them")] {
-        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"default":null,"rules":[{{"repo":"acme/*","cloud":"cloudflare"}}],"order":{order}}}"#));
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"order":{order}}}"#));
         let (mut child, link) = dashboard(&home);
         b.goto(&format!("{link}&p=runners"));
-        b.wait(&format!("{} && {}", reads(said), reads("acme/* only uses")));
+        b.wait(&reads(said));
         let _ = child.kill();
     }
     let _ = std::fs::remove_dir_all(&home);

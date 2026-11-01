@@ -98,6 +98,9 @@ pub struct Config {
     /// application) or sandboxes (a Modal control plane), in `own_cloud`.
     pub containers: bool,
     pub own_cloud: String,
+    /// The further accounts and runners (see `Stored::runners`).
+    pub accounts: Vec<Account>,
+    pub runners: Vec<RunnerRecord>,
     /// When the control plane runs in AWS: its own account and the region for machines, and the runtime's credentials
     /// (no role to assume, no OpenID Connect).
     pub aws_own: Option<(String, String)>,
@@ -179,6 +182,8 @@ impl Config {
             more_labels: Vec::new(),
             name: None,
             own_cloud: "cloudflare".into(),
+            accounts: Vec::new(),
+            runners: Vec::new(),
             app: None,
             gitlab: None,
             more_gitlabs: Vec::new(),
@@ -266,7 +271,7 @@ pub struct AwsConnection { pub account_id: String, pub region: String, pub role_
 pub struct Job {
     pub job_id: u64, pub run_id: u64, pub repo: String, pub state: String, pub at_ms: u64,
     pub runner: Option<String>, pub runner_id: Option<u64>, pub installation_id: u64,
-    /// Where it ran ("aws", "cloudflare", "modal"), the machine's id there, and its kind.
+    /// The runner it ran on ("aws", "cloudflare", "modal", or a further one's word), the machine's id there, and its kind.
     pub cloud: String, pub machine_id: Option<String>, pub machine_type: Option<String>,
     pub error: Option<String>, pub seen_in_progress: bool,
     /// The label it asked for (`superci`, `superci/cpu=8/arch=arm64`): what machine, and what its runner registers as.
@@ -741,6 +746,12 @@ pub struct Stored {
     pub version: u64,
     #[serde(default)] pub routing: Routing,
     #[serde(default)] pub launchers: Vec<Launcher>,
+    /// Accounts and runners beyond those every CI can have without a record: the runners `aws`, `aws-on-demand`,
+    /// `cloudflare` and `modal`, in the accounts `aws`, `cloudflare` and `modal`. Each has one word, for good: what the
+    /// order, the limits, the launchers, a job and a day's spend say. Beside `routing` and `launchers`, which an older
+    /// SuperCI writes whole: it cannot strip these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub runners: Vec<RunnerRecord>,
     /// Its cloud's own copy of them as taken (a fingerprint, and when: ms), the newest last. One that differs from
     /// all of these was written there by an older SuperCI, which knows no other way: it is taken, whole, as that
     /// version always meant it. One taken in the last minute is a copy an instance read before (AWS's are read every
@@ -750,7 +761,41 @@ pub struct Stored {
 
 /// The settings as the changes see them (see `settings`).
 #[derive(Deserialize)]
-struct Document { #[serde(default)] routing: Routing, #[serde(default)] launchers: Vec<Launcher> }
+struct Document { #[serde(default)] routing: Routing, #[serde(default)] launchers: Vec<Launcher>, #[serde(default)] accounts: Vec<Account>, #[serde(default)] runners: Vec<RunnerRecord> }
+
+/// A cloud account beyond a provider's first (which is the provider's word): see `Stored::accounts`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Account { pub name: String, pub provider: String }
+
+/// A runner beyond the four without a record, in an account: see `Stored::runners`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RunnerRecord { pub name: String, pub account: String }
+
+/// A word for an account or a runner: lowercase letters, digits and dashes, 2 to 32, a dash at neither end.
+fn valid_word(word: &str) -> bool {
+    (2..=32).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !word.starts_with('-') && !word.ends_with('-')
+}
+
+/// Why these further accounts and runners cannot be, if so.
+fn records_refused(accounts: &[Account], runners: &[RunnerRecord]) -> Option<String> {
+    let mut words = std::collections::HashSet::new();
+    for a in accounts {
+        if !valid_word(&a.name) { return Some(format!("{}: {WORD_RULE}", a.name)) }
+        if !crate::spec::CLOUDS.contains(&a.provider.as_str()) { return Some(format!("{}: no provider called {}", a.name, a.provider)) }
+        if crate::spec::CLOUDS.contains(&a.name.as_str()) && a.name != a.provider { return Some(format!("{} is that provider's first account", a.name)) }
+        if !words.insert(a.name.as_str()) { return Some(format!("{} is named twice", a.name)) }
+    }
+    words.clear();
+    for r in runners {
+        if !valid_word(&r.name) { return Some(format!("{}: {WORD_RULE}", r.name)) }
+        if CLOUD_NAMES.iter().any(|(word, _)| *word == r.name) { return Some(format!("{} needs no record", r.name)) }
+        if !words.insert(r.name.as_str()) { return Some(format!("{} is named twice", r.name)) }
+        if !crate::spec::CLOUDS.contains(&r.account.as_str()) && !accounts.iter().any(|a| a.name == r.account) { return Some(format!("{}: no account called {}", r.name, r.account)) }
+    }
+    None
+}
+
+const WORD_RULE: &str = "a word is 2 to 32 lowercase letters, digits and dashes, a dash at neither end";
 
 /// How long a read of the settings record stands for a request that need not see a write just made.
 pub const SETTINGS_READ_MS: u64 = 10_000;
@@ -761,10 +806,9 @@ const SETTINGS_TAKEN_MS: u64 = 60_000;
 /// How many writes lost to others at the same moment a write is made again over (each loss is another's success).
 const SETTINGS_TRIES: usize = 8;
 
-/// Where jobs run. A job naming a cloud in its label (`superci/provider=aws`) runs only there; else the first rule whose
-/// repository pattern matches ("owner/repo", "owner/*" or "*") names its only cloud; else the places in `order` are tried
-/// top to bottom: the first that can run the job's machine and is within its limits takes it. Without an order: the
-/// default cloud, else every connected cloud (AWS, Cloudflare, launchers).
+/// Where jobs run. A job naming a provider in its label (`superci/provider=aws`) runs only on that provider's runners;
+/// the places in `order` are tried top to bottom: the first that can run the job's machine and is within its limits takes
+/// it. Places connected and not in the order come after it (see `ControlPlane::place`).
 ///
 /// AWS is two places: `aws`, its spot machines, and `AWS_ON_DEMAND`, its on-demand ones (right after `aws` unless the
 /// order puts it elsewhere, or turns it off). A job goes to the next place that can run it when the one before cannot
@@ -772,13 +816,9 @@ const SETTINGS_TRIES: usize = 8;
 /// it waits for one.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Routing {
-    #[serde(default)]
-    pub default: Option<String>,
-    #[serde(default)]
-    pub rules: Vec<Rule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<Pool>,
-    /// Public repositories whose jobs may run here (patterns as in rules). Others' jobs are refused: on a public
+    /// Public repositories whose jobs may run here ("owner/repo", "owner/*" or "*"). Others' jobs are refused: on a public
     /// repository anyone can open a pull request. Even here, runs from forks and `pull_request_target` are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_repos: Vec<String>,
@@ -842,14 +882,12 @@ fn pool_of(key: &str) -> (String, String) {
     (parts.next().unwrap_or_default(), zone)
 }
 
-/// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
+/// The cloud account one of the runners without a record spends in: AWS's on-demand machines are the same account's as
+/// its spot ones. (With the further ones known: `Config::account_of`.)
 pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
 
 /// A limit in dollars as it is said: whole dollars without cents ($200), another amount with them ($12.50).
 pub fn dollars(usd: f64) -> String { if usd.fract() == 0.0 { format!("${usd:.0}") } else { format!("${usd:.2}") } }
-
-/// What a month's spending by place (`month_spend`) comes to in one cloud account.
-pub fn account_spend(spend: &HashMap<String, f64>, account: &str) -> f64 { spend.iter().filter(|(c, _)| account_of(c) == account).map(|(_, usd)| usd).sum() }
 
 /// The longest a job may run unless the dashboard sets another: six hours, as on GitHub's own runners.
 pub const MAX_JOB_MINUTES: u32 = 360;
@@ -882,15 +920,21 @@ impl Pool {
     pub fn of(cloud: &str) -> Pool { Pool { regions: vec![], off: false, cloud: cloud.to_string(), max_jobs: None, monthly_usd: None } }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Rule { pub repo: String, pub cloud: String }
+impl Config {
+    /// The account a runner spends in.
+    pub fn account_of<'a>(&'a self, runner: &'a str) -> &'a str { self.runners.iter().find(|r| r.name == runner).map_or(account_of(runner), |r| r.account.as_str()) }
 
-impl Routing {
-    /// The cloud a repository's rule names (an exception to the order), if any.
-    pub fn rule_for(&self, repo: &str) -> Option<&str> {
-        self.rules.iter().find(|r| matches_repo(&r.repo, repo)).map(|r| r.cloud.as_str())
+    /// The provider a runner is on: what its machines are, what they cost, how long they may live.
+    pub fn provider_of<'a>(&'a self, runner: &'a str) -> &'a str {
+        let account = self.account_of(runner);
+        self.accounts.iter().find(|a| a.name == account).map_or(account, |a| a.provider.as_str())
     }
 
+    /// What a month's spending by runner (`month_spend`) comes to in one cloud account.
+    fn account_spend(&self, spend: &HashMap<String, f64>, account: &str) -> f64 { spend.iter().filter(|(c, _)| self.account_of(c) == account).map(|(_, usd)| usd).sum() }
+}
+
+impl Routing {
     /// A public repository allowed to run jobs here.
     pub fn allows_public(&self, repo: &str) -> bool { self.public_repos.iter().any(|p| matches_repo(p, repo)) }
 
@@ -1273,7 +1317,7 @@ impl<'a> ControlPlane<'a> {
             }
         };
         let Some(stored) = stored else { return Ok(None) };
-        Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, ..self.config.clone() }))
+        Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, accounts: stored.accounts, runners: stored.runners, ..self.config.clone() }))
     }
 
     /// Its cloud's own copy of the settings (as this instance read it): a fingerprint.
@@ -1300,7 +1344,7 @@ impl<'a> ControlPlane<'a> {
     /// and the record as read. (One that is not settings was refused just before this: see `settled`.)
     async fn settings_now(&self) -> Result<(Stored, Option<String>)> {
         let raw = self.store.get(SETTINGS).await?;
-        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
+        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), accounts: vec![], runners: vec![], taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
         Ok((stored, raw))
     }
 
@@ -1316,13 +1360,14 @@ impl<'a> ControlPlane<'a> {
             tries += 1;
             if tries > SETTINGS_TRIES { return Ok(Response::text(503, "the settings were being changed by others all along: try again")) }
             let (now, raw) = self.settings_now().await?;
-            let doc = serde_json::json!({ "routing": now.routing, "launchers": now.launchers });
+            let doc = serde_json::json!({ "routing": now.routing, "launchers": now.launchers, "accounts": now.accounts, "runners": now.runners });
             let changed = match crate::settings::apply(&doc, &asked.changes) {
                 Ok(changed) => changed,
                 Err(conflicts) => return Ok(Response::json(&serde_json::json!({ "error": "changed meanwhile", "conflicts": conflicts, "version": now.version })).with_status(409)),
             };
             let Ok(next) = serde_json::from_value::<Document>(changed) else { return Ok(Response::text(400, "those changes do not make settings SuperCI takes")) };
-            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, taken: now.taken };
+            if let Some(why) = records_refused(&next.accounts, &next.runners) { return Ok(Response::text(400, &why)) }
+            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, accounts: next.accounts, runners: next.runners, taken: now.taken };
             let written = crate::io::json(&next);
             if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
             if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
@@ -1554,7 +1599,7 @@ impl<'a> ControlPlane<'a> {
                     let Some(usd) = usd.as_f64().filter(|u| (0.0..1000.0).contains(u)) else { continue };
                     if !key.starts_with("job:") { continue }
                     let Some(mut j) = get_json::<Job>(self.store, key).await? else { continue };
-                    if j.cloud != "cloudflare" || active(&j) { continue }
+                    if self.config.provider_of(&j.cloud) != "cloudflare" || active(&j) { continue }
                     j.cost_usd = Some(usd);
                     j.cost_from = Some("measured".into());
                     self.keep(key, &j).await?;
@@ -1778,7 +1823,7 @@ impl<'a> ControlPlane<'a> {
     /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
     /// and never more than that cloud lets a machine live. Enforced by the machine itself or its cloud, so it holds
     /// with the control plane gone; a job's own time limit (`timeout-minutes`) ends it sooner.
-    fn machine_minutes(&self, cloud: &str) -> u32 { job_minutes(self.config.routing.max_minutes, cloud) }
+    fn machine_minutes(&self, runner: &str) -> u32 { job_minutes(self.config.routing.max_minutes, self.config.provider_of(runner)) }
 
     /// Whether a request may read: a dashboard session's key, or a key that only reads and has not expired.
     fn reader(&self, req: &Request) -> bool {
@@ -1934,6 +1979,8 @@ impl<'a> ControlPlane<'a> {
             "cloudflare_location": self.config.cloudflare_location,
             "cloudflare_image": self.config.cloudflare_image,
             "launchers": self.config.launchers,
+            "accounts": self.config.accounts,
+            "runners": self.config.runners,
             "containers": self.own_containers(),
             "own_cloud": self.config.own_cloud,
             "gitlab": self.config.gitlab.as_ref().map(|g| serde_json::json!({ "url": g.url })),
@@ -2558,7 +2605,7 @@ impl<'a> ControlPlane<'a> {
     /// Where a job's machine may go, by the order and limits set in the dashboard (see `Routing`): the places that can
     /// run it now, first to last. The job goes to the first; to the next when that one cannot start its machine.
     /// `no_spot`: AWS's spot machines are passed over when another place can run it (see `Job::no_spot`, `spot_paused`).
-    async fn place(&self, repo: &str, spec: &Spec, gitlab: bool, no_spot: bool, failed_at: &[String]) -> Result<Placement> {
+    async fn place(&self, spec: &Spec, gitlab: bool, no_spot: bool, failed_at: &[String]) -> Result<Placement> {
         let aws = self.aws_connection().await?.filter(|a| a.connected);
         let routing = &self.config.routing;
         let mut connected = vec![];
@@ -2571,13 +2618,11 @@ impl<'a> ControlPlane<'a> {
             if order.contains(c) { continue }
             match order.iter().position(|o| o == "aws") { Some(at) if c == AWS_ON_DEMAND => order.insert(at + 1, c.clone()), _ => order.push(c.clone()) }
         }
-        // A label or a rule naming AWS means both of its places, as the order has them.
-        let named = |c: &str| -> Vec<String> { if c == "aws" { order.iter().filter(|o| *o == "aws" || *o == AWS_ON_DEMAND).cloned().collect() } else { vec![c.to_string()] } };
-        let candidates: Vec<String> = if let Some(c) = &spec.cloud { let v = named(c); if v.is_empty() { vec![c.clone()] } else { v } }
-            else if let Some(c) = routing.rule_for(repo) { let v = named(c); if v.is_empty() { vec![c.to_string()] } else { v } }
-            else if !routing.order.is_empty() { order.clone() }
-            else if let Some(d) = &routing.default { let v = named(d); if v.is_empty() { vec![d.clone()] } else { v } }
-            else { connected };
+        // A label naming a provider means all of its runners, as the order has them.
+        let candidates: Vec<String> = match &spec.cloud {
+            Some(c) => { let v: Vec<String> = order.iter().filter(|o| self.config.provider_of(o) == c).cloned().collect(); if v.is_empty() { vec![c.clone()] } else { v } }
+            None => order,
+        };
         if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
         let (spend, today) = self.spend().await?;
         let jobs: Vec<Job> = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect();
@@ -2598,23 +2643,24 @@ impl<'a> ControlPlane<'a> {
             let name = cloud_name(cloud);
             let runner = match cloud.as_str() {
                 "aws" | AWS_ON_DEMAND => aws.clone().map(|a| (Capacity::aws(), Runner::Aws(a))),
-                c if c == self.config.own_cloud && self.own_containers() => Some((capacity_of(c), Runner::Own)),
-                c => self.config.launchers.iter().find(|a| a.cloud == c).map(|a| (capacity_of(c), Runner::Launcher(a.clone()))),
+                c if c == self.config.own_cloud && self.own_containers() => Some((capacity_of(self.config.provider_of(c)), Runner::Own)),
+                c => self.config.launchers.iter().find(|a| a.cloud == c).map(|a| (capacity_of(self.config.provider_of(c)), Runner::Launcher(a.clone()))),
             };
             // Limits from the order: turned off, jobs at once, spend this month.
             let pool = routing.pool(cloud);
             if pool.is_some_and(|p| p.off) { never.push(format!("{name} is turned off")); continue }
             // Its cloud account's limit for the month, its providers together.
-            if let Some(cap) = routing.account_usd.get(account_of(cloud)) {
-                if account_spend(&spend, account_of(cloud)) >= *cap {
-                    let said = format!("the {} account reached its {} a month (`superci accounts update {} --monthly-usd=N` raises it)", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap), account_of(cloud));
+            let account = self.config.account_of(cloud);
+            if let Some(cap) = routing.account_usd.get(account) {
+                if self.config.account_spend(&spend, account) >= *cap {
+                    let said = format!("the {} account reached its {} a month (`superci accounts update {account} --monthly-usd=N` raises it)", cloud_name(account), dollars(*cap));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
             }
-            if let Some(cap) = routing.account_daily_usd.get(account_of(cloud)) {
-                if account_spend(&today, account_of(cloud)) >= *cap {
-                    let said = format!("the {} account reached its {} a day (`superci accounts update {} --daily-usd=N` raises it)", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap), account_of(cloud));
+            if let Some(cap) = routing.account_daily_usd.get(account) {
+                if self.config.account_spend(&today, account) >= *cap {
+                    let said = format!("the {} account reached its {} a day (`superci accounts update {account} --daily-usd=N` raises it)", cloud_name(account), dollars(*cap));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
@@ -2622,15 +2668,15 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
-            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
+            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if self.config.provider_of(cloud) == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
             if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
-            // A label that names this provider, and it is not added here: said as it is.
+            // A label that names this provider, and none of its runners is added here: said as it is.
             let Some((capacity, runner)) = runner else {
-                if spec.cloud.is_some() { return Ok(Placement::Fail(format!("its label needs {} runners, which this control plane has not added", cloud_name(spec.cloud.as_deref().unwrap_or(cloud))))) }
+                if spec.cloud.is_some() && !candidates.iter().any(|c| connected.contains(c)) { return Ok(Placement::Fail(format!("its label needs {} runners, which this control plane has not added", cloud_name(spec.cloud.as_deref().unwrap_or(cloud))))) }
                 never.push(format!("{name} is not connected"));
                 continue
             };
-            if gitlab && cloud == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
+            if gitlab && self.config.provider_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
             // Its label asks for an on-demand machine: not AWS's spot ones.
@@ -3138,7 +3184,7 @@ impl<'a> ControlPlane<'a> {
             let spec = match spec { Ok(s) => s, Err(e) => { intrinsic = true; return Err(e) } };
             if let Some(why) = self.config.routing.too_large(&spec) { intrinsic = true; return Err(why) }
             let now = self.clock.now_ms();
-            let places = match self.place(&job.repo, &spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), &job.failed_at).await? {
+            let places = match self.place(&spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), &job.failed_at).await? {
                 Placement::Run(p) => p,
                 Placement::Wait(why) => {
                     job.state = "waiting".into();
@@ -3146,7 +3192,7 @@ impl<'a> ControlPlane<'a> {
                     self.keep(&key, &*job).await?;
                     return self.timer.wake_in(20_000).await;
                 }
-                Placement::Fail(why) => { intrinsic = spec.cloud.is_some() || self.config.routing.rule_for(&job.repo).is_none(); return Err(why) }
+                Placement::Fail(why) => { intrinsic = true; return Err(why) }
             };
             let cloud_of = |r: &Runner| match r { Runner::Aws(_) => "aws".to_string(), Runner::Launcher(a) => a.cloud.clone(), Runner::Own => self.config.own_cloud.clone() };
             job.state = "launching".into();
@@ -3443,10 +3489,11 @@ impl<'a> ControlPlane<'a> {
                     Runner::Launcher(a) => async {
                         job.cpu = Some(size.cpu);
                         // (Priced as its capacity is had: Cloudflare's, else Modal's, see `capacity_of`.)
-                        job.usd_per_hour = Some(if a.cloud == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) });
-                        if a.cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
+                        let provider = self.config.provider_of(&a.cloud);
+                        job.usd_per_hour = Some(if provider == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) });
+                        if provider == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
-                        if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
+                        if provider == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
                         Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
@@ -3503,7 +3550,7 @@ impl<'a> ControlPlane<'a> {
                     // limit not letting its machine start: a job larger than that limit would wait for room that
                     // never comes, when the spot limit it ran under a moment ago is free. A spot machine is asked
                     // for again (the pool that took one back is asked last, see `pools_to_avoid`).
-                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&job.repo, &spec, gitlab, false, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _, _)| c == "aws")) {
+                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&spec, gitlab, false, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _, _)| c == "aws")) {
                         return Err(format!("{BACK_ON_SPOT}{}", answers.join("; ")))
                     }
                     if at_limit { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
@@ -3644,7 +3691,7 @@ impl<'a> ControlPlane<'a> {
         enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| a.cloud == *c)).map(|a| Place::Launcher(a.clone())));
+        places.extend(["cloudflare", "modal"].iter().flat_map(|c| self.config.launchers.iter().filter(move |a| self.config.provider_of(&a.cloud) == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
