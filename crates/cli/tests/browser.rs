@@ -13651,7 +13651,7 @@ mod runs_suite_in_browser {
         assert!(out.status.success() && said.contains("The run ended: success"), "{said}");
         // Its summary says it was started again, and which job its first attempt was.
         let first_id = first_job["job_id"].to_string();
-        assert!(said.contains(&format!("Started again on an on-demand machine: AWS took back its spot machine (its first attempt was job {first_id}).")), "{said}");
+        assert!(said.contains(&format!("Started again further down the order: AWS took back its spot machine (its first attempt was job {first_id}).")), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }

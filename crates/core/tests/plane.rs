@@ -1774,7 +1774,7 @@ fn a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_d
 /// run has finished, on a sandbox (so once at most), and the month's count says both. Other jobs stay on Functions,
 /// and AWS's spot machines are not paused for it.
 #[test]
-fn a_preempted_modal_function_is_run_again_once_on_a_sandbox_and_counted() {
+fn a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted() {
     use superci_core::plane::{modal_function_usd_per_hour, modal_usd_per_hour};
     let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(false), may_rerun: true }, Wakes::default(), Cache::default(), OwnContainers::default());
     let mut config = Config::new(PLANE_ID.into());
@@ -1862,7 +1862,7 @@ fn functions_are_a_row_a_label_and_a_preemption_go_past() {
     let runner = format!("superci-{PLANE_ID}-4");
     block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/cpu=4")));
     let token = job(&store, 4)["notice"].as_str().unwrap().to_string();
-    block_on(plane.handle(webhook("in_progress", Some(&runner)).clone()));
+    block_on(plane.handle(webhook("in_progress", Some(&runner))));
     block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={token}"))));
     block_on(plane.handle(webhook("completed", Some(&runner))));
     block_on(plane.alarm()).unwrap();
@@ -7643,7 +7643,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
         a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,
-        a_preempted_modal_function_is_run_again_once_on_a_sandbox_and_counted,
+        a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted,
+        functions_are_a_row_a_label_and_a_preemption_go_past,
         a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)

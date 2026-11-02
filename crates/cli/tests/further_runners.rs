@@ -151,6 +151,10 @@ fn an_update_deploys_each_modal_launcher_with_its_own_workspaces_sign_in_and_nam
 fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind() {
     let (served, home) = two_workspaces();
     with_further(&served, PLANE, &["modal-acme-two", "modal-globex"]);
+    // (And one removed: no launcher to bring.)
+    let mut record = stored(&served);
+    record["runners"].as_array_mut().unwrap().push(serde_json::json!({ "name": "modal-old", "account": "modal-globex", "gone": true }));
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
     let aws = served.aws.clone();
     let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
     for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
@@ -171,9 +175,15 @@ fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind
     let theirs: serde_json::Value = serde_json::from_str(&new.store.0.lock().unwrap()["settings"]).unwrap();
     assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two" && a["url"].as_str().unwrap().contains("acme-two--superci-runners-testplane0002")), "{theirs}");
     assert!(!theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-globex"), "{theirs}");
-    assert_eq!(theirs["runners"].as_array().unwrap().len(), 4, "{theirs}");
+    assert_eq!(theirs["runners"].as_array().unwrap().len(), 5, "{theirs}");
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("modal-globex stayed behind")).unwrap_or_default();
     assert!(page.contains("sign in to the Modal workspace globex"), "{page}");
+    // The old one deleted: what is in a workspace not signed in to is said as left.
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
+    assert!(status == 303, "{status} {to} {}", words(&said));
+    let page = (0..80).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("Its launcher in the Modal workspace globex")).unwrap_or_default();
+    assert!(page.contains("sign in there to remove it"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -383,10 +393,12 @@ fn a_move_brings_further_aws_accounts_and_deleting_the_old_control_plane_cleans_
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("aws-globex stayed behind")).unwrap_or_default();
     assert!(page.contains("sign in to AWS account 333333333333"), "{page}");
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    // (AWS refusing to say what networks there are: said as left in the account signed in to.)
+    served.aws.fail("Action=DescribeVpcs", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>may not</Message></Error></Errors></Response>", None);
     let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
     assert!(status == 303, "{status} {to} {}", words(&said));
     let page = (0..80).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("Its role in AWS account 333333333333")).unwrap_or_default();
-    assert!(page.contains("sign in with AWS to remove it"), "{page}");
+    assert!(page.contains("sign in with AWS to remove it") && page.contains("Its machines' network in AWS account 222222222222"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -701,8 +713,10 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
     let answers = || for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1", "us-east-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) };
     answers();
+    // (Beside a further runner elsewhere, whose record stays.)
+    served.store.0.lock().unwrap().insert("settings".into(), serde_json::json!({ "version": 1, "routing": {}, "launchers": [], "accounts": [{ "name": "modal-x", "provider": "modal", "cloud_id": "x" }], "runners": [{ "name": "modal-x", "account": "modal-x" }] }).to_string());
     let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
-    assert!(ok, "{said}");
+    assert!(ok && stored(&served)["runners"][0]["name"] == "modal-x", "{said}");
     let regions = || { let c: serde_json::Value = serde_json::from_str(&served.store.0.lock().unwrap()["aws:connection:aws-acme"]).unwrap(); c["regions"].clone() };
     // Its spot runner's regions; a repeat counted once; its on-demand runner keeps what it had, so the account has both.
     let (ok, said) = run(&["runners", "update", "aws-acme", "--regions=eu-west-1,eu-west-1"]);

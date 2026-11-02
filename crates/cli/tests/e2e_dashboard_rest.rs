@@ -898,7 +898,7 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
     cf.answer_as("", &[]);
     served.aws.worker_secrets.lock().unwrap().entry("superci".into()).or_default().insert("LAUNCHERS".into(), r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00002.acme.workers.dev"}]"#.into());
     cf.store_refuses(Some(superci_core::plane::SETTINGS));
-    let (status, said) = sent(&link, "/runners/cloudflare", &[]);
+    let (status, said) = sent(&link, "/runners/cloudflare", &[("account", "1111111111111111111111111111111a")]);
     assert!(status >= 400 && said.contains("the control plane answered 500"), "{status} {said}");
     assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "LAUNCHERS" && v.contains("cloudflare")));
     let _ = std::fs::remove_dir_all(&home);
