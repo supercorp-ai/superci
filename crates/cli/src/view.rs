@@ -126,11 +126,16 @@ impl PlaneView {
         let records = self.records();
         let further: Vec<String> = places.iter().filter(|c| records.provider_of(c) == "aws" && *c != "aws" && *c != AWS_ON_DEMAND).cloned().collect();
         for word in further { let at = places.iter().position(|c| *c == word).map_or(places.len(), |at| at + 1); places.insert(at, format!("{word}-on-demand")) }
+        // (Modal's Functions, a row of each Modal runner's: taken out until someone puts them in.)
+        if self.status.as_ref().is_some_and(|s| s["function_mode"] == true) {
+            let sandboxes: Vec<String> = places.iter().filter(|c| records.provider_of(c) == "modal").cloned().collect();
+            for word in sandboxes { let at = places.iter().position(|c| *c == word).map_or(places.len(), |at| at + 1); places.insert(at, format!("{word}-functions")) }
+        }
         let mut order: Vec<_> = routing.order.into_iter().filter(|p| places.contains(&p.cloud)).collect();
         for c in places {
             if order.iter().any(|p| p.cloud == c) { continue }
-            let new = Pool { regions: vec![], off: false, cloud: c.clone(), max_jobs: None, monthly_usd: None, function: false };
-            match c.strip_suffix("-on-demand").and_then(|spot| order.iter().position(|p| p.cloud == spot)) { Some(at) => order.insert(at + 1, new), None => order.push(new) }
+            let new = Pool { regions: vec![], off: records.modal_function(&c), cloud: c.clone(), max_jobs: None, monthly_usd: None };
+            match c.strip_suffix("-on-demand").or(c.strip_suffix("-functions")).and_then(|first| order.iter().position(|p| p.cloud == first)) { Some(at) => order.insert(at + 1, new), None => order.push(new) }
         }
         order
     }

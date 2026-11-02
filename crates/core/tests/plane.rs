@@ -1072,7 +1072,7 @@ fn gpus_and_windows_get_their_own_images_types_and_prices() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     // A GPU: the image with NVIDIA's drivers, T4 machines first.
@@ -1115,7 +1115,7 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=any")));
     let launch = clouds.calls.borrow().iter().find(|c| c.1 == "https://runners.acme.workers.dev/launch").cloned().expect("agent launch");
@@ -1201,8 +1201,8 @@ fn an_image_of_ones_own_goes_to_a_further_modal_workspaces_launcher_too() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.launchers = vec![Launcher { cloud: "modal-acme-two".into(), url: "https://acme-two--superci-runners.modal.run".into() }];
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal-acme-two".into(), max_jobs: None, monthly_usd: None, function: false }];
-    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false }] };
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal-acme-two".into(), max_jobs: None, monthly_usd: None }];
+    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false, function: false }] };
     config.routing.images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci:2".into(), modal_secret: Some("ghcr-read".into()) })].into_iter().collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=rust-ci")));
@@ -1223,7 +1223,7 @@ fn an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise(
     config.app = Some(app());
     config.containers = true;
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None, function: false }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=l4")));
     let j = job(&store, 1);
@@ -1241,7 +1241,7 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     config.app = Some(app());
     config.containers = true;
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None, function: false }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
 
@@ -1277,7 +1277,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.containers = true;
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: Some(1), monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: Some(1), monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
 
@@ -1301,7 +1301,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: Some(1.0), function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: Some(1.0) }];
     let store = Mem::default();
     store.0.borrow_mut().insert("job:50".into(), serde_json::json!({ "job_id": 50, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_996_400_000u64, "ended_ms": 1_790_000_000_000u64,
         "installation_id": 42, "cloud": "aws", "usd_per_hour": 2.0, "seen_in_progress": true }).to_string());
@@ -1311,7 +1311,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     assert_eq!((job(&store, 51)["state"].as_str(), job(&store, 51)["on_demand"].as_bool()), (Some("launched"), Some(true)), "{}", job(&store, 51));
     assert_eq!(field(launches(&clouds).last().unwrap(), "InstanceMarketOptions.MarketType"), "");
     // With on-demand turned off there is nothing below: it fails with why.
-    config.routing.order.push(Pool { regions: vec![], off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None, function: false });
+    config.routing.order.push(Pool { regions: vec![], off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None });
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(job_event("queued", 52, "acme/app", None)));
     let e = job(&store, 52)["error"].as_str().unwrap().to_string();
@@ -1769,7 +1769,7 @@ fn a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_d
     assert_eq!(job(&store, 10)["on_demand"], true);
 }
 
-/// Modal in Function mode (`Pool::function`): a job's runner is a preemptible Modal Function, at Function prices, with
+/// Modal's Functions (the `modal-functions` row): a job's runner is a preemptible Modal Function, at Function prices, with
 /// a link of its own to say Modal preempted it. Then its job fails on GitHub (its runner gone), is run again once its
 /// run has finished, on a sandbox (so once at most), and the month's count says both. Other jobs stay on Functions,
 /// and AWS's spot machines are not paused for it.
@@ -1781,7 +1781,7 @@ fn a_preempted_modal_function_is_run_again_once_on_a_sandbox_and_counted() {
     config.app = Some(app());
     (config.containers, config.own_cloud) = (true, "modal".into());
     config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
-    config.routing.order = vec![Pool { function: true, ..Pool::of("modal") }];
+    config.routing.order = vec![Pool::of("modal-functions")];
     config.routing.images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci:1".into(), modal_secret: Some("ghcr-read".into()) })].into_iter().collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
@@ -1838,7 +1838,7 @@ fn a_preempted_modal_function_is_run_again_once_on_a_sandbox_and_counted() {
     assert_eq!(own.0.borrow().last().cloned(), Some(format!("stop fc-superci-{PLANE_ID}-9")));
 }
 
-/// A further Modal workspace's launcher in Function mode is told so, with the link; one from before Function mode
+/// A further Modal workspace's launcher is told a Function, with the link; one from before Functions
 /// (it says back a sandbox) has it stopped, and the job says to update it.
 #[test]
 fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
@@ -1850,8 +1850,8 @@ fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.launchers = vec![Launcher { cloud: "modal-acme-two".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = vec![Pool { function: true, ..Pool::of("modal-acme-two") }];
-    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false }] };
+    config.routing.order = vec![Pool::of("modal-acme-two-functions"), Pool { off: true, ..Pool::of("modal-acme-two") }];
+    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false, function: false }, superci_core::plane::RunnerRecord { name: "modal-acme-two-functions".into(), account: "modal-acme-two".into(), gone: false, on_demand: false, function: true }] };
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let calls = |url: &str| clouds.0.calls.borrow().iter().filter(|c| c.1 == url).map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap_or_default()).collect::<Vec<_>>();
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/cpu=4")));
@@ -1863,7 +1863,7 @@ fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
     block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=4")));
     assert_eq!(calls("https://runners.acme.workers.dev/stop"), vec![serde_json::json!({ "id": "sb-7" })]);
     let e = job(&store, 2)["error"].as_str().unwrap_or_default().to_string();
-    assert!(e.contains("the modal-acme-two launcher is from before Function mode, and would start a sandbox: update it (`superci runners create modal --account=acme-two`)"), "{e}");
+    assert!(e.contains("the modal-acme-two launcher is from before Functions, and would start a sandbox: update it (`superci runners create modal --account=acme-two`)"), "{e}");
 }
 
 #[test]
@@ -2367,7 +2367,7 @@ fn with_no_spot_machine_the_job_goes_to_the_next_place_in_the_order() {
     config.containers = true;
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
-    config.routing.order = ["aws", "cloudflare", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None, function: false }).collect();
+    config.routing.order = ["aws", "cloudflare", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
     // The standard machine fits Cloudflare: the job runs there, and no on-demand machine is asked for.
@@ -2423,7 +2423,7 @@ fn with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_s
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None, function: false }, Pool { regions: vec![], off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     // No spot machine, and on-demand is off: the job waits (it does not fail), however many times it is tried.
     block_on(plane.handle(webhook("queued", None)));
@@ -2457,7 +2457,7 @@ fn a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_ord
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None, function: false }).collect();
+    config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     // The job starts on AWS (a spot machine) at once: it does not wait on Cloudflare.
@@ -2495,7 +2495,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = ["modal", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None, function: false }).collect();
+    config.routing.order = ["modal", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/gpu=any")));
     let j = job(&store, 7);
@@ -6755,7 +6755,7 @@ fn a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None, function: false }, Pool { regions: vec![], off: true, cloud: superci_core::plane::AWS_ON_DEMAND.into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: true, cloud: superci_core::plane::AWS_ON_DEMAND.into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=l4")));
     let e = job(&store, 1)["error"].as_str().unwrap_or_default().to_string();
@@ -7160,7 +7160,7 @@ fn a_further_aws_accounts_machine_uses_the_one_cache_and_its_refusals_are_its_ow
     config.app = Some(app());
     config.records = superci_core::plane::Records {
         accounts: vec![superci_core::plane::Account { name: "aws-acme".into(), provider: "aws".into(), cloud_id: Some("222222222222".into()) }],
-        runners: vec![superci_core::plane::RunnerRecord { name: "aws-acme".into(), account: "aws-acme".into(), gone: false, on_demand: false }, superci_core::plane::RunnerRecord { name: "aws-acme-on-demand".into(), account: "aws-acme".into(), gone: false, on_demand: true }] };
+        runners: vec![superci_core::plane::RunnerRecord { name: "aws-acme".into(), account: "aws-acme".into(), gone: false, on_demand: false, function: false }, superci_core::plane::RunnerRecord { name: "aws-acme-on-demand".into(), account: "aws-acme".into(), gone: false, on_demand: true, function: false }] };
     config.routing.order = vec![Pool::of("aws-acme"), Pool::of("aws-acme-on-demand"), Pool { off: true, ..Pool::of("aws") }, Pool { off: true, ..Pool::of("aws-on-demand") }];
     let connection = |name: &str, id: &str| { let mut c = serde_json::json!({ "account_id": id, "region": "us-east-1", "role_arn": role_arn(id, PLANE_ID), "connected": true, "error": null }); if !name.is_empty() { (c["name"], c["regions"]) = (name.into(), serde_json::json!(["us-east-1"])) } c.to_string() };
     store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222"));
@@ -7197,7 +7197,7 @@ fn several_aws_accounts_each_case_a_job_at_a_time() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
-    let word = |w: &str, a: &str, on_demand: bool| superci_core::plane::RunnerRecord { name: w.into(), account: a.into(), gone: false, on_demand };
+    let word = |w: &str, a: &str, on_demand: bool| superci_core::plane::RunnerRecord { name: w.into(), account: a.into(), gone: false, on_demand, function: false };
     config.records = superci_core::plane::Records {
         accounts: vec![superci_core::plane::Account { name: "aws-acme".into(), provider: "aws".into(), cloud_id: Some("222222222222".into()) }],
         runners: vec![word("aws-acme", "aws-acme", false), word("aws-acme-on-demand", "aws-acme", true)] };
@@ -7693,7 +7693,7 @@ fn what_a_launchers_cloud_says_beside_its_answers_is_kept_once_each_and_its_stat
     config.app = Some(app());
     config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None, function: false }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let status = || json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))["cloud_says"].clone();
     assert_eq!(status(), serde_json::json!([]), "nothing said yet");

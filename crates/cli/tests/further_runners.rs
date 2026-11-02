@@ -61,7 +61,7 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
     assert!(ok && said.contains("modal-acme-two runs jobs now."), "{said}");
     let kept = stored(&served);
-    assert_eq!(kept["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two" }]), "{kept}");
+    assert_eq!(kept["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two" }, { "name": "modal-acme-two-functions", "account": "modal-acme-two", "function": true }]), "{kept}");
     assert_eq!(kept["accounts"], serde_json::json!([{ "name": "modal-acme-two", "provider": "modal", "cloud_id": "acme-two" }]), "{kept}");
     assert!(kept["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two" && a["url"].as_str().unwrap().starts_with("https://acme-two--")), "{kept}");
     // Listed, and changed, by its word; the first stays as it was.
@@ -105,7 +105,7 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     let (ok, said) = run(&["runners", "delete", "modal-acme-two", "--confirm"]);
     assert!(ok && said.contains("Removed modal-acme-two."), "{said}");
     let kept = stored(&served);
-    assert_eq!(kept["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two", "gone": true }]), "{kept}");
+    assert_eq!(kept["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two", "gone": true }, { "name": "modal-acme-two-functions", "account": "modal-acme-two", "gone": true, "function": true }]), "{kept}");
     assert!(!kept["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two") && !kept["routing"]["order"].as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two"), "{kept}");
     let (ok, said) = run(&["runners", "delete", "modal-acme-two", "--confirm"]);
     assert!(!ok && said.contains("Say which"), "{said}");
@@ -113,7 +113,7 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     deploy_answers(&served);
     let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
     assert!(ok, "{said}");
-    assert_eq!(stored(&served)["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two" }]));
+    assert_eq!(stored(&served)["runners"], serde_json::json!([{ "name": "modal-acme-two", "account": "modal-acme-two" }, { "name": "modal-acme-two-functions", "account": "modal-acme-two", "function": true }]));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -125,7 +125,7 @@ fn with_further(served: &superci_testkit::Served, plane: &str, words: &[&str]) {
     served.aws.put(&format!("/superci/{plane}/LAUNCHERS"), &serde_json::Value::Array(launchers.clone()).to_string());
     let record = serde_json::json!({ "version": 1, "routing": {}, "launchers": launchers,
         "accounts": words.iter().map(|w| serde_json::json!({ "name": w, "provider": "modal", "cloud_id": w.trim_start_matches("modal-") })).collect::<Vec<_>>(),
-        "runners": words.iter().map(|w| serde_json::json!({ "name": w, "account": w })).collect::<Vec<_>>() });
+        "runners": words.iter().flat_map(|w| [serde_json::json!({ "name": w, "account": w }), serde_json::json!({ "name": format!("{w}-functions"), "account": w, "function": true })]).collect::<Vec<_>>() });
     served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
 }
 
@@ -171,7 +171,7 @@ fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind
     let theirs: serde_json::Value = serde_json::from_str(&new.store.0.lock().unwrap()["settings"]).unwrap();
     assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two" && a["url"].as_str().unwrap().contains("acme-two--superci-runners-testplane0002")), "{theirs}");
     assert!(!theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-globex"), "{theirs}");
-    assert_eq!(theirs["runners"].as_array().unwrap().len(), 2, "{theirs}");
+    assert_eq!(theirs["runners"].as_array().unwrap().len(), 4, "{theirs}");
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("modal-globex stayed behind")).unwrap_or_default();
     assert!(page.contains("sign in to the Modal workspace globex"), "{page}");
     let _ = child.kill();
@@ -267,7 +267,7 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     };
     // Not signed in to, the first's own, no region, a word with no room for its on-demand one.
     for (args, why) in [(&["runners", "create", "aws", "--account=333333333333", "--region=eu-west-1"][..], "Sign in to account 333333333333"), (&["runners", "create", "aws", "--account=222222222222"], "Say where its machines start"),
-        (&["runners", "create", "aws", "--account=111111111111", "--region=eu-west-1"], "runs jobs as aws"), (&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=a-word-of-twenty-three-c"], "no room for -on-demand"), (&["runners", "create", "aws", "--account=222222222222", "--region=nowhere"], "Choose a region")] {
+        (&["runners", "create", "aws", "--account=111111111111", "--region=eu-west-1"], "runs jobs as aws"), (&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=a-word-of-twenty-three-c"], "no room for its second runner"), (&["runners", "create", "aws", "--account=222222222222", "--region=nowhere"], "Choose a region")] {
         let (ok, said) = run(args);
         assert!(!ok && said.contains(why), "{args:?}: {said}");
     }
@@ -582,11 +582,9 @@ fn a_second_cloudflare_accounts_refusals_are_each_said() {
     answers(third, "initech");
     let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={third}"), "--name=cf-globex"]);
     assert!(!ok && said.contains("another runner's word"), "{said}");
-    // Its limits, by its word; `--mode` is Modal's.
+    // Its limits, by its word.
     let (ok, said) = run(&["runners", "update", "cf-globex", "--max-jobs=2", "--monthly-usd=10"]);
     assert!(ok && said.contains("cf-globex"), "{said}");
-    let (ok, said) = run(&["runners", "update", "cf-globex", "--mode=function"]);
-    assert!(!ok && said.contains("--mode is for a Modal runner"), "{said}");
     // The dashboard offers what is left; none for the account it runs on.
     let (mut child, link) = common::dashboard(&home);
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=add-runners&fragment=1").1) }).find(|p| p.contains("Cloudflare account Initech")).unwrap_or_default();
@@ -606,10 +604,11 @@ fn a_second_cloudflare_accounts_refusals_are_each_said() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Function mode by command, on the first runner and a further one: Functions deployed first, by each one's own workspace;
-/// an image added while it is on, deployed again; what its preemptions came to said in the status and the list.
+/// Modal's Functions by command, on the first runner and a further one: a row of each, taken out until put in, deployed
+/// first by each one's own workspace; an image added while it is on, deployed again; what its preemptions came to said
+/// in the status and the list.
 #[test]
-fn function_mode_by_command_on_each_modal_runner_and_its_preemptions_said() {
+fn functions_by_command_on_each_modal_runner_and_their_preemptions_said() {
     let (served, home) = two_workspaces();
     with_further(&served, PLANE, &["modal-acme-two"]);
     let run = |args: &[&str]| {
@@ -619,19 +618,21 @@ fn function_mode_by_command_on_each_modal_runner_and_its_preemptions_said() {
     deploy_answers(&served);
     let (ok, said) = run(&["runner_images", "list"]);
     assert!(ok && said.contains("No image of your own"), "{said}");
-    for (args, why) in [(&["runners", "update", "modal", "--mode=fast"][..], "--mode is function or sandbox"), (&["runners", "update", "aws", "--mode=function"], "--mode is for a Modal runner"), (&["runner_images", "create", "own-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=not a secret"], "Modal Secret")] {
-        let (ok, said) = run(args);
-        assert!(!ok && said.contains(why), "{args:?}: {said}");
-    }
+    let (ok, said) = run(&["runner_images", "create", "own-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=not a secret"]);
+    assert!(!ok && said.contains("Modal Secret"), "{said}");
+    // Each Modal runner has its row, taken out.
+    let (_, data) = common::json(&home, &["runners", "list"]);
+    let row = |data: &serde_json::Value, cloud: &str| data["order"].as_array().unwrap().iter().find(|p| p["cloud"] == cloud).cloned().unwrap_or_default();
+    for cloud in ["modal-functions", "modal-acme-two-functions"] { assert_eq!(row(&data, cloud)["taken_out"], true, "{data}") }
     let made = |served: &superci_testkit::Served| sandboxes_made(served);
     let before = made(&served);
-    let (ok, said) = run(&["runners", "update", "modal-acme-two", "--mode=function"]);
-    assert!(ok && said.contains("Preempted: 0 Modal Functions this month · 0 jobs run again."), "{said}");
+    let (ok, said) = run(&["runners", "order", "modal-acme-two-functions", "modal-acme-two", "modal"]);
+    assert!(ok && said.contains("Order: modal-acme-two-functions, modal-acme-two, modal."), "{said}");
     assert!(made(&served) > before, "its Functions deployed");
-    let order = stored(&served)["routing"]["order"].clone();
-    assert!(order.as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two" && p["function"] == true), "{order}");
+    let (ok, said) = run(&["runners", "list"]);
+    assert!(ok && said.contains("Preempted: 0 Modal Functions this month · 0 jobs run again."), "{said}");
     let (_, data) = common::json(&home, &["runners", "list"]);
-    assert!(data["order"].as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two" && p["mode"] == "function") && data["order"].as_array().unwrap().iter().any(|p| p["cloud"] == "modal" && p["mode"] == "sandbox"), "{data}");
+    assert!(row(&data, "modal-acme-two-functions")["taken_out"] != true && row(&data, "modal-functions")["taken_out"] == true, "{data}");
     // An image added while it runs Functions: its Function first, in that workspace; with a Secret by a good name.
     deploy_answers(&served);
     let before = made(&served);
@@ -650,10 +651,12 @@ fn function_mode_by_command_on_each_modal_runner_and_its_preemptions_said() {
     served.store.0.lock().unwrap().insert(format!("modal:preempted:{now}:2"), now.to_string());
     let (_, said) = run(&["runners", "list"]);
     assert!(said.contains("Preempted: 2 Modal Functions this month · 1 job run again."), "{said}");
-    // Back to sandboxes: nothing deployed.
+    // Back to sandboxes: nothing deployed. Removed with its runner, not by itself.
     let before = made(&served);
-    let (ok, _) = run(&["runners", "update", "modal-acme-two", "--mode=sandbox"]);
+    let (ok, _) = run(&["runners", "order", "modal-acme-two", "modal"]);
     assert!(ok && made(&served) == before);
+    let (ok, said) = run(&["runners", "delete", "modal-acme-two-functions", "--confirm"]);
+    assert!(!ok && said.contains("goes with modal-acme-two"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

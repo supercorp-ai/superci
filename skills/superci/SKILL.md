@@ -45,7 +45,7 @@ A job that installs the same tools at each run can start from an image that has 
 
 `provider=modal` (or `aws`, `cloudflare`) means every runner of that provider, in the order's order: a CI may have several accounts of one provider, and a workflow does not name which. Do not add one to a label to pick an account.
 
-On Modal, `superci runners update modal --mode=function` runs jobs as preemptible Modal Functions, at a third of a sandbox's price. A preempted job fails on GitHub and is run again by itself on a sandbox once its run has finished; `superci status` says how many this month.
+On Modal, `modal-functions` is a row of its own, like `aws-on-demand`: preemptible Modal Functions at a third of a sandbox's price, taken out until put in (`superci runners order modal-functions modal`; a further runner's is `WORD-functions`). A preempted job fails on GitHub and is run again by itself further down the order once its run has finished; `superci status` says how many this month.
 
 ## 4. Replace vendor actions
 
