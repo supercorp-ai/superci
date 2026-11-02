@@ -1539,6 +1539,16 @@ impl<'a> ControlPlane<'a> {
                     let now = self.clock.now_ms();
                     let note = if self.config.records.provider_of(&j.cloud) == "modal" { PREEMPTED } else { "spot:interrupted:" };
                     put_json(self.store, &format!("{note}{now}:{}", j.job_id), &now).await?;
+                    // A preempted Function's runner is gone and says nothing more; GitHub notices by itself, but a
+                    // run from a computer has only this control plane to: over now, and started again by its run.
+                    if note == PREEMPTED && j.provider == "local" {
+                        let (lost, again) = lost_said("modal");
+                        j.state = "failed".into();
+                        j.error = Some(format!("{lost}; SuperCI starts the job again by itself, {again}"));
+                        j.ended_ms.get_or_insert(now);
+                        self.keep(&job_key(&j), &j).await?;
+                        self.timer.wake_in(1_000).await?;
+                    }
                 }
                 // What the machine runs with this answer: the reason, in the job's own log on GitHub, where it is
                 // otherwise only "The runner has received a shutdown signal" (a GitHub job: GitLab's says its own).
@@ -3924,6 +3934,8 @@ impl<'a> ControlPlane<'a> {
         if self.own_containers() { places.push(Place::Own) }
         places.extend(["cloudflare", "modal"].iter().flat_map(|c| self.config.launchers.iter().filter(move |a| self.config.records.provider_of(&a.cloud) == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
+        // (And each further AWS account's.)
+        places.extend(self.further_aws().await.unwrap_or_default().into_iter().filter(|a| a.connected).map(Place::Aws));
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
         let owner = Self::owner_of(app);
@@ -4602,7 +4614,7 @@ impl<'a> ControlPlane<'a> {
                     j["state"] = "pending".into();
                     j["off_spot"] = true.into();
                     // (Its first attempt, said with the run: its job, and why it is started again.)
-                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": "AWS took back its spot machine" });
+                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": lost_said(record.as_ref().map_or("aws", |r| self.config.records.provider_of(&r.cloud))).0 });
                     let o = j.as_object_mut().expect("an object: its fields were just set");
                     o.remove("job_id");
                     o.remove("token");

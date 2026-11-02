@@ -424,3 +424,182 @@ fn settings_as_0_19_21_left_them_stand_after_an_update_and_an_older_write_leaves
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Everything that can stop a second AWS account being added or removed, each said as what it is, nothing half done.
+#[test]
+fn a_second_aws_accounts_refusals_are_each_said() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let answers = || {
+        let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+        for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) }
+    };
+    let add = ["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"];
+    // AWS refusing its role: said as AWS said it, no record written.
+    answers();
+    served.aws.fail("Action=CreateRole", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>not allowed to create roles</Message></Error></ErrorResponse>", Some(1));
+    let (ok, said) = run(&add);
+    assert!(!ok && said.contains("not allowed to create roles"), "{said}");
+    assert!(served.store.0.lock().unwrap().get("settings").is_none_or(|s| !s.contains("aws-acme")), "nothing kept");
+    served.aws.fail_none();
+    // The role never usable: said, and its records there for the next try, which keeps the same word.
+    answers();
+    served.aws.fail("Action=DescribeImages", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>not authorized to assume it</Message></Error></ErrorResponse>", None);
+    let (ok, said) = run(&add);
+    assert!(!ok && said.contains("not authorized to assume it"), "{said}");
+    let connection: serde_json::Value = serde_json::from_str(&served.store.0.lock().unwrap()["aws:connection:aws-acme"]).unwrap();
+    assert_eq!(connection["connected"], false, "{connection}");
+    let (ok, said) = run(&["runners", "list"]);
+    assert!(ok && !said.contains("aws-acme"), "not connected, not listed: {said}");
+    served.aws.fail_none();
+    answers();
+    let (ok, said) = run(&add);
+    assert!(ok && said.contains("aws-acme runs jobs now."), "{said}");
+    // Another word for the same account, or its word for another: refused.
+    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-other"]);
+    assert!(!ok && said.contains("runs jobs as aws-acme"), "{said}");
+    // Regions: not one of the list.
+    let (ok, said) = run(&["runners", "update", "aws-acme", "--regions=nowhere"]);
+    assert!(!ok && said.contains("Choose a region"), "{said}");
+    // With jobs on it: said, and stopped only when asked.
+    let (id, q) = served.github.queue("job", "superci/provider=aws", served.now_ms());
+    let _ = (id, q);
+    let mut record: serde_json::Value = serde_json::from_str(&served.store.0.lock().unwrap()["settings"]).unwrap();
+    record["routing"]["order"] = serde_json::json!([{ "cloud": "aws-acme" }, { "cloud": "aws-acme-on-demand" }]);
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+    served.store.0.lock().unwrap().insert("job:1".into(), serde_json::json!({ "job_id": 1, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": served.now_ms(), "runner": "r", "runner_id": null, "installation_id": 42, "cloud": "aws-acme-on-demand", "machine_id": "i-1", "machine_type": "c8a.xlarge", "error": null, "seen_in_progress": true, "on_demand": true }).to_string());
+    served.store.0.lock().unwrap().insert("live:1".into(), String::new());
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
+    assert!(!ok && said.contains("1 job is running on aws-acme"), "{said}");
+    served.store.0.lock().unwrap().remove("live:1");
+    served.store.0.lock().unwrap().remove("job:1");
+    // Not signed in there any more: asks to sign in, or forgets it here only, saying what was left.
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept.as_object_mut().unwrap().remove("aws_more");
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
+    assert!(!ok && said.contains("Sign in to account 222222222222"), "{said}");
+    let (ok, said) = run(&["runners", "update", "aws-acme", "--regions=eu-west-2,eu-central-1"]);
+    assert!(!ok && said.contains("Sign in to account 222222222222"), "{said}");
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm", "--only-here"]);
+    assert!(ok && said.contains("Removed aws-acme.") && said.contains("in AWS account 222222222222: the role"), "{said}");
+    assert!(!served.store.0.lock().unwrap().contains_key("aws:connection:aws-acme"), "forgotten");
+    // Its word, for another account: for good.
+    let mut other = kept["aws"].clone();
+    other["account_id"] = "333333333333".into();
+    kept["aws_more"] = serde_json::json!([other]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (ok, said) = run(&["runners", "create", "aws", "--account=333333333333", "--region=eu-west-1", "--name=aws-acme"]);
+    assert!(!ok && said.contains("another runner's word"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A second AWS account on a control plane that cannot have one: from before them, or with no first account yet. And with
+/// the first signed out, it is added all the same, saying its jobs lack the cache there until it is signed in.
+#[test]
+fn a_second_aws_account_needs_a_control_plane_that_keeps_it_and_says_when_its_cache_waits() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let add = [("account", "222222222222"), ("region", "eu-west-1")];
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
+    let (status, _, said) = common::post(&link, "/runners/aws", &add);
+    assert!(status == 409 && words(&said).contains("A further runner needs a newer control plane"), "{status} {}", words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Signed in to the further account alone.
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let other = kept["aws_more"][0].clone();
+    (kept["aws"], kept["aws_more"]) = (other, serde_json::json!([]));
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) }
+    let o = common::command(&home).args(["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme", "--plane=testplane0001"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == "PUT" && a["url"].as_str().is_some_and(|u| u.contains(&format!("superci-plane-{PLANE}-eu-")))), "no bucket made by a further account");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A second Cloudflare account's refusals, each said; and its word kept through deleting it.
+#[test]
+fn a_second_cloudflare_accounts_refusals_are_each_said() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let (first, second, third) = ("1111111111111111111111111111111a", "2222222222222222222222222222222b", "3333333333333333333333333333333c");
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &format!(r#"[{{"cloud":"cloudflare","url":"https://superci-runners-{PLANE}.acme.workers.dev"}}]"#));
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let accounts = |ids: &[(&str, &str)]| serde_json::json!({ "result": ids.iter().map(|(i, n)| serde_json::json!({ "id": i, "name": n, "type": "standard" })).collect::<Vec<_>>(), "success": true, "errors": [], "messages": [] }).to_string();
+    served.aws.fail("/accounts?per_page", 200, &accounts(&[(first, "Acme"), (second, "Globex"), (third, "Initech")]), None);
+    let cf: Vec<String> = include_str!("../fixtures/runners/03-cf-agent.jsonl").lines().filter(|l| !l.contains("/accounts?per_page") && !l.contains("iam.amazonaws.com") && !l.contains("api.modal.com")).map(str::to_string).collect();
+    let answers = |id: &str, sub: &str| { let (to, sub) = (id.to_string(), format!("subdomain\\\":\\\"{sub}")); served.aws.replaying(&cf.join("\n"), &[(first, to.as_str()), ("awsplane0001", PLANE), ("subdomain\\\":\\\"acme", sub.as_str())]) };
+    { let mut w = served.aws.workers.lock().unwrap(); for sub in ["globex", "initech"] { w.insert(format!("superci-runners-{PLANE}.{sub}.workers.dev"), served.url.clone()); } }
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // An account the sign-in does not reach; a word that cannot be one, or is another's.
+    answers(third, "initech");
+    answers(second, "globex");
+    answers(first, "acme");
+    let (ok, said) = run(&["runners", "create", "cloudflare", "--account=4444444444444444444444444444444d"]);
+    assert!(!ok && said.contains("does not reach that account"), "{said}");
+    answers(second, "globex");
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}"), "--name=Not A Word"]);
+    assert!(!ok && said.contains("a word is 2 to 32"), "{said}");
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}"), "--name=modal"]);
+    assert!(!ok && said.contains("another runner's word"), "{said}");
+    // Cloudflare refusing the launcher: said, nothing kept.
+    served.aws.fail("/workers/scripts/superci-runners", 500, r#"{"success":false,"errors":[{"code":10000,"message":"Internal server error"}],"messages":[],"result":null}"#, None);
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}")]);
+    assert!(!ok && said.contains("Internal server error"), "{said}");
+    assert!(served.store.0.lock().unwrap().get("settings").is_none_or(|s| !s.contains("cloudflare-globex")), "nothing kept");
+    served.aws.fail_none();
+    served.aws.fail("/accounts?per_page", 200, &accounts(&[(first, "Acme"), (second, "Globex"), (third, "Initech")]), None);
+    // Asked for by name, then its word stays with its account: another word, or another account under it, refused.
+    answers(second, "globex");
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}"), "--name=cf-globex"]);
+    assert!(ok && said.contains("cf-globex runs jobs now."), "{said}");
+    answers(second, "globex");
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}"), "--name=cf-other"]);
+    assert!(!ok && said.contains("runs jobs as cf-globex"), "{said}");
+    answers(third, "initech");
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={third}"), "--name=cf-globex"]);
+    assert!(!ok && said.contains("another runner's word"), "{said}");
+    // Its limits, by its word; `--mode` is Modal's.
+    let (ok, said) = run(&["runners", "update", "cf-globex", "--max-jobs=2", "--monthly-usd=10"]);
+    assert!(ok && said.contains("cf-globex"), "{said}");
+    let (ok, said) = run(&["runners", "update", "cf-globex", "--mode=function"]);
+    assert!(!ok && said.contains("--mode is for a Modal runner"), "{said}");
+    // The dashboard offers what is left; none for the account it runs on.
+    let (mut child, link) = common::dashboard(&home);
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=add-runners&fragment=1").1) }).find(|p| p.contains("Cloudflare account Initech")).unwrap_or_default();
+    assert!(page.contains("Cloudflare account Initech") && !page.contains("Cloudflare account Globex"), "{page}");
+    let runners = words(&part(&link, "/?p=runners&fragment=1").1);
+    assert!(runners.contains("cf-globex") && runners.contains("Containers sized per job, in a Cloudflare account of its own"), "{runners}");
+    let _ = child.kill();
+    // Deleted, a job's word kept; added again it comes back as it was, under its own account.
+    served.aws.fail("/workers/scripts/superci-runners", 200, r#"{"result":null,"success":true,"errors":[],"messages":[]}"#, None);
+    let (ok, said) = run(&["runners", "delete", "cf-globex", "--confirm", "--only-here"]);
+    assert!(ok && said.contains("Removed cf-globex."), "{said}");
+    served.aws.fail_none();
+    served.aws.fail("/accounts?per_page", 200, &accounts(&[(first, "Acme"), (second, "Globex"), (third, "Initech")]), None);
+    answers(second, "globex");
+    let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}")]);
+    assert!(ok && said.contains("cf-globex runs jobs now."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}

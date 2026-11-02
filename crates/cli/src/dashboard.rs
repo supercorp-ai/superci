@@ -834,8 +834,11 @@ pub fn runs_of(jobs: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut runs: Vec<serde_json::Value> = order.into_iter().map(|k| {
         let rows = &by[&k];
         let n = |j: &serde_json::Value, f: &str| j[f].as_u64();
-        let words: Vec<&str> = rows.iter().map(|j| job_ended(j).1).collect();
-        let going = words.iter().any(|w| ["Running", "Waiting", "Starting"].contains(w));
+        // (A first attempt its machine was taken back from, which SuperCI starts again by itself: the run is as its next
+        // attempt is, once there is one.)
+        let again = |j: &&&serde_json::Value| j["provider"] == "local" && j["interrupted"] == true && j["no_spot"] != true && job_ended(j).1 == "Failed";
+        let words: Vec<&str> = rows.iter().filter(|j| !again(j)).map(|j| job_ended(j).1).collect();
+        let going = words.is_empty() || words.iter().any(|w| ["Running", "Waiting", "Starting"].contains(w));
         let state = if going { "running" } else if words.contains(&"Failed") { "failed" } else if words.contains(&"Cancelled") { "cancelled" }
             else if words.iter().all(|w| ["Passed", "Skipped"].contains(w)) { "passed" } else { "done" };
         let at = rows.iter().filter_map(|j| n(j, "at_ms")).min().unwrap_or_default();
