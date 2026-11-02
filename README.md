@@ -2,9 +2,9 @@
 
 # SuperCI
 
-The cheapest way to run GitHub Actions: each job runs on an AWS spot machine in your own account, at AWS's price with nothing added. A 2 vCPU job costs $0.0008 a minute, against $0.006 on GitHub's runners. One command sets it up; there are no servers or Kubernetes to run. Free and open source (MIT), and an alternative to RunsOn, Blacksmith and Actions Runner Controller.
+OpenRouter for CI, and the cheapest way to run GitHub Actions: each job goes to the first cloud that can run it (AWS spot, Cloudflare, Modal, AWS on-demand when spot is full), in your own accounts at their prices with nothing added. On AWS spot, a 2 vCPU job costs $0.0008 a minute, against $0.006 on GitHub's runners. One command sets it up; there are no servers or Kubernetes to run. Free and open source (MIT), and an alternative to RunsOn, Blacksmith and Actions Runner Controller.
 
-It also runs GitLab CI jobs, and can start them in Cloudflare or Modal instead of AWS.
+It also runs GitLab CI jobs.
 
 ```sh
 npx @superci/cli dashboard
