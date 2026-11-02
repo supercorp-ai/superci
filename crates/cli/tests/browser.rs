@@ -2280,7 +2280,14 @@ fn modal_runners_month_with_nothing_metered_but_something_billed_says_no_share_b
         modal_answered("WorkspaceBillingReport", &[pb(&[Pb::B(1, b"ap-1".to_vec()), Pb::B(2, b"superci-runners-testplane0001".to_vec()), Pb::B(5, b"1.25".to_vec())])])].concat(), &[]);
     let (mut child, link) = dashboard(&home);
     until("its month", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("$1.25 this month · $0.00 billed"));
+    // Kept in the control plane: the figures alone, and another computer of this CI, signed in to no Modal, shows them.
+    until("its bill kept", || served.store.0.lock().unwrap().get("bills").is_some_and(|b| b.contains("\"superci\":1.25")));
     let _ = child.kill();
+    let elsewhere = signed_in(&served);
+    let (mut child, link) = dashboard(&elsewhere);
+    until("its month elsewhere", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("$1.25 this month · $0.00 billed"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&elsewhere);
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -10548,7 +10555,7 @@ fn a_cloud_that_answers_nothing_is_a_note_on_the_pages_which_keep_working() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane in AWS with a Modal launcher; Modal signed in, and answering nothing at all.
     let served = serve(|_| {});
-    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners.modal.run"}]"#);
     let home = signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -13644,7 +13651,7 @@ mod runs_suite_in_browser {
         assert!(out.status.success() && said.contains("The run ended: success"), "{said}");
         // Its summary says it was started again, and which job its first attempt was.
         let first_id = first_job["job_id"].to_string();
-        assert!(said.contains(&format!("Started again on an on-demand machine: AWS took back its spot machine (its first attempt was job {first_id}).")), "{said}");
+        assert!(said.contains(&format!("Started again further down the order: AWS took back its spot machine (its first attempt was job {first_id}).")), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
@@ -18054,8 +18061,19 @@ fn a_modal_control_plane_is_deployed_given_sandboxes_and_deleted_from_the_dashbo
     until_page(&mut b, "p=planes", "acmeorg--superci-plane-mdplane00001");
     step("03-use");
     until_page(&mut b, "c=mdplane00001&p=planes", "Modal · acmeorg");
+    // Its Functions put in the order first (deployed then), so its own sandboxes deploy them again as they go on.
+    let functions = || {
+        served.aws.replaying(include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+        let deploy: Vec<&str> = include_str!("../fixtures/modal/further/01-add.jsonl").lines().filter(|l| !l.contains("/AppList\"")).collect();
+        served.aws.replaying(&deploy.join("\n"), &[("mdplane00002", "mdplane00001")]);
+    };
+    functions();
+    quiet(&mut b);
+    let (got, text) = post(&mut b, "/routing?c=mdplane00001", &[("action", "put_back"), ("cloud", "modal-functions"), ("current", "modal-functions")]);
+    assert!(got < 400, "{got} {text}");
     // Its own sandboxes, switched on.
     step("04-sandboxes");
+    functions();
     quiet(&mut b);
     assert!(post(&mut b, "/runners/modal-own?c=mdplane00001", &[]).0 < 400);
     step("05-dashboard");

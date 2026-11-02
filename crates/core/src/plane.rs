@@ -98,9 +98,8 @@ pub struct Config {
     /// application) or sandboxes (a Modal control plane), in `own_cloud`.
     pub containers: bool,
     pub own_cloud: String,
-    /// The further accounts and runners (see `Stored::runners`).
-    pub accounts: Vec<Account>,
-    pub runners: Vec<RunnerRecord>,
+    /// The further accounts and runners (see `Records`).
+    pub records: Records,
     /// When the control plane runs in AWS: its own account and the region for machines, and the runtime's credentials
     /// (no role to assume, no OpenID Connect).
     pub aws_own: Option<(String, String)>,
@@ -182,8 +181,7 @@ impl Config {
             more_labels: Vec::new(),
             name: None,
             own_cloud: "cloudflare".into(),
-            accounts: Vec::new(),
-            runners: Vec::new(),
+            records: Records::default(),
             app: None,
             gitlab: None,
             more_gitlabs: Vec::new(),
@@ -238,7 +236,8 @@ pub struct Cache {
     /// When each dashboard key's use was last noted (by its name), so it is noted ten minutes apart at most.
     key_seen: RefCell<HashMap<String, u64>>,
     installed: RefCell<Option<(bool, u64)>>,
-    creds: RefCell<Option<Credentials>>,
+    /// Each role's credentials, as last had.
+    creds: RefCell<HashMap<String, Credentials>>,
     tokens: RefCell<HashMap<u64, (String, u64)>>,
     /// The machine image per region and architecture (its id and its disk's size), and until when it is taken as current.
     image: RefCell<HashMap<String, ((String, u32), u64)>>,
@@ -265,7 +264,19 @@ pub struct Cache {
 struct Identity { signing: SigningKeyStore }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct AwsConnection { pub account_id: String, pub region: String, pub role_arn: String, pub connected: bool, pub error: Option<String> }
+pub struct AwsConnection { pub account_id: String, pub region: String, pub role_arn: String, pub connected: bool, pub error: Option<String>,
+    /// A further account's word (none: the first, the account `aws`), and the regions its machines start in.
+    #[serde(default, skip_serializing_if = "String::is_empty")] pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub regions: Vec<String> }
+
+impl AwsConnection {
+    /// The account's word.
+    fn account(&self) -> &str { if self.name.is_empty() { "aws" } else { &self.name } }
+}
+
+/// Where an AWS account's notes are kept (what AWS said of it: its spot pools, its templates, whether it may ask for
+/// many pools at once): zones and rules are each account's own.
+fn aws_notes(account: &str) -> String { if account == "aws" { "aws:".to_string() } else { format!("aws:{account}:") } }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Job {
@@ -416,11 +427,11 @@ fn unwritten(rev: &std::cell::Cell<u64>) -> bool { rev.get() == 0 }
 
 /// Where it is noted that this control plane's role could not ask many spot pools in one request (see `aws::fleet`):
 /// for ten minutes they are asked one by one without trying.
-const NO_FLEET_KEY: &str = "aws:no-fleet";
+const NO_FLEET_KEY: &str = "no-fleet";
 
 /// Where a launch template made for one request is noted until it is removed (`aws:template:<region>:<name>`): one
 /// still noted later was not, and a sweep removes it.
-fn template_key(region: &str, name: &str) -> String { format!("aws:template:{region}:{name}") }
+fn template_key(account: &str, region: &str, name: &str) -> String { format!("{}template:{region}:{name}", aws_notes(account)) }
 
 /// One request to AWS for a job's machine: when (ms after the control plane heard of the job), for which machine type
 /// in which zone, spot or on-demand, what AWS said ("started", or its word for no), and how long the answer took (ms).
@@ -471,12 +482,18 @@ const MORE_SPOT: &str = "more spot pools to ask";
 fn gone_key(j: &Job) -> String { format!("gone:{}", job_key(j).trim_start_matches("job:")) }
 
 /// Where it is noted that AWS does not offer a machine type in a zone (it said "Unsupported"): not asked again for a day.
-fn unoffered_key(region: &str, kind: &str, zone: &str) -> String { format!("aws:unoffered:{region}:{kind}:{zone}") }
+fn unoffered_key(account: &str, region: &str, kind: &str, zone: &str) -> String { format!("{}unoffered:{region}:{kind}:{zone}", aws_notes(account)) }
 
 fn is_zero(n: &u32) -> bool { *n == 0 }
 
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
+
+/// Where each Modal Function preempted is noted (`modal:preempted:<ms>:<job>`), and each job run again for one
+/// (`modal:rerun:<ms>:<job>`): counted for the month in the status (`preempted`), kept a little longer than a month.
+const PREEMPTED: &str = "modal:preempted:";
+const PREEMPTED_RERUN: &str = "modal:rerun:";
+const PREEMPTED_KEPT_MS: u64 = 32 * 86_400_000;
 
 /// How much cheaper the first of a place's spot regions counts when they are ranked by what a job costs (see
 /// `spot_steps`): its cache and Docker layers are there, where another region reads them from afar.
@@ -551,7 +568,7 @@ pub fn over(j: &Job) -> bool { !["waiting", "launching", "launched", "running", 
 pub fn needs_care(j: &Job, now: u64) -> bool {
     let ended = j.ended_ms.unwrap_or(j.at_ms);
     !over(j) || j.rerun.as_ref().is_some_and(|r| r.state == "pending") || j.fail_pending.is_some()
-        || (j.cloud == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && now < ended + 2 * 86_400_000)
+        || (j.region.is_some() && j.cost_from.is_some() && j.sent_gb.is_none() && now < ended + 2 * 86_400_000)
         || (!(j.began || j.over || j.failed_fast) && now.saturating_sub(j.at_ms) < 86_400_000)
         || now < ended + LIVE_AFTER_MS
 }
@@ -637,6 +654,9 @@ pub const CLOUDFLARE_JOBS_AT_ONCE: u32 = 20;
 /// A Modal sandbox of `cpu` vCPUs (half as many of Modal's physical cores) and `ram_gb`, per hour, at Modal's sandbox
 /// rates: $0.00003942 a core-second, $0.00000667 a GiB-second (held to its size, it is billed exactly that).
 pub fn modal_usd_per_hour(cpu: u32, ram_gb: u32) -> f64 { (cpu as f64 / 2.0 * 0.00003942 + ram_gb as f64 * 0.00000667) * 3600.0 }
+/// The same as a Modal Function (preemptible), per hour, at Modal's Function rates: $0.0000131 a core-second, $0.00000222
+/// a GiB-second (a third of a sandbox's).
+pub fn modal_function_usd_per_hour(cpu: u32, ram_gb: u32) -> f64 { (cpu as f64 / 2.0 * 0.0000131 + ram_gb as f64 * 0.00000222) * 3600.0 }
 
 /// Modal's per-second list price of each GPU (A100: the 40 GB one).
 pub const MODAL_GPU_USD_PER_SECOND: [(&str, f64); 8] = [("t4", 0.000164), ("l4", 0.000222), ("a10g", 0.000306), ("l40s", 0.000542), ("a100", 0.000583),
@@ -711,7 +731,7 @@ fn runner_prefix(ci: &str, plane_id: &str) -> String {
 pub const SPOT_NOT_ALLOWED: &str = "SpotNotAllowedByOrganization";
 
 /// Where the control plane notes when its organization last refused a spot machine (see where it is read).
-const SPOT_NOT_ALLOWED_KEY: &str = "aws:spot-not-allowed";
+const SPOT_NOT_ALLOWED_KEY: &str = "spot-not-allowed";
 
 /// How a job fails when AWS lets the account run no GPU machines (followed by the quota to raise).
 const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, ";
@@ -719,11 +739,16 @@ const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask A
 pub fn cloud_name(cloud: &str) -> &str { CLOUD_NAMES.iter().find(|(id, _)| *id == cloud).map_or(cloud, |(_, name)| *name) }
 
 /// Each cloud a job's machine can be in, as people read it.
-pub const CLOUD_NAMES: [(&str, &str); 4] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal")];
+pub const CLOUD_NAMES: [(&str, &str); 5] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), (MODAL_FUNCTIONS, "Modal Functions")];
 
 /// AWS's on-demand machines, as a place of their own in the order (`aws` there is its spot machines): when no region
 /// has a spot machine for a job, the job goes to the next place in the order that can run it, which may be this one.
 pub const AWS_ON_DEMAND: &str = "aws-on-demand";
+
+/// Modal's preemptible Functions, as a place of their own in the order (`modal` there is its sandboxes): a third of a
+/// sandbox's price. Never in the order by itself: put there, jobs go as the order says, and a job Modal preempted goes
+/// on down it, past every Function. (A further Modal runner's: `<word>-functions`.)
+pub const MODAL_FUNCTIONS: &str = "modal-functions";
 
 /// The place in the order a job's machine counts toward (its limits and its spend).
 fn place_of(j: &Job) -> &str { if j.cloud == "aws" && j.on_demand { AWS_ON_DEMAND } else { &j.cloud } }
@@ -746,12 +771,8 @@ pub struct Stored {
     pub version: u64,
     #[serde(default)] pub routing: Routing,
     #[serde(default)] pub launchers: Vec<Launcher>,
-    /// Accounts and runners beyond those every CI can have without a record: the runners `aws`, `aws-on-demand`,
-    /// `cloudflare` and `modal`, in the accounts `aws`, `cloudflare` and `modal`. Each has one word, for good: what the
-    /// order, the limits, the launchers, a job and a day's spend say. Beside `routing` and `launchers`, which an older
-    /// SuperCI writes whole: it cannot strip these.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub accounts: Vec<Account>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub runners: Vec<RunnerRecord>,
+    /// Beside `routing` and `launchers`, which an older SuperCI writes whole: it cannot strip these.
+    #[serde(flatten)] pub records: Records,
     /// Its cloud's own copy of them as taken (a fingerprint, and when: ms), the newest last. One that differs from
     /// all of these was written there by an older SuperCI, which knows no other way: it is taken, whole, as that
     /// version always meant it. One taken in the last minute is a copy an instance read before (AWS's are read every
@@ -761,41 +782,87 @@ pub struct Stored {
 
 /// The settings as the changes see them (see `settings`).
 #[derive(Deserialize)]
-struct Document { #[serde(default)] routing: Routing, #[serde(default)] launchers: Vec<Launcher>, #[serde(default)] accounts: Vec<Account>, #[serde(default)] runners: Vec<RunnerRecord> }
+struct Document { #[serde(default)] routing: Routing, #[serde(default)] launchers: Vec<Launcher>, #[serde(flatten)] records: Records }
 
-/// A cloud account beyond a provider's first (which is the provider's word): see `Stored::accounts`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Account { pub name: String, pub provider: String }
+/// Accounts and runners beyond those every CI can have without a record: the runners `aws`, `aws-on-demand`, `cloudflare`
+/// and `modal`, in the accounts `aws`, `cloudflare` and `modal`. Each has one word, for good: what the order, the limits,
+/// the launchers, a job and a day's spend say.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Records {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub runners: Vec<RunnerRecord>,
+}
 
-/// A runner beyond the four without a record, in an account: see `Stored::runners`.
+/// A cloud account beyond a provider's first (which is the provider's word). `cloud_id`: what its cloud calls it (Modal:
+/// the workspace), how a sign-in finds it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct RunnerRecord { pub name: String, pub account: String }
+pub struct Account { pub name: String, pub provider: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub cloud_id: Option<String> }
+
+/// A runner beyond the four without a record, in an account. `gone`: deleted. Its record stays: what it spent goes on
+/// counting toward its account's limit, its jobs keep their provider, and its word comes back only for the same account.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RunnerRecord { pub name: String, pub account: String, #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub gone: bool,
+    /// AWS's on-demand machines in the account, beside its spot ones (`<word>-on-demand`, as `aws-on-demand` is `aws`'s).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub on_demand: bool,
+    /// Modal's Functions in the account, beside its sandboxes (`<word>-functions`, as `modal-functions` is `modal`'s).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub function: bool }
+
+impl Records {
+    /// The account a runner spends in.
+    pub fn account_of<'a>(&'a self, runner: &'a str) -> &'a str { self.runners.iter().find(|r| r.name == runner).map_or(account_of(runner), |r| r.account.as_str()) }
+
+    /// The provider a runner is on: what its machines are, what they cost, how long they may live.
+    pub fn provider_of<'a>(&'a self, runner: &'a str) -> &'a str {
+        let account = self.account_of(runner);
+        self.accounts.iter().find(|a| a.name == account).map_or(account, |a| a.provider.as_str())
+    }
+
+    /// Whether a runner is AWS's spot machines (its account's other runner being its on-demand ones).
+    pub fn aws_spot(&self, runner: &str) -> bool { self.provider_of(runner) == "aws" && !self.aws_on_demand(runner) }
+
+    /// Whether a runner is AWS's on-demand machines.
+    pub fn aws_on_demand(&self, runner: &str) -> bool { runner == AWS_ON_DEMAND || self.runners.iter().any(|r| r.name == runner && r.on_demand) }
+
+    /// Whether a runner is Modal's Functions.
+    pub fn modal_function(&self, runner: &str) -> bool { runner == MODAL_FUNCTIONS || self.runners.iter().any(|r| r.name == runner && r.function) }
+
+    /// The runner whose launcher or machines a runner uses: Modal's Functions go through its sandboxes' launcher.
+    pub fn launcher_word<'a>(&self, runner: &'a str) -> &'a str { if self.modal_function(runner) { runner.strip_suffix("-functions").unwrap_or(runner) } else { runner } }
+
+    /// What spending by runner comes to in one cloud account.
+    pub fn account_spend<'a>(&self, spend: impl IntoIterator<Item = (&'a str, f64)>, account: &str) -> f64 { spend.into_iter().filter(|(c, _)| self.account_of(c) == account).map(|(_, usd)| usd).sum::<f64>() + 0.0 }
+}
 
 /// A word for an account or a runner: lowercase letters, digits and dashes, 2 to 32, a dash at neither end.
-fn valid_word(word: &str) -> bool {
+pub fn valid_word(word: &str) -> bool {
     (2..=32).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !word.starts_with('-') && !word.ends_with('-')
 }
 
 /// Why these further accounts and runners cannot be, if so.
-fn records_refused(accounts: &[Account], runners: &[RunnerRecord]) -> Option<String> {
+fn records_refused(records: &Records, before: &Records) -> Option<String> {
+    let (accounts, runners) = (&records.accounts, &records.runners);
     let mut words = std::collections::HashSet::new();
     for a in accounts {
         if !valid_word(&a.name) { return Some(format!("{}: {WORD_RULE}", a.name)) }
         if !crate::spec::CLOUDS.contains(&a.provider.as_str()) { return Some(format!("{}: no provider called {}", a.name, a.provider)) }
         if crate::spec::CLOUDS.contains(&a.name.as_str()) && a.name != a.provider { return Some(format!("{} is that provider's first account", a.name)) }
         if !words.insert(a.name.as_str()) { return Some(format!("{} is named twice", a.name)) }
+        if before.accounts.iter().any(|b| b.name == a.name && (b.provider != a.provider || b.cloud_id.is_some() && b.cloud_id != a.cloud_id)) { return Some(format!("{} stays the account it was: a word is for good", a.name)) }
     }
+    if let Some(a) = before.accounts.iter().find(|b| !accounts.iter().any(|a| a.name == b.name) && before.runners.iter().any(|r| r.account == b.name)) { return Some(format!("{}: its runners' records need it", a.name)) }
     words.clear();
     for r in runners {
         if !valid_word(&r.name) { return Some(format!("{}: {WORD_RULE}", r.name)) }
         if CLOUD_NAMES.iter().any(|(word, _)| *word == r.name) { return Some(format!("{} needs no record", r.name)) }
         if !words.insert(r.name.as_str()) { return Some(format!("{} is named twice", r.name)) }
         if !crate::spec::CLOUDS.contains(&r.account.as_str()) && !accounts.iter().any(|a| a.name == r.account) { return Some(format!("{}: no account called {}", r.name, r.account)) }
+        if before.runners.iter().any(|b| b.name == r.name && b.account != r.account) { return Some(format!("{} stays in the account it was in: a word is for good", r.name)) }
     }
+    if let Some(r) = before.runners.iter().find(|b| !runners.iter().any(|r| r.name == b.name)) { return Some(format!("{}: a runner's record stays, marked gone", r.name)) }
     None
 }
 
-const WORD_RULE: &str = "a word is 2 to 32 lowercase letters, digits and dashes, a dash at neither end";
+pub const WORD_RULE: &str = "a word is 2 to 32 lowercase letters, digits and dashes, a dash at neither end";
 
 /// How long a read of the settings record stands for a request that need not see a write just made.
 pub const SETTINGS_READ_MS: u64 = 10_000;
@@ -850,7 +917,36 @@ pub struct Routing {
     /// The cache (see `cache`): on unless turned off, and how much it keeps.
     #[serde(default, skip_serializing_if = "cache::Settings::is_default")]
     pub cache: cache::Settings,
+    /// Images of this control plane's own, by the name a label gives (`image=NAME`): what a job's sandbox starts from
+    /// in place of GitHub's runner image, with a repository's tools in it already.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, RunnerImage>,
 }
+
+/// An image of a control plane's own, in a container registry (`ghcr.io/acme/ci:2026-10`, or by its digest), that a
+/// job's sandbox starts from on Modal. It is made FROM `ghcr.io/actions/actions-runner` (GitHub's runner at
+/// /home/runner/run.sh, which starts the job): one without the runner fails its job, saying so. Modal keeps an image
+/// by its address, so one that names a tag that is pushed again is not fetched again: a new tag, or a digest, is.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RunnerImage {
+    /// Where it is: a registry's address, as `docker pull` takes it.
+    pub reference: String,
+    /// For a private registry: the name of a Secret in each Modal workspace that runs jobs (`modal`, and each
+    /// further one, reads its own) with REGISTRY_USERNAME and REGISTRY_PASSWORD
+    /// (Modal's names for them). Only its name is kept here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_secret: Option<String>,
+}
+
+/// Whether an image's address is one a registry could have (`ghcr.io/acme/ci:1`, `acme/ci@sha256:…`): letters, digits
+/// and `._-/:@`, not more than 255, beginning and ending with a letter or digit, and no `//` (not a web address).
+pub fn valid_image_reference(r: &str) -> bool {
+    let edge = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric());
+    (1..=255).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/:@".contains(&b)) && edge(r.as_bytes().first()) && edge(r.as_bytes().last()) && !r.contains("//")
+}
+
+/// Whether a word can be a Modal Secret's name (letters, digits, dashes, underscores and dots, up to 64, as Modal has them).
+pub fn valid_modal_secret(name: &str) -> bool { (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) }
 
 /// What the AWS account's own budget does beside its emails.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -866,6 +962,12 @@ pub const BUDGET_STOPPED: &str = "AWS's budget for this account reached its limi
 /// Where the control plane notes when AWS last refused a machine by the budget's rule (the dashboard says so).
 const BUDGET_STOPPED_KEY: &str = "aws:budget-stopped";
 
+/// Where the control plane keeps each account's bill as a computer last read it (see `/bills`): an observation, written
+/// by whoever read it, last one standing.
+const BILLS: &str = "bills";
+/// The most accounts one write of bills is taken for.
+const BILLS_AT_ONCE: usize = 64;
+
 /// Where the control plane keeps what a cloud said beside its answers (Modal's warning of a client release it will
 /// stop taking, heard by a launcher or by a Modal control plane's own client): `[{"cloud", "said"}]`, the newest ten,
 /// each once. Its status says them, so the dashboard does, before the cloud stops taking it.
@@ -873,7 +975,7 @@ pub const CLOUD_SAYS_KEY: &str = "cloud:says";
 
 /// Where the control plane notes a spot pool (a machine type in a zone of a region) that had no machine or took one
 /// back, with when: the next jobs ask the other pools first.
-fn pool_key(region: &str, kind: &str, zone: &str) -> String { format!("aws:pool:{region}:{kind}:{zone}") }
+fn pool_key(account: &str, region: &str, kind: &str, zone: &str) -> String { format!("{}pool:{region}:{kind}:{zone}", aws_notes(account)) }
 
 /// The machine type and zone a pool's note is kept under (`pool_key`, `unoffered_key`: its last two parts).
 fn pool_of(key: &str) -> (String, String) {
@@ -883,8 +985,8 @@ fn pool_of(key: &str) -> (String, String) {
 }
 
 /// The cloud account one of the runners without a record spends in: AWS's on-demand machines are the same account's as
-/// its spot ones. (With the further ones known: `Config::account_of`.)
-pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
+/// its spot ones, and Modal's Functions as its sandboxes. (With the further ones known: `Records::account_of`.)
+pub fn account_of(cloud: &str) -> &str { match cloud { AWS_ON_DEMAND => "aws", MODAL_FUNCTIONS => "modal", _ => cloud } }
 
 /// A limit in dollars as it is said: whole dollars without cents ($200), another amount with them ($12.50).
 pub fn dollars(usd: f64) -> String { if usd.fract() == 0.0 { format!("${usd:.0}") } else { format!("${usd:.2}") } }
@@ -920,20 +1022,6 @@ impl Pool {
     pub fn of(cloud: &str) -> Pool { Pool { regions: vec![], off: false, cloud: cloud.to_string(), max_jobs: None, monthly_usd: None } }
 }
 
-impl Config {
-    /// The account a runner spends in.
-    pub fn account_of<'a>(&'a self, runner: &'a str) -> &'a str { self.runners.iter().find(|r| r.name == runner).map_or(account_of(runner), |r| r.account.as_str()) }
-
-    /// The provider a runner is on: what its machines are, what they cost, how long they may live.
-    pub fn provider_of<'a>(&'a self, runner: &'a str) -> &'a str {
-        let account = self.account_of(runner);
-        self.accounts.iter().find(|a| a.name == account).map_or(account, |a| a.provider.as_str())
-    }
-
-    /// What a month's spending by runner (`month_spend`) comes to in one cloud account.
-    fn account_spend(&self, spend: &HashMap<String, f64>, account: &str) -> f64 { spend.iter().filter(|(c, _)| self.account_of(c) == account).map(|(_, usd)| usd).sum() }
-}
-
 impl Routing {
     /// A public repository allowed to run jobs here.
     pub fn allows_public(&self, repo: &str) -> bool { self.public_repos.iter().any(|p| matches_repo(p, repo)) }
@@ -948,6 +1036,12 @@ impl Routing {
 
     /// The limits for a cloud, from its place in the order.
     pub fn pool(&self, cloud: &str) -> Option<&Pool> { self.order.iter().find(|p| p.cloud == cloud) }
+
+    /// The image of this control plane's own a machine names (`image=NAME`), or why there is none by that name.
+    pub fn image_of(&self, spec: &Spec) -> std::result::Result<Option<&RunnerImage>, String> {
+        let Some(name) = spec.own_image() else { return Ok(None) };
+        self.images.get(name).map(Some).ok_or_else(|| format!("image={name} is no image of this control plane's: give it one with `superci runner_images create {name} --reference=REGISTRY/IMAGE:TAG`"))
+    }
 }
 
 enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
@@ -1057,6 +1151,17 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
 
 /// What a cloud's containers can be (Cloudflare's, or Modal's sandboxes): started by this control plane itself, or
 /// by a launcher.
+/// A Modal machine of this size, per hour: as a Function (`MODAL_FUNCTIONS`) or a sandbox, with its GPU.
+fn modal_price(size: Size, function: bool) -> f64 {
+    (if function { modal_function_usd_per_hour(size.cpu, size.ram_gb) } else { modal_usd_per_hour(size.cpu, size.ram_gb) }) + modal_gpu_usd_per_hour(size.gpu)
+}
+
+/// What a job's runner that was lost is said as, by its cloud: AWS took its spot machine back, or Modal preempted its
+/// Function; and what runs it again (`no_spot`: AWS's on-demand machines, Modal's sandboxes).
+fn lost_said(provider: &str) -> (&'static str, &'static str) {
+    if provider == "modal" { ("Modal preempted its Function", "further down the order") } else { ("AWS took back its spot machine", "off spot machines") }
+}
+
 fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
@@ -1317,7 +1422,7 @@ impl<'a> ControlPlane<'a> {
             }
         };
         let Some(stored) = stored else { return Ok(None) };
-        Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, accounts: stored.accounts, runners: stored.runners, ..self.config.clone() }))
+        Ok(Some(Config { routing: stored.routing, launchers: stored.launchers, records: stored.records, ..self.config.clone() }))
     }
 
     /// Its cloud's own copy of the settings (as this instance read it): a fingerprint.
@@ -1344,7 +1449,7 @@ impl<'a> ControlPlane<'a> {
     /// and the record as read. (One that is not settings was refused just before this: see `settled`.)
     async fn settings_now(&self) -> Result<(Stored, Option<String>)> {
         let raw = self.store.get(SETTINGS).await?;
-        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), accounts: vec![], runners: vec![], taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
+        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), records: Records::default(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
         Ok((stored, raw))
     }
 
@@ -1360,14 +1465,14 @@ impl<'a> ControlPlane<'a> {
             tries += 1;
             if tries > SETTINGS_TRIES { return Ok(Response::text(503, "the settings were being changed by others all along: try again")) }
             let (now, raw) = self.settings_now().await?;
-            let doc = serde_json::json!({ "routing": now.routing, "launchers": now.launchers, "accounts": now.accounts, "runners": now.runners });
+            let doc = serde_json::json!({ "routing": now.routing, "launchers": now.launchers, "accounts": now.records.accounts, "runners": now.records.runners });
             let changed = match crate::settings::apply(&doc, &asked.changes) {
                 Ok(changed) => changed,
                 Err(conflicts) => return Ok(Response::json(&serde_json::json!({ "error": "changed meanwhile", "conflicts": conflicts, "version": now.version })).with_status(409)),
             };
             let Ok(next) = serde_json::from_value::<Document>(changed) else { return Ok(Response::text(400, "those changes do not make settings SuperCI takes")) };
-            if let Some(why) = records_refused(&next.accounts, &next.runners) { return Ok(Response::text(400, &why)) }
-            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, accounts: next.accounts, runners: next.runners, taken: now.taken };
+            if let Some(why) = records_refused(&next.records, &now.records) { return Ok(Response::text(400, &why)) }
+            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, records: next.records, taken: now.taken };
             let written = crate::io::json(&next);
             if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
             if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
@@ -1420,7 +1525,8 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/webhook") => match self.forward(&req, "/webhook").await? { Some(r) => Ok(r), None => self.webhook(&req, &plane_url).await },
             ("POST", "/gitlab/webhook") => match self.forward(&req, "/gitlab/webhook").await? { Some(r) => Ok(r), None => self.gitlab_webhook(&req, &plane_url).await },
             ("POST", "/aws/callback") => self.aws_callback(&req, &plane_url).await,
-            // A spot machine saying AWS is taking it back (only it has its job's link).
+            // A spot machine saying AWS is taking it back, or a Modal Function started again after Modal preempted it
+            // (only it has its job's link).
             ("POST", "/interrupted") => {
                 let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
                 // The job its machine is on now: a GitHub runner may have taken another than the one it was started
@@ -1436,14 +1542,26 @@ impl<'a> ControlPlane<'a> {
                     j.interrupted = true;
                     self.keep(&job_key(&j), &j).await?;
                     // The pool that took it back is asked last for a while (it is short of machines now).
-                    if let (Some(region), Some(kind), Some(zone)) = (&j.region, &j.machine_type, &j.zone) { let _ = self.store.put(&pool_key(region, kind, zone), self.clock.now_ms().to_string()).await; }
-                    // One record each (two machines may say so at once), counted by `spot_paused`.
+                    if let (Some(region), Some(kind), Some(zone)) = (&j.region, &j.machine_type, &j.zone) { let _ = self.store.put(&pool_key(self.config.records.account_of(&j.cloud), region, kind, zone), self.clock.now_ms().to_string()).await; }
+                    // One record each (two machines may say so at once), counted by `spot_paused`; Modal's apart (kept
+                    // for the month's count, see `preempted`), so they never pause AWS's spot machines.
                     let now = self.clock.now_ms();
-                    put_json(self.store, &format!("spot:interrupted:{now}:{}", j.job_id), &now).await?;
+                    let note = if self.config.records.provider_of(&j.cloud) == "modal" { PREEMPTED } else { "spot:interrupted:" };
+                    put_json(self.store, &format!("{note}{now}:{}", j.job_id), &now).await?;
+                    // A preempted Function's runner is gone and says nothing more; GitHub notices by itself, but a
+                    // run from a computer has only this control plane to: over now, and started again by its run.
+                    if note == PREEMPTED && j.provider == "local" {
+                        let (lost, again) = lost_said("modal");
+                        j.state = "failed".into();
+                        j.error = Some(format!("{lost}; SuperCI starts the job again by itself, {again}"));
+                        j.ended_ms.get_or_insert(now);
+                        self.keep(&job_key(&j), &j).await?;
+                        self.timer.wake_in(1_000).await?;
+                    }
                 }
                 // What the machine runs with this answer: the reason, in the job's own log on GitHub, where it is
                 // otherwise only "The runner has received a shutdown signal" (a GitHub job: GitLab's says its own).
-                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said("SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said("SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
+                let said = if !j.gitlab.is_empty() || q.contains_key("gl") || self.config.records.provider_of(&j.cloud) == "modal" { String::new() } else if j.provider == "local" { aws::reclaim_said("SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said("SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
                 Ok(Response::new(200, "text/x-shellscript", said))
             }
             // A machine saying how its own start went (see `MachineStart`): with its link, and only what it may say.
@@ -1578,9 +1696,24 @@ impl<'a> ControlPlane<'a> {
             }
             // AWS runners removed (the dashboard deletes the role and network with the account's sign-in): the connection
             // is forgotten, so no job goes there; adding AWS again connects anew.
+            // A further AWS account connected, with the role the dashboard made there with its sign-in.
+            ("POST", "/aws/accounts") if self.dashboard(&req) => {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let text = |k: &str| body[k].as_str().unwrap_or_default().to_string();
+                let (name, account_id, region) = (text("name"), text("accountId"), text("region"));
+                let regions: Vec<String> = body["regions"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+                if !valid_word(&name) || name == "aws" || account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) || region.is_empty() { return Ok(Response::text(400, "unexpected account, word or region")) }
+                let a = self.verify_aws(&plane_url, AwsConnection { role_arn: role_arn(&account_id, &self.config.plane_id), account_id, region, connected: false, error: None, name, regions }).await?;
+                Ok(Response::json(&serde_json::json!({ "connected": a.connected, "error": a.error })))
+            }
             ("POST", "/aws/forget") if self.dashboard(&req) => {
-                self.store.delete("aws").await?;
-                self.cache.creds.replace(None);
+                // (A further account's, by its word.)
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                match body["account"].as_str().filter(|a| *a != "aws") {
+                    Some(account) => self.store.delete(&format!("aws:connection:{account}")).await?,
+                    None => self.store.delete("aws").await?,
+                }
+                self.cache.creds.borrow_mut().clear();
                 self.cache.network.borrow_mut().clear();
                 self.cache.image.borrow_mut().clear();
                 Ok(Response::json(&serde_json::json!({ "aws": false })))
@@ -1592,6 +1725,25 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::json(&serde_json::json!({ "cleared": cleared })))
             }
             // Costs the dashboard read from a cloud's own metering (Cloudflare's usage analytics), kept with the jobs.
+            // A cloud's bill for an account, read by a computer signed in there: only the figures come here, each with
+            // when and from which device, for every computer of this CI to show.
+            ("POST", "/bills") if self.dashboard(&req) => {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                let device = match self.device_key_name(&req) {
+                    Some(name) => get_json::<serde_json::Value>(self.store, &format!("dkey:{name}")).await?.and_then(|k| k["device"].as_str().map(str::to_string)).unwrap_or_default(),
+                    None => String::new(),
+                };
+                let mut bills: serde_json::Map<String, serde_json::Value> = get_json(self.store, BILLS).await?.unwrap_or_default();
+                for (account, bill) in body["bills"].as_object().into_iter().flatten().filter(|(a, _)| valid_word(a)).take(BILLS_AT_ONCE) {
+                    let figure = |name: &str| bill[name].as_f64().filter(|n| (0.0..1e9).contains(n));
+                    let (Some(metered), Some(billed)) = (figure("metered"), figure("billed")) else { continue };
+                    let mut kept = serde_json::json!({ "metered": metered, "billed": billed, "at_ms": self.clock.now_ms(), "device": device });
+                    if let Some(superci) = figure("superci") { kept["superci"] = superci.into() }
+                    bills.insert(account.clone(), kept);
+                }
+                put_json(self.store, BILLS, &bills).await?;
+                Ok(Response::json(&serde_json::json!({ "ok": true })))
+            }
             ("POST", "/costs") if self.dashboard(&req) => {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let mut kept = 0;
@@ -1599,7 +1751,7 @@ impl<'a> ControlPlane<'a> {
                     let Some(usd) = usd.as_f64().filter(|u| (0.0..1000.0).contains(u)) else { continue };
                     if !key.starts_with("job:") { continue }
                     let Some(mut j) = get_json::<Job>(self.store, key).await? else { continue };
-                    if self.config.provider_of(&j.cloud) != "cloudflare" || active(&j) { continue }
+                    if self.config.records.provider_of(&j.cloud) != "cloudflare" || active(&j) { continue }
                     j.cost_usd = Some(usd);
                     j.cost_from = Some("measured".into());
                     self.keep(key, &j).await?;
@@ -1823,7 +1975,8 @@ impl<'a> ControlPlane<'a> {
     /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
     /// and never more than that cloud lets a machine live. Enforced by the machine itself or its cloud, so it holds
     /// with the control plane gone; a job's own time limit (`timeout-minutes`) ends it sooner.
-    fn machine_minutes(&self, runner: &str) -> u32 { job_minutes(self.config.routing.max_minutes, self.config.provider_of(runner)) }
+    fn machine_minutes(&self, runner: &str) -> u32 { job_minutes(self.config.routing.max_minutes, self.config.records.provider_of(runner)) }
+
 
     /// Whether a request may read: a dashboard session's key, or a key that only reads and has not expired.
     fn reader(&self, req: &Request) -> bool {
@@ -1975,12 +2128,13 @@ impl<'a> ControlPlane<'a> {
             "installations": installations,
             "aws": self.aws_connection().await?,
             "aws_regions": self.aws_connection().await?.map(|a| self.aws_regions(&a)).unwrap_or_default(),
+            "aws_further": self.further_aws().await?,
             "aws_networks": self.config.aws_networks,
             "cloudflare_location": self.config.cloudflare_location,
             "cloudflare_image": self.config.cloudflare_image,
             "launchers": self.config.launchers,
-            "accounts": self.config.accounts,
-            "runners": self.config.runners,
+            "accounts": self.config.records.accounts,
+            "runners": self.config.records.runners,
             "containers": self.own_containers(),
             "own_cloud": self.config.own_cloud,
             "gitlab": self.config.gitlab.as_ref().map(|g| serde_json::json!({ "url": g.url })),
@@ -1994,6 +2148,8 @@ impl<'a> ControlPlane<'a> {
             }).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
             "spend": month_spend,
+            // (Each account's bill as a signed-in computer read it this month.)
+            "bills": get_json::<serde_json::Map<String, serde_json::Value>>(self.store, BILLS).await?.unwrap_or_default().into_iter().filter(|(_, b)| b["at_ms"].as_u64().is_some_and(|at| at >= month_start_ms(now))).collect::<serde_json::Map<_, _>>(),
             // (It keeps the CI's and a cloud account's limit for the month: one from before would drop them unsaid.)
             "account_limits": true,
             // (And for a day; and what the AWS account's own budget does.)
@@ -2001,7 +2157,12 @@ impl<'a> ControlPlane<'a> {
             // (And its settings kept and written through it, with their version: see `SETTINGS`.)
             "settings": true,
             "settings_version": self.settings_now().await.map(|(s, _)| s.version).unwrap_or(0),
+            // (And images of its own, `Routing::images`; and Modal's Functions, `MODAL_FUNCTIONS`.)
+            "runner_images": true,
+            "function_mode": true,
             "spend_today": day_spend,
+            // Modal Functions preempted this month (UTC), and jobs run again for it (see `MODAL_FUNCTIONS`).
+            "preempted": self.preempted(now).await,
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // (What a cloud said beside its answers: a client release it will stop taking.)
             "cloud_says": self.store.get(CLOUD_SAYS_KEY).await.ok().flatten().and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_else(|| serde_json::json!([])),
@@ -2157,14 +2318,15 @@ impl<'a> ControlPlane<'a> {
 
     /// Connected when the control plane can assume the role and see the machine image.
     async fn verify_aws(&self, plane_url: &str, mut a: AwsConnection) -> Result<AwsConnection> {
-        self.cache.creds.replace(None);
+        self.cache.creds.borrow_mut().remove(&a.role_arn);
         let check = async {
             let creds = self.aws_creds(plane_url, &a).await?;
             aws::latest_image(self.http, &a.region, &creds, &self.config.image_owner, &self.config.image_name, self.clock.now_ms()).await
         }.await;
         a.connected = check.is_ok();
         a.error = check.err().map(|e| e.chars().take(300).collect());
-        put_json(self.store, "aws", &a).await?;
+        let at = if a.name.is_empty() { "aws".to_string() } else { format!("aws:connection:{}", a.name) };
+        put_json(self.store, &at, &a).await?;
         Ok(a)
     }
 
@@ -2181,7 +2343,7 @@ impl<'a> ControlPlane<'a> {
         if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) || s("roleArn") != role_arn(&account_id, &self.config.plane_id) || s("region") != *region {
             return Ok(Response::text(400, "unexpected account, role or region"));
         }
-        let a = self.verify_aws(plane_url, AwsConnection { role_arn: role_arn(&account_id, &self.config.plane_id), account_id, region: region.clone(), connected: false, error: None }).await?;
+        let a = self.verify_aws(plane_url, AwsConnection { role_arn: role_arn(&account_id, &self.config.plane_id), account_id, region: region.clone(), name: String::new(), regions: vec![], connected: false, error: None }).await?;
         if a.connected { put_json(self.store, "aws_token_used", &used).await?; }
         Ok(Response::json(&serde_json::json!({ "connected": a.connected, "error": a.error })))
     }
@@ -2190,12 +2352,12 @@ impl<'a> ControlPlane<'a> {
     pub(crate) async fn aws_creds(&self, plane_url: &str, a: &AwsConnection) -> Result<Credentials> {
         if a.role_arn.is_empty() { return self.config.aws_own_creds.clone().ok_or_else(|| "no AWS credentials in this runtime".to_string()); }
         let now = self.clock.now_ms();
-        if let Some(c) = self.cache.creds.borrow().as_ref() { if c.expires_at_ms > now + 300_000 { return Ok(c.clone()); } }
+        if let Some(c) = self.cache.creds.borrow().get(&a.role_arn) { if c.expires_at_ms > now + 300_000 { return Ok(c.clone()); } }
         let signing = self.identity().await?.signing;
         let secs = now / 1000;
         let token = signing.jwt(&serde_json::json!({ "iss": plane_url, "sub": format!("plane:{}", self.config.plane_id), "aud": AUDIENCE, "iat": secs, "exp": secs + 300 }))?;
         let creds = aws::assume_role_with_web_identity(self.http, &a.region, &a.role_arn, &token, &runner_prefix(self.config.name(), &self.config.plane_id), now).await?;
-        self.cache.creds.replace(Some(creds.clone()));
+        self.cache.creds.borrow_mut().insert(a.role_arn.clone(), creds.clone());
         Ok(creds)
     }
 
@@ -2394,13 +2556,34 @@ impl<'a> ControlPlane<'a> {
     pub(crate) async fn aws_connection(&self) -> Result<Option<AwsConnection>> {
         if let Some((account_id, region)) = &self.config.aws_own {
             if self.config.aws_runners_off { return Ok(None) }
-            return Ok(Some(AwsConnection { account_id: account_id.clone(), region: region.clone(), role_arn: String::new(), connected: true, error: None }));
+            return Ok(Some(AwsConnection { account_id: account_id.clone(), region: region.clone(), role_arn: String::new(), connected: true, error: None, name: String::new(), regions: vec![] }));
         }
         get_json::<AwsConnection>(self.store, "aws").await
     }
 
-    /// The regions machines go to in AWS, in order (the dashboard's list, else the connection's region).
+    /// The connection of the AWS account a runner is in (none: not an AWS runner, or not connected).
+    async fn aws_connection_of(&self, runner: &str) -> Result<Option<AwsConnection>> {
+        let records = &self.config.records;
+        match records.account_of(runner) {
+            "aws" => self.aws_connection().await,
+            account => get_json(self.store, &format!("aws:connection:{account}")).await,
+        }
+    }
+
+    /// Every further AWS account's connection.
+    async fn further_aws(&self) -> Result<Vec<AwsConnection>> {
+        let mut all = vec![];
+        let mut each = self.config.records.accounts.iter().filter(|a| a.provider == "aws");
+        loop {
+            let Some(a) = each.next() else { return Ok(all) };
+            if let Some(c) = get_json::<AwsConnection>(self.store, &format!("aws:connection:{}", a.name)).await? { all.push(c) }
+        }
+    }
+
+    /// The regions machines go to in AWS, in order (a further account's own; the dashboard's list, else the connection's region).
     fn aws_regions(&self, a: &AwsConnection) -> Vec<String> {
+        if !a.regions.is_empty() { return a.regions.clone() }
+        if !a.name.is_empty() { return vec![a.region.clone()] }
         if self.config.aws_regions.is_empty() { vec![a.region.clone()] } else { self.config.aws_regions.clone() }
     }
 
@@ -2437,7 +2620,7 @@ impl<'a> ControlPlane<'a> {
                     prices
                 }
             };
-            let avoid = self.pools_to_avoid(r, now).await;
+            let avoid = self.pools_to_avoid(a.account(), r, now).await;
             let favour = if i == 0 { 1.0 - HOME_FAVOUR } else { 1.0 };
             // (A pool that lately had no machine counts for nothing here: it is asked last, in the region's own turn.)
             let worth: HashMap<(String, String), f64> = prices.iter().filter(|(pool, _)| !avoid.contains(pool)).map(|((t, z), p)| ((t.clone(), z.clone()), p / aws::speed(t) * favour)).collect();
@@ -2492,21 +2675,29 @@ impl<'a> ControlPlane<'a> {
     /// Pools not to ask at all now: a spot pool that had no machine, or took one back, within the last minute (the
     /// answer would be the same: said to this job a round ago, or to another queued with it), and a zone AWS does
     /// not offer a type in (noted for a day).
-    async fn pools_to_skip(&self, region: &str, spot: bool, now: u64) -> Vec<(String, String)> {
+    async fn pools_to_skip(&self, account: &str, region: &str, spot: bool, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
-        if spot { for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| now < at + 60_000) { pools.push(pool_of(&key)) } } }
-        for (key, at) in self.store.list(&format!("aws:unoffered:{region}:")).await.unwrap_or_default() {
+        let notes = aws_notes(account);
+        if spot { for (key, at) in self.store.list(&format!("{notes}pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| now < at + 60_000) { pools.push(pool_of(&key)) } } }
+        for (key, at) in self.store.list(&format!("{notes}unoffered:{region}:")).await.unwrap_or_default() {
             if at.parse::<u64>().is_ok_and(|at| now < at + 86_400_000) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
         }
         pools
     }
 
-    async fn pools_to_avoid(&self, region: &str, now: u64) -> Vec<(String, String)> {
+    async fn pools_to_avoid(&self, account: &str, region: &str, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
-        for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() {
+        for (key, at) in self.store.list(&format!("{}pool:{region}:", aws_notes(account))).await.unwrap_or_default() {
             if at.parse::<u64>().is_ok_and(|at| now < at + 900_000) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
         }
         pools
+    }
+
+    /// How many Modal Functions were preempted this month (UTC), and how many of their jobs were run again.
+    async fn preempted(&self, now: u64) -> serde_json::Value {
+        let since = month_start_ms(now);
+        let count = |all: Vec<(String, String)>| all.into_iter().filter(|(_, v)| v.trim_matches('"').parse::<u64>().is_ok_and(|at| at >= since)).count();
+        serde_json::json!({ "month": count(self.store.list(PREEMPTED).await.unwrap_or_default()), "rerun": count(self.store.list(PREEMPTED_RERUN).await.unwrap_or_default()) })
     }
 
     /// Whether spot is paused now: AWS took back two machines within a quarter of an hour, less than half an hour ago.
@@ -2554,7 +2745,10 @@ impl<'a> ControlPlane<'a> {
             None
         }.await;
         let Some(state) = settled else { return false };
-        j.error = Some(if state == "asked" { "AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines (the run's next attempt)".into() } else { format!("AWS took back its spot machine; {state}") });
+        let (lost, again) = lost_said(self.config.records.provider_of(&j.cloud));
+        j.error = Some(if state == "asked" { format!("{lost}; SuperCI ran the job again by itself, {again} (the run's next attempt)") } else { format!("{lost}; {state}") });
+        // (Modal's counted for the month, see `preempted`.)
+        if state == "asked" && self.config.records.provider_of(&j.cloud) == "modal" { let _ = put_json(self.store, &format!("{PREEMPTED_RERUN}{now}:{}", j.job_id), &now).await; }
         r.state = state;
         j.rerun = Some(r);
         true
@@ -2563,16 +2757,16 @@ impl<'a> ControlPlane<'a> {
     /// Whether other jobs' GPU machines are up in AWS now (then a quota refusal means it is full, not that it is 0).
     /// How many other jobs of this control plane have a machine in AWS now, and how many had one until two minutes
     /// ago (AWS counts a machine against the account's limits a little longer than it runs).
-    async fn aws_machines_up(&self, job_id: u64) -> (usize, usize) {
+    async fn aws_machines_up(&self, account: &str, job_id: u64) -> (usize, usize) {
         let now = self.clock.now_ms();
         let jobs: Vec<Job> = self.live_jobs().await.unwrap_or_default().into_iter().map(|(_, j)| j).collect();
-        let theirs = |j: &&Job| j.job_id != job_id && j.cloud == "aws" && j.machine_id.is_some();
+        let theirs = |j: &&Job| j.job_id != job_id && self.config.records.account_of(&j.cloud) == account && j.machine_id.is_some();
         (jobs.iter().filter(theirs).filter(|j| active(j)).count(), jobs.iter().filter(theirs).filter(|j| !active(j) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000)).count())
     }
 
-    async fn gpu_machines_up(&self, job_id: u64) -> bool {
+    async fn gpu_machines_up(&self, account: &str, job_id: u64) -> bool {
         let jobs: Vec<Job> = self.live_jobs().await.unwrap_or_default().into_iter().map(|(_, j)| j).collect();
-        jobs.iter().any(|j| j.job_id != job_id && j.cloud == "aws" && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
+        jobs.iter().any(|j| j.job_id != job_id && self.config.records.account_of(&j.cloud) == account && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
     }
 
     /// Its own network in an AWS region (made by the dashboard), looked up at most every ten minutes; without one
@@ -2580,15 +2774,17 @@ impl<'a> ControlPlane<'a> {
     /// A region with a network of the account's own set in the dashboard uses that one (looked up the same way), or
     /// fails saying what is wrong with it: its machines never start anywhere else. AWS not answering is an error too
     /// (the job is tried again), not a reason to use the default network.
-    async fn network(&self, region: &str, creds: &Credentials, now: u64) -> Result<Option<aws::Network>> {
-        // Kept by region and by what is set for it (a setting changed in the dashboard is used at once).
-        let key = match self.config.aws_networks.get(region) { Some(g) => format!("{region} {}", serde_json::to_string(g).unwrap_or_default()), None => region.to_string() };
+    async fn network(&self, a: &AwsConnection, region: &str, creds: &Credentials, now: u64) -> Result<Option<aws::Network>> {
+        // Kept by account, region and what is set for it (a setting changed in the dashboard is used at once).
+        // (The networks set in the dashboard are the first account's: a further one uses its own.)
+        let given = self.config.aws_networks.get(region).filter(|_| a.name.is_empty());
+        let key = match given { Some(g) => format!("{region} {}", serde_json::to_string(g).unwrap_or_default()), None => format!("{}{region}", aws_notes(a.account())) };
         if let Some((n, _)) = self.cache.network.borrow().get(&key).filter(|(_, until)| *until > now) { return Ok(n.clone()) }
-        let found = match self.config.aws_networks.get(region) {
+        let found = match given {
             Some(given) => aws::given_network(self.http, region, creds, given, now).await.map(Some),
             None => aws::find_network(self.http, region, creds, &self.config.plane_id, now).await,
         };
-        self.note_permission("aws", "ReadNetwork", &found).await;
+        self.note_permission(a.account(), "ReadNetwork", &found).await;
         let n = match found {
             Ok(n) => n,
             Err(e) if !self.config.aws_networks.contains_key(region) && ["AccessDenied", "UnauthorizedOperation", "not authorized"].iter().any(|d| e.contains(d)) => None,
@@ -2605,11 +2801,15 @@ impl<'a> ControlPlane<'a> {
     /// Where a job's machine may go, by the order and limits set in the dashboard (see `Routing`): the places that can
     /// run it now, first to last. The job goes to the first; to the next when that one cannot start its machine.
     /// `no_spot`: AWS's spot machines are passed over when another place can run it (see `Job::no_spot`, `spot_paused`).
-    async fn place(&self, spec: &Spec, gitlab: bool, no_spot: bool, failed_at: &[String]) -> Result<Placement> {
+    /// `no_function`: Modal's Functions likewise, for a job Modal preempted.
+    async fn place(&self, spec: &Spec, gitlab: bool, no_spot: bool, no_function: bool, failed_at: &[String]) -> Result<Placement> {
         let aws = self.aws_connection().await?.filter(|a| a.connected);
         let routing = &self.config.routing;
         let mut connected = vec![];
         if aws.is_some() { connected.extend(["aws".to_string(), AWS_ON_DEMAND.to_string()]) }
+        // (A further AWS account's runners, with their connection.)
+        let further: Vec<AwsConnection> = self.further_aws().await?.into_iter().filter(|a| a.connected).collect();
+        for r in self.config.records.runners.iter().filter(|r| !r.gone && further.iter().any(|a| a.name == r.account)) { connected.push(r.name.clone()) }
         if self.own_containers() { connected.push(self.config.own_cloud.clone()) }
         for a in &self.config.launchers { if !connected.contains(&a.cloud) { connected.push(a.cloud.clone()) } }
         // The order as set; places connected since then come after it (AWS's on-demand machines: right after its spot ones).
@@ -2620,7 +2820,7 @@ impl<'a> ControlPlane<'a> {
         }
         // A label naming a provider means all of its runners, as the order has them.
         let candidates: Vec<String> = match &spec.cloud {
-            Some(c) => { let v: Vec<String> = order.iter().filter(|o| self.config.provider_of(o) == c).cloned().collect(); if v.is_empty() { vec![c.clone()] } else { v } }
+            Some(c) => { let v: Vec<String> = order.iter().filter(|o| self.config.records.provider_of(o) == c).cloned().collect(); if v.is_empty() { vec![c.clone()] } else { v } }
             None => order,
         };
         if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
@@ -2643,23 +2843,24 @@ impl<'a> ControlPlane<'a> {
             let name = cloud_name(cloud);
             let runner = match cloud.as_str() {
                 "aws" | AWS_ON_DEMAND => aws.clone().map(|a| (Capacity::aws(), Runner::Aws(a))),
-                c if c == self.config.own_cloud && self.own_containers() => Some((capacity_of(self.config.provider_of(c)), Runner::Own)),
-                c => self.config.launchers.iter().find(|a| a.cloud == c).map(|a| (capacity_of(self.config.provider_of(c)), Runner::Launcher(a.clone()))),
+                c if self.config.records.provider_of(c) == "aws" => further.iter().find(|a| a.name == self.config.records.account_of(c)).filter(|_| self.config.records.runners.iter().any(|r| r.name == c && !r.gone)).map(|a| (Capacity::aws(), Runner::Aws(a.clone()))),
+                c if self.config.records.launcher_word(c) == self.config.own_cloud && self.own_containers() => Some((capacity_of(self.config.records.provider_of(c)), Runner::Own)),
+                c => self.config.launchers.iter().find(|a| a.cloud == self.config.records.launcher_word(c)).map(|a| (capacity_of(self.config.records.provider_of(c)), Runner::Launcher(a.clone()))),
             };
             // Limits from the order: turned off, jobs at once, spend this month.
             let pool = routing.pool(cloud);
             if pool.is_some_and(|p| p.off) { never.push(format!("{name} is turned off")); continue }
             // Its cloud account's limit for the month, its providers together.
-            let account = self.config.account_of(cloud);
+            let account = self.config.records.account_of(cloud);
             if let Some(cap) = routing.account_usd.get(account) {
-                if self.config.account_spend(&spend, account) >= *cap {
+                if self.config.records.account_spend(spend.iter().map(|(c, u)| (c.as_str(), *u)), account) >= *cap {
                     let said = format!("the {} account reached its {} a month (`superci accounts update {account} --monthly-usd=N` raises it)", cloud_name(account), dollars(*cap));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
             }
             if let Some(cap) = routing.account_daily_usd.get(account) {
-                if self.config.account_spend(&today, account) >= *cap {
+                if self.config.records.account_spend(today.iter().map(|(c, u)| (c.as_str(), *u)), account) >= *cap {
                     let said = format!("the {} account reached its {} a day (`superci accounts update {account} --daily-usd=N` raises it)", cloud_name(account), dollars(*cap));
                     if !never.contains(&said) { never.push(said) }
                     continue
@@ -2668,7 +2869,7 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
-            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if self.config.provider_of(cloud) == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
+            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if self.config.records.provider_of(cloud) == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
             if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
             // A label that names this provider, and none of its runners is added here: said as it is.
             let Some((capacity, runner)) = runner else {
@@ -2676,15 +2877,19 @@ impl<'a> ControlPlane<'a> {
                 never.push(format!("{name} is not connected"));
                 continue
             };
-            if gitlab && self.config.provider_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
+            if gitlab && self.config.records.provider_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
             // Its label asks for an on-demand machine: not AWS's spot ones.
-            if cloud == "aws" && spec.on_demand() { never.push("AWS spot machines are not asked for (spot=false)".into()); continue }
+            if self.config.records.aws_spot(cloud) && spec.on_demand() { never.push("AWS spot machines are not asked for (spot=false)".into()); continue }
+            // (Nor preemptible Functions.)
+            if self.config.records.modal_function(cloud) && spec.on_demand() { never.push("Modal's Functions are not asked for (spot=false)".into()); continue }
             places.push((cloud.clone(), runner, size));
         }
         // Spot is passed over only when something else can take the job: with nothing else, a spot machine it is.
-        if no_spot && places.iter().any(|(c, _, _)| c != "aws") { places.retain(|(c, _, _)| c != "aws") }
+        if no_spot && places.iter().any(|(c, _, _)| !self.config.records.aws_spot(c)) { places.retain(|(c, _, _)| !self.config.records.aws_spot(c)) }
+        // (And Functions, for a job Modal preempted.)
+        if no_function && places.iter().any(|(c, _, _)| !self.config.records.modal_function(c)) { places.retain(|(c, _, _)| !self.config.records.modal_function(c)) }
         // Places that failed this job before come after those that have not (still in order among themselves).
         places.sort_by_key(|(c, _, _)| failed_at.contains(c));
         Ok(if !places.is_empty() { Placement::Run(places) }
@@ -2725,19 +2930,19 @@ impl<'a> ControlPlane<'a> {
     /// An AWS machine's cost once it ended, at the prices AWS billed: its zone's spot prices over its time (or its
     /// on-demand price), its disk and its public address. Left as an estimate if AWS cannot say.
     async fn settle(&self, plane_url: &str, j: &mut Job) {
-        if j.cloud != "aws" || j.cost_usd.is_some() { return }
+        if self.config.records.provider_of(&j.cloud) != "aws" || j.cost_usd.is_some() { return }
         let (Some(region), Some(kind), Some(end)) = (j.region.clone(), j.machine_type.clone(), j.ended_ms) else { return };
-        let Ok(Some(a)) = self.aws_connection().await else { return };
+        let Ok(Some(a)) = self.aws_connection_of(&j.cloud).await else { return };
         let Ok(creds) = self.aws_creds(plane_url, &a).await else { return };
         let (from, now) = (j.launched_ms.unwrap_or(j.at_ms), self.clock.now_ms());
         let hours = end.saturating_sub(from).max(60_000) as f64 / 3_600_000.0;
         let spec = self.config.parse(&j.label).and_then(|s| s.ok()).map(|s| s.or(&self.config.machine)).unwrap_or_default();
         let machine = match j.zone.as_deref() {
             Some(zone) if !(spec.on_demand() || j.on_demand) => aws::spot_cost(self.http, &region, zone, &creds, &kind, spec.os(), from, end, now).await,
-            _ => { let p = aws::on_demand_price(self.http, &creds, &region, &kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.map(|p| p * hours) }
+            _ => { let p = aws::on_demand_price(self.http, &creds, &region, &kind, spec.os(), now).await; self.note_permission(a.account(), "Prices", &p).await; p.map(|p| p * hours) }
         };
         let disk = aws::disk_price(self.http, &creds, &region, now).await;
-        self.note_permission("aws", "Prices", &disk).await;
+        self.note_permission(a.account(), "Prices", &disk).await;
         let gb_month = disk.unwrap_or_else(|_| aws::disk_gb_month(&region));
         if let Ok(machine) = machine {
             j.cost_usd = Some(j.earlier_usd + machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers && !(j.ramdisk || j.local_disk))) * hours);
@@ -2749,10 +2954,10 @@ impl<'a> ControlPlane<'a> {
     /// traffic within the region too). Whether it could.
     async fn settle_sent(&self, plane_url: &str, j: &mut Job) -> bool {
         let (Some(region), Some(id), Some(end)) = (j.region.clone(), j.machine_id.clone(), j.ended_ms) else { return false };
-        let Ok(Some(a)) = self.aws_connection().await else { return false };
+        let Ok(Some(a)) = self.aws_connection_of(&j.cloud).await else { return false };
         let Ok(creds) = self.aws_creds(plane_url, &a).await else { return false };
         let sent = aws::bytes_sent(self.http, &region, &creds, &id, j.launched_ms.unwrap_or(j.at_ms), end, self.clock.now_ms()).await;
-        self.note_permission("aws", "MachineTraffic", &sent).await;
+        self.note_permission(a.account(), "MachineTraffic", &sent).await;
         let bytes = match sent {
             Ok(b) => b,
             // A role from before it could read CloudWatch: not known (-1), not asked again.
@@ -2767,14 +2972,14 @@ impl<'a> ControlPlane<'a> {
 
     async fn stop_machine(&self, plane_url: &str, j: &Job) {
         let Some(id) = &j.machine_id else { return };
-        if j.cloud == "aws" {
-            if let Ok(Some(a)) = self.aws_connection().await {
+        if self.config.records.provider_of(&j.cloud) == "aws" {
+            if let Ok(Some(a)) = self.aws_connection_of(&j.cloud).await {
                 let region = j.region.clone().unwrap_or(a.region.clone());
                 if let Ok(c) = self.aws_creds(plane_url, &a).await { let _ = aws::terminate_instance(self.http, &region, &c, id, self.clock.now_ms()).await; }
             }
-        } else if let Some(c) = self.containers.filter(|_| j.cloud == self.config.own_cloud && self.own_containers()) {
+        } else if let Some(c) = self.containers.filter(|_| self.config.records.launcher_word(&j.cloud) == self.config.own_cloud && self.own_containers()) {
             let _ = c.stop(id).await;
-        } else if let Some(launcher) = self.config.launchers.iter().find(|a| a.cloud == j.cloud) {
+        } else if let Some(launcher) = self.config.launchers.iter().find(|a| a.cloud == self.config.records.launcher_word(&j.cloud)) {
             let _ = self.launcher_call(plane_url, launcher, "/stop", serde_json::json!({ "id": id })).await;
         }
     }
@@ -2851,7 +3056,7 @@ impl<'a> ControlPlane<'a> {
         let limited: Vec<&str> = said.split("; ").filter(|a| a.contains("MaxSpotInstanceCountExceeded")).filter_map(|a| a.split(':').next()).collect();
         if limited.is_empty() { return false }
         let now = self.clock.now_ms();
-        self.live_jobs().await.unwrap_or_default().iter().any(|(_, j)| j.job_id != job.job_id && j.cloud == "aws" && !j.on_demand
+        self.live_jobs().await.unwrap_or_default().iter().any(|(_, j)| j.job_id != job.job_id && self.config.records.account_of(&j.cloud) == self.config.records.account_of(&job.cloud) && !j.on_demand
             && j.region.as_deref().is_some_and(|r| limited.contains(&r)) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000))
     }
 
@@ -3135,8 +3340,8 @@ impl<'a> ControlPlane<'a> {
 
     /// Removes a launch template made for one request, and the note of it (kept when AWS did not remove it: a sweep
     /// tries again).
-    async fn remove_template(&self, creds: &Credentials, region: &str, name: &str) {
-        if aws::delete_template(self.http, region, creds, name, self.clock.now_ms()).await.is_ok() { let _ = self.store.delete(&template_key(region, name)).await; }
+    async fn remove_template(&self, account: &str, creds: &Credentials, region: &str, name: &str) {
+        if aws::delete_template(self.http, region, creds, name, self.clock.now_ms()).await.is_ok() { let _ = self.store.delete(&template_key(account, region, name)).await; }
     }
 
     /// What was left for after an answer (see `Timer::later`), given back by the runtime with the address the
@@ -3154,7 +3359,9 @@ impl<'a> ControlPlane<'a> {
         let base = match origin(url) { o if o.starts_with("http") => o, _ => get_json::<String>(self.store, "plane_url").await?.unwrap_or_default() };
         // A launch template whose one use is over (see `aws::fleet`).
         if let Some((region, name)) = what.strip_prefix("template ").and_then(|t| t.split_once(' ')) {
-            if let Some(a) = self.aws_connection().await? { let creds = self.aws_creds(&base, &a).await?; self.remove_template(&creds, region, name).await }
+            // (Its account's word after its name, a further one's.)
+            let (name, runner) = name.split_once(' ').unwrap_or((name, "aws"));
+            if let Some(a) = self.aws_connection_of(runner).await? { let creds = self.aws_creds(&base, &a).await?; self.remove_template(a.account(), &creds, region, name).await }
             return Ok(())
         }
         let Some(key) = what.strip_prefix("start ") else { return Ok(()) };
@@ -3183,8 +3390,9 @@ impl<'a> ControlPlane<'a> {
         let result: Result<()> = async {
             let spec = match spec { Ok(s) => s, Err(e) => { intrinsic = true; return Err(e) } };
             if let Some(why) = self.config.routing.too_large(&spec) { intrinsic = true; return Err(why) }
+            let image = match self.config.routing.image_of(&spec) { Ok(i) => i, Err(why) => { intrinsic = true; return Err(why) } };
             let now = self.clock.now_ms();
-            let places = match self.place(&spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), &job.failed_at).await? {
+            let places = match self.place(&spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), job.no_spot, &job.failed_at).await? {
                 Placement::Run(p) => p,
                 Placement::Wait(why) => {
                     job.state = "waiting".into();
@@ -3194,11 +3402,13 @@ impl<'a> ControlPlane<'a> {
                 }
                 Placement::Fail(why) => { intrinsic = true; return Err(why) }
             };
-            let cloud_of = |r: &Runner| match r { Runner::Aws(_) => "aws".to_string(), Runner::Launcher(a) => a.cloud.clone(), Runner::Own => self.config.own_cloud.clone() };
+            // (AWS's first account's two runners are one word with `on_demand`, as jobs have always said; a further
+            // account's each its own.)
+            let cloud_of = |p: &str, r: &Runner| match r { Runner::Aws(a) if a.name.is_empty() => "aws".to_string(), _ => p.to_string() };
             job.state = "launching".into();
             job.error = None;
-            job.cloud = cloud_of(&places[0].1);
-            job.on_demand = places[0].0 == AWS_ON_DEMAND;
+            job.cloud = cloud_of(&places[0].0, &places[0].1);
+            job.on_demand = self.config.records.aws_on_demand(&places[0].0);
             let mut name = format!("{}-{}{}{}", runner_prefix(self.config.name(), &self.config.plane_id), if gitlab { "gl" } else { "" }, if gitlab { gitlab::local(&job.gitlab, job.job_id) } else { job.job_id.to_string() }, job.runner_suffix);
             let work = if job.provider == "local" {
                 // A run from a computer: its runner takes the job from this control plane, at its own address.
@@ -3277,8 +3487,8 @@ impl<'a> ControlPlane<'a> {
                         return self.timer.wake_in(20_000).await;
                     }
                 }
-                job.cloud = cloud_of(&runner);
-                job.on_demand = place == AWS_ON_DEMAND;
+                job.cloud = cloud_of(&place, &runner);
+                job.on_demand = self.config.records.aws_on_demand(&place);
                 // What only the place before had (a spot machine's notice, Cloudflare's price while waiting).
                 job.notice = None;
                 job.waiting_usd_per_hour = None;
@@ -3287,12 +3497,13 @@ impl<'a> ControlPlane<'a> {
                 if at > 0 && self.clock.now_ms().saturating_sub(began) > LAUNCH_BUDGET_MS { out_of_time = true; break }
                 let tried: Result<Tried> = match runner {
                     Runner::Aws(a) => async {
-                        let on_demand = place == AWS_ON_DEMAND;
+                        let on_demand = self.config.records.aws_on_demand(&place);
+                        let notes = aws_notes(a.account());
                         if on_demand { tried_on_demand = true } else { tried_spot = true }
                         // An organization that allowed no spot machine within the last ten minutes is not asked again
                         // for each job (it would refuse each one, a second lost every time): the job goes on down the
                         // order. Not longer: once its owner changes that rule, jobs are on spot within ten minutes.
-                        if !on_demand && self.store.get(SPOT_NOT_ALLOWED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000) {
+                        if !on_demand && self.store.get(&format!("{notes}{SPOT_NOT_ALLOWED_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000) {
                             answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.place_regions(&a, &place).first().cloned().unwrap_or_default()));
                             quota_only = false;
                             job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
@@ -3311,7 +3522,7 @@ impl<'a> ControlPlane<'a> {
                         // A spot machine says when AWS takes it back, with a link only it has.
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
-                        let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref())?;
+                        let user_data = aws::runner_user_data_for(&work, self.machine_minutes(&place), spec.os(), notice.as_deref())?;
                         // What a job writes most goes on the machine's own NVMe disk when it has one, or in memory
                         // when its label asks (`scratch=ramdisk`).
                         let user_data = aws::with_scratch(user_data, spec.ramdisk());
@@ -3339,20 +3550,20 @@ impl<'a> ControlPlane<'a> {
                             let (image, image_gb) = match self.image(region, &spec, &creds, now).await { Ok(i) => i, Err(e) => { last = said(&e); continue } };
                             // Never smaller than its image's disk (Windows' is 100 GB).
                             disk_gb = disk_gb.max(image_gb);
-                            let network = self.network(region, &creds, now).await?;
+                            let network = self.network(&a, region, &creds, now).await?;
                             let types = self.offered(region, kinds, &creds, now).await;
                             // Spot pools that had no machine, or took one back, in the last quarter of an hour: asked last.
-                            let avoid = if on_demand { vec![] } else { self.pools_to_avoid(region, now).await };
+                            let avoid = if on_demand { vec![] } else { self.pools_to_avoid(a.account(), region, now).await };
                             // Many jobs queued at once: AWS lets a few requests through and refuses the rest for a
                             // moment ("RequestLimitExceeded"). The launch waits and asks again by itself, each job
                             // after a wait of its own (see `aws::run_instance`).
                             // The disk's speed: by the machine's size unless the label or the default machine says.
                             (disk_mibs, disk_iops) = disk_speed(job.cpu.unwrap_or(4), disk_gb, &spec);
-                            let mut skip = self.pools_to_skip(region, !on_demand, self.clock.now_ms()).await;
+                            let mut skip = self.pools_to_skip(a.account(), region, !on_demand, self.clock.now_ms()).await;
                             skip.extend(out.iter().cloned());
                             // The spot pools left after the best has no machine are asked in one request, unless
                             // this role lately could not.
-                            let fleet = !on_demand && !self.store.get(NO_FLEET_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000);
+                            let fleet = !on_demand && !self.store.get(&format!("{notes}{NO_FLEET_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000);
                             // GitHub's cache, kept in this region's bucket, for a Linux machine of a GitHub job.
                             // (A GitLab job's machine is known by its runner's id: the job that runner takes is its own.)
                             let cache_runner = if gitlab { format!("gl:{}", gitlab::local(&job.gitlab, job.runner_id.unwrap_or_default())) } else { name.clone() };
@@ -3371,7 +3582,12 @@ impl<'a> ControlPlane<'a> {
                             // would be slower than either.
                             // (Linux only: AWS's place refuses a RAM disk or a local disk elsewhere, see `Capacity::refuses`.)
                             let on_scratch = spec.scratch.is_some();
-                            let (user_data, set_up, keeps) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
+                            // (One cache for a CI, in its first AWS account: a machine in a further one reaches it by links.)
+                            let cache_creds = if a.name.is_empty() { Some(creds.clone()) } else { match self.aws_connection().await.ok().flatten().filter(|h| h.connected) { Some(home) => self.aws_creds(plane_url, &home).await.ok(), None => None } };
+                            let (user_data, set_up, keeps) = match &cache_creds {
+                                Some(c) => self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, c, plane_url, &cache_runner, &key, now).await,
+                                None => (user_data.clone(), false, false),
+                            };
                             job.layers = set_up;
                             job.keeps = keeps;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
@@ -3379,16 +3595,16 @@ impl<'a> ControlPlane<'a> {
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
                             if let Some(e) = told.fleet_refused.take() {
-                                let _ = self.store.put(NO_FLEET_KEY, now.to_string()).await;
+                                let _ = self.store.put(&format!("{notes}{NO_FLEET_KEY}"), now.to_string()).await;
                                 self.note_permission::<()>("aws", "AskSpotPoolsAtOnce", &Err(e)).await;
-                            } else if fleet && told.asked.iter().any(|a| a.4 > 0) { self.note_permission("aws", "AskSpotPoolsAtOnce", &Ok(())).await }
+                            } else if fleet && told.asked.iter().any(|a| a.4 > 0) { self.note_permission(a.account(), "AskSpotPoolsAtOnce", &Ok(())).await }
                             // The launch template of a request for many pools is removed: after the request at hand
                             // is answered where the runtime can do that (it is in the way of nothing, and the job's
                             // machine is the sooner known), else now. Noted first, so that one not removed for any
                             // reason is removed by a sweep.
                             if let Some(name) = told.template_left.take() {
-                                let _ = self.store.put(&template_key(region, &name), now.to_string()).await;
-                                if !self.timer.later(&format!("template {region} {name}")) { self.remove_template(&creds, region, &name).await }
+                                let _ = self.store.put(&template_key(a.account(), region, &name), now.to_string()).await;
+                                if !self.timer.later(&format!("template {region} {name} {place}")) { self.remove_template(a.account(), &creds, region, &name).await }
                             }
                             // Each request and its answer is kept with the job (the last two dozen).
                             let mut at = self.clock.now_ms().saturating_sub(job.at_ms).saturating_sub(told.asked.iter().map(|a| a.3).sum());
@@ -3396,13 +3612,13 @@ impl<'a> ControlPlane<'a> {
                             for kind in told.priced_out.drain(..) { if !job.priced_out.contains(&kind) { job.priced_out.push(kind) } }
                             if job.asks.len() > 24 { let over = job.asks.len() - 24; job.asks.drain(..over); }
                             // A zone AWS does not offer a type in is not asked for it again (for a day).
-                            for (kind, zone, said) in &told.refused { if said == "Unsupported" && !zone.is_empty() { let _ = self.store.put(&unoffered_key(region, kind, zone), now.to_string()).await; } }
+                            for (kind, zone, said) in &told.refused { if said == "Unsupported" && !zone.is_empty() { let _ = self.store.put(&unoffered_key(a.account(), region, kind, zone), now.to_string()).await; } }
                             // One request's worth of spot pools asked, none with a machine, and others left: the job
                             // goes on with those in a moment (see `MORE_SPOT`), before any on-demand machine. (Others left
                             // is said only with no machine, and AWS's last word one of no room: see `aws::run_instance`.)
                             let more = told.more && !on_demand && job.spot_rounds < 2;
                             // A spot pool with no machine now is remembered, for the jobs that come next.
-                            if !on_demand { for (kind, zone, said) in &told.refused { if said == "InsufficientInstanceCapacity" && !zone.is_empty() { let _ = self.store.put(&pool_key(region, kind, zone), now.to_string()).await; } } }
+                            if !on_demand { for (kind, zone, said) in &told.refused { if said == "InsufficientInstanceCapacity" && !zone.is_empty() { let _ = self.store.put(&pool_key(a.account(), region, kind, zone), now.to_string()).await; } } }
                             // Still refused for the rate of requests after its waits: for a spot machine that is no
                             // room for it just now, said as that with the job (it goes on down the order, to an
                             // on-demand machine unless the order says otherwise, rather than wait a minute more).
@@ -3417,7 +3633,7 @@ impl<'a> ControlPlane<'a> {
                             // room for one, the job goes on down the order, and says why it ran on-demand.
                             if !on_demand && machine.as_ref().is_err_and(|e| aws::refusal(e).is_some_and(|r| r.by == aws::By::Organization)) {
                                 quota_only = false;
-                                let _ = self.store.put(SPOT_NOT_ALLOWED_KEY, now.to_string()).await;
+                                let _ = self.store.put(&format!("{notes}{SPOT_NOT_ALLOWED_KEY}"), now.to_string()).await;
                                 answers.push(said(SPOT_NOT_ALLOWED));
                                 last = said(machine.as_ref().err().map(String::as_str).unwrap_or_default());
                                 break
@@ -3429,7 +3645,7 @@ impl<'a> ControlPlane<'a> {
                                 let _ = self.store.put(BUDGET_STOPPED_KEY, now.to_string()).await;
                                 return Err(format!("{BUDGET_STOPPED}: raise the account's limit on Runners in the {} dashboard (that lifts it), or wait for next month", self.config.name()))
                             }
-                            self.note_permission("aws", "LaunchOnlyTaggedMachines", &machine).await;
+                            self.note_permission(a.account(), "LaunchOnlyTaggedMachines", &machine).await;
                             match machine {
                                 Ok(m) => {
                                     // (A machine started: the budget's rule, if it was on the role, is off it.)
@@ -3465,7 +3681,7 @@ impl<'a> ControlPlane<'a> {
                         if !on_demand { job.spot_refused = None }
                         job.private = private;
                         // Spot: its zone's price now. On-demand: AWS's list price. Settled at the prices in effect when it ends.
-                        let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
+                        let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission(a.account(), "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
                         job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && spec.scratch.is_none()));
@@ -3482,21 +3698,56 @@ impl<'a> ControlPlane<'a> {
                     Runner::Own => async {
                         // (Sized for the job where it was placed.)
                         job.cpu = Some(size.cpu);
-                        job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) } else { cloudflare_usd_per_hour(size) });
+                        let function = self.config.records.modal_function(&place);
+                        job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_price(size, function) } else { cloudflare_usd_per_hour(size) });
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
-                        Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, self.machine_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
+                        let containers = self.containers.ok_or("no containers here")?;
+                        let minutes = self.machine_minutes(&self.config.own_cloud);
+                        job.notice = function.then(|| crate::crypto::random_token(18));
+                        if let Some(t) = &job.notice {
+                            let id = containers.start_function(&name, &work, minutes, size, image.map(|i| (i.reference.as_str(), i.modal_secret.as_deref())), &format!("{plane_url}/interrupted?runner={name}&t={t}")).await?;
+                            return Ok(Tried::Started(id, format!("{}-function", machine_name(size))))
+                        }
+                        Ok(Tried::Started(match image { Some(i) => containers.start_from(&name, &work, minutes, size, &i.reference, i.modal_secret.as_deref()).await?, None => containers.start(&name, &work, minutes, size).await? }, machine_name(size)))
                     }.await,
                     Runner::Launcher(a) => async {
                         job.cpu = Some(size.cpu);
                         // (Priced as its capacity is had: Cloudflare's, else Modal's, see `capacity_of`.)
-                        let provider = self.config.provider_of(&a.cloud);
-                        job.usd_per_hour = Some(if provider == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) });
+                        let provider = self.config.records.provider_of(&a.cloud);
+                        // A Modal launcher not asked for a while starts from nothing, longer than a call waits with
+                        // a machine to start on top: a launch cut off that way still starts one nothing knows of.
+                        // Woken first, whatever it answers.
+                        if provider == "modal" { let _ = self.http.send(Request::new("GET", &format!("{}/health", a.url))).await; }
+                                                let function = self.config.records.modal_function(&place);
+                        job.usd_per_hour = Some(if provider == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_price(size, function) });
                         if provider == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
+                        // As a Function: with the link it says a preemption with.
+                        job.notice = function.then(|| crate::crypto::random_token(18));
+                        if let Some(t) = &job.notice { body["function"] = true.into(); body["notice"] = format!("{plane_url}/interrupted?runner={name}&t={t}").into() }
                         if provider == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
+                        // (An image of its own: where it is, and the Modal Secret that reaches a private registry.)
+                        if let Some(i) = image { body["image"] = i.reference.clone().into(); if let Some(s) = &i.modal_secret { body["image_secret"] = s.clone().into() } }
                         let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
-                        Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
+                        let id = v["id"].as_str().ok_or("launcher answered without an id")?.to_string();
+                        // A launcher from before images of one's own starts GitHub's runner image whatever it is told
+                        // (it says back no image): its sandbox is stopped, and the job says to update it.
+                        if let Some(i) = image.filter(|i| v["image"].as_str() != Some(&i.reference)) {
+                            let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
+                            // (A further Modal workspace's is made again with `--account`.)
+                            let records = &self.config.records;
+                            let again = records.accounts.iter().find(|c| c.name == records.account_of(&a.cloud)).and_then(|c| c.cloud_id.as_ref()).map_or(a.cloud.clone(), |w| format!("modal --account={w}"));
+                            return Err(format!("the {} launcher is from before images of your own, and would start GitHub's runner image in place of {}: update it (`superci runners create {again}`)", cloud_name(&a.cloud), i.reference))
+                        }
+                        // Nor one from before Functions, which starts a sandbox whatever it is told (it says so).
+                        if function && v["kind"] != "function" {
+                            let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
+                            let records = &self.config.records;
+                            let again = records.accounts.iter().find(|c| c.name == records.account_of(&a.cloud)).and_then(|c| c.cloud_id.as_ref()).map_or(a.cloud.clone(), |w| format!("modal --account={w}"));
+                            return Err(format!("the {} launcher is from before Functions, and would start a sandbox: update it (`superci runners create {again}`)", cloud_name(&a.cloud)))
+                        }
+                        Ok(Tried::Started(id, v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
                 match tried {
@@ -3508,7 +3759,7 @@ impl<'a> ControlPlane<'a> {
                     Err(e) => {
                         if !job.failed_at.contains(&place) { job.failed_at.push(place.clone()) }
                         // AWS failing alike for its spot and its on-demand machines (its network, its permissions) is said once.
-                        if !(place == AWS_ON_DEMAND && failures.iter().any(|(p, said)| p == "aws" && *said == e)) { failures.push((place, e)) }
+                        if !(self.config.records.aws_on_demand(&place) && failures.iter().any(|(p, said)| self.config.records.aws_spot(p) && self.config.records.account_of(p) == self.config.records.account_of(&place) && *said == e)) { failures.push((place, e)) }
                     }
                 }
             }
@@ -3536,7 +3787,7 @@ impl<'a> ControlPlane<'a> {
                     // every refusal was for the account's limits, or every on-demand one was (spot may have said
                     // something else: a type a zone does not have).
                     let no_quota = quota_only || (on_demand_refused && on_demand_quota_only);
-                    if spec.gpu.is_some() && no_quota && !answers.is_empty() && !self.gpu_machines_up(job.job_id).await {
+                    if spec.gpu.is_some() && no_quota && !answers.is_empty() && !self.gpu_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await {
                         let (spot, od) = ("“All G and VT Spot Instance Requests” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-3819A6DF)", "“Running On-Demand G and VT instances” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-DB2E81BA)");
                         let why = format!("{NO_GPU_QUOTA}{}{}", match (tried_spot && quota_only, tried_on_demand) { (true, true) => format!("{spot} or {od}"), (true, false) => spot.to_string(), _ => od.to_string() }, " in each region it uses");
                         if failures.is_empty() { return Err(why) }
@@ -3550,7 +3801,7 @@ impl<'a> ControlPlane<'a> {
                     // limit not letting its machine start: a job larger than that limit would wait for room that
                     // never comes, when the spot limit it ran under a moment ago is free. A spot machine is asked
                     // for again (the pool that took one back is asked last, see `pools_to_avoid`).
-                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&spec, gitlab, false, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _, _)| c == "aws")) {
+                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&spec, gitlab, false, job.no_spot, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _, _)| self.config.records.aws_spot(c))) {
                         return Err(format!("{BACK_ON_SPOT}{}", answers.join("; ")))
                     }
                     if at_limit { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
@@ -3627,7 +3878,7 @@ impl<'a> ControlPlane<'a> {
             let e = match e.strip_prefix(AT_LIMIT) {
                 None => e,
                 Some(said) => {
-                    let (ours, ended) = self.aws_machines_up(job.job_id).await;
+                    let (ours, ended) = self.aws_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await;
                     if ours > 0 {
                         job.state = "waiting".into();
                         job.error = Some(format!("waiting: your AWS account's limit of running CPUs is in use by {ours} of your job{} there; it starts when one ends ({})", if ours == 1 { "" } else { "s" }, said.chars().take(160).collect::<String>()));
@@ -3691,8 +3942,10 @@ impl<'a> ControlPlane<'a> {
         enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        places.extend(["cloudflare", "modal"].iter().flat_map(|c| self.config.launchers.iter().filter(move |a| self.config.provider_of(&a.cloud) == *c)).map(|a| Place::Launcher(a.clone())));
+        places.extend(["cloudflare", "modal"].iter().flat_map(|c| self.config.launchers.iter().filter(move |a| self.config.records.provider_of(&a.cloud) == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
+        // (And each further AWS account's.)
+        places.extend(self.further_aws().await.unwrap_or_default().into_iter().filter(|a| a.connected).map(Place::Aws));
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
         let owner = Self::owner_of(app);
@@ -3737,7 +3990,7 @@ impl<'a> ControlPlane<'a> {
                         loop {
                             let Some(region) = regions.next() else { break };
                             let (image, image_gb) = match self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await { Ok(i) => i, Err(e) => { started = Err(e); continue } };
-                            let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
+                            let network = match self.network(&a, &region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
                             let start = async |spot: bool| aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, skip: &[], tags: &tags, spot, os: "linux",
                                 avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet: false, store_disk: None }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
                             started = start(true).await;
@@ -3907,6 +4160,8 @@ impl<'a> ControlPlane<'a> {
             }
             j.for_job = None;
             j.seen_in_progress = true;
+            // (Whatever it waited for is over.)
+            if j.error.as_deref().is_some_and(|e| e.starts_with("waiting")) { j.error = None }
             // A machine left idle by a cancelled job (an orphan) that took a job before the sweep came is busy too.
             if j.state == "launched" || j.state == "orphan" { j.state = "running".into(); }
             j.started_ms.get_or_insert(self.clock.now_ms());
@@ -4369,7 +4624,7 @@ impl<'a> ControlPlane<'a> {
                     j["state"] = "pending".into();
                     j["off_spot"] = true.into();
                     // (Its first attempt, said with the run: its job, and why it is started again.)
-                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": "AWS took back its spot machine" });
+                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": lost_said(record.as_ref().map_or("aws", |r| self.config.records.provider_of(&r.cloud))).0 });
                     let o = j.as_object_mut().expect("an object: its fields were just set");
                     o.remove("job_id");
                     o.remove("token");
@@ -4920,7 +5175,7 @@ impl<'a> ControlPlane<'a> {
         if let (Some(name), Some(mut j)) = (runner, self.by_runner(runner).await?) {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
             // (One that keeps its job's images goes off by itself once it has: ended later only if it has not.)
-            if j.keeps && j.cloud == "aws" {
+            if j.keeps && self.config.records.provider_of(&j.cloud) == "aws" {
                 self.store.put_until(&format!("keeping:{}", j.job_id), (self.clock.now_ms() + KEEPING_MS).to_string(), self.clock.now_ms() + 2 * KEEPING_MS).await?;
                 self.timer.wake_in(KEEPING_MS).await?;
             } else { self.stop_machine(plane_url, &j).await; }
@@ -4933,10 +5188,11 @@ impl<'a> ControlPlane<'a> {
             // (A run from a computer's is started again by its run, at once: see `advance_run`.)
             if j.interrupted && j.rerun.is_none() && !matches!(ev.conclusion.as_deref(), Some("success" | "skipped" | "neutral")) {
                 j.state = "failed".into();
+                let (lost, again) = lost_said(self.config.records.provider_of(&j.cloud));
                 if j.provider == "local" {
-                    j.error = Some("AWS took back its spot machine; SuperCI starts the job again by itself, off spot machines".into());
+                    j.error = Some(format!("{lost}; SuperCI starts the job again by itself, {again}"));
                 } else {
-                    j.error = Some("AWS took back its spot machine; SuperCI runs the job again by itself, off spot machines, once its run has finished (GitHub runs a job again only then)".into());
+                    j.error = Some(format!("{lost}; SuperCI runs the job again by itself, {again}, once its run has finished (GitHub runs a job again only then)"));
                     j.rerun = Some(Rerun { job_id, run_id: ev.run_id, repo: ev.repo.clone(), name: ev.name.clone(), state: "pending".into(), at_ms: self.clock.now_ms() });
                     self.timer.wake_in(60_000).await?;
                 }
@@ -5076,7 +5332,7 @@ impl<'a> ControlPlane<'a> {
                 continue;
             }
             // An AWS machine that ended a while ago: what it sent, once CloudWatch has counted it, added to its cost.
-            if j.cloud == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && j.ended_ms.is_some_and(|e| now > e + 12 * 60_000 && now < e + 2 * 86_400_000) {
+            if self.config.records.provider_of(&j.cloud) == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && j.ended_ms.is_some_and(|e| now > e + 12 * 60_000 && now < e + 2 * 86_400_000) {
                 if self.settle_sent(&plane_url, &mut j).await { self.keep(&key, &j).await?; }
                 continue;
             }
@@ -5085,7 +5341,7 @@ impl<'a> ControlPlane<'a> {
             // placed again, twice at most, then the job fails with why (GitHub would otherwise keep it queued for a day).
             if j.state == "launched" && !j.seen_in_progress {
                 let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
-                let (wait, up_by) = if j.cloud == "aws" { (8 * 60_000, 90_000) } else { (3 * 60_000, 60_000) };
+                let (wait, up_by) = if self.config.records.provider_of(&j.cloud) == "aws" { (8 * 60_000, 90_000) } else { (3 * 60_000, 60_000) };
                 let late = age > wait;
                 // Once it has had time to come up and has begun nothing, GitHub is asked at every sweep whether the
                 // job it is for still waits (one request): a machine nobody waits for is ended then, not minutes later.
@@ -5239,19 +5495,29 @@ impl<'a> ControlPlane<'a> {
         self.sweep_gitlab_runners(now).await?;
         // Notes that only matter for a while: spot interruptions (counted for the pause), jobs asked to run again and
         // not arrived.
-        let mut notes = [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000)].into_iter();
+        let mut notes = [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000), (PREEMPTED, PREEMPTED_KEPT_MS), (PREEMPTED_RERUN, PREEMPTED_KEPT_MS)].into_iter();
         loop {
             let Some((prefix, keep)) = notes.next() else { break };
             for (k, v) in self.store.list(prefix).await? { if v.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > keep) { self.store.delete(&k).await? } }
         }
         // A launch template left behind by a request for many spot pools (it could not be removed at the time):
         // removed now; given up on after a day.
-        for (k, at) in self.store.list("aws:template:").await? {
-            let mut parts = k.trim_start_matches("aws:template:").splitn(2, ':');
+        // (Each account's, its connection gone or not: given up on after a day all the same.)
+        // (The first account's always; then each further one's, as long as there are any.)
+        let mut further = self.config.records.accounts.iter().filter(|a| a.provider == "aws").map(|a| a.name.clone());
+        let (mut left, mut account) = (vec![], "aws".to_string());
+        loop {
+            let notes = aws_notes(&account);
+            for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((account.clone(), notes.clone(), k, at)) }
+            match further.next() { Some(next) => account = next, None => break }
+        }
+        for (account, notes, k, at) in left {
+            let mut parts = k.trim_start_matches(&format!("{notes}template:")).splitn(2, ':');
             let (Some(region), Some(name)) = (parts.next(), parts.next()) else { continue };
             // (Not one of a moment ago: its removal may be on its way.)
             if at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 30_000) { continue }
-            let removed = match self.aws_connection().await { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
+            let connection = if account == "aws" { self.aws_connection().await } else { get_json::<AwsConnection>(self.store, &format!("aws:connection:{account}")).await };
+            let removed = match connection { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
             if removed.is_ok() || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
         }
         // Runs from a computer with jobs still going: moved on (a job whose machine never came has ended).

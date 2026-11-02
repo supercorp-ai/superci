@@ -341,9 +341,12 @@ impl Cloudflare {
             attempt += 1;
             if attempt == 10 { return Err(e) }
         }
-        let sub = self.call("GET", &format!("/accounts/{a}/workers/subdomain"), None)?["subdomain"].as_str().ok_or("this account has no workers.dev subdomain yet: open Workers in Cloudflare's dashboard once")?.to_string();
+        let sub = self.subdomain(a)?;
         Ok(format!("https://{name}.{sub}.workers.dev"))
     }
+
+    /// An account's workers.dev subdomain: which account a launcher's address is in.
+    pub fn subdomain(&self, a: &str) -> Result<String> { Ok(self.call("GET", &format!("/accounts/{a}/workers/subdomain"), None)?["subdomain"].as_str().ok_or("this account has no workers.dev subdomain yet: open Workers in Cloudflare's dashboard once")?.to_string()) }
 
     /// The names of a Worker's secrets (Cloudflare never returns their values).
     pub fn secret_names(&self, a: &str, script: &str) -> Result<Vec<String>> {

@@ -1,0 +1,126 @@
+Modal did not answer (Modal AuthTokenGet: the test kit's Modal has no answer for it).
+What is there is not shown; it is asked again on the next page.
+Runners + Add provider Runner providers Each provider starts a fresh runner for every job.
+A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next.
+When all are full, it waits.
+Drag to reorder.
+Not added aws-acme-on-demand is not added to this control plane yet · Add it aws AWS spot Spot machines of any size · x64, arm64 · N.
+Virginia $0.00 this month Ready aws aws-acme Spot machines of any size · x64, arm64 · Ireland, then London 4 at once $0.00 this month Ready modal-acme-two Sandboxes in the Modal workspace acme-two · up to 64 CPU, x64 $0.00 of $50.00 Ready cf-globex Containers sized per job, in a Cloudflare account of its own · up to 4 CPU, 12 GB, x64 Ready Modal Sandboxes · up to 64 CPU, x64 Ready AWS on-demand Taken out of the order: no job goes to it.
+Its settings are kept.
+Put back Modal Functions Taken out of the order: no job goes to it.
+Its settings are kept.
+Put back modal-acme-two-functions Taken out of the order: no job goes to it.
+Its settings are kept.
+Put back aws-acme-on-demand Taken out of the order: no job goes to it.
+Its settings are kept.
+Put back aws AWS spot Spot machines of any size · x64, arm64 · N.
+Virginia Jobs at once When this many run, the next job goes to the next provider (or waits).
+Monthly budget $ $0.00 this month.
+At the budget, jobs go to the next provider.
+Regions US East (N.
+Virginia) us-east-1 · up to 96 spot CPUs · closest to GitHub + Add a region… US East (Ohio) · us-east-2 US West (Oregon) · us-west-2 Canada (Central) · ca-central-1 · copy the runner image in first Europe (Ireland) · eu-west-1 Europe (London) · eu-west-2 Europe (Frankfurt) · eu-central-1 Europe (Stockholm) · eu-north-1 · copy the runner image in first Asia Pacific (Mumbai) · ap-south-1 Asia Pacific (Tokyo) · ap-northeast-1 Asia Pacific (Singapore) · ap-southeast-1 Asia Pacific (Sydney) · ap-southeast-2 Spot machines start where a job costs least, the first region counted 15% cheaper (its cache is there); when one has no spot machine left, in the next.
+Drag to reorder.
+Your account may run up to 96 spot CPUs at once in these (24 jobs of 4 CPU).
+The runner image is not in Canada, Stockholm yet: copy it in under Control plane, then add the region here.
+Take out of the order Cancel Save aws aws-acme Spot machines of any size · x64, arm64 · Ireland, then London Jobs at once When this many run, the next job goes to the next provider (or waits).
+Monthly budget $ $0.00 this month.
+At the budget, jobs go to the next provider.
+Regions Europe (Ireland) eu-west-1 Europe (London) eu-west-2 + Add a region… US East (N.
+Virginia) · us-east-1 · closest to GitHub US East (Ohio) · us-east-2 US West (Oregon) · us-west-2 Canada (Central) · ca-central-1 · copy the runner image in first Europe (Frankfurt) · eu-central-1 Europe (Stockholm) · eu-north-1 · copy the runner image in first Asia Pacific (Mumbai) · ap-south-1 Asia Pacific (Tokyo) · ap-northeast-1 Asia Pacific (Singapore) · ap-southeast-1 Asia Pacific (Sydney) · ap-southeast-2 Machines start in the first; when it has no room, in the next.
+Drag to reorder.
+The runner image is not in Canada, Stockholm yet: copy it in under Control plane, then add the region here.
+Take out of the order Cancel Save modal-acme-two Sandboxes in the Modal workspace acme-two · up to 64 CPU, x64 Jobs at once When this many run, the next job goes to the next provider (or waits).
+Monthly budget $ $0.00 this month.
+At the budget, jobs go to the next provider.
+Take out of the order Cancel Save cf-globex Containers sized per job, in a Cloudflare account of its own · up to 4 CPU, 12 GB, x64 Jobs at once When this many run, the next job goes to the next provider (or waits).
+Monthly budget $ $0.00 this month.
+At the budget, jobs go to the next provider.
+Take out of the order Cancel Save Modal Sandboxes · up to 64 CPU, x64 Jobs at once When this many run, the next job goes to the next provider (or waits).
+Monthly budget $ $0.00 this month.
+At the budget, jobs go to the next provider.
+Take out of the order Cancel Save Clouds The accounts your runners start machines in.
+Removing one deletes what SuperCI made there.
+aws AWS account 111111111111 Set up in N.
+Virginia · networks SuperCI made Modal Its launcher starts the sandboxes modal-acme-two Its launcher starts the sandboxes cf-globex Its launcher starts the containers aws aws-acme: AWS account 222222222222 Set up in Ireland, London aws AWS account 111111111111 Set up in N.
+Virginia · networks SuperCI made Your own network One line a region: its subnets and security groups.
+Machines there start in your network, so jobs reach what it reaches.
+Add private for subnets with no public addresses (they need a NAT to reach GitHub).
+Regions not listed use the network SuperCI made.
+Remove… Cancel Save aws Remove AWS? Jobs stop going to AWS.
+Your control plane and your sign-ins stay; adding it back is a click.
+Deleted in AWS: Its machines, and their network in each region The machines' policy on the role superci-plane-testplane0001 (the control plane's own role stays) Cancel Remove from SuperCI only Remove Modal Its launcher starts the sandboxes Remove… Cancel Remove Modal? Jobs stop going to Modal.
+Your control plane and your sign-ins stay; adding it back is a click.
+Deleted in Modal: The app superci-runners-testplane0001 in your Modal workspace, and its sandboxes Cancel Remove from SuperCI only Remove modal-acme-two Its launcher starts the sandboxes Remove… Cancel Remove modal-acme-two? Jobs stop going to modal-acme-two.
+Your control plane and your sign-ins stay; adding it back is a click.
+Deleted in modal-acme-two: The app superci-runners-testplane0001 in your Modal workspace, and its sandboxes Cancel Remove from SuperCI only Remove cf-globex Its launcher starts the containers Remove… Cancel Remove cf-globex? Jobs stop going to cf-globex.
+Your control plane and your sign-ins stay; adding it back is a click.
+Deleted in cf-globex: The launcher superci-runners-testplane0001 in your Cloudflare account, and its containers Sign in with cf-globex to delete these.
+Sign in with cf-globex Cancel Remove from SuperCI only aws aws-acme: AWS account 222222222222 Set up in Ireland, London Remove… Cancel aws Remove aws-acme? Jobs stop going to aws-acme.
+Your control plane and your sign-ins stay; adding it back is a click.
+Deleted in aws-acme: Its machines, and their network in each region The role superci-plane-testplane0001 and its identity provider in that account Cancel Remove from SuperCI only Remove Limits The most SuperCI may spend on machines in a month and in a day.
+A provider's own budget is in its settings above.
+Everything All providers together.
+At a limit no job starts until it is over.
+$0.00 this month No limit aws AWS account 111111111111 Its spot and on-demand machines together.
+At a limit, jobs go to other providers.
+$0.00 this month No limit aws aws-acme Its runners together.
+At a limit, jobs go to other providers.
+$0.00 of $300.00 modal-acme-two Its runners together.
+At a limit, jobs go to other providers.
+$0.00 this month No limit cf-globex Its runners together.
+At a limit, jobs go to other providers.
+$0.00 this month No limit Modal account Its runners together.
+At a limit, jobs go to other providers.
+$0.00 this month No limit Everything All providers together.
+At a limit no job starts until it is over.
+Monthly limit $ $0.00 this month.
+At a limit no job starts, until the month (or the day, UTC) is over or the limit is raised.
+Limits count the machines jobs ran on, as estimated here.
+A cloud's bill also has storage and small fees, and jobs already running finish.
+Daily limit $ $0.00 today (UTC).
+A day that runs away stops that day.
+Cancel Save aws AWS account 111111111111 Its spot and on-demand machines together.
+At a limit, jobs go to other providers.
+Monthly limit $ $0.00 this month.
+At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so.
+Limits count the machines jobs ran on, as estimated here.
+A cloud's bill also has storage and small fees, and jobs already running finish.
+Daily limit $ $0.00 today (UTC).
+A day that runs away stops that day.
+In AWS itself Nothing AWS emails me at 80% and 100% AWS emails me, and stops new machines at 100% A budget in the account for the monthly limit.
+AWS counts the account's real bill, all of it and hours late.
+At 100% it can also refuse new machines to the control plane, until the next month or until you lift it.
+It is made with your sign-in; the control plane gets no permission for it.
+AWS's emails go to Cancel Save aws aws-acme Its runners together.
+At a limit, jobs go to other providers.
+Monthly limit $ $0.00 this month.
+At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so.
+Limits count the machines jobs ran on, as estimated here.
+A cloud's bill also has storage and small fees, and jobs already running finish.
+Daily limit $ $0.00 today (UTC).
+A day that runs away stops that day.
+Cancel Save modal-acme-two Its runners together.
+At a limit, jobs go to other providers.
+Monthly limit $ $0.00 this month.
+At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so.
+Limits count the machines jobs ran on, as estimated here.
+A cloud's bill also has storage and small fees, and jobs already running finish.
+Daily limit $ $0.00 today (UTC).
+A day that runs away stops that day.
+Cancel Save cf-globex Its runners together.
+At a limit, jobs go to other providers.
+Monthly limit $ $0.00 this month.
+At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so.
+Limits count the machines jobs ran on, as estimated here.
+A cloud's bill also has storage and small fees, and jobs already running finish.
+Daily limit $ $0.00 today (UTC).
+A day that runs away stops that day.
+Cancel Save Modal account Its runners together.
+At a limit, jobs go to other providers.
+Monthly limit $ $0.00 this month.
+At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so.
+Limits count the machines jobs ran on, as estimated here.
+A cloud's bill also has storage and small fees, and jobs already running finish.
+Daily limit $ $0.00 today (UTC).
+A day that runs away stops that day.
+Cancel Save D default AWS · 111111111111 · us-east-1 New workspace…

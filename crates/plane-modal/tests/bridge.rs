@@ -388,3 +388,23 @@ fn what_plane_py_refuses_is_said_as_the_control_planes_error() {
     let done = py.exchange(json!({ "kind": "alarm", "secrets": secrets })).unwrap();
     assert!(done["type"] == "done" && py.ops().iter().filter(|o| *o == "expire").count() == 1, "{done} {:?}", py.ops());
 }
+
+/// Modal's Functions put in the order, and an image of the control plane's own: a job gets a Function from that image,
+/// told its link; one asking for no preemptible machine, a sandbox from it.
+#[test]
+fn a_function_and_a_sandbox_from_an_image_of_its_own_are_started_by_plane_py() {
+    let aws = aws();
+    let gh = aws.github.lock().unwrap().clone().unwrap();
+    let routing = json!({ "order": [{ "cloud": "modal-functions" }, { "cloud": "modal" }], "images": { "own": { "reference": "ghcr.io/acme/ci:1", "modal_secret": "ghcr-read" } } });
+    let secrets = json!({ "CONTAINERS": "on", "GITHUB_APP": GitHub::app().to_string(), "ROUTING": routing.to_string() });
+    let mut py = PlanePy::start(&aws);
+    for label in ["acmeci/image=own", "acmeci/image=own/spot=false"] {
+        let (_, hook) = gh.queue("build", label, now_ms());
+        py.deliver(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    }
+    let starts: Vec<&Value> = py.asked.iter().filter(|q| q["op"] == "sandbox_start").collect();
+    assert_eq!(starts.len(), 2, "{:?}", py.ops());
+    assert!(starts.iter().all(|q| q["image"] == "ghcr.io/acme/ci:1" && q["image_secret"] == "ghcr-read"), "{starts:?}");
+    assert!(starts[0]["function"] == true && starts[0]["notice"].as_str().is_some_and(|n| n.contains("/interrupted?runner=")), "{}", starts[0]);
+    assert!(starts[1].get("function").is_none(), "{}", starts[1]);
+}

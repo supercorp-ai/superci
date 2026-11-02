@@ -19,7 +19,7 @@ use superci_core::github::{self, app_manifest, manifest_target, Owner};
 use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
 use superci_core::settings::Conflict;
-use superci_core::plane::{AwsBudget, Launcher, Pool, Routing, AWS_ON_DEMAND, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
+use superci_core::plane::{Account, AwsBudget, Launcher, Pool, Records, Routing, RunnerRecord, AWS_ON_DEMAND, MODAL_FUNCTIONS, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
 use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, region_short, REGIONS};
 
@@ -113,6 +113,10 @@ pub struct Dashboard {
     /// When the sign-in with AWS under way was started (see `aws_stuck`).
     aws_asked_ms: u64,
     modal: Option<modal::Session>,
+    /// The other Modal workspaces signed in to, and whether a sign-in came back in this run (what `superci login modal
+    /// --add` waits for). As AWS's: in hand (`modal`), the workspace of the control plane in use.
+    modal_others: Vec<modal::Session>,
+    modal_came: bool,
     modal_pending: Option<modal::Pending>,
     /// The page a sign-in started from, to come back to (`?p=…`).
     return_to: String,
@@ -167,7 +171,8 @@ pub struct Dashboard {
     /// This month as the clouds bill it (read with `measure`): Cloudflare's containers in the signed-in accounts (metered,
     /// billed after included usage), and Modal's workspace.
     cf_month: Option<(f64, f64)>,
-    modal_month: Option<modal::Month>,
+    /// Each Modal workspace's bill this month, as last read.
+    modal_months: HashMap<String, modal::Month>,
     /// Each control plane's AWS runner role, as read while signed in to its account: what it lacks of what this version
     /// asks for (or why it could not be read), and when it was read.
     aws_missing: Arc<Mutex<HashMap<String, (std::result::Result<Vec<&'static superci_core::permissions::Need>, String>, u64)>>>,
@@ -240,7 +245,7 @@ fn owners_said(owners: &str) -> String {
     owners.split(',').filter_map(|o| o.split_once(':')).map(|(kind, name)| format!("{} {name}", if kind == "gitlab" { "GitLab" } else { "GitHub" })).collect::<Vec<_>>().join(", ")
 }
 
-struct Writer { cf: Option<cloudflare::Cloudflare>, aws: Option<superci_core::aws::Credentials>, modal: Option<modal::Session>, own: Own }
+struct Writer { cf: Option<cloudflare::Cloudflare>, aws: Option<superci_core::aws::Credentials>, modal: Option<modal::Session>, modals: Vec<modal::Session>, aws_all: Vec<(String, superci_core::aws::Credentials)>, own: Own }
 
 /// Whose the sign-ins kept are: the AWS account, the Cloudflare accounts the login reaches (none: not asked yet), the
 /// Modal workspace.
@@ -703,6 +708,29 @@ fn github_cost(j: &serde_json::Value) -> Option<f64> {
     Some((end.saturating_sub(start) as f64 / 60_000.0).ceil().max(1.0) * superci_core::plane::github_usd_per_minute(cpu, arm64))
 }
 
+/// Each account's bill a computer read, by the word this control plane has for it. Cloudflare's accounts with no record
+/// of their own are the first's, together.
+fn bills_of(v: &PlaneView, status: &serde_json::Value, modal_months: &[(String, modal::Month)], cf_months: &[(String, (f64, f64))]) -> serde_json::Map<String, serde_json::Value> {
+    let records = view::records_in(status);
+    let mut bills = serde_json::Map::new();
+    let own = status["containers"] == true;
+    for (workspace, m) in modal_months {
+        let word = v.launchers().into_iter().find(|a| launcher_workspace(&a.url) == workspace && records.provider_of(&a.cloud) == "modal").map(|a| records.account_of(&a.cloud).to_string())
+            .or_else(|| (own && v.plane.workspace() == Some(workspace.as_str()) && status["own_cloud"] == "modal").then(|| "modal".to_string()));
+        if let Some(word) = word { bills.insert(word, serde_json::json!({ "metered": m.metered, "billed": m.billed, "superci": m.superci })); }
+    }
+    let first = v.launchers().iter().any(|a| a.cloud == "cloudflare") || (own && status["own_cloud"] == "cloudflare");
+    let mut rest = (0.0, 0.0);
+    for (id, m) in cf_months {
+        match records.accounts.iter().find(|a| a.provider == "cloudflare" && a.cloud_id.as_deref() == Some(id.as_str())) {
+            Some(a) => { bills.insert(a.name.clone(), serde_json::json!({ "metered": m.0, "billed": m.1 })); }
+            None => rest = (rest.0 + m.0, rest.1 + m.1),
+        }
+    }
+    if first && !cf_months.is_empty() { bills.insert("cloudflare".into(), serde_json::json!({ "metered": rest.0, "billed": rest.1 })); }
+    bills
+}
+
 /// A provider's month, as its cloud bills it when that is known: what SuperCI's jobs cost there, and what is
 /// billed after the cloud's included usage or credits (Cloudflare's Workers Paid allowance, Modal's plan credits).
 /// With a budget set, its figure ("$a of $b") already says the spend: only what is billed is added.
@@ -806,8 +834,11 @@ pub fn runs_of(jobs: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut runs: Vec<serde_json::Value> = order.into_iter().map(|k| {
         let rows = &by[&k];
         let n = |j: &serde_json::Value, f: &str| j[f].as_u64();
-        let words: Vec<&str> = rows.iter().map(|j| job_ended(j).1).collect();
-        let going = words.iter().any(|w| ["Running", "Waiting", "Starting"].contains(w));
+        // (A first attempt its machine was taken back from, which SuperCI starts again by itself: the run is as its next
+        // attempt is, once there is one.)
+        let again = |j: &&&serde_json::Value| j["provider"] == "local" && j["interrupted"] == true && j["no_spot"] != true && job_ended(j).1 == "Failed";
+        let words: Vec<&str> = rows.iter().filter(|j| !again(j)).map(|j| job_ended(j).1).collect();
+        let going = words.is_empty() || words.iter().any(|w| ["Running", "Waiting", "Starting"].contains(w));
         let state = if going { "running" } else if words.contains(&"Failed") { "failed" } else if words.contains(&"Cancelled") { "cancelled" }
             else if words.iter().all(|w| ["Passed", "Skipped"].contains(w)) { "passed" } else { "done" };
         let at = rows.iter().filter_map(|j| n(j, "at_ms")).min().unwrap_or_default();
@@ -982,7 +1013,7 @@ pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
     let asked = asks_said(j);
     // (A wait for room under the account's spot limit first: said apart, as SuperCI's, not AWS's.)
     let asked_at = match n(&j["spot_waited_ms"]) { Some(w) if heard + w <= launched => { step("waited for room under your AWS spot limit", heard, heard + w, String::new()); heard + w } _ => heard };
-    step(if j["cloud"] == "aws" { "AWS gave a machine" } else { "its machine was asked for" }, asked_at, launched, asked.clone());
+    step(if j["cloud"] == "aws" || j["region"].is_string() { "AWS gave a machine" } else { "its machine was asked for" }, asked_at, launched, asked.clone());
     let m = &j["machine"];
     match (n(&m["script_ms"]), m["boot_s"].as_f64()) {
         (Some(script), Some(boot)) => {
@@ -1043,7 +1074,7 @@ pub fn runner_log_lines(log: &str, local: bool) -> Vec<String> {
 /// 3,000 IOPS; the IOPS a speed needs when only the speed was), and whether its files were in memory or on a local
 /// disk. Nothing for a job with no disk kept (another cloud's, or one that never got a machine).
 fn job_disk(j: &serde_json::Value) -> serde_json::Value {
-    let Some(gb) = j["disk_gb"].as_u64().filter(|_| j["cloud"] == "aws") else { return serde_json::Value::Null };
+    let Some(gb) = j["disk_gb"].as_u64().filter(|_| j["cloud"] == "aws" || j["region"].is_string()) else { return serde_json::Value::Null };
     let mibs = j["disk_mibs"].as_u64().unwrap_or(superci_core::spec::DISK_MIBS_INCLUDED as u64);
     let iops = j["disk_iops"].as_u64().unwrap_or((mibs * 4).max(superci_core::spec::DISK_IOPS_INCLUDED as u64));
     serde_json::json!({ "gb": gb, "mibs": mibs, "iops": iops, "ramdisk": j["ramdisk"] == true, "local_disk": j["local_disk"] == true })
@@ -1174,8 +1205,8 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{}", oauth_port()), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), modal_others: vec![], modal_came: false, store: None, named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_months: HashMap::new(), aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -1190,7 +1221,11 @@ impl Dashboard {
         let its = match &kept.plane { Some(Plane::Aws { account_id, .. }) => accounts.iter().position(|a| &a.account_id == account_id), _ => None };
         if !accounts.is_empty() { d.aws = Some(accounts.remove(its.unwrap_or(0))) }
         d.aws_others = accounts;
-        if d.modal.is_none() { d.modal = kept.modal }
+        // Every Modal workspace kept; in hand, the kept control plane's own (else the first).
+        let mut workspaces: Vec<modal::Session> = kept.modal.into_iter().chain(kept.modal_more).collect();
+        let its = match &kept.plane { Some(Plane::Modal { workspace, .. }) => workspaces.iter().position(|m| &m.workspace == workspace), _ => None };
+        if d.modal.is_none() && !workspaces.is_empty() { d.modal = Some(workspaces.remove(its.unwrap_or(0))) }
+        d.modal_others = workspaces.into_iter().filter(|m| Some(&m.workspace) != d.modal.as_ref().map(|h| &h.workspace)).collect();
         d.aws_ended = kept.aws_ended && d.aws.is_none();
         (d.cf_ended, d.modal_ended) = (kept.cloudflare_ended && d.cf.is_none(), kept.modal_ended && d.modal.is_none());
         // The key the control planes were handed, while it lasts another day; else a new one, good for thirty days.
@@ -1224,6 +1259,7 @@ impl Dashboard {
         let kept = || self.store.as_ref().map(|s| s.path().display().to_string()).unwrap_or_else(|| "nothing (no home folder)".into());
         match self.task.as_ref()? {
             Task::Login(Some("aws")) if self.adding && !self.aws_came => None,
+            Task::Login(Some("modal")) if self.adding && !self.modal_came => None,
             Task::Login(cloud) if cloud.is_none_or(|c| self.signed_in_with(c)) => self.signed_in_as().map(|now| format!("Signed in: {now}. Kept in {}; `superci logout` removes it.", kept())),
             Task::GitHub { login, done: true, .. } => Some(format!("GitHub is connected for {login}: its App is installed. Jobs with `runs-on: superci` in its repositories now come here.")),
             _ => None,
@@ -1346,6 +1382,14 @@ impl Dashboard {
             else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() }
             else if let Some((cloud, why)) = self.unanswered.iter().filter_map(|u| u.split_once(": ")).find(|(cloud, _)| e.contains(&format!("Sign in with {cloud}"))) { format!("{cloud} did not answer: {why}") }
             else { e }
+    }
+
+    /// Deploys the jobs' Modal Functions in the workspace a launcher is in, with its sign-in.
+    fn deploy_jobs(&self, plane: &Plane, url: &str, images: &std::collections::BTreeMap<String, superci_core::plane::RunnerImage>) -> Result<()> {
+        let workspace = launcher_workspace(url);
+        let session = self.modal_of_launcher(url).ok_or_else(|| format!("Sign in with Modal to the workspace {workspace} first: `superci login modal --add`."))?;
+        eprintln!("Deploying the jobs' Modal Functions in {} (the first time builds their images there)…", session.workspace);
+        modal::deploy_jobs(session, plane.plane_id(), images)
     }
 
     /// The same of Modal's.
@@ -1509,7 +1553,7 @@ impl Dashboard {
         let mut at = vec![];
         for a in self.aws_accounts() { at.push(format!("AWS account {}", a.account_id)) }
         if self.cf.is_some() { at.push(if self.cf_given { "Cloudflare (a token given for this run)".to_string() } else { "Cloudflare".to_string() }) }
-        if let Some(m) = &self.modal { at.push(format!("Modal workspace {}", m.workspace)) }
+        for m in self.modal_accounts() { at.push(format!("Modal workspace {}", m.workspace)) }
         if at.is_empty() { None } else { Some(at.join(", ")) }
     }
 
@@ -1635,7 +1679,7 @@ impl Dashboard {
             let mut have: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. })).cloned().collect();
             if let Some(k) = self.kept_plane.clone().filter(|k| !have.iter().any(|p| p.plane_id() == k.plane_id())) { have.push(k) }
             have.retain(|p| self.keyed.contains(p.plane_id()));
-            let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+            let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
             for p in have {
                 if before_names(p.url()) { let _ = writer.drop(&p, &old_key_name(&self.status_secret)); }
                 match writer.drop(&p, &self.status_secret) {
@@ -1647,12 +1691,13 @@ impl Dashboard {
         if let Some(refresh) = self.cf.as_ref().filter(|_| !self.cf_given).and_then(|s| s.refresh_token()) {
             said.push(if cloudflare::end_sign_in(refresh) { "Cloudflare ended SuperCI's sign-in.".into() } else { "Cloudflare did not confirm ending SuperCI's sign-in; it is removed here.".to_string() });
         }
-        if self.modal.is_some() && !self.modal_given { said.push("SuperCI's Modal token is removed here; it stays listed in Modal (Settings → API tokens) until deleted there.".into()) }
+        if (self.modal.is_some() && !self.modal_given) || !self.modal_others.is_empty() { said.push("SuperCI's Modal token is removed here; it stays listed in Modal (Settings → API tokens) until deleted there.".into()) }
         if self.aws.is_some() { said.push("SuperCI's AWS sign-in is removed here; AWS ends it by itself within twelve hours of when it was made.".into()) }
         said.push(if store.remove()? { format!("Removed {}.", store.path().display()) } else { "Nothing was kept on this machine.".into() });
         // As on a first start: no sign-in (but one given by name for this run), no control plane, a new key.
         if !self.cf_given { self.cf = None }
         if !self.modal_given { self.modal = None }
+        self.modal_others.clear();
         self.aws = None;
         self.aws_others.clear();
         // (Signed out, the workspace is still called what it was; whose jobs it ran is not known any more.)
@@ -1680,6 +1725,7 @@ impl Dashboard {
             aws: self.aws_accounts().into_iter().next(),
             aws_more: self.aws_accounts().into_iter().skip(1).collect(),
             modal: if self.modal_given { None } else { self.modal.clone() },
+            modal_more: self.modal_others.clone(),
             key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
             plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
             planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != self.selected && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
@@ -1713,7 +1759,7 @@ impl Dashboard {
         // is in it: what a workspace picking among an account's CIs shows), once it changes.
         let owners = about.hosts.iter().map(|(kind, name)| format!("{kind}:{name}")).collect::<Vec<_>>().join(",");
         if !owners.is_empty() && self.owners_written.get(v.plane.plane_id()) != Some(&owners) {
-            let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+            let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
             // (Tried once a session: without its cloud's sign-in here, the next session that has it writes it.)
             let _ = writer.put(&v.plane, "OWNERS", &owners);
             self.owners_written.insert(v.plane.plane_id().to_string(), owners);
@@ -1780,7 +1826,7 @@ impl Dashboard {
     pub fn other_accounts_signed_in(&self) -> Vec<(&'static str, String)> {
         let mut out = vec![];
         if self.cf.is_some() { out.push(("cloudflare", if self.cf_given { "a token given for this run".to_string() } else { "signed in".to_string() })) }
-        if let Some(m) = &self.modal { out.push(("modal", m.workspace.clone())) }
+        for m in self.modal_accounts() { out.push(("modal", m.workspace)) }
         out
     }
 
@@ -2036,7 +2082,43 @@ impl Dashboard {
     /// Makes one of the control planes listed the one that pages and changes act on, with its own account's sign-in.
     fn select(&mut self, i: usize) {
         self.selected = i;
-        if let Some(Plane::Aws { account_id, .. }) = self.planes.get(i).cloned() { self.hold_account(&account_id); }
+        match self.planes.get(i).cloned() {
+            Some(Plane::Aws { account_id, .. }) => { self.hold_account(&account_id); }
+            Some(Plane::Modal { workspace, .. }) => self.hold_workspace(&workspace),
+            _ => {}
+        }
+    }
+
+    /// Every AWS account signed in to whose sign-in still gives credentials, with them.
+    fn aws_all(&mut self) -> Vec<(String, superci_core::aws::Credentials)> {
+        self.aws.iter_mut().chain(self.aws_others.iter_mut()).filter_map(|s| Some((s.account_id.clone(), s.credentials().ok()?))).collect()
+    }
+
+    /// Every Modal workspace signed in to, in one order (by workspace) whichever is in hand.
+    fn modal_accounts(&self) -> Vec<modal::Session> {
+        let mut all: Vec<modal::Session> = self.modal.iter().chain(&self.modal_others).cloned().collect();
+        all.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+        all
+    }
+
+    /// The sign-in to a Modal workspace, when it is kept.
+    fn modal_for(&self, workspace: &str) -> Option<&modal::Session> { self.modal.iter().chain(&self.modal_others).find(|m| m.workspace == workspace) }
+
+    /// The sign-in to the workspace a Modal launcher is in (its address says which).
+    fn modal_of_launcher(&self, url: &str) -> Option<&modal::Session> { self.modal.iter().chain(&self.modal_others).find(|m| url.starts_with(&format!("https://{}--", m.workspace))) }
+
+    /// Takes the sign-in to a Modal workspace in hand, when it is kept.
+    fn hold_workspace(&mut self, workspace: &str) {
+        let Some(i) = self.modal_others.iter().position(|m| m.workspace == workspace) else { return };
+        let theirs = self.modal_others.remove(i);
+        if let Some(was) = self.modal.replace(theirs) { self.modal_others.push(was) }
+    }
+
+    /// A sign-in to Modal that just came back: a new workspace is added beside the others, a known one is renewed.
+    fn came_modal(&mut self, session: modal::Session) {
+        self.modal_others.retain(|m| m.workspace != session.workspace);
+        if let Some(was) = self.modal.replace(session) { if self.modal.as_ref().is_some_and(|now| now.workspace != was.workspace) { self.modal_others.push(was) } }
+        (self.modal_ended, self.modal_pending, self.looked_modal, self.modal_came) = (false, None, false, true);
     }
 
     /// A sign-in to AWS that just came back: a new account is added beside the others, a known one is renewed.
@@ -2067,7 +2149,13 @@ impl Dashboard {
             (self.aws_others, self.aws_ended, self.looked_aws, took) = (all, on_disk.aws_ended, false, true);
         }
         if theirs("cloudflare") && !self.cf_given { (self.cf, self.cf_ended, self.looked_cf, took) = (on_disk.cloudflare, on_disk.cloudflare_ended, false, true); self.cf_accounts.clear(); }
-        if theirs("modal") && !self.modal_given { (self.modal, self.modal_ended, self.looked_modal, took) = (on_disk.modal, on_disk.modal_ended, false, true) }
+        if (theirs("modal") || theirs("modal_more")) && !self.modal_given {
+            let held = self.modal.as_ref().map(|m| m.workspace.clone());
+            let mut all: Vec<modal::Session> = on_disk.modal.into_iter().chain(on_disk.modal_more).collect();
+            let at = held.and_then(|h| all.iter().position(|m| m.workspace == h)).unwrap_or(0);
+            self.modal = if all.is_empty() { None } else { Some(all.remove(at)) };
+            (self.modal_others, self.modal_ended, self.looked_modal, took) = (all, on_disk.modal_ended, false, true);
+        }
         if theirs("key") { if let Some(k) = on_disk.key { (self.status_key, self.status_secret, self.keyed, took) = (k.value, k.name, k.planes.into_iter().collect(), true) } }
         if took {
             self.views = None;
@@ -2075,7 +2163,7 @@ impl Dashboard {
             // too (it was taken for this one's own, and the write put it back as it was).
             let mut known = last.clone();
             let now = value(&self.kept());
-            ["aws", "aws_more", "aws_ended", "cloudflare", "cloudflare_ended", "modal", "modal_ended", "key"].into_iter().filter(|f| now[*f] == disk[*f]).for_each(|field| {
+            ["aws", "aws_more", "aws_ended", "cloudflare", "cloudflare_ended", "modal", "modal_more", "modal_ended", "key"].into_iter().filter(|f| now[*f] == disk[*f]).for_each(|field| {
                 // (One the file leaves out, as it leaves out what is not there: left out too.)
                 match (&disk[field], known.as_object_mut()) { (serde_json::Value::Null, Some(o)) => { o.remove(field); } (v, _) => known[field] = v.clone() }
             });
@@ -2154,7 +2242,7 @@ impl Dashboard {
                 if let Some(pending) = asked {
                     if let Ok(Some(session)) = modal::wait(&pending, 2.0) {
                         let mut d = lock(&shared);
-                        (d.modal, d.modal_pending, d.looked_modal) = (Some(session), None, false);
+                        d.came_modal(session);
                     }
                 }
                 let mut d = lock(&shared);
@@ -2236,6 +2324,28 @@ impl Dashboard {
         if after.get("routing").is_some() { self.put_secret(plane, "ROUTING", &written["routing"].to_string())? }
         if after.get("launchers").is_some() { self.put_secret(plane, "LAUNCHERS", &written["launchers"].to_string())? }
         Ok(None)
+    }
+
+    /// Writes a launcher just deployed: the launchers, and for a further runner its account and its record, in one write.
+    /// Waits for the control plane to show it.
+    #[allow(clippy::too_many_arguments)]
+    fn put_runner(&mut self, plane: &Plane, status: &serde_json::Value, records: &Records, launchers: &[Launcher], word: &str, provider: &str, cloud_id: &str) -> Result<()> {
+        let (mut before, mut after) = (launchers_in(status), settings_doc(None, Some(launchers)));
+        if word != provider {
+            let mut now = records.clone();
+            if !now.accounts.iter().any(|a| a.name == word) { now.accounts.push(Account { name: word.to_string(), provider: provider.to_string(), cloud_id: Some(cloud_id.to_string()) }) }
+            // (Modal's Functions, beside its sandboxes: a row of their own, taken out until someone puts them in.)
+            let functions = format!("{word}-functions");
+            now.runners.retain(|r| r.name != word && r.name != functions);
+            now.runners.push(RunnerRecord { name: word.to_string(), account: word.to_string(), gone: false, on_demand: false, function: false });
+            if provider == "modal" { now.runners.push(RunnerRecord { name: functions, account: word.to_string(), gone: false, on_demand: false, function: true }) }
+            (before["accounts"], before["runners"]) = (json_value(&records.accounts), json_value(&records.runners));
+            (after["accounts"], after["runners"]) = (json_value(&now.accounts), json_value(&now.runners));
+        }
+        self.put_as_said(plane, status, before, after)?;
+        let word = word.to_string();
+        wait_for(plane.url(), &self.status_key, move |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == word.as_str())));
+        Ok(())
     }
 
     /// `put_settings` of changes meant as said, not made from what a page showed: one whose way is gone (an item another
@@ -2545,7 +2655,7 @@ impl Dashboard {
             return;
         }
         let (new, name) = (folder_key(), format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()));
-        let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+        let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
         let before: Vec<bool> = planes.iter().map(|p| before_names(p.url())).collect();
         if !planes.iter().zip(&before).all(|(p, b)| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok() && (!b || writer.put(p, &old_key_name(&name), &cloudflare::plane_key(&new, p.url())).is_ok())) { return }
         planes.iter().for_each(|p| say_device(p.url(), &new));
@@ -2562,7 +2672,7 @@ impl Dashboard {
         let unkeyed = |d: &Dashboard| -> Vec<Plane> { d.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. }) && !d.keyed.contains(p.plane_id())).cloned().collect() };
         if unkeyed(self).is_empty() { return }
         // (Its sign-ins renewed first: that takes the lock below too.)
-        let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+        let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
         // One SuperCI at a time on this computer (commands run side by side): a key made meanwhile by another one, and
         // written, is taken instead of handing one more; this one's is written before the next goes on.
         let held = self.store.clone().and_then(|s| s.renewing());
@@ -2790,11 +2900,51 @@ impl Dashboard {
                 // The control plane the dialog was shown for (another may be in use since).
                 if form_has("plane") && field("plane") != plane.plane_id() { return Ok(message(409, "Another control plane is in use now", "Open Runners again and remove it there.")) }
                 let cloud = field("cloud");
-                if !["aws", "cloudflare", "modal"].contains(&cloud.as_str()) { return Ok(message(400, "Unknown provider", "")) }
                 let only = field("only") == "on";
                 let Some(status) = status_soon(plane.url(), &self.status_key) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
+                let records = view::records_in(&status);
+                let further = records.runners.iter().any(|r| r.name == cloud && !r.gone);
+                if !further && !["aws", "cloudflare", "modal"].contains(&cloud.as_str()) { return Ok(message(400, "Unknown provider", "")) }
+                let is_modal = records.provider_of(&cloud) == "modal";
+                // (A runner's Functions go with it; to stop using them, they are taken out of the order.)
+                if records.modal_function(&cloud) { return Ok(message(400, "Take it out of the order, or remove its runner", &format!("{} goes with {}.", esc(&cloud), esc(records.launcher_word(&cloud))))) }
+                if further && records.provider_of(&cloud) == "aws" {
+                    // Removed by its spot word, its on-demand one with it (as `aws`'s).
+                    if records.aws_on_demand(&cloud) { return Ok(message(400, "Remove it by its account's word", &format!("{} goes with {}.", esc(&cloud), esc(records.account_of(&cloud))))) }
+                    let sibling = format!("{cloud}-on-demand");
+                    let running = running_on(&status, &cloud) + running_on(&status, &sibling);
+                    if running > 0 && field("stop") != "on" { return Ok(message(409, &format!("{running} job{} running on {cloud}", if running == 1 { " is" } else { "s are" }), "Remove it when they finish, or stop them as you remove it.")) }
+                    let id = records.accounts.iter().find(|a| a.name == cloud).and_then(|a| a.cloud_id.clone()).unwrap_or_default();
+                    let only = field("only") == "on";
+                    if !only && !self.hold_account(&id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} to delete what SuperCI made there, or remove it from SuperCI only.", esc(&id)))) }
+                    let creds = if only { None } else { Some(self.aws_creds()?) };
+                    let was: Routing = serde_json::from_value(status["routing"].clone()).unwrap_or_default();
+                    let mut routing = was.clone();
+                    routing.order.retain(|p| p.cloud != cloud && p.cloud != sibling);
+                    let mut kept = records.clone();
+                    kept.runners.iter_mut().filter(|r| r.account == cloud).for_each(|r| r.gone = true);
+                    let (mut before, mut after) = (settings_doc(Some(&was), None), settings_doc(Some(&routing), None));
+                    (before["runners"], after["runners"]) = (json_value(&records.runners), json_value(&kept.runners));
+                    self.put_as_said(&plane, &status, before, after)?;
+                    cloudflare::plane_post(plane.url(), &self.status_key, "/aws/forget", &serde_json::json!({ "account": cloud }))?;
+                    // (Once no instance of the control plane still reads it as there.)
+                    aws::pause(superci_core::plane::SETTINGS_READ_MS);
+                    let plane_id = plane.plane_id().to_string();
+                    let mut left = vec![];
+                    match &creds {
+                        Some(creds) => {
+                            if let Err(e) = aws::disconnect_runners(creds, &id, plane.url(), &plane_id) { left.push(format!("its role ({e})")) }
+                            if let Err(e) = aws::delete_further_networks(creds, &plane_id, &REGIONS).or_else(|_| aws::delete_further_networks(creds, &plane_id, &REGIONS)) { left.push(format!("its machines' network ({e})")) }
+                        }
+                        None => left.push(format!("in AWS account {id}: the role superci-plane-{plane_id}, and its machines' network (none cost anything)")),
+                    }
+                    self.views = None;
+                    self.flash = Some(format!("Removed {cloud}.{}", if left.is_empty() { String::new() } else { format!(" Left: {}.", left.join("; ")) }));
+                    return Ok(Response::redirect("/?p=runners"))
+                }
+                let launcher_url = status["launchers"].as_array().into_iter().flatten().find(|a| a["cloud"] == cloud.as_str()).and_then(|a| a["url"].as_str()).unwrap_or_default().to_string();
                 let name = cloud_name(&cloud).to_string();
                 let running = running_on(&status, &cloud);
                 if running > 0 && field("stop") != "on" {
@@ -2811,29 +2961,41 @@ impl Dashboard {
                     let signed_in = match cloud.as_str() {
                         "aws" => account.as_ref().is_some_and(|a| self.hold_account(a)),
                         _ if own_containers => true,
-                        "modal" => self.modal.is_some(),
+                        // (No launcher to find a workspace by: nothing of its own to delete.)
+                        _ if is_modal && launcher_url.is_empty() => self.modal.is_some(),
+                        _ if is_modal => self.modal_of_launcher(&launcher_url).is_some(),
+                        // (A further one's account within this sign-in's reach.)
+                        _ if further => self.cf.is_some() && records.accounts.iter().find(|a| a.name == records.account_of(&cloud)).and_then(|a| a.cloud_id.as_ref()).is_some_and(|id| self.cf_accounts.iter().any(|c| c.0 == *id)),
                         _ => self.cf.is_some(),
                     };
                     if !signed_in {
-                        let whom = if cloud == "aws" { format!(" to account {}", account.as_deref().unwrap_or("")) } else { String::new() };
+                        let whom = if cloud == "aws" { format!(" to account {}", account.as_deref().unwrap_or("")) } else if is_modal && !launcher_url.is_empty() { format!(" to the Modal workspace {}", launcher_workspace(&launcher_url)) } else { String::new() };
                         return Ok(message(403, &format!("Sign in with {name} first"), &format!("Sign in{} to delete what SuperCI made there, or remove it from SuperCI only.", esc(&whom))))
                     }
                 }
                 // What deleting its part needs, read now: a sign-in that ended is said before anything changes.
                 let aws_creds = if cloud == "aws" && !only { Some(self.aws_creds()?) } else { None };
-                let cf = if cloud == "cloudflare" && !only && !own_containers { Some(self.cloudflare()?) } else { None };
+                let cf = if records.provider_of(&cloud) == "cloudflare" && !only && !own_containers { Some(self.cloudflare()?) } else { None };
                 // (Signed in to Modal, above, for its part.)
-                let md = if cloud == "modal" && !only && !own_containers { self.modal.clone() } else { None };
+                let md = if is_modal && !only && !own_containers { if launcher_url.is_empty() { self.modal.clone() } else { self.modal_of_launcher(&launcher_url).cloned() } } else { None };
                 // 1. Forgotten: out of the order, then its connection.
                 let was: Routing = serde_json::from_value(status["routing"].clone()).unwrap_or_default();
                 let mut routing = was.clone();
-                routing.order.retain(|p| p.cloud != cloud && !(cloud == "aws" && p.cloud == AWS_ON_DEMAND));
+                let functions = format!("{cloud}-functions");
+                routing.order.retain(|p| p.cloud != cloud && p.cloud != functions && !(cloud == "aws" && p.cloud == AWS_ON_DEMAND));
                 // (AWS's own budget for the account goes with AWS: see below.)
                 let had_budget = cloud == "aws" && routing.aws_budget.take().is_some();
                 // (Its launcher, when it has one, out of the launchers in the same write.)
                 let launchers_were: Vec<Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
                 let launchers = (cloud != "aws" && !own_containers).then(|| launchers_were.iter().filter(|a| a.cloud != cloud).cloned().collect::<Vec<_>>());
-                let (before, after) = (settings_doc(Some(&was), launchers.as_ref().map(|_| launchers_were.as_slice())), settings_doc(Some(&routing), launchers.as_deref()));
+                let (mut before, mut after) = (settings_doc(Some(&was), launchers.as_ref().map(|_| launchers_were.as_slice())), settings_doc(Some(&routing), launchers.as_deref()));
+                // (A further runner's record stays, marked gone: see `Records`.)
+                if further {
+                    let mut kept = records.clone();
+                    kept.runners.iter_mut().filter(|r| r.name == cloud || r.name == functions).for_each(|r| r.gone = true);
+                    before["runners"] = json_value(&records.runners);
+                    after["runners"] = json_value(&kept.runners);
+                }
                 self.put_as_said(&plane, &status, before, after)?;
                 if cloud == "aws" {
                     if matches!(plane, Plane::Aws { .. }) { self.put_secret(&plane, "AWS_RUNNERS", "off")? } else { cloudflare::plane_post(plane.url(), &self.status_key, "/aws/forget", &serde_json::json!({}))?; }
@@ -2869,9 +3031,14 @@ impl Dashboard {
                     ("aws", true, ..) => left.push(format!("in AWS account {}: the role superci-plane-{id}{}, and its machines' network (none cost anything; add AWS again and remove it while signed in to delete them)",
                         account.as_deref().unwrap_or(""), if matches!(plane, Plane::Aws { .. }) { "'s machines policy" } else { " and its identity provider" })),
                     (_, _, _, _, Some(session)) => if let Err(e) = modal::delete_runners(session, &id) { left.push(format!("its Modal app superci-runners-{id} ({e})")) },
-                    (_, _, _, Some(cf), _) => for (a, _) in self.cf_accounts.clone() { if let Err(e) = cf.delete_runners(&a, &id) { left.push(format!("its Cloudflare launcher ({e})")) } },
+                    // (Each account's launcher has the same name: only this runner's account's is deleted.)
+                    (_, _, _, Some(cf), _) => {
+                        let its = records.accounts.iter().find(|a| a.name == records.account_of(&cloud)).and_then(|a| a.cloud_id.clone());
+                        let others: Vec<&str> = records.runners.iter().filter(|r| !r.gone && r.name != cloud && records.provider_of(&r.name) == "cloudflare").filter_map(|r| records.accounts.iter().find(|a| a.name == r.account).and_then(|a| a.cloud_id.as_deref())).collect();
+                        for (a, _) in self.cf_accounts.clone().iter().filter(|(a, _)| its.as_ref().map_or(!others.contains(&a.as_str()), |i| i == a)) { if let Err(e) = cf.delete_runners(a, &id) { left.push(format!("its Cloudflare launcher ({e})")) } }
+                    }
                     (_, _, _, None, None) if own_containers => {}
-                    ("modal", ..) => left.push(format!("the Modal app superci-runners-{id} in your workspace")),
+                    _ if is_modal => left.push(format!("the Modal app superci-runners-{id} in your workspace")),
                     _ => left.push(format!("the Cloudflare launcher superci-runners-{id}")),
                 }
                 self.views = None;
@@ -2881,6 +3048,8 @@ impl Dashboard {
             // A Modal control plane starts sandboxes itself: switching them on is one setting.
             ("POST", "/runners/modal-own") => {
                 let plane = self.plane()?;
+                // (Its Functions, when they are in the order: again, for the images there are now.)
+                if let Some(r) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()).filter(|r| r.pool(MODAL_FUNCTIONS).is_some_and(|p| !p.off)) { self.deploy_jobs(&plane, plane.url(), &r.images)? }
                 self.put_secret(&plane, "CONTAINERS", "on")?;
                 wait_for(plane.url(), &self.status_key, |s| s["containers"] == true);
                 Ok(Response::redirect("/?p=runners"))
@@ -3147,7 +3316,7 @@ impl Dashboard {
                 }
                 let plan = self.carry_plan(&from_view, &to_view);
                 if let Some(Carry::NeedsSignIn(p)) = plan.iter().find(|c| matches!(c, Carry::NeedsSignIn(_))) { return Ok(message(409, &format!("Sign in with {} first", provider_name(p)), "Its runners come along with the move.")) }
-                let writer = Writer { cf: if self.cf.is_some() { Some(self.cf_client()?) } else { None }, aws: self.aws.as_mut().map(|s| s.credentials()).transpose()?, modal: self.modal.clone(), own: self.own() };
+                let writer = Writer { cf: if self.cf.is_some() { Some(self.cf_client()?) } else { None }, aws: self.aws.as_mut().map(|s| s.credentials()).transpose()?, modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
                 let aws_account = self.aws.as_ref().map(|a| a.account_id.clone());
                 let cf_account = match &from { Plane::Cloudflare { account_id, .. } => Some(account_id.clone()), _ => self.cf_accounts.first().map(|a| a.0.clone()) };
                 let state = self.moving.clone();
@@ -3267,7 +3436,7 @@ impl Dashboard {
                 let before = before_names(plane.url());
                 let launchers = if before { status["agents"].clone() } else { status["launchers"].clone() };
                 // In the background, its steps shown where its Update button was (the sidebar, the Control plane page).
-                let cf = if matches!(plane, Plane::Cloudflare { .. }) || launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")) { self.cloudflare().ok() } else { None };
+                let cf = if matches!(plane, Plane::Cloudflare { .. }) || launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"].as_str().is_some_and(|w| view::records_in(&status).provider_of(w) == "cloudflare"))) { self.cloudflare().ok() } else { None };
                 // What deploys it, with its cloud's sign-in (a Modal control plane's is there: checked above).
                 let (steps, deploying): (&'static [&'static str], Deploying) = match (plane.clone(), self.modal.clone()) {
                     (Plane::Cloudflare { account_id, script, label, .. }, _) => (&UPDATE_CLOUDFLARE, Deploying::Cloudflare { account_id, script, label }),
@@ -3280,18 +3449,49 @@ impl Dashboard {
                 let cf_account = self.cf_accounts.first().map(|a| a.0.clone());
                 let state = self.updating.clone();
                 let containers = status["containers"] == true;
-                let cf_launcher = launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
+                let records_now = view::records_in(&status);
+                // Its Cloudflare launchers' accounts: a further one's as kept; the first's, the one account reached, or
+                // of several the one whose subdomain its address has (never just the first: another's would get one).
+                let typed: Vec<Launcher> = serde_json::from_value(launchers.clone()).unwrap_or_default();
+                let cf_launchers: Vec<(String, String)> = typed.iter().map(|a| (a.cloud.clone(), a.url.clone())).filter(|(word, _)| records_now.provider_of(word) == "cloudflare").collect();
+                let cf_launcher = !cf_launchers.is_empty();
+                let mut cf_accounts_of: Vec<String> = vec![];
+                let mut cf_missing: Vec<String> = vec![];
+                if let (Some(cf), false) = (&cf, matches!(plane, Plane::Cloudflare { .. }) && cf_launchers.iter().all(|(w, _)| w == "cloudflare")) {
+                    // (There is one at least: a sign-in to Cloudflare is asked for only then.)
+                    cf_launchers.iter().for_each(|(word, url)| {
+                        let id = records_now.accounts.iter().find(|a| a.name == records_now.account_of(word)).and_then(|a| a.cloud_id.clone())
+                            .or_else(|| if self.cf_accounts.len() == 1 { cf_account.clone() } else { self.cf_accounts.iter().find(|(a, _)| cf.subdomain(a).is_ok_and(|s| url.contains(&format!(".{s}.workers.dev")))).map(|(a, _)| a.clone()) });
+                        match id.filter(|id| self.cf_accounts.iter().any(|c| c.0 == *id)) { Some(id) => cf_accounts_of.push(id), None => cf_missing.push(word.clone()) }
+                    });
+                }
                 // Its launcher in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
                 // that is over stops nothing else, and is said with the result.
                 // Its Modal launcher likewise, with Modal's sign-in: it keeps the Modal client it was deployed with, and
                 // Modal stops taking old ones (see `modal::heard`).
-                let modal_launcher = launchers.as_array().into_iter().flatten().find(|a| a["cloud"] == "modal").and_then(|a| a["url"].as_str()).map(str::to_string);
-                // (Signed in to the workspace it is in: another's would get a second one.)
-                let modal_for_launcher = self.modal.clone().filter(|m| modal_launcher.as_deref().is_some_and(|u| u.starts_with(&format!("https://{}--", m.workspace))));
-                let modal_note = if modal_launcher.is_some() && modal_for_launcher.is_none() { "Its Modal launcher was not updated: Modal is not signed in to here, or to another workspace. Sign in to its own (`superci login modal`) and update once more." } else { "" };
+                let records = view::records_in(&status);
+                let modal_launchers: Vec<(String, String)> = typed.iter().map(|a| (a.cloud.clone(), a.url.clone())).filter(|(word, _)| records.provider_of(word) == "modal").collect();
+                // (Each with a sign-in to the workspace it is in: another's would get a second one.)
+                // Each further AWS account's role gets what this version asks for, with its own sign-in.
+                let aws_all = self.aws_all();
+                let connections: Vec<superci_core::plane::AwsConnection> = serde_json::from_value(status["aws_further"].clone()).unwrap_or_default();
+                let further_aws: Vec<(String, superci_core::aws::Credentials, Vec<String>)> = connections.into_iter()
+                    .filter_map(|a| Some((a.account_id.clone(), aws_all.iter().find(|(s, _)| *s == a.account_id)?.1.clone(), a.regions))).collect();
+                let first_creds = aws_all.iter().find(|(id, _)| status["aws"]["account_id"].as_str() == Some(id.as_str())).map(|(_, c)| c.clone());
+                let further_given: Vec<String> = status["aws_further"].as_array().into_iter().flatten().filter(|a| further_aws.iter().any(|(id, _, _)| a["account_id"].as_str() == Some(id.as_str()))).filter_map(|a| a["name"].as_str().map(str::to_string)).collect();
+                let aws_missing_further: Vec<&str> = status["aws_further"].as_array().into_iter().flatten().filter(|a| !further_aws.iter().any(|(id, _, _)| a["account_id"].as_str() == Some(id.as_str()))).filter_map(|a| a["name"].as_str()).collect();
+                let modal_sessions: Vec<modal::Session> = modal_launchers.iter().filter_map(|(_, url)| self.modal_of_launcher(url).cloned()).collect();
+                let modal_missing: Vec<&str> = modal_launchers.iter().filter(|(_, url)| self.modal_of_launcher(url).is_none()).map(|(word, _)| word.as_str()).collect();
+                let modal_note = match modal_missing.as_slice() {
+                    [] => String::new(),
+                    ["modal"] => "Its Modal launcher was not updated: Modal is not signed in to here, or to another workspace. Sign in to its own (`superci login modal`) and update once more.".to_string(),
+                    words => format!("Its Modal launchers {} were not updated: sign in to their workspaces (`superci login modal --add`) and update again.", words.join(", ")),
+                };
                 let note = if cf_launcher && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare launcher was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
                 let gone = steered_before(&status);
-                let note = [note.as_str(), modal_note, gone.as_str()].iter().filter(|n| !n.is_empty()).copied().collect::<Vec<_>>().join(" ");
+                let aws_note = if aws_missing_further.is_empty() { String::new() } else { format!("The roles of {} were not updated: sign in to their AWS accounts (`superci login aws --add`) and update once more.", aws_missing_further.join(", ")) };
+                let cf_note = if cf_missing.is_empty() { String::new() } else { format!("Its Cloudflare launchers {} were not updated: this sign-in does not reach their accounts, or Cloudflare did not say which they are in.", cf_missing.join(", ")) };
+                let note = [note.as_str(), aws_note.as_str(), cf_note.as_str(), modal_note.as_str(), gone.as_str()].iter().filter(|n| !n.is_empty()).copied().collect::<Vec<_>>().join(" ");
                 *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
@@ -3304,7 +3504,7 @@ impl Dashboard {
                 // An AWS control plane whose AWS runners were removed keeps them off.
                 let aws_runners = !status["aws"].is_null();
                 let (aws_missing, key) = (self.aws_missing.clone(), self.status_key.clone());
-                let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+                let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
                 let (puts, drops) = if before {
                     // (Modal's settings are not listed: its old names are taken out by name.)
                     let names = if matches!(plane, Plane::Modal { .. }) { vec!["AGENTS".to_string(), old_key_name(&self.status_secret)] } else { writer.names(&plane) };
@@ -3321,9 +3521,14 @@ impl Dashboard {
                             Deploying::Modal { session, plane_id, label, recreate } => modal::deploy_plane(session, plane_id, label, *recreate, &step)?,
                         };
                         // A separate Cloudflare launcher (for a control plane elsewhere) is updated with it.
-                        if let (true, Some(cf), Some(account)) = (cf_launcher && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }
+                        for (account, creds, regions) in &further_aws { aws::give_further_role(creds, account, plane.plane_id(), regions)?; }
+                        // (The cache in their regions, in the first account, when that one is signed in to; and the
+                        // refusals noted of each role just given what it lacked go.)
+                        if let Some(c) = &first_creds { let regions: Vec<String> = further_aws.iter().flat_map(|(_, _, r)| r.clone()).collect(); if !regions.is_empty() { let _ = aws::make_caches(c, plane.plane_id(), &regions); } }
+                        for word in &further_given { let _ = cloudflare::plane_post(&url, &key, "/permissions/given", &serde_json::json!({ "cloud": word })); }
+                        if let Some(cf) = &cf { for account in &cf_accounts_of { cf.deploy_runners(account, plane.url(), plane.plane_id())?; } }
                         // (And a Modal launcher, at the address it has: its name stays.)
-                        if let Some(session) = &modal_for_launcher { plane_keys(&url).and_then(|keys| modal::deploy_runners(session, plane.url(), plane.plane_id(), &keys))?; }
+                        for session in &modal_sessions { plane_keys(&url).and_then(|keys| modal::deploy_runners(session, plane.url(), plane.plane_id(), &keys))?; }
                         // An AWS control plane's machines get their own network in each of its regions too.
                         if let (Deploying::Aws { creds, .. }, true) = (&deploying, aws_runners) { aws::make_networks(creds, plane.plane_id(), &regions)?; }
                         if let Some((creds, account)) = &aws_give {
@@ -3460,21 +3665,76 @@ impl Dashboard {
                 Ok(Response::redirect(&link))
             }
             ("GET", "/oauth/modal") => Ok(back_to("Signed in with Modal", "Back to where you were…", &self.back_url(&self.return_to))),
+            // A further AWS account signed in to: the role its control plane may assume there (as for a control plane
+            // outside AWS), its machines' networks, and its two runners under one word.
+            ("POST", "/runners/aws") => {
+                let plane = self.plane()?;
+                let (account_id, region) = (field("account"), field("region"));
+                if !REGIONS.contains(&region.as_str()) { return Ok(message(400, "Choose a region from the list", "")) }
+                let Some(status) = status_soon(plane.url(), &self.status_key) else {
+                    return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
+                };
+                if status["settings"] != true { return Ok(message(409, "Update the control plane first", "A further runner needs a newer control plane: update it on the Control plane page (or `superci planes update`).")) }
+                if status["aws"].is_null() { return Ok(message(409, "Add AWS first", "A further account comes after the first: `superci runners create aws --region=us-east-1`.")) }
+                if status["aws"]["account_id"].as_str() == Some(account_id.as_str()) { return Ok(message(400, "That word cannot be this runner's", "This AWS account runs jobs as aws: a word is for good.")) }
+                if !self.hold_account(&account_id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} (`superci login aws --add`).", esc(&account_id)))) }
+                let records = view::records_in(&status);
+                let word = match runner_word("aws", "AWS account", "\0", &[], &records, true, &account_id, &account_id, &field("name")) { Ok(word) => word, Err(e) => return Ok(message(400, "That word cannot be this runner's", &esc(&e))) };
+                let on_demand = format!("{word}-on-demand");
+                let creds = self.aws_creds()?;
+                aws::connect_runners(&creds, &account_id, plane.url(), plane.plane_id(), AUDIENCE)?;
+                let regions: Vec<String> = std::iter::once(region.as_str()).chain(nearby_regions(&region).iter().copied()).map(str::to_string).collect();
+                aws::make_further_networks(&creds, plane.plane_id(), &regions)?;
+                // One cache for a CI, in its first account: there in these regions too, when that one is signed in to.
+                let first = status["aws"]["account_id"].as_str().unwrap_or_default().to_string();
+                let cached = self.aws_all().into_iter().find(|(id, _)| *id == first).map(|(_, c)| aws::make_caches(&c, plane.plane_id(), &regions));
+                let cache_note = match cached {
+                    Some(Ok(())) => None,
+                    Some(Err(e)) => Some(format!("Its jobs run without the cache in some regions: {e}")),
+                    None => Some(format!("Sign in to AWS account {first} and update the control plane to give its jobs the cache in these regions.")),
+                };
+                let mut now = records.clone();
+                if !now.accounts.iter().any(|a| a.name == word) { now.accounts.push(Account { name: word.clone(), provider: "aws".into(), cloud_id: Some(account_id.clone()) }) }
+                now.runners.retain(|r| r.name != word && r.name != on_demand);
+                now.runners.push(RunnerRecord { name: word.clone(), account: word.clone(), gone: false, on_demand: false, function: false });
+                now.runners.push(RunnerRecord { name: on_demand, account: word.clone(), gone: false, on_demand: true, function: false });
+                self.put_as_said(&plane, &status, serde_json::json!({ "accounts": records.accounts, "runners": records.runners }), serde_json::json!({ "accounts": now.accounts, "runners": now.runners }))?;
+                // (Its role takes a moment to be seen by AWS everywhere.)
+                let body = serde_json::json!({ "name": word, "accountId": account_id, "region": region, "regions": regions });
+                let mut asked = 0;
+                let said = loop {
+                    let said = cloudflare::plane_post(plane.url(), &self.status_key, "/aws/accounts", &body)?;
+                    asked += 1;
+                    if said["connected"] == true || asked == 12 { break said }
+                    aws::pause(5000);
+                };
+                if said["connected"] != true { return Ok(message(502, "AWS did not let the control plane use the role yet", &esc(said["error"].as_str().unwrap_or("Try again in a minute.")))) }
+                self.views = None;
+                self.flash = cache_note;
+                Ok(Response::redirect("/?p=runners"))
+            }
+            // `account`: which Modal workspace signed in to (none: the one in hand); `name`: its word, chosen once for good.
             ("POST", "/runners/modal") => {
                 let plane = self.plane()?;
-                let session = self.modal.clone().ok_or("Sign in with Modal first.")?;
+                let asked = field("account");
+                let session = if asked.is_empty() { self.modal.clone().ok_or("Sign in with Modal first.")? }
+                    else { self.modal_for(&asked).cloned().ok_or_else(|| format!("Sign in with Modal to the workspace {asked} first: `superci login modal --add`."))? };
                 let status = status_soon(plane.url(), &self.status_key).unwrap_or_default();
                 let Some(mut launchers) = serde_json::from_value::<Vec<superci_core::plane::Launcher>>(status["launchers"].clone()).ok().filter(|_| !status.is_null()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
+                let records = view::records_in(&status);
+                let word = match modal_word(&launchers, &records, matches!(plane, Plane::Modal { .. }), &session.workspace, &field("name")) { Ok(word) => word, Err(e) => return Ok(message(400, "That word cannot be this runner's", &esc(&e))) };
+                if word != "modal" && status["settings"] != true { return Ok(message(409, "Update the control plane first", "A further runner needs a newer control plane: update it on the Control plane page (or `superci planes update`).")) }
                 let keys = plane_keys(plane.url())?;
                 eprintln!("Deploying the Modal launcher (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 launcher_up(&url);
-                launchers.retain(|a| a.cloud != "modal");
-                launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
-                self.put_as_said(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)))?;
-                wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
+                // (Its Functions, when they are in the order: too, for the images there are now.)
+                if let Some(r) = serde_json::from_value::<Routing>(status["routing"].clone()).ok().filter(|r| r.pool(&format!("{word}-functions")).is_some_and(|p| !p.off)) { self.deploy_jobs(&plane, &url, &r.images)? }
+                launchers.retain(|a| a.cloud != word);
+                launchers.push(Launcher { cloud: word.clone(), url });
+                self.put_runner(&plane, &status, &records, &launchers, &word, "modal", &session.workspace)?;
                 Ok(Response::redirect("/?p=runners"))
             }
             ("POST", "/runners/cloudflare") => {
@@ -3486,7 +3746,7 @@ impl Dashboard {
                 match &plane {
                     // A Cloudflare control plane starts the containers itself: its own Worker gets the runner image and
                     // the container application (each container sized per job), then containers are switched on.
-                    Plane::Cloudflare { account_id, script, label, .. } => {
+                    Plane::Cloudflare { account_id, script, label, .. } if field("account").is_empty() || field("account") == *account_id => {
                         cf.deploy(account_id, script, label, true)?;
                         self.put_secret(&plane, "CONTAINERS", "on")?;
                         // A separate Cloudflare launcher from before is no longer needed.
@@ -3510,11 +3770,16 @@ impl Dashboard {
                             (all, _) => return Ok(message(409, "Which Cloudflare account?", &format!("Your Cloudflare sign-in reaches {}: {}. Say which one the runners go into: `superci runners create cloudflare --account=ID`. Nothing has changed.",
                                 all.len(), esc(&all.iter().map(|a| format!("{} ({})", a.1, a.0)).collect::<Vec<_>>().join(", "))))),
                         };
+                        let records = view::records_in(&status);
+                        let called = self.cf_accounts.iter().find(|a| a.0 == account).map_or(account.clone(), |a| a.1.clone());
+                        // (A launcher's address says its account: one there already keeps its word.)
+                        let sub = if launchers.iter().any(|a| records.provider_of(&a.cloud) == "cloudflare") { cf.subdomain(&account)? } else { String::new() };
+                        let word = match cloudflare_word(&launchers, &records, matches!(plane, Plane::Cloudflare { .. }), &account, &called, &sub, &field("name")) { Ok(word) => word, Err(e) => return Ok(message(400, "That word cannot be this runner's", &esc(&e))) };
+                        if word != "cloudflare" && status["settings"] != true { return Ok(message(409, "Update the control plane first", "A further runner needs a newer control plane: update it on the Control plane page (or `superci planes update`).")) }
                         let url = cf.deploy_runners(&account, plane.url(), plane.plane_id())?;
-                        launchers.retain(|a| a.cloud != "cloudflare");
-                        launchers.push(superci_core::plane::Launcher { cloud: "cloudflare".into(), url });
-                        self.put_as_said(&plane, &status, launchers_in(&status), settings_doc(None, Some(&launchers)))?;
-                        wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
+                        launchers.retain(|a| a.cloud != word);
+                        launchers.push(Launcher { cloud: word.clone(), url });
+                        self.put_runner(&plane, &status, &records, &launchers, &word, "cloudflare", &account)?;
                     }
                 }
                 Ok(Response::redirect("/?p=runners"))
@@ -3628,6 +3893,7 @@ impl Dashboard {
                 let seen = Some(field("seen")).filter(|s| !s.is_empty() && field("seen_plane") == plane.plane_id()).and_then(|s| serde_json::from_str::<Routing>(&s).ok());
                 let was = seen.clone().unwrap_or(now);
                 let mut routing = was.clone();
+                let records = status.as_ref().map(view::records_in).unwrap_or_default();
                 // A dollar amount, or none (empty, `none`, zero).
                 let money = |name: &str| field(name).parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
                 let usd = || money("usd");
@@ -3645,10 +3911,13 @@ impl Dashboard {
                     "monthly_usd" => { routing.monthly_usd = usd(); if newer { routing.daily_usd = money("daily") } }
                     "account_usd" => {
                         let account = field("account");
-                        if account != "aws" { return Ok(message(400, "Which account?", "An account's limit is for a cloud with several providers: aws (its spot and on-demand machines). Another provider's limit is its own: its settings on Runners.")) }
+                        // (Every provider's first account, and each further one; AWS's own budget is AWS's.)
+                        if !["aws", "cloudflare", "modal"].contains(&account.as_str()) && !records.accounts.iter().any(|a| a.name == account) { return Ok(message(400, "Which account?", "An account's limit is for one of its accounts: aws, cloudflare, modal, or a further one by its word. Nothing has changed.")) }
                         let (was, limit) = (routing.account_usd.get(&account).copied(), usd());
                         match limit { Some(n) => { routing.account_usd.insert(account.clone(), n); } None => { routing.account_usd.remove(&account); } }
                         if newer { match money("daily") { Some(n) => { routing.account_daily_usd.insert(account.clone(), n); } None => { routing.account_daily_usd.remove(&account); } } }
+                        if account != "aws" && !["", "none"].contains(&field("budget").as_str()) { return Ok(message(400, "A budget in the account itself is AWS's", "")) }
+                        if account == "aws" {
                         // The account's own budget in AWS, for the same monthly limit: nothing, AWS's emails, or its
                         // emails and the rule that stops new machines at the limit (`lift` takes that rule off the
                         // role). Not said: as it is, kept in step with the limit. It is made, changed and removed
@@ -3675,6 +3944,7 @@ impl Dashboard {
                             self.budget_lifted.insert(plane.plane_id().to_string(), now_ms());
                         }
                         routing.aws_budget = want;
+                        }
                     }
                     // Limits: the largest machine a label may ask for; public repositories allowed to run here.
                     "max_cpu" => routing.max_cpu = field("max_cpu").parse().ok().filter(|n: &u32| *n >= 1 && *n <= 192 && *n != MAX_CPU),
@@ -3691,6 +3961,26 @@ impl Dashboard {
                         if !routing.public_repos.iter().any(|r| r.eq_ignore_ascii_case(&repo)) { routing.public_repos.push(repo) }
                     }
                     "public_remove" => { let repo = field("repo"); routing.public_repos.retain(|r| *r != repo) }
+                    // An image of the control plane's own, by the name a label gives it (`image=NAME`), or none by it.
+                    // An update changes one there is, in this one write of the routing: a job that names it never
+                    // meets a moment with no image by that name. What it does not say (its address, its Modal
+                    // Secret) stays as the control plane has it now.
+                    "image_add" | "image_update" => {
+                        if !status.as_ref().is_some_and(|s| s["runner_images"] == true) { return Ok(message(409, "Update the control plane first", "Images of your own need a newer control plane: update it on the Control plane page (or `superci planes update`), then add one.")) }
+                        let name = field("name").trim().to_string();
+                        let had = if field("action") == "image_update" {
+                            let Some(had) = routing.images.get(&name).cloned() else { return Ok(message(404, "No image by that name", &esc(&no_image(&name)))) };
+                            Some(had)
+                        } else { None };
+                        let given = |n: &str, had: Option<String>| match had { Some(h) if !form_has(n) => h, _ => field(n).trim().to_string() };
+                        let reference = given("reference", had.as_ref().map(|i| i.reference.clone()));
+                        let secret = given("modal_secret", had.as_ref().map(|i| i.modal_secret.clone().unwrap_or_default()));
+                        if let Err(e) = superci_core::spec::valid_image_name(&name) { return Ok(message(400, "Check the image's name", &esc(&e))) }
+                        if !superci_core::plane::valid_image_reference(&reference) { return Ok(message(400, "Check the image's address", "As `docker pull` takes it: ghcr.io/acme/ci:2026-10, or by its digest (ghcr.io/acme/ci@sha256:…).")) }
+                        if !secret.is_empty() && !superci_core::plane::valid_modal_secret(&secret) { return Ok(message(400, "Check the Modal Secret's name", "Letters, digits, dashes, underscores and dots, as Modal names a Secret.")) }
+                        routing.images.insert(name, superci_core::plane::RunnerImage { reference, modal_secret: Some(secret).filter(|s| !s.is_empty()) });
+                    }
+                    "image_remove" => { routing.images.remove(field("name").trim()); }
                     // The cache: on or off, what a repository keeps, how long an entry may go unused.
                     "cache_on" => routing.cache.off = field("on") != "on",
                     "cache_images" => routing.cache.images_off = field("on") != "on",
@@ -3716,13 +4006,13 @@ impl Dashboard {
                     "order" => {
                         let mut order = vec![];
                         for cloud in (0..64).map(|i| field(&format!("cloud_{i}"))).take_while(|c| !c.is_empty()) {
-                            if !pool_name_ok(&cloud) || order.iter().any(|p: &Pool| p.cloud == cloud) { return Ok(message(400, "Unknown provider", "")) }
+                            if !pool_name_ok(&cloud, &records) || order.iter().any(|p: &Pool| p.cloud == cloud) { return Ok(message(400, "Unknown provider", "")) }
                             let mut p = routing.pool(&cloud).cloned().unwrap_or(Pool::of(&cloud));
                             p.off = false;
                             order.push(p);
                         }
                         for cloud in (0..64).map(|i| field(&format!("out_{i}"))).take_while(|c| !c.is_empty()) {
-                            if !pool_name_ok(&cloud) || order.iter().any(|p: &Pool| p.cloud == cloud) { return Ok(message(400, "Unknown provider", "")) }
+                            if !pool_name_ok(&cloud, &records) || order.iter().any(|p: &Pool| p.cloud == cloud) { return Ok(message(400, "Unknown provider", "")) }
                             let mut p = routing.pool(&cloud).cloned().unwrap_or(Pool::of(&cloud));
                             p.off = true;
                             order.push(p);
@@ -3734,8 +4024,8 @@ impl Dashboard {
                     // A place taken out of the order (its settings kept, nothing deleted anywhere), or put back, at its end.
                     "take_out" | "put_back" => {
                         let cloud = field("cloud");
-                        if !pool_name_ok(&cloud) { return Ok(message(400, "Unknown provider", "")) }
-                        let mut order = order_as_shown(&routing, &field("current"));
+                        if !pool_name_ok(&cloud, &records) { return Ok(message(400, "Unknown provider", "")) }
+                        let mut order = order_as_shown(&routing, &field("current"), &records);
                         let Some(at) = order.iter().position(|p| p.cloud == cloud) else { return Ok(message(400, "Unknown provider", "")) };
                         let mut p = order.remove(at);
                         p.off = field("action") == "take_out";
@@ -3749,9 +4039,9 @@ impl Dashboard {
                     // (AWS's own network, Cloudflare's image). The order shown (`current`) is kept as it was.
                     "pool" | "account" => {
                         let cloud = field("cloud");
-                        if !pool_name_ok(&cloud) { return Ok(message(400, "Unknown provider", "")) }
-                        let account = superci_core::plane::account_of(&cloud).to_string();
-                        let mut order = order_as_shown(&routing, &field("current"));
+                        if !pool_name_ok(&cloud, &records) { return Ok(message(400, "Unknown provider", "")) }
+                        let account = records.account_of(&cloud).to_string();
+                        let mut order = order_as_shown(&routing, &field("current"), &records);
                         if !order.iter().any(|p| p.cloud == cloud) { order.push(Pool::of(&cloud)) }
                         // Checked whole before anything changes (a form refused halfway would leave half of it set).
                         let want_image = if cloud == "cloudflare" && form_has("image") {
@@ -3802,6 +4092,31 @@ impl Dashboard {
                                 self.shown(&plane, |s| s["aws_regions"] == want)?;
                             }
                         }
+                        // A further AWS account's: its connection says them, its own network in each new one first.
+                        if field("action") == "pool" && account != "aws" && records.provider_of(&cloud) == "aws" && !field("region_0").is_empty() {
+                            let asked: Vec<String> = (0..REGIONS.len()).map(|i| field(&format!("region_{i}"))).filter(|r| !r.is_empty()).collect();
+                            if asked.iter().any(|r| !REGIONS.contains(&r.as_str())) { return Ok(message(400, "Choose a region from the list", "")) }
+                            let mut regions: Vec<String> = vec![];
+                            asked.into_iter().for_each(|r| if !regions.contains(&r) { regions.push(r) });
+                            let st = status.clone().unwrap_or_default();
+                            let Some(kept) = st["aws_further"].as_array().and_then(|f| f.iter().find(|a| a["name"] == account.as_str())).cloned() else { return Ok(message(400, "Unknown provider", "")) };
+                            let have: Vec<String> = kept["regions"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+                            order.iter_mut().filter(|p| records.account_of(&p.cloud) == account).for_each(|p| { if p.cloud == cloud { p.regions = regions.clone() } else if p.regions.is_empty() { p.regions = have.clone() } });
+                            let mut all: Vec<String> = vec![];
+                            order.iter().filter(|p| records.account_of(&p.cloud) == account).flat_map(|p| &p.regions).for_each(|r| if !all.contains(r) { all.push(r.clone()) });
+                            if all != have {
+                                let id = kept["account_id"].as_str().unwrap_or_default().to_string();
+                                if !self.hold_account(&id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} to set up its new regions.", esc(&id)))) }
+                                let new: Vec<String> = all.iter().filter(|r| !have.contains(r)).cloned().collect();
+                                if !new.is_empty() {
+                                    aws::make_further_networks(&self.aws_creds()?, plane.plane_id(), &new)?;
+                                    // (Its cache there is the first account's, when that one is signed in to.)
+                                    let first = status.as_ref().and_then(|s| s["aws"]["account_id"].as_str()).unwrap_or_default().to_string();
+                                    if let Some((_, c)) = self.aws_all().into_iter().find(|(s, _)| *s == first) { let _ = aws::make_caches(&c, plane.plane_id(), &new); }
+                                }
+                                cloudflare::plane_post(plane.url(), &self.status_key, "/aws/accounts", &serde_json::json!({ "name": account, "accountId": id, "region": all.first().cloned().unwrap_or_default(), "regions": all }))?;
+                            }
+                        }
                         // Cloudflare's location (where its containers start).
                         let location = field("location");
                         if field("action") == "pool" && cloud == "cloudflare" && CF_LOCATIONS.iter().any(|(k, _)| *k == location) {
@@ -3830,6 +4145,17 @@ impl Dashboard {
                     }
                     _ => return Ok(message(400, "Unknown change", "")),
                 }
+                // Modal's Functions, deployed before any job can ask for one: where a row of them goes on, and each one on
+                // when an image is added or changed.
+                let images = ["image_add", "image_update"].contains(&field("action").as_str());
+                let launchers: Vec<Launcher> = status.as_ref().and_then(|s| serde_json::from_value(s["launchers"].clone()).ok()).unwrap_or_default();
+                for p in routing.order.iter().filter(|p| !p.off && records.modal_function(&p.cloud)) {
+                    if !images && was.pool(&p.cloud).is_some_and(|w| !w.off) { continue }
+                    if !status.as_ref().is_some_and(|s| s["function_mode"] == true) { return Ok(message(409, "Update the control plane first", "Modal's Functions need a newer control plane: update it on the Control plane page (or `superci planes update`).")) }
+                    let base = records.launcher_word(&p.cloud);
+                    let url = launchers.iter().find(|l| l.cloud == base).map_or(plane.url(), |l| l.url.as_str());
+                    self.deploy_jobs(&plane, url, &routing.images)?;
+                }
                 let (before, after) = (settings_doc(Some(&was), None), settings_doc(Some(&routing), None));
                 let ours = superci_core::settings::diff(&before, &after, false);
                 if let Some(c) = self.put_settings(&plane, status.as_ref().unwrap_or(&serde_json::Value::Null), before.clone(), after, seen.is_some())? {
@@ -3847,7 +4173,7 @@ impl Dashboard {
                     let read = |d: &serde_json::Value| serde_json::from_value::<Routing>(d["routing"].clone()).ok();
                     superci_core::settings::apply(&doc, &ours).is_ok_and(|d| read(&d) == read(&doc))
                 })?;
-                Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
+                Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || field("action").starts_with("image") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
             // A run cancelled (see `superci runs cancel`), then its page again.
             ("POST", "/run/cancel") => {
@@ -4059,7 +4385,7 @@ mark();load()})();</script>"#;
         if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.select(i) }
         if let Some((_, account)) = quota_creds { d.quotas = quotas; d.quotas_for = Some((account, now_ms())); }
         if let (Some((_, account)), Some((look, copying, behind))) = (look_creds, looked) { d.take_look(account, look, copying, behind) }
-        if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
+        if let Some(Ok(Some(session))) = modal { d.came_modal(session) }
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
         let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
@@ -4499,9 +4825,14 @@ mark();load()})();</script>"#;
         } else {
             // Signed in where each provider's part is (removing it deletes that part).
             let account = aws_account(v);
-            let signed_in: Vec<&str> = [("aws", self.aws.iter().chain(&self.aws_others).any(|a| Some(&a.account_id) == account.as_ref())), ("modal", self.modal.is_some()), ("cloudflare", self.cf.is_some())]
-                .into_iter().filter(|(_, yes)| *yes).map(|(c, _)| c).collect();
-            format!("{}{}{}", pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), self.aws_look()), clouds_card(v, &signed_in), spending_card(v, self.budget_lifted.get(v.plane.plane_id()).copied().unwrap_or(0)))
+            // (A Modal runner's part is in its own workspace.)
+            let launchers = v.launchers();
+            let records = v.records();
+            let reached = |word: &str| self.cf.is_some() && records.accounts.iter().find(|a| a.name == records.account_of(word)).and_then(|a| a.cloud_id.as_ref()).is_some_and(|id| self.cf_accounts.iter().any(|c| c.0 == *id));
+            let signed_in: Vec<&str> = [("aws", self.aws.iter().chain(&self.aws_others).any(|a| Some(&a.account_id) == account.as_ref())), ("cloudflare", self.cf.is_some())]
+                .into_iter().filter(|(_, yes)| *yes).map(|(c, _)| c).chain(launchers.iter().filter(|a| self.modal_of_launcher(&a.url).is_some() || reached(&a.cloud)).map(|a| a.cloud.as_str()))
+                .chain(records.accounts.iter().filter(|a| a.provider == "aws" && self.aws.iter().chain(&self.aws_others).any(|s| Some(&s.account_id) == a.cloud_id.as_ref())).map(|a| a.name.as_str())).collect();
+            format!("{}{}{}", pools_card(v, &self.quotas, self.cf_month, &self.modal_months, self.aws_look()), clouds_card(v, &signed_in), spending_card(v, self.budget_lifted.get(v.plane.plane_id()).copied().unwrap_or(0)))
         };
         let note = match &self.flash { Some(f) => format!(r#"<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => String::new() };
         format!(r#"<div class="bar"><h1 class="page-title">Runners</h1>{add}</div>{note}<div class="cards">{body}</div>"#)
@@ -4530,6 +4861,23 @@ mark();load()})();</script>"#;
         let modal = if launcher("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if self.modal.is_some() { row_form("/runners/modal", "", "Add") }
             else if self.modal_pending.is_some() { format!(r#"{}<form method="post" action="/modal/signin"><input type="hidden" name="next"><button class="button secondary sm">Open again</button></form>"#, pill("open", "Waiting for Modal")) }
             else { connect_action("modal") };
+        // Each further Modal workspace signed in to: its own runner, with its own limits.
+        let records = v.records();
+        let launchers = v.launchers();
+        let further = self.modal_accounts().into_iter().filter(|m| v.plane.workspace() != Some(m.workspace.as_str()) && !launchers.iter().any(|a| a.url.starts_with(&format!("https://{}--", m.workspace))) && modal_word(&launchers, &records, own_modal, &m.workspace, "").is_ok_and(|w| w != "modal")).map(|m| {
+            let word = modal_word(&launchers, &records, own_modal, &m.workspace, "").unwrap_or_default();
+            provider_row("modal", &format!("Sandboxes, one per job, in the Modal workspace {}, as the runner {word}: its own limits and spend.", m.workspace), &row_form("/runners/modal", &format!(r#"<input type="hidden" name="account" value="{}">"#, esc(&m.workspace)), "Add"))
+        }).collect::<String>();
+        // And each further AWS account signed in to, with the first added.
+        let first_aws = aws_account(v);
+        let further_aws = self.aws_accounts().into_iter().filter(|a| v.aws && Some(&a.account_id) != first_aws.as_ref() && !records.accounts.iter().any(|r| r.cloud_id.as_deref() == Some(a.account_id.as_str()) && records.runners.iter().any(|x| x.account == r.name && !x.gone))).map(|a| {
+            provider_row("aws", &format!("Spot and on-demand machines, one per job, in account {}: its own limits and spend.", a.account_id), &format!(r#"<form method="post" action="/runners/aws" class="row-form"><input type="hidden" name="account" value="{}"><select name="region" aria-label="Region">{}</select><button class="button primary sm">Add</button></form>"#, esc(&a.account_id), region_select_options("us-east-1", &self.quotas, &closest(Some(v)), self.aws_look())))
+        }).collect::<String>();
+        // And each further Cloudflare account this sign-in reaches, with the first added.
+        let first_cf = launchers.iter().any(|a| a.cloud == "cloudflare") || matches!(v.plane, Plane::Cloudflare { .. });
+        let further_cf = self.cf_accounts.iter().filter(|(id, _)| first_cf && self.cf_accounts.len() > 1 && !matches!(&v.plane, Plane::Cloudflare { account_id, .. } if account_id == id) && !records.accounts.iter().any(|a| a.cloud_id.as_deref() == Some(id.as_str()) && records.runners.iter().any(|r| r.account == a.name && !r.gone))).map(|(id, name)| {
+            provider_row("cloudflare", &format!("Containers, one per job, in the Cloudflare account {name}: its own limits and spend."), &row_form("/runners/cloudflare", &format!(r#"<input type="hidden" name="account" value="{}">"#, esc(id)), "Add"))
+        }).collect::<String>();
         let containers = if matches!(v.plane, Plane::Cloudflare { .. }) { "Containers, one per job, started by your control plane." } else { "Containers, one per job, through a small launcher in your Cloudflare." };
         let aws_what = match &self.aws {
             Some(a) if !v.aws => {
@@ -4539,7 +4887,7 @@ mark();load()})();</script>"#;
             }
             _ => "Spot machines, one per job, in your AWS account.".to_string(),
         };
-        let rows = format!("{}{}{}{}", provider_row("cloudflare", containers, &cloudflare), provider_row_html("aws", &aws_what, &aws),
+        let rows = format!("{}{further_cf}{}{further_aws}{}{further}{}", provider_row("cloudflare", containers, &cloudflare), provider_row_html("aws", &aws_what, &aws),
             provider_row("modal", "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.", &modal), more_clouds(&RUNNERS_SOON));
         format!(r#"<div class="bar"><h1 class="page-title">Add a provider</h1><a class="chip" href="/?p=runners">Back to runners</a></div><p class="note" style="margin-bottom:22px">Where runners come from: each provider starts a fresh one for every job. Add one or more.</p><div class="picks page">{rows}</div>"#)
     }
@@ -4953,32 +5301,38 @@ mark();load()})();</script>"#;
             })
         }).collect();
         let cf = if d.cf_accounts.is_empty() { None } else { d.cf_client().ok() };
-        let (accounts, key, shared, modal) = (d.cf_accounts.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), d.status_key.clone(), shared.clone(), d.modal.clone());
+        let (accounts, key, shared, modals) = (d.cf_accounts.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), d.status_key.clone(), shared.clone(), d.modal_accounts());
         d.measuring = true;
         std::thread::spawn(move || {
             let mut costs = std::collections::HashMap::new();
-            let mut cf_month = None;
+            let (mut cf_month, mut cf_months): (Option<(f64, f64)>, Vec<(String, (f64, f64))>) = (None, vec![]);
             if let Some(cf) = &cf {
                 for chunk in todo.chunks(100) {
                     let ids: Vec<String> = chunk.iter().map(|t| t.2.clone()).collect();
                     let (from, to) = (chunk.iter().map(|t| t.3).min().unwrap_or(now) - 60_000, chunk.iter().map(|t| t.4).max().unwrap_or(now) + 600_000);
                     costs.extend(accounts.iter().filter_map(|a| cf.container_costs(a, &ids, from, to).ok()).flatten());
                 }
-                let months: Vec<(f64, f64)> = accounts.iter().filter_map(|a| cf.containers_month(a, now).ok()).collect();
-                if !months.is_empty() { cf_month = Some(months.iter().fold((0.0, 0.0), |s, m| (s.0 + m.0, s.1 + m.1))) }
+                cf_months = accounts.iter().filter_map(|a| Some((a.clone(), cf.containers_month(a, now).ok()?))).collect();
+                if !cf_months.is_empty() { cf_month = Some(cf_months.iter().fold((0.0, 0.0), |s, (_, m)| (s.0 + m.0, s.1 + m.1))) }
             }
-            let modal_month = modal.as_ref().and_then(|m| modal::month(m).ok());
+            let modal_months: Vec<(String, modal::Month)> = modals.iter().filter_map(|m| Some((m.workspace.clone(), modal::month(m).ok()?))).collect();
             // Per control plane: its jobs' measured costs.
             let mut by_plane: std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>> = Default::default();
             for (url, job, id, _, _, least) in &todo {
                 if let Some((usd, gib_s)) = costs.get(id).filter(|(_, gib_s)| *gib_s >= *least && *gib_s > 0.0) { let _ = gib_s; by_plane.entry(url.clone()).or_default().insert(job.clone(), (*usd).into()); }
             }
             for (url, measured) in &by_plane { let _ = cloudflare::plane_post(url, &key, "/costs", &serde_json::json!({ "measured": measured })); }
+            // Each account's bill, for the other computers of its CI: only the figures.
+            for v in &views {
+                let Some(status) = v.status.as_ref().filter(|s| s["settings"] == true) else { continue };
+                let bills = bills_of(v, status, &modal_months, &cf_months);
+                if !bills.is_empty() { let _ = cloudflare::plane_post(v.plane.url(), &key, "/bills", &serde_json::json!({ "bills": bills })); }
+            }
             let mut d = lock(&shared);
             d.measuring = false;
             d.measured_at = now_ms();
             if cf_month.is_some() { d.cf_month = cf_month }
-            if modal_month.is_some() { d.modal_month = modal_month }
+            d.modal_months.extend(modal_months);
             if let Some((views, _)) = d.views.as_mut() {
                 for v in views.iter_mut() {
                     let Some(measured) = by_plane.get(v.plane.url()) else { continue };
@@ -5025,12 +5379,26 @@ mark();load()})();</script>"#;
             Plane::Modal { plane_id, .. } => modal::delete_plane(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id)?,
             Plane::Seen { .. } => return Err("Sign in where this control plane runs to delete it.".into()),
         }
-        let launcher = |c: &str| status["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c));
-        if launcher("cloudflare") && !matches!(plane, Plane::Cloudflare { .. }) {
+        let records = view::records_in(&status);
+        // Each further AWS account's part, with its own sign-in.
+        let aws_all = self.aws_all();
+        for a in status["aws_further"].as_array().into_iter().flatten() {
+            let id = a["account_id"].as_str().unwrap_or_default();
+            match aws_all.iter().find(|(s, _)| s == id) {
+                Some((_, creds)) => {
+                    if let Err(e) = aws::delete_further_networks(creds, plane.plane_id(), &REGIONS) { left.push(format!("Its machines' network in AWS account {id} ({e}).")) }
+                    let _ = aws::disconnect_runners(creds, id, plane.url(), plane.plane_id());
+                }
+                None => left.push(format!("Its role in AWS account {id} (sign in with AWS to remove it).")),
+            }
+        }
+        let launcher = |c: &str| status["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"].as_str().is_some_and(|w| records.provider_of(w) == c && !(w == c && matches!(plane, Plane::Cloudflare { .. })))));
+        if launcher("cloudflare") {
             match self.cloudflare() { Ok(cf) => for (a, _) in self.cf_accounts.clone() { let _ = cf.delete_runners(&a, plane.plane_id()); }, Err(_) => left.push("Its Cloudflare launcher (sign in with Cloudflare to remove it).".to_string()) }
         }
-        if launcher("modal") && !matches!(plane, Plane::Modal { .. }) {
-            match &self.modal { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None => left.push("Its Modal launcher (sign in with Modal to remove it).".into()) }
+        for a in status["launchers"].as_array().into_iter().flatten().filter(|a| a["cloud"].as_str().is_some_and(|c| records.provider_of(c) == "modal" && !(c == "modal" && matches!(plane, Plane::Modal { .. })))) {
+            let url = a["url"].as_str().unwrap_or_default();
+            match self.modal_of_launcher(url) { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None if a["cloud"] == "modal" => left.push("Its Modal launcher (sign in with Modal to remove it).".into()), None => left.push(format!("Its launcher in the Modal workspace {} (sign in there to remove it).", launcher_workspace(url))) }
         }
         if let (Some(account), false) = (status["aws"]["account_id"].as_str(), matches!(plane, Plane::Aws { .. })) {
             match (&mut self.aws, account) {
@@ -5125,6 +5493,14 @@ mark();load()})();</script>"#;
                 }
                 (false, _) => (match &other { Some(o) => format!("Signed in to account {o}; its role is in {account}"), None => "Sign in to check its role".to_string() }, signin("aws")),
             };
+            rows.push_str(&row("aws", &sub, end));
+        }
+        // Each further AWS account's refusals, by its word: its role is made right with its own sign-in.
+        for a in st["aws_further"].as_array().into_iter().flatten() {
+            let word = a["name"].as_str().unwrap_or_default();
+            let refused = perms["denied"].as_object().into_iter().flatten().filter(|(k, _)| k.strip_prefix(word).is_some_and(|r| r.starts_with(':'))).count();
+            let end = if refused == 0 { ok() } else { pill("bad", "Refused") };
+            let sub = if refused == 0 { format!("Its role in account {}", a["account_id"].as_str().unwrap_or_default()) } else { format!("AWS refused {refused} permission{} in account {}: sign in there and update the control plane", if refused == 1 { "" } else { "s" }, a["account_id"].as_str().unwrap_or_default()) };
             rows.push_str(&row("aws", &sub, end));
         }
         // Cloudflare and Modal: what each sign-in asks for (nothing kept in the account to fall behind).
@@ -5520,6 +5896,7 @@ fn running_on(status: &serde_json::Value, cloud: &str) -> usize {
 fn provider_connected(status: &serde_json::Value, cloud: &str) -> bool {
     match cloud {
         "aws" => status["aws"]["connected"] == true,
+        c if status["aws_further"].as_array().is_some_and(|f| f.iter().any(|a| a["name"] == c)) => status["aws_further"].as_array().is_some_and(|f| f.iter().any(|a| a["name"] == c && a["connected"] == true)),
         c => (status["containers"] == true && status["own_cloud"].as_str().unwrap_or("cloudflare") == c) || status["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c)),
     }
 }
@@ -5527,18 +5904,20 @@ fn provider_connected(status: &serde_json::Value, cloud: &str) -> bool {
 /// Removing a runner provider, confirmed: what is deleted where (the control plane and sign-ins stay), its running jobs,
 /// and the sign-in that needs; or removing it from SuperCI only.
 fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> String {
-    let (logo_key, name) = (cloud.to_string(), cloud_name(cloud).to_string());
+    let provider = v.records().provider_of(cloud).to_string();
+    let (logo_key, name) = (provider.clone(), cloud_name(cloud).to_string());
     let id = v.plane.plane_id();
     let st = v.status.clone().unwrap_or_default();
     let own = st["containers"] == true && st["own_cloud"].as_str().unwrap_or("cloudflare") == cloud;
     let account = aws_account(v).unwrap_or_default();
-    let deleted: Vec<String> = match cloud {
+    let deleted: Vec<String> = match provider.as_str() {
+        "aws" if cloud != "aws" => vec!["Its machines, and their network in each region".into(), format!("The role superci-plane-{id} and its identity provider in that account")],
         "aws" => vec!["Its machines, and their network in each region".into(), if matches!(v.plane, Plane::Aws { .. }) { format!("The machines' policy on the role superci-plane-{id} (the control plane's own role stays)") } else { format!("The role superci-plane-{id} and its identity provider, in account {account}") }],
         _ if own => vec![],
         "modal" => vec![format!("The app superci-runners-{id} in your Modal workspace, and its sandboxes")],
         _ => vec![format!("The launcher superci-runners-{id} in your Cloudflare account, and its containers")],
     };
-    let what = if deleted.is_empty() { format!(r#"<p class="note">Nothing is deleted: your control plane stops starting {}.</p>"#, if cloud == "modal" { "sandboxes" } else { "containers" }) }
+    let what = if deleted.is_empty() { format!(r#"<p class="note">Nothing is deleted: your control plane stops starting {}.</p>"#, if provider == "modal" { "sandboxes" } else { "containers" }) }
         else { format!(r#"<p class="note">Deleted in {name}:</p><ul class="needs">{}</ul>"#, deleted.iter().map(|d| format!("<li><span>{}</span></li>", esc(d))).collect::<String>()) };
     let running = running_on(&st, cloud);
     let (stop, warn) = if running == 0 { (String::new(), String::new()) } else {
@@ -5546,7 +5925,7 @@ fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> St
     };
     let can = own || signed_in.contains(&cloud);
     let main = if can { format!(r#"<button class="button danger sm">{}</button>"#, if running > 0 && !own { format!("Stop {running} and remove") } else { "Remove".into() }) } else { String::new() };
-    let signin = if can { String::new() } else { format!(r#"<div class="dlg-signin"><span class="note">Sign in with {name} to delete these.</span>{}</div>"#, signin_button(cloud, &format!("Sign in with {name}"), true)) };
+    let signin = if can { String::new() } else { format!(r#"<div class="dlg-signin"><span class="note">Sign in with {name} to delete these.</span>{}</div>"#, signin_button(&provider, &format!("Sign in with {name}"), true)) };
     let only = if own { String::new() } else { r#"<button class="button secondary sm" name="only" value="on">Remove from SuperCI only</button>"#.to_string() };
     format!(r#"<dialog class="dlg" id="pool-remove-{i}" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {}?</strong><small>Jobs stop going to {}. Your control plane and your sign-ins stay; adding it back is a click.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>{what}{warn}{signin}<form method="post" action="/runners/remove" class="dlg-foot"><input type="hidden" name="plane" value="{}"><input type="hidden" name="cloud" value="{}">{stop}<button type="button" class="button secondary sm" style="margin-right:auto" onclick="this.closest('dialog').close()">Cancel</button>{only}{main}</form></div></dialog>"#,
         logo(&logo_key, 36), esc(&name), esc(&name), esc(id), esc(cloud))
@@ -5776,7 +6155,7 @@ fn section_title(section: &str) -> &'static str { SECTION_TITLES.iter().find(|(k
 
 
 /// Each place a job can run, as the dashboard names it.
-const CLOUD_NAMES: [(&str, &str); 5] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("machine", "Your computer")];
+const CLOUD_NAMES: [(&str, &str); 6] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), (MODAL_FUNCTIONS, "Modal Functions"), ("machine", "Your computer")];
 
 fn cloud_name(cloud: &str) -> &str { named(&CLOUD_NAMES, cloud) }
 
@@ -5878,8 +6257,41 @@ fetch('/routing'+(qs?'?'+qs:''),{method:'POST',body:body,credentials:'same-origi
 </script>"#;
 
 /// A pool's name in the order: a cloud.
-fn pool_name_ok(name: &str) -> bool {
-    ["aws", AWS_ON_DEMAND, "cloudflare", "modal"].contains(&name)
+fn pool_name_ok(name: &str, records: &Records) -> bool {
+    ["aws", AWS_ON_DEMAND, "cloudflare", "modal", MODAL_FUNCTIONS].contains(&name) || records.runners.iter().any(|r| r.name == name && !r.gone)
+}
+
+/// The workspace a Modal launcher's address is in.
+fn launcher_workspace(url: &str) -> &str { url.strip_prefix("https://").and_then(|u| u.split_once("--")).map_or("", |(w, _)| w) }
+
+/// The word a Modal workspace's launcher goes by: the one it has; `modal` for a control plane's first; else the one
+/// asked for, or the provider and the workspace's name made safe, with a few characters more when that is another's.
+/// A word stays with its account (see `Records`).
+fn modal_word(launchers: &[Launcher], records: &Records, own_modal: bool, workspace: &str, name: &str) -> std::result::Result<String, String> {
+    runner_word("modal", "Modal workspace", &format!("https://{workspace}--"), launchers, records, own_modal, workspace, workspace, name)
+}
+
+/// The same of a Cloudflare account: `sub`, its workers.dev subdomain, is how its launcher's address says it.
+fn cloudflare_word(launchers: &[Launcher], records: &Records, own: bool, id: &str, account_name: &str, sub: &str, name: &str) -> std::result::Result<String, String> {
+    runner_word("cloudflare", "Cloudflare account", &format!(".{sub}.workers.dev"), launchers, records, own, id, account_name, name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runner_word(provider: &str, kind: &str, address: &str, launchers: &[Launcher], records: &Records, own: bool, cloud_id: &str, called: &str, name: &str) -> std::result::Result<String, String> {
+    let had = launchers.iter().find(|a| records.provider_of(&a.cloud) == provider && a.url.contains(address)).map(|a| a.cloud.clone())
+        .or_else(|| records.accounts.iter().find(|a| a.provider == provider && a.cloud_id.as_deref() == Some(cloud_id)).map(|a| a.name.clone()));
+    if let Some(word) = had { return if name.is_empty() || name == word { Ok(word) } else { Err(format!("The {kind} {called} runs jobs as {word}: a word is for good.")) } }
+    if !own && !launchers.iter().any(|a| a.cloud == provider) && (name.is_empty() || name == provider) { return Ok(provider.into()) }
+    let taken = |word: &str| superci_core::plane::CLOUD_NAMES.iter().any(|(c, _)| *c == word) || records.accounts.iter().any(|a| a.name == word) || records.runners.iter().any(|r| r.name == word);
+    if !name.is_empty() {
+        if !superci_core::plane::valid_word(name) { return Err(format!("{}: {}.", name, superci_core::plane::WORD_RULE)) }
+        // (Each AWS and Modal runner has a second by its word: `-on-demand`, `-functions`.)
+        if name.len() > 22 && provider != "cloudflare" { return Err(format!("{name} leaves no room for its second runner: 22 letters at most.")) }
+        return if taken(name) { Err(format!("{name} is another runner's word.")) } else { Ok(name.to_string()) }
+    }
+    let safe: String = called.to_lowercase().chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '-' }).take(21 - provider.len()).collect();
+    let word = format!("{provider}-{}", safe.trim_matches('-'));
+    Ok(if taken(&word) { format!("{}-{}", &word[..word.len().min(17)], &superci_core::crypto::sha256_hex(cloud_id.as_bytes())[..4]) } else { word })
 }
 
 /// One numbered step of Set up: its number (a check once done), its title and what it says or offers.
@@ -5890,11 +6302,14 @@ fn setup_step(n: u8, state: &str, title: String, body: String) -> String {
 /// What a step of Set up waits for.
 fn setup_locked(what: &str) -> String { format!(r#"<div class="locked-note">{}Needs {what} first</div>"#, icon("lock")) }
 
+/// What is said of an image name the control plane does not have (`superci runner_images update`).
+pub fn no_image(name: &str) -> String { format!("There is no image {name} here (`superci runner_images list`). `superci runner_images create {name} --reference=REGISTRY/IMAGE:TAG` adds it.") }
+
 /// The order as a page showed it (`current`: every place, taken out ones too, by name), each with its stored settings,
 /// and any stored place the page did not show after them.
-fn order_as_shown(routing: &Routing, current: &str) -> Vec<Pool> {
+fn order_as_shown(routing: &Routing, current: &str, records: &Records) -> Vec<Pool> {
     let mut order: Vec<Pool> = vec![];
-    for c in current.split(',').filter(|c| pool_name_ok(c)) { if !order.iter().any(|p| p.cloud == c) { order.push(routing.pool(c).cloned().unwrap_or(Pool::of(c))) } }
+    for c in current.split(',').filter(|c| pool_name_ok(c, records)) { if !order.iter().any(|p| p.cloud == c) { order.push(routing.pool(c).cloned().unwrap_or(Pool { off: records.modal_function(c), ..Pool::of(c) })) } }
     for p in &routing.order { if !order.iter().any(|o| o.cloud == p.cloud) { order.push(p.clone()) } }
     order
 }
@@ -5916,10 +6331,15 @@ fn pool_text(v: &PlaneView, pool: &Pool) -> (String, String, String) {
         AWS_ON_DEMAND => ("AWS on-demand".to_string(), format!("On-demand machines of any size, never taken back · x64, arm64{}", at(pool))),
         "cloudflare" => (cloud_name("cloudflare").to_string(), "Containers sized per job · up to 4 CPU, 12 GB, x64".into()),
         "modal" => (cloud_name("modal").to_string(), "Sandboxes · up to 64 CPU, x64".into()),
+        c if v.records().modal_function(c) => (if c == MODAL_FUNCTIONS { cloud_name(c).to_string() } else { c.to_string() }, "Preemptible, at a third of a sandbox's price: a job Modal preempts runs again, down the order · up to 64 CPU, x64".into()),
+        c if v.records().aws_on_demand(c) => (c.to_string(), format!("On-demand machines of any size, never taken back · x64, arm64{}", at(pool))),
+        c if v.records().provider_of(c) == "aws" => (c.to_string(), format!("Spot machines of any size · x64, arm64{}", at(pool))),
+        c if v.records().provider_of(c) == "cloudflare" => (c.to_string(), "Containers sized per job, in a Cloudflare account of its own · up to 4 CPU, 12 GB, x64".into()),
+        c if v.records().provider_of(c) == "modal" => (c.to_string(), format!("Sandboxes in the Modal workspace {} · up to 64 CPU, x64", v.launchers().iter().find(|a| a.cloud == c).map_or("", |a| launcher_workspace(&a.url)))),
         c => (cloud_name(c).to_string(), String::new()),
     };
     // AWS's on-demand machines carry AWS's logo.
-    (superci_core::plane::account_of(&pool.cloud).to_string(), name, what)
+    (v.records().provider_of(&pool.cloud).to_string(), name, what)
 }
 
 /// What each pool can run, for the machine picker: its capacity (the largest machine, systems, standard machine and
@@ -5978,7 +6398,7 @@ fn regions_field(v: &PlaneView, p: &Pool, quotas: &HashMap<String, Result<u32>>,
 /// and has room. Every row is alike (AWS's spot machines, its on-demand ones, Cloudflare, Modal): dragged to reorder,
 /// with its settings in a dialog (jobs at once, a monthly budget, where it starts machines), and taken out of the order
 /// there; one taken out is listed below the order with a way to put it back.
-fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Option<(f64, f64)>, modal_month: Option<&modal::Month>, look: Option<&aws::Look>) -> String {
+fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Option<(f64, f64)>, modal_months: &HashMap<String, modal::Month>, look: Option<&aws::Look>) -> String {
     let order = v.order();
     let jobs = v.jobs();
     let current = order.iter().map(|p| p.cloud.as_str()).collect::<Vec<_>>().join(",");
@@ -6008,15 +6428,27 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         let mut limits = vec![];
         if let Some(n) = p.max_jobs { limits.push(format!("{n} at once")) }
         if let Some(cap) = p.monthly_usd { limits.push(format!("{} of {}", usd(spent), usd(cap))) }
+        // Modal's Functions: their preemptions this month (all of Modal's together).
+        let preempted = v.status.as_ref().and_then(|s| s["preempted"]["month"].as_u64()).unwrap_or(0);
+        if v.records().modal_function(&p.cloud) && preempted > 0 { limits.push(format!("{preempted} preempted · {} run again", v.status.as_ref().and_then(|s| s["preempted"]["rerun"].as_u64()).unwrap_or(0))) }
         let mut limits = limits.iter().map(|l| format!(r#"<span class="lim">{}</span>"#, esc(l))).collect::<String>();
-        limits.push_str(&month_text(&p.cloud, spent, p.monthly_usd.is_none(), cf_month, modal_month));
+        // (Modal's bill is its workspace's own.)
+        let provider = v.records().provider_of(&p.cloud).to_string();
+        let launcher = v.launchers().into_iter().find(|a| a.cloud == v.records().launcher_word(&p.cloud)).map(|a| a.url).unwrap_or_default();
+        let workspace = if launcher.is_empty() { v.plane.workspace().unwrap_or_default() } else { launcher_workspace(&launcher) };
+        // (As a computer of this CI last read it; else as this one has.)
+        let bill = &v.status.as_ref().map(|s| s["bills"][v.records().account_of(&p.cloud)].clone()).unwrap_or_default();
+        let figure = |name: &str| bill[name].as_f64();
+        let kept_cf = figure("metered").zip(figure("billed")).filter(|_| provider == "cloudflare");
+        let kept_modal = figure("metered").zip(figure("billed")).zip(figure("superci")).filter(|_| provider == "modal").map(|((metered, billed), superci)| modal::Month { metered, billed, superci });
+        limits.push_str(&month_text(&provider, spent, p.monthly_usd.is_none(), kept_cf.or(cf_month), kept_modal.as_ref().or(modal_months.get(workspace))));
         rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
             esc(&p.cloud), logo(&logo_key, 32), esc(&name), esc(&what), esc(&name)));
         // Its settings, alike for every row: jobs at once, a monthly budget, and where it starts machines.
         let value = |n: Option<String>| n.map(|n| format!(r#" value="{n}""#)).unwrap_or_default();
         let budget = format!(r#"<label class="field"><span>Monthly budget</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{}></span><small>{} this month. At the budget, jobs go to the next provider.</small></label>"#,
             value(p.monthly_usd.map(|n| format!("{n:.0}"))), usd(spent));
-        let place = if superci_core::plane::account_of(&p.cloud) == "aws" && v.status.as_ref().is_some_and(|s| s.get("aws_regions").is_some()) { regions_field(v, p, quotas, look) }
+        let place = if v.records().provider_of(&p.cloud) == "aws" && v.status.as_ref().is_some_and(|s| s.get("aws_regions").is_some()) { regions_field(v, p, quotas, look) }
             else if p.cloud == "cloudflare" && v.status.as_ref().is_some_and(|s| s.get("cloudflare_location").is_some()) {
                 // Cloudflare: where its containers start.
                 let current = v.status.as_ref().and_then(|s| s["cloudflare_location"].as_str().map(str::to_string)).unwrap_or_else(|| "enam".into());
@@ -6037,7 +6469,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
     };
     // Providers in the order that this control plane has not added (after a move: they belong to the one before).
     let clouds = v.clouds();
-    let missing: Vec<String> = v.routing().order.iter().map(|p| p.cloud.clone()).filter(|c| !c.starts_with("machine:") && !clouds.contains(c) && !(c == AWS_ON_DEMAND && clouds.iter().any(|c| c == "aws"))).collect();
+    let missing: Vec<String> = v.routing().order.iter().map(|p| p.cloud.clone()).filter(|c| !c.starts_with("machine:") && !clouds.contains(c) && !(c == AWS_ON_DEMAND && clouds.iter().any(|c| c == "aws")) && !v.records().modal_function(c)).collect();
     let waiting = if missing.is_empty() { waiting } else {
         format!(r#"{waiting}<div class="waiting">{} {} {} not added to this control plane yet · <a href="/?p=add-runners">Add {}</a></div>"#, pill("open", "Not added"),
             esc(&missing.iter().map(|c| cloud_name(c)).collect::<Vec<_>>().join(", ")), if missing.len() == 1 { "is" } else { "are" }, if missing.len() == 1 { "it" } else { "them" })
@@ -6069,15 +6501,17 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
                 let field = if st.get("cloudflare_location").is_some() { format!(r#"<label class="field"><span>GitHub's full image (experimental)</span><input type="url" name="image" value="{}" placeholder="https://… (empty: the small image)"><small>Jobs then run inside GitHub's own runner image, with everything it has, loaded from this address as it is read and checked piece by piece (an address as <code>image-reader pack</code> names it). Empty: GitHub's small runner image, with few tools.</small></label>"#, esc(&image)) } else { String::new() };
                 (name.clone(), if image.is_empty() { "GitHub's small runner image".into() } else { "GitHub's full image (experimental)".to_string() }, field)
             }
+            c if v.records().provider_of(c) == "aws" => (format!("{c}: AWS account {}", v.records().accounts.iter().find(|a| a.name == *c).and_then(|a| a.cloud_id.clone()).unwrap_or_default()), format!("Set up in {}", regions_text(&v.pool_regions(&Pool::of(c))).replace(", then", ",")), String::new()),
+            c if v.records().provider_of(c) == "cloudflare" => (name.clone(), "Its launcher starts the containers".to_string(), String::new()),
             _ => (name.clone(), "Its launcher starts the sandboxes".to_string(), String::new()),
         };
         let n = 100 + i;
         rows.push_str(&format!(r#"<li class="pool still">{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now"></span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{n}').showModal()">{ICON_GEAR}</button></li>"#,
-            logo(cloud, 32), esc(&title), esc(&what), esc(&if title.contains("account") { title.clone() } else { format!("{title} account") })));
+            logo(v.records().provider_of(cloud), 32), esc(&title), esc(&what), esc(&if title.contains("account") { title.clone() } else { format!("{title} account") })));
         let remove = format!(r#"<button type="button" class="button danger sm" style="margin-right:auto" onclick="this.closest('dialog').close();document.getElementById('pool-remove-{n}').showModal()">Remove…</button>"#);
         let save = if field.is_empty() { String::new() } else { r#"<button class="button primary sm">Save</button>"#.to_string() };
         dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{n}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="account"><input type="hidden" name="cloud" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div>{field}<div class="dlg-foot">{remove}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button>{save}</div></form></dialog>{}"#,
-            esc(cloud), logo(cloud, 36), esc(&title), esc(&what), remove_dialog(v, cloud, n, signed_in)));
+            esc(cloud), logo(v.records().provider_of(cloud), 36), esc(&title), esc(&what), remove_dialog(v, cloud, n, signed_in)));
     }
     // (Shown beside the order, which has a place for each of these clouds: never without a row.)
     format!(r#"<section class="card"><div class="card-head"><h2>Clouds</h2></div><p class="note">The accounts your runners start machines in. Removing one deletes what SuperCI made there.</p><ol class="pools">{rows}</ol>{dialogs}</section>"#)
@@ -6120,13 +6554,23 @@ fn spending_card(v: &PlaneView, lifted_ms: u64) -> String {
     let routing = v.routing();
     let daily = v.daily_limits();
     let estimate = "Limits count the machines jobs ran on, as estimated here. A cloud's bill also has storage and small fees, and jobs already running finish.";
-    struct Row { id: &'static str, action: &'static str, account: &'static str, mark: String, name: String, what: &'static str, month: (f64, Option<f64>), day: (f64, Option<f64>), at_limit: &'static str }
-    let mut rows = vec![Row { id: "all", action: "monthly_usd", account: "", mark: brand_logo(32), name: "Everything".into(), what: "All providers together. At a limit no job starts until it is over.",
+    struct Row { id: String, action: &'static str, account: String, mark: String, name: String, what: &'static str, month: (f64, Option<f64>), day: (f64, Option<f64>), at_limit: &'static str }
+    let mut rows = vec![Row { id: "all".into(), action: "monthly_usd", account: String::new(), mark: brand_logo(32), name: "Everything".into(), what: "All providers together. At a limit no job starts until it is over.",
         month: (v.spend_total(), routing.monthly_usd), day: (v.spend_today_total(), routing.daily_usd), at_limit: "At a limit no job starts, until the month (or the day, UTC) is over or the limit is raised." }];
     let aws = aws_account(v).filter(|_| v.order().iter().any(|p| p.cloud == "aws"));
     if let Some(account) = &aws {
-        rows.push(Row { id: "aws", action: "account_usd", account: "aws", mark: logo("aws", 32), name: format!("AWS account {account}"), what: "Its spot and on-demand machines together. At a limit, jobs go to other providers.",
+        rows.push(Row { id: "aws".into(), action: "account_usd", account: "aws".into(), mark: logo("aws", 32), name: format!("AWS account {account}"), what: "Its spot and on-demand machines together. At a limit, jobs go to other providers.",
             month: (v.spend_account("aws"), routing.account_usd.get("aws").copied()), day: (v.spend_today_account("aws"), routing.account_daily_usd.get("aws").copied()),
+            at_limit: "At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so." });
+    }
+    // Every other account that runs jobs: its runners together.
+    let records = v.records();
+    let mut others: Vec<String> = vec![];
+    v.order().iter().map(|p| records.account_of(&p.cloud).to_string()).filter(|a| a != "aws").for_each(|a| if !others.contains(&a) { others.push(a) });
+    for account in others {
+        let provider = records.accounts.iter().find(|a| a.name == account).map_or(account.as_str(), |a| a.provider.as_str()).to_string();
+        rows.push(Row { id: account.clone(), action: "account_usd", account: account.clone(), mark: logo(&provider, 32), name: if account == provider { format!("{} account", cloud_name(&provider)) } else { account.clone() }, what: "Its runners together. At a limit, jobs go to other providers.",
+            month: (v.spend_account(&account), routing.account_usd.get(&account).copied()), day: (v.spend_today_account(&account), routing.account_daily_usd.get(&account).copied()),
             at_limit: "At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so." });
     }
     // AWS's own budget for the account (see `aws_budget`), and whether its rule is on the control plane's role now:
@@ -6275,7 +6719,7 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         let opts = opts.iter().map(|(val, text)| format!(r#"<option value="{val}"{}>{text}</option>"#, if current == Some(*val) { " selected" } else { "" })).collect::<String>();
         format!(r#"<label class="field"><span>{label}</span><select name="{name}">{}{opts}</select></label>"#, if first.is_empty() { String::new() } else { format!(r#"<option value="">{first}</option>"#) })
     };
-    let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND).map(|p| { let (key, name) = (p.cloud.clone(), cloud_name(&p.cloud).to_string()); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
+    let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND && !v.records().modal_function(&p.cloud)).map(|p| { let (key, name) = (p.cloud.clone(), cloud_name(&p.cloud).to_string()); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
     // The disk's speed on AWS: by the machine's size unless set (what AWS includes, at no extra price, or a number).
     let speed = m.disk_mibs.map(|s| s.to_string());
     let custom = speed.clone().filter(|s| !["125", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
@@ -7287,7 +7731,12 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
             }
         }
     }
-    if let (true, Some(session)) = (comes("modal"), &w.modal) {
+    // (With its own workspace's sign-in: another may be in hand.)
+    let records = view::records_in(&old);
+    let launcher_of = |word: &str| old["launchers"].as_array().into_iter().flatten().find(|a| a["cloud"] == word).and_then(|a| a["url"].as_str()).map(str::to_string);
+    let session_of = |url: &str| w.modals.iter().find(|m| url.starts_with(&format!("https://{}--", m.workspace)));
+    let first = launcher_of("modal").and_then(|url| session_of(&url).cloned()).or_else(|| w.modal.clone());
+    if let (true, Some(session)) = (comes("modal"), &first) {
         match to {
             Plane::Modal { .. } => w.put(to, "CONTAINERS", "on")?,
             _ => {
@@ -7296,6 +7745,34 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
                 launchers.retain(|a| a.cloud != "modal");
                 launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
             }
+        }
+    }
+    // A further runner's launcher, with its workspace's sign-in.
+    for word in records.runners.iter().filter(|r| !r.gone && records.provider_of(&r.name) != "aws").map(|r| r.name.as_str()) {
+        let url = launcher_of(word).unwrap_or_default();
+        let id = records.accounts.iter().find(|a| a.name == records.account_of(word)).and_then(|a| a.cloud_id.clone()).unwrap_or_default();
+        let deployed = match (records.provider_of(word), session_of(&url), &w.cf) {
+            ("modal", Some(session), _) => { let url = modal::deploy_runners(session, to.url(), to.plane_id(), &plane_keys(to.url())?)?; launcher_up(&url); url }
+            ("modal", None, _) => { left.push(format!("{word} stayed behind: sign in to the Modal workspace {} (`superci login modal --add`) and add it again.", launcher_workspace(&url))); continue }
+            (_, _, Some(cf)) if !id.is_empty() => cf.deploy_runners(&id, to.url(), to.plane_id())?,
+            _ => { left.push(format!("{word} stayed behind: sign in with Cloudflare where it runs and add it again.")); continue }
+        };
+        launchers.retain(|a| a.cloud != word);
+        launchers.push(superci_core::plane::Launcher { cloud: word.into(), url: deployed });
+    }
+    // A further AWS account: a role for the new control plane, with its own sign-in.
+    let mut aws_after: Vec<serde_json::Value> = vec![];
+    for a in old["aws_further"].as_array().into_iter().flatten() {
+        let id = a["account_id"].as_str().unwrap_or_default();
+        let word = a["name"].as_str().unwrap_or_default();
+        match w.aws_all.iter().find(|(s, _)| s == id) {
+            Some((_, creds)) => {
+                aws::connect_runners(creds, id, to.url(), to.plane_id(), AUDIENCE)?;
+                let regions: Vec<String> = a["regions"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+                aws::make_further_networks(creds, to.plane_id(), &regions)?;
+                aws_after.push(serde_json::json!({ "name": word, "accountId": id, "region": a["region"], "regions": regions }));
+            }
+            None => left.push(format!("{word} stayed behind: sign in to AWS account {id} (`superci login aws --add`) and add it again.")),
         }
     }
     // AWS: a Cloudflare control plane assumes its own role in the account (one in AWS uses its own).
@@ -7312,6 +7789,18 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     for c in plan { if let Carry::Cannot(p, why) = c { left.push(format!("{} runners stayed behind: {why}.", cloud_name(p))) } }
     if launchers.len() != launchers_before || plan.iter().any(|c| matches!(c, Carry::Comes("cloudflare") | Carry::Comes("modal"))) {
         carry_settings(w, to, key, &mut kept, None, Some(json_value(&launchers)))?;
+    }
+    // (The further accounts and runners, deleted ones too: what they spent came along. Only a control plane that keeps
+    // settings has them.)
+    if let Some(now) = &mut kept {
+        let mut after = now.clone();
+        (after["accounts"], after["runners"]) = (json_value(&records.accounts), json_value(&records.runners));
+        if let Err(conflicts) = cloudflare::plane_settings(to.url(), key, &superci_core::settings::diff(now, &after, false))? { return Err(meanwhile(&conflicts)) }
+        *now = after;
+    }
+    for body in &aws_after {
+        let mut said = String::new();
+        if tries(12, 3000, || match cloudflare::plane_post(to.url(), key, "/aws/accounts", body) { Ok(v) if v["connected"] == true => Some(()), Ok(v) => { said = v["error"].as_str().unwrap_or_default().to_string(); None } Err(e) => { said = e; None } }).is_none() { left.push(format!("{}: AWS did not let the new control plane use its role yet ({said}): add it again in a minute.", body["name"].as_str().unwrap_or_default())) }
     }
     // The new one says each provider it was given is there, before any job is sent to it: a control plane given its
     // containers a moment ago starts again with them, and until it has, a job for them would find none.
@@ -8398,7 +8887,7 @@ mod tests {
         let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status) };
         // This month as the clouds bill it: Cloudflare's account within its included usage, Modal's after credits.
         d.cf_month = Some((0.9, 0.0));
-        d.modal_month = Some(modal::Month { metered: 3.0, billed: 1.0, superci: 1.5 });
+        d.modal_months.insert("acme".into(), modal::Month { metered: 3.0, billed: 1.0, superci: 1.5 });
         // In an AWS account whose organization allows no spot machines (as a project of AWS's new sign-up answered),
         // the spot provider says so in "ready"'s place.
         d.aws = Some(aws::Session::for_test("111111111111"));
@@ -8879,7 +9368,7 @@ mod tests {
         // Not signed in to that cloud at all: the existing "Sign in with … first" says it, not this check.
         assert!(Own::default().check(&theirs).is_ok());
         // The dashboard's own writers carry it: a setting of another account's control plane is refused before any call.
-        let writer = Writer { cf: None, aws: None, modal: None, own: own.clone() };
+        let writer = Writer { cf: None, aws: None, modal: None, modals: vec![], aws_all: vec![], own: own.clone() };
         assert!(writer.put(&theirs, "ROUTING", "{}").unwrap_err().starts_with("This control plane is in AWS account 222222222222") && writer.drop(&theirs, "ROUTING").is_err());
     }
 
@@ -8920,7 +9409,7 @@ mod tests {
         assert!(renames(&serde_json::json!({ "agents": [] }), &[]).0.is_empty());
         // What a control plane from before steered jobs by: said with its update, with the label that does it now.
         let said = |routing: serde_json::Value| steered_before(&serde_json::json!({ "label": "acmeci", "routing": routing }));
-        assert_eq!(said(serde_json::json!({ "rules": [{ "repo": "acme/*", "cloud": "cloudflare" }, { "repo": "broken" }], "default": "aws", "order": [{ "cloud": "aws" }] })), "Repository rules are gone. acme/* only used Cloudflare: a workflow says that now with `runs-on: acmeci/provider=cloudflare`.");
+        assert_eq!(said(serde_json::json!({ "rules": [{ "repo": "acme/*", "cloud": "cloudflare" }, { "repo": "broken" }, { "cloud": "aws" }], "default": "aws", "order": [{ "cloud": "aws" }] })), "Repository rules are gone. acme/* only used Cloudflare: a workflow says that now with `runs-on: acmeci/provider=cloudflare`.");
         assert_eq!(said(serde_json::json!({ "default": "modal", "order": [] })), "Repository rules are gone. Every repository only used Modal: a workflow says that now with `runs-on: acmeci/provider=modal`.");
         assert_eq!(said(serde_json::json!({ "default": "modal" })), "Repository rules are gone. Every repository only used Modal: a workflow says that now with `runs-on: acmeci/provider=modal`.");
         assert_eq!(steered_before(&serde_json::json!({ "routing": { "rules": [{ "repo": "a/b", "cloud": "modal" }] } })), "Repository rules are gone. a/b only used Modal: a workflow says that now with `runs-on: superci/provider=modal`.");
@@ -9831,7 +10320,7 @@ mod rest_tests {
     fn a_control_plane_known_only_from_afar_is_changed_nowhere() {
         // Its settings are written nowhere: by the dashboard, or in the background.
         let seen = seen_plane("p3", NOWHERE);
-        let writer = Writer { cf: None, aws: None, modal: None, own: Own::default() };
+        let writer = Writer { cf: None, aws: None, modal: None, modals: vec![], aws_all: vec![], own: Own::default() };
         assert_eq!(writer.put(&seen, "NAME", "x").unwrap_err(), "Sign in where this control plane runs first.");
         assert_eq!(writer.drop(&seen, "NAME").unwrap_err(), "Sign in where this control plane runs first.");
         assert!(writer.names(&seen).is_empty() && writer.names(&modal_plane("p2", NOWHERE)).is_empty() && writer.names(&cf_plane("p1", NOWHERE)).is_empty());
@@ -10045,6 +10534,86 @@ mod rest_tests {
     }
 
     #[test]
+    fn an_image_of_ones_own_is_checked_before_it_is_written_and_needs_a_control_plane_that_keeps_it() {
+        let add = |d: &mut Dashboard, name: &str, reference: &str, secret: &str| send(d, "/routing", &[("action", "image_add"), ("name", name), ("reference", reference), ("modal_secret", secret)]);
+        // A control plane from before images of one's own would drop it unsaid.
+        let mut d = modal_answering(serde_json::json!({ "routing": {} }));
+        let r = add(&mut d, "rust-ci", "ghcr.io/acme/ci:1", "").unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("Images of your own need a newer control plane"), "{}", words_of(&r));
+        let mut d = modal_answering(serde_json::json!({ "routing": {}, "runner_images": true }));
+        for (name, reference, secret, says) in [("Rust", "ghcr.io/acme/ci:1", "", "Check the image's name"), ("ubuntu-ci", "ghcr.io/acme/ci:1", "", "begins with ubuntu"),
+            ("rust-ci", "", "", "Check the image's address"), ("rust-ci", "ghcr.io/acme/ci:1 --privileged", "", "Check the image's address"), ("rust-ci", "https://ghcr.io/acme/ci", "", "Check the image's address"),
+            ("rust-ci", "ghcr.io/acme/ci:1", "a secret", "Check the Modal Secret's name")] {
+            let r = add(&mut d, name, reference, secret).unwrap();
+            assert!(r.status == 400 && words_of(&r).contains(says), "{name} {reference}: {}", words_of(&r));
+        }
+        // What can be taken stops at writing it, without a sign-in to Modal.
+        for (reference, secret) in [("ghcr.io/acme/ci:1", ""), ("ghcr.io/acme/ci@sha256:0f1e", "ghcr-read"), ("acme/node-ci:22", "")] {
+            assert_eq!(add(&mut d, "rust-ci", reference, secret).err().as_deref(), Some("Sign in with Modal first."), "{reference}");
+        }
+        let mut d = modal_answering(serde_json::json!({ "routing": { "images": { "rust-ci": { "reference": "ghcr.io/acme/ci:1" } } }, "runner_images": true }));
+        assert_eq!(send(&mut d, "/routing", &[("action", "image_remove"), ("name", "rust-ci")]).err().as_deref(), Some("Sign in with Modal first."));
+    }
+
+    /// Modal's Functions, a row of their own: only on a control plane that keeps them, deployed in that workspace before
+    /// the row goes on (and again before an image is added), not taken out by a deploy, removed only with their runner.
+    #[test]
+    fn modals_functions_are_a_row_checked_and_deployed_before_it_goes_on() {
+        let put_back = |d: &mut Dashboard, cloud: &str| send(d, "/routing", &[("action", "put_back"), ("cloud", cloud), ("current", cloud)]);
+        let mut d = modal_answering(serde_json::json!({ "routing": {} }));
+        let r = put_back(&mut d, "modal-functions").unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("Modal's Functions need a newer control plane"), "{}", words_of(&r));
+        let further = serde_json::json!({ "accounts": [{ "name": "modal-initech", "provider": "modal", "cloud_id": "initech" }], "runners": [{ "name": "modal-initech", "account": "modal-initech" }, { "name": "modal-initech-functions", "account": "modal-initech", "function": true }],
+            "launchers": [{ "cloud": "modal-initech", "url": "https://initech--superci-runners-p2.modal.run" }, { "cloud": "modal", "url": "https://acme--superci-runners-p2.modal.run" }] });
+        let with = |more: serde_json::Value| { let mut status = further.clone(); more.as_object().unwrap().iter().for_each(|(k, v)| status[k] = v.clone()); status };
+        let mut d = modal_answering(with(serde_json::json!({ "routing": {}, "function_mode": true })));
+        // Its Functions first, with that workspace's sign-in, whichever way the row goes on.
+        assert_eq!(put_back(&mut d, "modal-initech-functions").err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
+        assert_eq!(put_back(&mut d, "modal-functions").err().as_deref(), Some("Sign in with Modal to the workspace acme first: `superci login modal --add`."));
+        let r = send(&mut d, "/routing", &[("action", "order"), ("cloud_0", "modal-functions"), ("cloud_1", "modal")]);
+        assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace acme first: `superci login modal --add`."));
+        // Taken out, or on already: straight to the one write.
+        let on = || with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech-functions" }, { "cloud": "modal" }] }, "function_mode": true }));
+        let mut d = modal_answering(on());
+        assert_eq!(send(&mut d, "/routing", &[("action", "take_out"), ("cloud", "modal-initech-functions")]).err().as_deref(), Some("Sign in with Modal first."));
+        let mut d = modal_answering(on());
+        assert_eq!(send(&mut d, "/routing", &[("action", "pool"), ("cloud", "modal-initech-functions"), ("max", "2")]).err().as_deref(), Some("Sign in with Modal first."));
+        // An image added while the row is on: its Function there first.
+        let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech-functions" }] }, "runner_images": true, "function_mode": true })));
+        let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
+        assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
+        // Its own sandboxes switched on again, with the row on: its Functions first.
+        let own = serde_json::json!({ "routing": { "order": [{ "cloud": "modal-functions" }] }, "function_mode": true });
+        let mut d = modal_answering(own);
+        assert!(send(&mut d, "/runners/modal-own", &[]).is_err_and(|e| e.contains("Sign in with Modal to the workspace")));
+        // Its row goes with its runner.
+        let mut d = modal_answering(on());
+        let r = send(&mut d, "/runners/remove", &[("cloud", "modal-initech-functions")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("modal-initech-functions goes with modal-initech"), "{}", words_of(&r));
+    }
+
+    #[test]
+    fn an_image_changes_in_place_only_when_the_control_plane_has_it_by_that_name() {
+        let update = |d: &mut Dashboard, fields: &[(&str, &str)]| send(d, "/routing", &[&[("action", "image_update")][..], fields].concat());
+        let mut d = modal_answering(serde_json::json!({ "routing": { "images": { "rust-ci": { "reference": "ghcr.io/acme/ci:1", "modal_secret": "ghcr-read" } } }, "runner_images": true }));
+        // A name it does not have: refused, saying how to add it; nothing written.
+        let r = update(&mut d, &[("name", "gone"), ("reference", "ghcr.io/acme/ci:2")]).unwrap();
+        assert!(r.status == 404 && words_of(&r).contains("There is no image gone here (`superci runner_images list`)"), "{}", words_of(&r));
+        // What it says is checked as a new one's is; what it leaves out is kept, so it is checked too.
+        for (fields, says) in [(&[("name", "rust-ci"), ("reference", "https://ghcr.io/acme/ci")][..], "Check the image's address"), (&[("name", "rust-ci"), ("modal_secret", "a secret")], "Check the Modal Secret's name")] {
+            let r = update(&mut d, fields).unwrap();
+            assert!(r.status == 400 && words_of(&r).contains(says), "{fields:?}: {}", words_of(&r));
+        }
+        // A new tag, a Secret taken off (empty), or both: each goes as far as the one write, without a sign-in to Modal.
+        for fields in [&[("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:2")][..], &[("name", "rust-ci"), ("modal_secret", "")], &[("name", "rust-ci"), ("reference", "ghcr.io/acme/ci@sha256:0f1e"), ("modal_secret", "ghcr-other")]] {
+            assert_eq!(update(&mut d, fields).err().as_deref(), Some("Sign in with Modal first."), "{fields:?}");
+        }
+        // A control plane from before images of one's own has none to change.
+        let mut d = modal_answering(serde_json::json!({ "routing": {} }));
+        assert_eq!(update(&mut d, &[("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:2")]).unwrap().status, 409);
+    }
+
+    #[test]
     fn the_kept_control_plane_is_read_with_its_key_also_when_it_is_listed_no_more() {
         let url = plane_answering(serde_json::json!({ "jobs": [] }));
         let mut d = Dashboard::new();
@@ -10196,7 +10765,7 @@ mod rest_tests {
     #[test]
     fn a_places_budget_and_a_repository_without_its_name_are_shown() {
         let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": { "order": [{ "cloud": "aws", "monthly_usd": 50.0, "max_jobs": 4 }] } })) };
-        let card = pools_card(&v, &HashMap::new(), None, None, None);
+        let card = pools_card(&v, &HashMap::new(), None, &HashMap::new(), None);
         assert!(card.contains(r#"name="usd" min="1" step="1" placeholder="No limit" value="50""#) && card.contains("4 at once"), "{card}");
         let cache = plain(&cache_card(&v, Some(&serde_json::json!({ "now_ms": 1, "repos": [{ "id": "gh123", "entries": 1, "bytes": 10, "used_ms": 1 }] }))));
         assert!(cache.contains("Repository 123"), "{cache}");
@@ -10295,7 +10864,7 @@ mod rest_tests {
         let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": {} })) };
         assert!(plain(&cache_card(&v, Some(&serde_json::json!({ "now_ms": 1, "repos": [], "images": { "layers": 3, "bytes": 2_000_000 } })))).contains("3 layers kept now (2.0 MB)."));
         let v = seen_as(cf_plane("p1", NOWHERE), serde_json::json!({ "cloudflare_location": null, "containers": true, "routing": { "order": [{ "cloud": "cloudflare" }] } }));
-        assert!(pools_card(&v, &HashMap::new(), None, None, None).contains(r#"<option value="enam" selected>"#));
+        assert!(pools_card(&v, &HashMap::new(), None, &HashMap::new(), None).contains(r#"<option value="enam" selected>"#));
         // What GitHub's App asks for anew of a control plane from before versions were said.
         let first = PlaneView { version: Some("0.0.1".into()), ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "gitlab": { "url": "https://gitlab.com" } })) };
         assert!(new_needs(&first, &[]).iter().any(|(cloud, _)| *cloud == "gitlab"));
@@ -10326,6 +10895,299 @@ mod rest_tests {
         // With its key: read as it answers (here not at all).
         d.keyed.insert("p0".into());
         assert!(d.current().unwrap().is_some_and(|v| !v.online));
+    }
+
+    /// `superci login modal --add`: another Modal workspace goes beside those signed in to, is kept with them, and the
+    /// one in hand follows the control plane in use. By #6, Taras Kornichuk.
+    #[test]
+    fn modal_workspaces_are_kept_beside_each_other_and_the_control_planes_is_in_hand() {
+        let f = Folder::new("modal-more");
+        let store = Store::at(f.0.join("workspaces/default"));
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.modal = Some(modal_session("acme"));
+        // Signed in again with --add: not done until one comes back.
+        (d.adding, d.task) = (true, Some(Task::Login(Some("modal"))));
+        assert!(d.task_done().is_none());
+        d.came_modal(modal_session("acme-two"));
+        d.came_modal(modal_session("acme-three"));
+        // The same workspace again: its token is renewed, not listed twice.
+        d.came_modal(modal::Session { token_id: "ak-new".into(), ..modal_session("acme-two") });
+        let workspaces = |d: &Dashboard| d.modal_accounts().iter().map(|m| m.workspace.clone()).collect::<Vec<_>>();
+        assert_eq!(workspaces(&d), ["acme", "acme-three", "acme-two"]);
+        assert!(d.task_done().is_some_and(|t| t.contains("Modal workspace acme, Modal workspace acme-three, Modal workspace acme-two")), "{:?}", d.task_done());
+        assert_eq!(d.other_accounts_signed_in().iter().filter(|(c, _)| *c == "modal").count(), 3);
+        assert_eq!((d.modal_for("acme-two").map(|m| m.token_id.as_str()), d.modal_for("globex").is_none()), (Some("ak-new"), true));
+        assert_eq!(d.modal_of_launcher("https://acme-three--superci-runners-p1.modal.run").map(|m| m.workspace.as_str()), Some("acme-three"));
+        assert!(d.modal_of_launcher("https://globex--superci-runners-p1.modal.run").is_none());
+        // Kept, and read back as they were, the kept control plane's in hand.
+        d.planes = vec![modal_plane("p1", NOWHERE)];
+        d.select(0);
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        d.keep();
+        let again = Dashboard::signed_in(Some(store.clone()));
+        assert_eq!((again.modal.as_ref().map(|m| m.workspace.clone()), workspaces(&again)), (Some("acme".into()), vec!["acme".to_string(), "acme-three".into(), "acme-two".into()]));
+        // Written by another process: taken in, in hand as it was.
+        let mut other = Dashboard::signed_in(Some(store.clone()));
+        other.came_modal(modal_session("acme-four"));
+        other.keep();
+        d.take_in();
+        assert_eq!(d.modal_accounts().len(), 4);
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        // Only another workspace beside the one in hand, written by another process: taken in all the same.
+        let mut here = Dashboard::signed_in(Some(store.clone()));
+        let mut beside: crate::store::Kept = serde_json::from_str(&here.kept_as).unwrap();
+        beside.modal_more.push(modal_session("acme-five"));
+        store.write(&beside).unwrap();
+        here.take_in();
+        assert_eq!(here.modal_accounts().len(), 5);
+        // A control plane in a workspace kept: its sign-in in hand; in one not kept: as it was.
+        d.hold_workspace("globex");
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        d.hold_workspace("acme-two");
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme-two"));
+        // Signed out: every one of them.
+        let said = d.sign_out().unwrap();
+        assert!(said.iter().any(|s| s.contains("SuperCI's Modal token is removed here")) && d.modal_accounts().is_empty(), "{said:?}");
+        d.modal_others = vec![modal_session("acme")];
+        assert!(d.sign_out().unwrap().iter().any(|s| s.contains("SuperCI's Modal token is removed here")));
+    }
+
+    /// A Modal workspace's word for its runner, and what cannot be one (see `Records`).
+    #[test]
+    fn a_modal_runners_word_stays_with_its_workspace() {
+        let launcher = |word: &str, workspace: &str| Launcher { cloud: word.into(), url: format!("https://{workspace}--superci-runners-p1.modal.run") };
+        let none = Records::default();
+        let first = [launcher("modal", "acme")];
+        // The first of a control plane elsewhere; its own again; one asked for as `modal`.
+        assert_eq!(modal_word(&[], &none, false, "acme", ""), Ok("modal".to_string()));
+        assert_eq!(modal_word(&[], &none, false, "acme", "modal"), Ok("modal".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "acme", ""), Ok("modal".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "acme", "modal"), Ok("modal".to_string()));
+        assert!(modal_word(&first, &none, false, "acme", "other").is_err_and(|e| e.contains("runs jobs as modal")));
+        // A further one: from its name, made safe; or as asked. In a Modal control plane, even the first.
+        assert_eq!(modal_word(&first, &none, false, "Acme_Two-", ""), Ok("modal-acme-two".to_string()));
+        assert_eq!(modal_word(&[], &none, true, "acme", ""), Ok("modal-acme".to_string()));
+        assert_eq!(modal_word(&[], &none, false, "acme", "staging"), Ok("staging".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "two", "staging"), Ok("staging".to_string()));
+        assert_eq!(modal_word(&first, &none, false, "a-very-long-workspace-name-that-goes-on", "").map(|w| w.len() <= 32), Ok(true));
+        assert!(modal_word(&first, &none, false, "two", "No Way").is_err_and(|e| e.contains("a word is")));
+        // Another's: said when asked for; a few characters more when it was only the default. Its own, deleted: back.
+        let records = Records { accounts: vec![Account { name: "modal-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![RunnerRecord { name: "modal-two".into(), account: "modal-two".into(), gone: true, on_demand: false, function: false }] };
+        assert!(modal_word(&first, &records, false, "other", "modal-two").is_err_and(|e| e.contains("another runner's word")));
+        assert!(modal_word(&first, &records, false, "other", "cloudflare").is_err_and(|e| e.contains("another runner's word")));
+        assert!(modal_word(&first, &records, false, "two", "").is_ok_and(|w| w.starts_with("modal-two-") && w.len() == 14));
+        assert_eq!(modal_word(&first, &records, false, "acme-two", ""), Ok("modal-two".to_string()));
+        assert_eq!(launcher_workspace("https://acme--x.modal.run"), "acme");
+        // A Cloudflare account: by its address, or kept; a Cloudflare control plane's own containers are the first.
+        let there = [Launcher { cloud: "cloudflare".into(), url: "https://superci-runners-p1.acme.workers.dev".into() }];
+        assert_eq!(cloudflare_word(&there, &none, false, "a1", "Acme", "acme", ""), Ok("cloudflare".to_string()));
+        assert_eq!(cloudflare_word(&there, &none, false, "a2", "Globex Inc", "globex", ""), Ok("cloudflare-globex-inc".to_string()));
+        assert_eq!(cloudflare_word(&[], &none, false, "a2", "Globex", "", ""), Ok("cloudflare".to_string()));
+        assert_eq!(cloudflare_word(&[], &none, true, "a2", "Globex", "", ""), Ok("cloudflare-globex".to_string()));
+        // (A Modal launcher is no Cloudflare one, whatever its address.)
+        assert_eq!(cloudflare_word(&first, &none, false, "a2", "Globex", "acme", ""), Ok("cloudflare".to_string()));
+        assert_eq!((launcher_workspace("https://nothing.modal.run"), launcher_workspace("nothing")), ("", ""));
+    }
+
+    /// A status with further Modal, Cloudflare and AWS runners, for the pages and forms below.
+    fn with_further_all(more: serde_json::Value) -> serde_json::Value {
+        let mut status = serde_json::json!({
+            "settings": true, "function_mode": true, "account_limits": true, "daily_limits": true, "runner_images": true, "own_cloud": "cloudflare", "containers": false, "jobs": [],
+            "aws": { "account_id": "123456789012", "region": "us-east-1", "connected": true },
+            "accounts": [{ "name": "modal-two", "provider": "modal", "cloud_id": "two" }, { "name": "cf-two", "provider": "cloudflare", "cloud_id": "a2" }, { "name": "aws-two", "provider": "aws", "cloud_id": "222222222222" }],
+            "runners": [{ "name": "modal-two", "account": "modal-two" }, { "name": "cf-two", "account": "cf-two" }, { "name": "aws-two", "account": "aws-two" }, { "name": "aws-two-on-demand", "account": "aws-two", "on_demand": true }, { "name": "modal-old", "account": "modal-two", "gone": true }, { "name": "modal-two-functions", "account": "modal-two", "function": true }, { "name": "modal-old-functions", "account": "modal-two", "gone": true, "function": true }],
+            "aws_further": [{ "name": "aws-two", "account_id": "222222222222", "region": "us-east-1", "regions": ["us-east-1"], "role_arn": "r", "connected": true, "error": null }, { "name": "aws-down", "account_id": "333333333333", "region": "us-east-1", "regions": [], "role_arn": "r", "connected": false, "error": "no" }],
+            "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners-p2.modal.run" }, { "cloud": "modal-two", "url": "https://two--superci-runners-p2.modal.run" }, { "cloud": "cf-two", "url": "https://superci-runners-p2.two.workers.dev" }],
+            "routing": { "order": [{ "cloud": "aws" }, { "cloud": "aws-two" }, { "cloud": "modal-two-functions" }, { "cloud": "modal-two" }, { "cloud": "modal" }, { "cloud": "cf-two" }] },
+            "permissions": { "denied": {} } });
+        more.as_object().unwrap().iter().for_each(|(k, v)| status[k] = v.clone());
+        status
+    }
+
+    /// What each page and word says of further runners, whichever cloud its control plane is in.
+    #[test]
+    fn further_runners_on_each_page_and_in_each_word() {
+        // A further AWS account asked of no control plane, or of one that does not answer.
+        assert!(send(&mut Dashboard::new(), "/runners/aws", &[("account", "222222222222"), ("region", "eu-west-1")]).is_err());
+        let mut d = Dashboard::new();
+        d.planes = vec![aws_plane("p0", NOWHERE)];
+        let r = send(&mut d, "/runners/aws", &[("account", "222222222222"), ("region", "eu-west-1")]).unwrap();
+        assert!(r.status == 503 && words_of(&r).contains("The control plane did not answer yet"), "{}", words_of(&r));
+        // Limits with AWS alone: no other account's row.
+        let card = plain(&spending_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "account_limits": true, "aws": { "account_id": "123456789012" }, "routing": { "order": [{ "cloud": "aws" }] } })), 0));
+        assert!(card.contains("All providers together") && !card.contains("Modal account") && !card.contains("Cloudflare account"), "{card}");
+        // Spend a control plane says that is not a number: none.
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "spend": { "aws": "a lot", "modal": 1.0 }, "spend_today": { "aws": null, "modal": 2.0 } }));
+        assert_eq!((v.spend_account("modal"), v.spend_today_account("modal"), v.spend_account("aws")), (1.0, 2.0, 0.0));
+        // A second Cloudflare account beside a control plane in Cloudflare: not its own Worker's containers, but a launcher
+        // under a word of its own, which a control plane from before cannot keep.
+        let mut d = Dashboard::new();
+        d.planes = vec![cf_plane("p1", &plane_answering(serde_json::json!({ "routing": {}, "launchers": [] })))];
+        d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": 4102444800000u64 })).unwrap());
+        d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Globex".into())];
+        let r = send(&mut d, "/runners/cloudflare", &[("account", "a2")]).unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("A further runner needs a newer control plane"), "{}", words_of(&r));
+        // Modal's Functions: their row says this month's preemptions; a word too long for a second row is refused only
+        // where a runner has one; Cloudflare's has none.
+        let v = seen_as(modal_plane("p2", NOWHERE), with_further_all(serde_json::json!({ "preempted": { "month": 2, "rerun": 1 } })));
+        let card = plain(&pools_card(&v, &HashMap::new(), None, &HashMap::new(), None));
+        assert!(card.contains("2 preempted · 1 run again"), "{card}");
+        assert!(!plain(&machines_card(&v).1).contains("modal-two-functions"));
+        let (long, none) = ("a-word-of-twenty-three-c", Records::default());
+        assert_eq!(cloudflare_word(&[], &none, true, "a2", "Globex", "", long), Ok(long.to_string()));
+        assert!(modal_word(&[], &none, false, "two", long).is_err_and(|e| e.contains("no room for its second runner")));
+        // Bills: a workspace's only by a Modal runner of it; a control plane's own only when it runs in Modal.
+        let month = modal::Month { metered: 1.0, billed: 1.0, superci: 1.0 };
+        let elsewhere = serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "cf-two", "url": "https://acme--superci-runners-p2.modal.run" }],
+            "accounts": [{ "name": "cf-two", "provider": "cloudflare", "cloud_id": "a2" }], "runners": [{ "name": "cf-two", "account": "cf-two" }] });
+        assert!(bills_of(&seen_as(modal_plane("p2", NOWHERE), elsewhere.clone()), &elsewhere, &[("acme".to_string(), month)], &[]).is_empty());
+        // A further AWS account's machine started in its region is said as AWS's, by that.
+        assert!(job_start(&serde_json::json!({ "cloud": "aws-two", "region": "us-east-1", "machine_id": "i-1", "at_ms": 1, "asked_ms": 2, "launched_ms": 3 })).to_string().contains("AWS gave a machine"));
+        // The same workspace signed in again: one sign-in, none left over.
+        let session = || modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() };
+        let mut d = Dashboard::new();
+        d.came_modal(session());
+        d.came_modal(session());
+        assert!(d.modal_others.is_empty());
+        // A job on a further AWS account's machine is AWS's, by its region; one elsewhere is not.
+        assert!(job_disk(&serde_json::json!({ "cloud": "aws-two", "region": "us-east-1", "disk_gb": 60 })).is_object());
+        assert!(job_disk(&serde_json::json!({ "cloud": "modal-two", "disk_gb": 60 })).is_null());
+        // A run with its first attempt taken back and nothing after it yet is going; with its next, as that one is.
+        let taken = serde_json::json!({ "job_id": 1, "run_id": 7, "repo": "acme/a", "provider": "local", "state": "failed", "interrupted": true, "at_ms": now_ms(), "ended_ms": now_ms() });
+        assert_eq!(runs_of(std::slice::from_ref(&taken))[0]["state"], "running");
+        let next = serde_json::json!({ "job_id": 2, "run_id": 7, "repo": "acme/a", "provider": "local", "state": "done", "conclusion": "success", "no_spot": true, "at_ms": now_ms(), "ended_ms": now_ms() });
+        assert_eq!(runs_of(&[taken.clone(), next])[0]["state"], "passed");
+        // Words: a name with capitals and digits made safe; taken by a runner with no account, or a kept one.
+        let none = Records::default();
+        assert_eq!(modal_word(&[Launcher { cloud: "modal".into(), url: "https://acme--x.modal.run".into() }], &none, false, "Two2", ""), Ok("modal-two2".to_string()));
+        let runner_only = Records { accounts: vec![], runners: vec![RunnerRecord { name: "modal-two".into(), account: "modal".into(), gone: false, on_demand: false, function: false }] };
+        assert!(modal_word(&[Launcher { cloud: "modal".into(), url: "https://acme--x.modal.run".into() }], &runner_only, false, "two", "").is_ok_and(|w| w.starts_with("modal-two-")));
+        let other_provider = Records { accounts: vec![Account { name: "cf-two".into(), provider: "cloudflare".into(), cloud_id: Some("two".into()) }], runners: vec![] };
+        assert_eq!(modal_word(&[], &other_provider, false, "two", ""), Ok("modal".to_string()), "an id of another provider's is not this one's");
+        // A pool's name: a further runner's; a deleted one's no more.
+        let records = view::records_in(&with_further_all(serde_json::json!({})));
+        assert!(pool_name_ok("modal-two", &records) && !pool_name_ok("modal-old", &records) && !pool_name_ok("nothing", &records));
+        // What is connected: a further AWS account by its connection.
+        let status = with_further_all(serde_json::json!({}));
+        assert!(provider_connected(&status, "aws-two") && !provider_connected(&status, "aws-down") && provider_connected(&status, "modal-two") && !provider_connected(&status, "cloudflare"));
+        // Bills, by word: each Modal workspace's and Cloudflare account's; a workspace it has no launcher in, none; Cloudflare's first with what has no record.
+        let v = seen_as(aws_plane("p2", NOWHERE), status.clone());
+        let month = modal::Month { metered: 1.0, billed: 0.5, superci: 0.25 };
+        let bills = bills_of(&v, &status, &[("two".to_string(), month.clone()), ("elsewhere".to_string(), month.clone())], &[("a2".to_string(), (2.0, 1.0)), ("a9".to_string(), (3.0, 1.0))]);
+        assert_eq!((bills.get("modal-two").map(|b| b["superci"].clone()), bills.get("cf-two").map(|b| b["metered"].clone()), bills.contains_key("cloudflare")), (Some(serde_json::json!(0.25)), Some(serde_json::json!(2.0)), false), "{bills:?}");
+        let own = with_further_all(serde_json::json!({ "containers": true, "own_cloud": "modal", "launchers": [{ "cloud": "cloudflare", "url": "https://superci-runners-p2.acme.workers.dev" }] }));
+        let v = seen_as(modal_plane("p2", NOWHERE), own.clone());
+        let bills = bills_of(&v, &own, &[("acme".to_string(), month.clone()), ("other".to_string(), month.clone())], &[("a9".to_string(), (3.0, 1.0))]);
+        assert_eq!((bills.len(), bills["modal"]["superci"].clone(), bills["cloudflare"]["metered"].clone()), (2, serde_json::json!(0.25), serde_json::json!(3.0)), "{bills:?}");
+        let cf_own = with_further_all(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [] }));
+        let v = seen_as(cf_plane("p2", NOWHERE), cf_own.clone());
+        assert!(bills_of(&v, &cf_own, &[("acme".to_string(), month.clone())], &[("a1".to_string(), (1.0, 0.0))]).contains_key("cloudflare"));
+        // The Runners and Add pages, on a control plane in each cloud, with every kind of sign-in beside it.
+        let mut status = status;
+        status["launchers"].as_array_mut().unwrap().push(serde_json::json!({ "cloud": "cloudflare", "url": "https://superci-runners-p2.acme.workers.dev" }));
+        // (Accounts whose runners were removed are offered again; one not signed in to is not.)
+        for (word, provider, id) in [("aws-gone", "aws", "555555555555"), ("cf-gone", "cloudflare", "a4"), ("aws-far", "aws", "999999999999")] {
+            status["accounts"].as_array_mut().unwrap().push(serde_json::json!({ "name": word, "provider": provider, "cloud_id": id }));
+            status["runners"].as_array_mut().unwrap().push(serde_json::json!({ "name": word, "account": word, "gone": true }));
+        }
+        for (plane, say) in [(aws_plane("p2", &plane_answering(status.clone())), "Runner providers"), (cf_plane("p2", &plane_answering(status.clone())), "Runner providers"), (modal_plane("p2", &plane_answering(status.clone())), "Runner providers")] {
+            let mut d = Dashboard::new();
+            d.modal = Some(modal_session("two"));
+            d.modal_others = vec![modal_session("three")];
+            d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": 4102444800000u64 })).unwrap());
+            d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Two".into()), ("a3".into(), "Three".into()), ("a4".into(), "Four".into())];
+            d.aws = Some(aws::Session::for_test("123456789012"));
+            d.aws_others = vec![aws::Session::for_test("222222222222"), aws::Session::for_test("444444444444"), aws::Session::for_test("555555555555")];
+            d.planes = vec![plane.clone()];
+            let mut v = seen_as(plane.clone(), status.clone());
+            v.aws = true;
+            let page = plain(&d.runners_page(Some(&v)));
+            assert!(page.contains(say) && page.contains("aws-two: AWS account 222222222222") && page.contains("modal-two"), "{page}");
+            let adds = plain(&d.add_runners_page(Some(&v)));
+            assert!(adds.contains("in account 555555555555") && adds.contains("Cloudflare account Four") && !adds.contains("in account 999999999999"), "{adds}");
+            assert!(adds.contains("in account 444444444444") && !adds.contains("in account 222222222222") && adds.contains("Cloudflare account Three") && !adds.contains("Cloudflare account Two") && adds.contains("Modal workspace three"), "{adds}");
+        }
+        // A further account's refusals, on the permissions page.
+        let d = Dashboard::new();
+        for (denied, says) in [(serde_json::json!({}), "Its role in account 222222222222"), (serde_json::json!({ "aws-two:Prices": {} }), "AWS refused 1 permission in account 222222222222"), (serde_json::json!({ "aws-two:Prices": {}, "aws-two:ReadNetwork": {} }), "AWS refused 2 permissions in account 222222222222")] {
+            let st = with_further_all(serde_json::json!({ "permissions": { "denied": denied } }));
+            let v = seen_as(aws_plane("p2", NOWHERE), st);
+            let (a, b) = d.permissions_card(&v);
+            let page = plain(&format!("{a}{b}"));
+            assert!(page.contains(says), "{says}: {page}");
+        }
+    }
+
+    /// The forms of further runners, each stopping where it should; what each sign-in needs.
+    #[test]
+    fn further_runners_forms_stop_where_they_should() {
+        // A Modal sign-in with none in hand; one taken in hand with none in hand before.
+        let mut d = Dashboard::new();
+        d.came_modal(modal_session("one"));
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("one"));
+        d.modal = None;
+        d.modal_others = vec![modal_session("two")];
+        d.hold_workspace("two");
+        assert_eq!((d.modal.as_ref().map(|m| m.workspace.as_str()), d.modal_others.len()), (Some("two"), 0));
+        // Removing: a deleted one's word is no runner; jobs on it; and a sign-in that does not reach its account.
+        let remove = |d: &mut Dashboard, cloud: &str, more: &[(&str, &str)]| send(d, "/runners/remove", &[&[("cloud", cloud)][..], more].concat());
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        let r = remove(&mut d, "modal-old", &[]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Unknown provider"), "{}", words_of(&r));
+        let r = remove(&mut d, "aws-two-on-demand", &[]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("goes with aws-two"), "{}", words_of(&r));
+        for (active, says) in [(serde_json::json!({ "aws-two": 1 }), "1 job is running on aws-two"), (serde_json::json!({ "aws-two": 2, "aws-two-on-demand": 1 }), "3 jobs are running on aws-two")] {
+            let mut d = modal_answering(with_further_all(serde_json::json!({ "active": active })));
+            let r = remove(&mut d, "aws-two", &[]).unwrap();
+            assert!(r.status == 409 && words_of(&r).contains(says), "{}", words_of(&r));
+            // Told to stop them, it goes on to what it needs next: its account's sign-in.
+            let r = remove(&mut d, "aws-two", &[("stop", "on")]).unwrap();
+            assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
+        }
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        let r = remove(&mut d, "cf-two", &[]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in with cf-two first"), "{}", words_of(&r));
+        d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": u64::MAX })).unwrap());
+        d.cf_accounts = vec![("a1".into(), "Acme".into())];
+        let r = remove(&mut d, "cf-two", &[]).unwrap();
+        assert_eq!(r.status, 403, "its account out of this sign-in's reach");
+        // A Modal runner with no launcher to find it by, not signed in: said with no workspace.
+        let mut d = modal_answering(with_further_all(serde_json::json!({ "launchers": [] })));
+        let r = remove(&mut d, "modal-two", &[]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to delete what SuperCI made there"), "{}", words_of(&r));
+        // Adding a further AWS account: with no first, on one that is the first, and not signed in to it.
+        let aws_add = |d: &mut Dashboard, account: &str| send(d, "/runners/aws", &[("account", account), ("region", "us-east-1")]);
+        let mut d = modal_answering(with_further_all(serde_json::json!({ "aws": null })));
+        let r = aws_add(&mut d, "222222222222").unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("A further account comes after the first"), "{}", words_of(&r));
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        let r = aws_add(&mut d, "123456789012").unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("runs jobs as aws"), "{}", words_of(&r));
+        let r = aws_add(&mut d, "555555555555").unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to account 555555555555"), "{}", words_of(&r));
+        // Its regions: not its account's sign-in; one it has no connection for.
+        let regions = |d: &mut Dashboard, cloud: &str, r: &[(&str, &str)]| send(d, "/routing", &[&[("action", "pool"), ("cloud", cloud), ("current", "aws-two,modal-two")][..], r].concat());
+        let r = regions(&mut d, "aws-two", &[("region_0", "eu-west-1")]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
+        let r = regions(&mut d, "aws-two", &[("region_0", "nowhere")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Choose a region"), "{}", words_of(&r));
+        let mut gone = with_further_all(serde_json::json!({}));
+        gone["aws_further"] = serde_json::json!([]);
+        let mut d = modal_answering(gone);
+        let r = regions(&mut d, "aws-two", &[("region_0", "eu-west-1")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Unknown provider"), "{}", words_of(&r));
+        // Functions put in: its workspace's sign-in for them, from the launcher's address; its own for a control plane in Modal.
+        let put_back = |d: &mut Dashboard, cloud: &str| send(d, "/routing", &[("action", "put_back"), ("cloud", cloud), ("current", &format!("{cloud},modal"))]);
+        let mut d = modal_answering(with_further_all(serde_json::json!({ "launchers": [] })));
+        assert!(put_back(&mut d, "modal-functions").is_err_and(|e| e.starts_with("Sign in with Modal to the workspace")));
+        // Already on: nothing to deploy, what else the form says is written.
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        assert!(put_back(&mut d, "modal-two-functions").is_err_and(|e| e.contains("not here")), "straight to the write");
+        // An image added: only the rows of Functions that are on, and only a runner's still here.
+        let on = serde_json::json!({ "routing": { "order": [{ "cloud": "modal-two-functions" }, { "cloud": "modal-functions", "off": true }, { "cloud": "aws-two" }, { "cloud": "modal" }, { "cloud": "modal-old-functions" }] } });
+        let mut d = modal_answering(with_further_all(on));
+        let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
+        assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace two first: `superci login modal --add`."));
     }
 
     #[test]

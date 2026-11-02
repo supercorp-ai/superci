@@ -786,6 +786,7 @@ fn cloudflare_runners_go_into_the_account_named_and_an_update_says_a_launcher_cl
     kept_as(&home, |k| k["cloudflare"] = cloudflare_signed_in());
     served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
     served.aws.fail("/client/v4/accounts?per_page", 200, r#"{"success":true,"errors":[],"messages":[],"result":[{"id":"1111111111111111111111111111111a","name":"Acme"},{"id":"2222222222222222222222222222222b","name":"Globex"}]}"#, None);
+    served.aws.fail("/workers/subdomain", 200, r#"{"success":true,"errors":[],"messages":[],"result":{"subdomain":"acme"}}"#, None);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     // (The accounts the sign-in reaches, read as one is set up in an account it does not.)
     let (status, said) = sent(&link, "/plane/cloudflare", &[("account", "3333333333333333333333333333333c")]);
@@ -832,7 +833,12 @@ fn aws_runners_for_a_control_plane_in_cloudflare_connect_or_say_what_stopped_the
 #[test]
 fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_for() {
     let served = serve(|_| {});
-    let cf = superci_testkit::serve_as("cfplane00003", move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role())));
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role()));
+        // (And a further Cloudflare runner, in an account this sign-in does not reach: left as it is, and said.)
+        c.launchers = vec![superci_core::plane::Launcher { cloud: "cf-two".into(), url: "https://superci-runners-cfplane00003.two.workers.dev".into() }];
+        c.records = serde_json::from_value(serde_json::json!({ "accounts": [{ "name": "cf-two", "provider": "cloudflare", "cloud_id": "2222222222222222222222222222222b" }], "runners": [{ "name": "cf-two", "account": "cf-two" }] })).unwrap();
+    });
     let home = common::signed_in(&served);
     let url = cf.url.clone();
     kept_as(&home, |k| {
@@ -897,7 +903,7 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
     cf.answer_as("", &[]);
     served.aws.worker_secrets.lock().unwrap().entry("superci".into()).or_default().insert("LAUNCHERS".into(), r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00002.acme.workers.dev"}]"#.into());
     cf.store_refuses(Some(superci_core::plane::SETTINGS));
-    let (status, said) = sent(&link, "/runners/cloudflare", &[]);
+    let (status, said) = sent(&link, "/runners/cloudflare", &[("account", "1111111111111111111111111111111a")]);
     assert!(status >= 400 && said.contains("the control plane answered 500"), "{status} {said}");
     assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "LAUNCHERS" && v.contains("cloudflare")));
     let _ = std::fs::remove_dir_all(&home);

@@ -11,7 +11,7 @@ use futures::executor::block_on;
 use sha2::{Digest, Sha256};
 use superci_core::crypto::{hex, hmac_sha256};
 use superci_core::github::App;
-use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing};
+use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, RunnerImage};
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
 /// The store: kept in memory. `1`: what another request does meanwhile, run before each operation (its name and
@@ -624,6 +624,17 @@ impl Containers for OwnContainers {
         self.0.borrow_mut().push(format!("start {name} {what} {}cpu {}gb {}disk", size.cpu, size.ram_gb, size.disk_gb));
         Ok(name.to_string())
     }
+    async fn start_from(&self, name: &str, work: &superci_core::io::Work, max: u32, size: superci_core::spec::Size, image: &str, secret: Option<&str>) -> io::Result<String> {
+        self.start(name, work, max, size).await?;
+        self.0.borrow_mut().push(format!("from {image} {}", secret.unwrap_or("public")));
+        Ok(name.to_string())
+    }
+    async fn start_function(&self, name: &str, work: &superci_core::io::Work, _max: u32, size: superci_core::spec::Size, image: Option<(&str, Option<&str>)>, notice: &str) -> io::Result<String> {
+        faults::container(name)?;
+        let superci_core::io::Work::GitHub { jit } = work else { return Err("not a GitHub job".into()) };
+        self.0.borrow_mut().push(format!("function {name} {jit} {}cpu {}gb {} {notice}", size.cpu, size.ram_gb, image.map_or("github".into(), |(r, s)| format!("{r}|{}", s.unwrap_or("public")))));
+        Ok(format!("fc-{name}"))
+    }
     async fn stop(&self, id: &str) -> io::Result<()> { faults::container(id)?; self.0.borrow_mut().push(format!("stop {id}")); Ok(()) }
 }
 
@@ -1115,6 +1126,98 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
 }
 
 #[test]
+fn an_image_of_the_control_planes_own_goes_to_modals_sandbox_by_its_name_and_elsewhere_is_refused() {
+    let images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci@sha256:0f1e".into(), modal_secret: Some("ghcr-read".into()) }), ("node".to_string(), RunnerImage { reference: "docker.io/acme/node-ci:22".into(), modal_secret: None })];
+    // (Modal's launcher says back the image it started from; one from before images of one's own says none.)
+    let old = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| (r.url == "https://runners.acme.workers.dev/launch").then(|| {
+        let image = if old.get() { serde_json::Value::Null } else { serde_json::from_str::<serde_json::Value>(body).unwrap()["image"].clone() };
+        Response::new(200, "application/json", serde_json::json!({ "id": "sb-7", "kind": "sandbox", "image": image }).to_string())
+    }));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.routing.images = images.clone().into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // Modal's launcher is told where the image is, and the Secret for its registry; a public one has none.
+    let launched = |n: usize| serde_json::from_str::<serde_json::Value>(&clouds.0.calls.borrow().iter().filter(|c| c.1 == "https://runners.acme.workers.dev/launch").nth(n).expect("launch").2).unwrap();
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=rust-ci/cpu=8")));
+    assert_eq!(job(&store, 1)["state"], "launched", "{}", job(&store, 1));
+    assert_eq!((launched(0)["image"].as_str(), launched(0)["image_secret"].as_str(), launched(0)["cpu"].as_u64()), (Some("ghcr.io/acme/ci@sha256:0f1e"), Some("ghcr-read"), Some(8)));
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/image=node")));
+    assert_eq!((launched(1)["image"].as_str(), launched(1).get("image_secret")), (Some("docker.io/acme/node-ci:22"), None));
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci")));
+    assert_eq!(launched(2).get("image"), None, "GitHub's runner image, as before");
+    // A name the control plane does not have: failed at once, saying how to add it, with no machine started.
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/image=gone")));
+    let j = job(&store, 4);
+    assert_eq!((j["state"].as_str(), j["error"].as_str()), (Some("failed"), Some("image=gone is no image of this control plane's: give it one with `superci runner_images create gone --reference=REGISTRY/IMAGE:TAG`")));
+    // (Its one machine is the runner that fails it on GitHub, saying why: GitHub's runner image.)
+    assert_eq!((clouds.0.calls.borrow().iter().filter(|c| c.1.ends_with("/launch")).count(), launched(3)["fail"].is_string(), launched(3).get("image")), (4, true, None));
+    // A launcher from before images of one's own: its sandbox (of GitHub's runner image) is stopped, and the job says to update it.
+    old.set(true);
+    block_on(plane.handle(labelled("queued", 9, "acme/app", None, "superci/image=node")));
+    let j = job(&store, 9);
+    assert!(j["error"].as_str().is_some_and(|e| e.contains("the Modal launcher is from before images of your own, and would start GitHub's runner image in place of docker.io/acme/node-ci:22: update it (`superci runners create modal`)")), "{j}");
+    assert!(clouds.0.calls.borrow().iter().any(|c| c.1 == "https://runners.acme.workers.dev/stop" && c.2.contains("sb-7")), "its sandbox stopped");
+    let clouds = FakeClouds::default();
+    // A Modal control plane's own sandbox starts from it too.
+    let (store, own) = (Mem::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "modal".into());
+    config.routing.images = images.clone().into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 5, "acme/app", None, "superci/image=rust-ci")));
+    assert_eq!(job(&store, 5)["state"], "launched", "{}", job(&store, 5));
+    assert!(own.0.borrow().iter().any(|c| c == "from ghcr.io/acme/ci@sha256:0f1e ghcr-read"), "{:?}", own.0.borrow());
+    // AWS's machines and Cloudflare's containers start from no such image: said, not tried.
+    let (store, own) = (Mem::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "cloudflare".into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.images = images.into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 6, "acme/app", None, "superci/image=rust-ci")));
+    let j = job(&store, 6);
+    assert_eq!(j["state"], "failed", "{j}");
+    let e = j["error"].as_str().unwrap();
+    assert_eq!(e, "nowhere to run image rust-ci: AWS runs no images of your own (image=rust-ci: Modal only); AWS on-demand runs no images of your own (image=rust-ci: Modal only); Cloudflare runs no images of your own (image=rust-ci: Modal only)");
+    // (Only the runner that fails it on GitHub was started.)
+    assert!(own.0.borrow().iter().all(|c| c.contains(" fail ")) && !clouds.calls.borrow().iter().any(|c| c.2.contains("RunInstances")), "{:?}", own.0.borrow());
+}
+
+/// A further Modal workspace's launcher (`modal:<workspace>`) is told the image and its Secret as the first one's is
+/// (the Secret is read in that workspace); one from before images of one's own says to make it again with `--account`.
+#[test]
+fn an_image_of_ones_own_goes_to_a_further_modal_workspaces_launcher_too() {
+    let old = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| (r.url == "https://acme-two--superci-runners.modal.run/launch").then(|| {
+        let image = if old.get() { serde_json::Value::Null } else { serde_json::from_str::<serde_json::Value>(body).unwrap()["image"].clone() };
+        Response::new(200, "application/json", serde_json::json!({ "id": "sb-8", "kind": "sandbox", "image": image }).to_string())
+    }));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal-acme-two".into(), url: "https://acme-two--superci-runners.modal.run".into() }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal-acme-two".into(), max_jobs: None, monthly_usd: None }];
+    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false, function: false }] };
+    config.routing.images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci:2".into(), modal_secret: Some("ghcr-read".into()) })].into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=rust-ci")));
+    assert_eq!((job(&store, 1)["state"].as_str(), job(&store, 1)["cloud"].as_str()), (Some("launched"), Some("modal-acme-two")), "{}", job(&store, 1));
+    let launch = clouds.0.calls.borrow().iter().find(|c| c.1 == "https://acme-two--superci-runners.modal.run/launch").map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap()).expect("launch");
+    assert_eq!((launch["image"].as_str(), launch["image_secret"].as_str()), (Some("ghcr.io/acme/ci:2"), Some("ghcr-read")));
+    old.set(true);
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/image=rust-ci")));
+    let j = job(&store, 2);
+    assert!(j["error"].as_str().is_some_and(|e| e.contains("the modal-acme-two launcher is from before images of your own, and would start GitHub's runner image in place of ghcr.io/acme/ci:2: update it (`superci runners create modal --account=acme-two`)")), "{j}");
+    assert!(clouds.0.calls.borrow().iter().any(|c| c.1 == "https://acme-two--superci-runners.modal.run/stop" && c.2.contains("sb-8")), "its sandbox stopped");
+}
+
+#[test]
 fn an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise() {
     let (store, clouds, wakes, cache, own) = (Mem::default(), Kinds { clouds: FakeClouds::default(), no_gpus: true }, Wakes::default(), Cache::default(), OwnContainers::default());
     let mut config = Config::new(PLANE_ID.into());
@@ -1378,6 +1481,10 @@ fn a_failing_runner_that_would_not_start_is_started_by_the_next_sweep() {
     let j = job(&store, 1);
     assert_eq!((j["failed_fast"].as_bool(), j.get("fail_pending")), (Some(true), None));
     assert_eq!(flaky.starts.get(), 2);
+    // Containers other than Modal's start no image of one's own and no Function (placement sends them none).
+    let (work, size) = (superci_core::io::Work::GitHub { jit: "j".into() }, superci_core::spec::Size { cpu: 2, ram_gb: 8, disk_gb: 14, gpu: None });
+    assert!(block_on(flaky.start_from("n", &work, 10, size.clone(), "ghcr.io/acme/ci:1", None)).is_err_and(|e| e.contains("no image of your own")));
+    assert!(block_on(flaky.start_function("n", &work, 10, size, None, "https://plane.example/interrupted")).is_err_and(|e| e.contains("no Modal Functions")));
 }
 
 #[test]
@@ -1665,6 +1772,135 @@ fn a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_d
     run(job_event("queued", 10, "acme/app", None));
     assert_eq!(field(&launches(&clouds.clouds)[3], "InstanceMarketOptions.MarketType"), "");
     assert_eq!(job(&store, 10)["on_demand"], true);
+}
+
+/// Modal's Functions (the `modal-functions` row): a job's runner is a preemptible Modal Function, at Function prices, with
+/// a link of its own to say Modal preempted it. Then its job fails on GitHub (its runner gone), is run again once its
+/// run has finished, on a sandbox (so once at most), and the month's count says both. Other jobs stay on Functions,
+/// and AWS's spot machines are not paused for it.
+#[test]
+fn a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted() {
+    use superci_core::plane::{modal_function_usd_per_hour, modal_usd_per_hour};
+    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(false), may_rerun: true }, Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "modal".into());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.routing.order = vec![Pool::of("modal-functions")];
+    config.routing.images = [("rust-ci".to_string(), RunnerImage { reference: "ghcr.io/acme/ci:1".into(), modal_secret: Some("ghcr-read".into()) })].into_iter().collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    let run = |r: Request| block_on(plane.handle(r));
+    let status = || json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")));
+    let runner = format!("superci-{PLANE_ID}-7");
+
+    // A Function, not a sandbox, priced as one, with the link it says a preemption with.
+    run(labelled("queued", 7, "acme/app", None, "superci/cpu=8/ram=16"));
+    let token = job(&store, 7)["notice"].as_str().unwrap().to_string();
+    assert_eq!(own.0.borrow().first().cloned(), Some(format!("function {runner} JITCONFIG+/= 8cpu 16gb github {PLANE_URL}/interrupted?runner={runner}&t={token}")));
+    let j = job(&store, 7);
+    assert_eq!((j["machine_id"].as_str(), j["machine_type"].as_str()), (Some(format!("fc-{runner}").as_str()), Some("8cpu-16gb-function")));
+    assert!((j["usd_per_hour"].as_f64().unwrap() - modal_function_usd_per_hour(8, 16)).abs() < 1e-9 && modal_function_usd_per_hour(8, 16) * 2.9 < modal_usd_per_hour(8, 16), "{j}");
+    // An image of the control plane's own: its Function, by its address and Secret.
+    run(labelled("queued", 6, "acme/app", None, "superci/image=rust-ci"));
+    assert!(own.0.borrow().last().unwrap().contains(" ghcr.io/acme/ci:1|ghcr-read "), "{:?}", own.0.borrow());
+
+    // Modal started the Function again on the same input: it says so with its link (only with it), runs no runner.
+    run(webhook("in_progress", Some(&runner)));
+    let notice = |t: &str| run(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={t}")));
+    assert_eq!(notice("wrong-wrong-wrong-wrong").status, 404);
+    let said = notice(&token);
+    assert_eq!((said.status, said.body.is_empty()), (200, true), "no AWS script for a Function");
+    assert_eq!(job(&store, 7)["interrupted"], true);
+    assert_eq!(notice(&token).status, 200, "said twice: counted once");
+    let keys = |prefix: &str| store.0.borrow().keys().filter(|k| k.starts_with(prefix)).count();
+    assert_eq!((keys("modal:preempted:"), keys("spot:interrupted:")), (1, 0));
+    assert_eq!(status()["preempted"], serde_json::json!({ "month": 1, "rerun": 0 }));
+
+    // Its job fails on GitHub (its runner is gone): run again once its run has finished.
+    run(webhook("completed", Some(&runner)));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["rerun"]["state"].as_str()), (Some("failed"), Some("pending")));
+    assert_eq!(j["error"], "Modal preempted its Function; SuperCI runs the job again by itself, further down the order, once its run has finished (GitHub runs a job again only then)");
+    block_on(plane.alarm()).unwrap();
+    assert!(!clouds.clouds.calls.borrow().iter().any(|c| c.1.ends_with("/rerun")));
+    clouds.done.set(true);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(clouds.clouds.calls.borrow().iter().filter(|c| c.0 == "POST" && c.1 == "https://api.github.com/repos/acme/app/actions/jobs/7/rerun").count(), 1);
+    assert_eq!((job(&store, 7)["rerun"]["state"].as_str(), job(&store, 7)["error"].as_str()), (Some("asked"), Some("Modal preempted its Function; SuperCI ran the job again by itself, further down the order (the run's next attempt)")));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(status()["preempted"], serde_json::json!({ "month": 1, "rerun": 1 }), "asked once");
+
+    // The new attempt: a sandbox (not preempted), at a sandbox's price, with no link. A later job: a Function again.
+    run(labelled("queued", 8, "acme/app", None, "superci/cpu=8/ram=16"));
+    assert_eq!(own.0.borrow().iter().filter(|c| c.starts_with(&format!("start superci-{PLANE_ID}-8 "))).count(), 1, "{:?}", own.0.borrow());
+    let j = job(&store, 8);
+    assert_eq!((j.get("notice"), j["machine_type"].as_str(), j["after_reclaim"].as_bool()), (None, Some("8cpu-16gb"), Some(true)));
+    assert!((j["usd_per_hour"].as_f64().unwrap() - modal_usd_per_hour(8, 16)).abs() < 1e-9);
+    run(labelled("queued", 9, "acme/app", None, "superci/cpu=8/ram=16"));
+    assert!(own.0.borrow().last().unwrap().starts_with(&format!("function superci-{PLANE_ID}-9 ")));
+    // Stopped by its call's id.
+    run(labelled("completed", 9, "acme/app", Some(&format!("superci-{PLANE_ID}-9")), "superci/cpu=8/ram=16"));
+    assert_eq!(own.0.borrow().last().cloned(), Some(format!("stop fc-superci-{PLANE_ID}-9")));
+}
+
+/// A label that asks for no preemptible machine (`spot=false`) goes past Functions, and with nothing after them says why.
+/// A job Modal preempted goes past them too, unless nothing else can take it: then a Function it is.
+#[test]
+fn functions_are_a_row_a_label_and_a_preemption_go_past() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true }, Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "modal".into());
+    config.routing.order = vec![Pool::of("modal-functions"), Pool::of("modal")];
+    {
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/cpu=4/spot=false")));
+        assert_eq!(job(&store, 1)["cloud"], "modal", "{}", job(&store, 1));
+        block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=4")));
+        assert_eq!(job(&store, 2)["cloud"], "modal-functions", "{}", job(&store, 2));
+    }
+    // Functions alone in the order.
+    config.routing.order = vec![Pool::of("modal-functions"), Pool { off: true, ..Pool::of("modal") }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/cpu=4/spot=false")));
+    assert!(job(&store, 3)["error"].as_str().is_some_and(|e| e.contains("Modal's Functions are not asked for (spot=false)")), "{}", job(&store, 3));
+    let runner = format!("superci-{PLANE_ID}-4");
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/cpu=4")));
+    let token = job(&store, 4)["notice"].as_str().unwrap().to_string();
+    block_on(plane.handle(webhook("in_progress", Some(&runner))));
+    block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={token}"))));
+    block_on(plane.handle(webhook("completed", Some(&runner))));
+    block_on(plane.alarm()).unwrap();
+    block_on(plane.handle(labelled("queued", 5, "acme/app", None, "superci/cpu=4")));
+    assert_eq!(job(&store, 5)["cloud"], "modal-functions", "{}", job(&store, 5));
+}
+
+/// A further Modal workspace's launcher is told a Function, with the link; one from before Functions
+/// (it says back a sandbox) has it stopped, and the job says to update it.
+#[test]
+fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
+    let old = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, _body: &str| (r.url == "https://runners.acme.workers.dev/launch").then(|| {
+        Response::new(200, "application/json", serde_json::json!({ "id": if old.get() { "sb-7" } else { "fc-7" }, "kind": if old.get() { "sandbox" } else { "function" } }).to_string())
+    }));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal-acme-two".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.routing.order = vec![Pool::of("modal-acme-two-functions"), Pool { off: true, ..Pool::of("modal-acme-two") }];
+    config.records = superci_core::plane::Records { accounts: vec![superci_core::plane::Account { name: "modal-acme-two".into(), provider: "modal".into(), cloud_id: Some("acme-two".into()) }], runners: vec![superci_core::plane::RunnerRecord { name: "modal-acme-two".into(), account: "modal-acme-two".into(), gone: false, on_demand: false, function: false }, superci_core::plane::RunnerRecord { name: "modal-acme-two-functions".into(), account: "modal-acme-two".into(), gone: false, on_demand: false, function: true }] };
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let calls = |url: &str| clouds.0.calls.borrow().iter().filter(|c| c.1 == url).map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap_or_default()).collect::<Vec<_>>();
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/cpu=4")));
+    let token = job(&store, 1)["notice"].as_str().unwrap().to_string();
+    let launch = &calls("https://runners.acme.workers.dev/launch")[0];
+    assert_eq!((launch["function"].as_bool(), launch["notice"].as_str()), (Some(true), Some(format!("{PLANE_URL}/interrupted?runner=superci-{PLANE_ID}-1&t={token}").as_str())));
+    assert_eq!((job(&store, 1)["machine_id"].as_str(), job(&store, 1)["machine_type"].as_str()), (Some("fc-7"), Some("function")));
+    old.set(true);
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=4")));
+    assert_eq!(calls("https://runners.acme.workers.dev/stop"), vec![serde_json::json!({ "id": "sb-7" })]);
+    let e = job(&store, 2)["error"].as_str().unwrap_or_default().to_string();
+    assert!(e.contains("the modal-acme-two launcher is from before Functions, and would start a sandbox: update it (`superci runners create modal --account=acme-two`)"), "{e}");
 }
 
 #[test]
@@ -6772,12 +7008,21 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     let first = queued(1, "superci");
     assert_eq!((first["cloud"].as_str(), first["machine_id"].as_str()), (Some("modal-staging"), Some("sb-second")), "{first}");
     let launch = clouds.0.calls.borrow().iter().find(|c| c.1 == "https://second.modal.example/launch").map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap()).expect("its launcher");
+    // (Woken first: a launcher starting from nothing would cut a launch off.)
+    let asked: Vec<String> = clouds.0.calls.borrow().iter().map(|c| c.1.clone()).filter(|u| u.starts_with("https://second.modal.example")).collect();
+    assert_eq!(asked[..2], ["https://second.modal.example/health".to_string(), "https://second.modal.example/launch".to_string()]);
     assert_eq!(launch["max_minutes"], 1440, "what Modal lets a machine live, not a longer one");
     // At its own limit of jobs at once: the next runner, priced alike. A label naming the provider means either.
     let second = queued(2, "superci");
     assert_eq!((second["cloud"].as_str(), second["machine_id"].as_str()), (Some("modal"), Some("sb-first")), "{second}");
     assert_eq!(first["usd_per_hour"], second["usd_per_hour"]);
     assert_eq!(queued(3, "superci/provider=modal")["cloud"], "modal");
+    // A note of waiting goes when its job runs: whatever it waited for is over.
+    let mut waited = job(&store, 2);
+    (waited["error"], waited["runner"]) = ("waiting: starting its machine failed, trying again".into(), format!("superci-{PLANE_ID}-2").into());
+    store.0.borrow_mut().insert("job:2".into(), waited.to_string());
+    block_on(plane.handle(job_event("in_progress", 2, "acme/app", Some(&format!("superci-{PLANE_ID}-2")))));
+    assert_eq!(job(&store, 2)["error"], serde_json::Value::Null, "{}", job(&store, 2));
     // A provider with no runner here is said as that.
     assert!(queued(4, "superci/provider=cloudflare")["error"].as_str().is_some_and(|e| e.contains("its label needs Cloudflare runners")), "{}", job(&store, 4));
 
@@ -6817,13 +7062,19 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     refused(serde_json::json!([account("modal", "aws")]), "that provider's first account");
     refused(serde_json::json!([runner("aws-on-demand", "aws")]), "needs no record");
     refused(serde_json::json!([runner("modal-three", "modal-prod")]), "no account called modal-prod");
-    refused(serde_json::json!([set(&["accounts", "modal-staging"], serde_json::Value::Null, None)]), "no account called modal-staging");
+    refused(serde_json::json!([set(&["accounts", "modal-staging"], serde_json::Value::Null, None)]), "its runners' records need it");
+    refused(serde_json::json!([set(&["runners", "modal-staging"], serde_json::Value::Null, None)]), "a runner's record stays");
+    refused(serde_json::json!([set(&["runners", "modal-staging", "account"], "modal".into(), None)]), "stays in the account it was in");
+    refused(serde_json::json!([set(&["accounts", "modal-staging", "provider"], "cloudflare".into(), None)]), "stays the account it was");
+    assert_eq!(write(serde_json::json!([set(&["accounts", "modal-staging", "cloud_id"], "acme-staging".into(), None)])).status, 200, "what its cloud calls it is filled in once");
+    refused(serde_json::json!([set(&["accounts", "modal-staging", "cloud_id"], "globex".into(), None)]), "stays the account it was");
     let two = serde_json::json!({ "name": "modal-two", "provider": "modal" });
     refused(serde_json::json!([set(&["accounts"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
     let two = serde_json::json!({ "name": "modal-two", "account": "modal" });
     refused(serde_json::json!([set(&["runners"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
     assert_eq!(write(serde_json::json!([account("modal", "modal")])).status, 200, "a provider's first account may have a record");
-    assert_eq!(write(serde_json::json!([set(&["accounts", "modal"], serde_json::Value::Null, None), set(&["routing", "account_usd", "modal"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], serde_json::Value::Null, None)])).status, 200);
+    assert_eq!(write(serde_json::json!([account("modal-2", "modal")])).status, 200, "digits in a word");
+    assert_eq!(write(serde_json::json!([set(&["routing", "account_usd", "modal"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], serde_json::Value::Null, None)])).status, 200);
 
     // A provider's other runner not added here, first in the order: passed over, said as not connected only if nothing runs it.
     assert_eq!(write(serde_json::json!([
@@ -6839,6 +7090,300 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &older, cache: &Cache::default(), containers: None };
     let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
     assert_eq!((&status["routing"]["max_cpu"], &status["runners"][0]["name"], &status["accounts"][0]["name"]), (&serde_json::json!(4), &serde_json::json!("modal-staging"), &serde_json::json!("modal-staging")), "{status}");
+}
+
+/// A cloud's bill, as a signed-in computer read it: the figures kept with when and which device, for the status to say;
+/// what is no figure or no account's word left out; last month's said no more; refused without a device's key.
+#[test]
+fn bills_are_kept_as_a_computer_read_them_and_said_for_this_month() {
+    let p = Settled::new(|c| { c.device_key_names = vec![("DEVICE_KEY_X".into(), "dashboard-session-key-1".into())]; c.device_keys.push((u64::MAX, "a-key-of-no-name-given-0001".into())) });
+    let post = |body: serde_json::Value, key: Option<&str>| {
+        let r = Request::new("POST", &format!("{PLANE_URL}/bills")).with_body(body.to_string());
+        block_on(p.plane().handle(match key { Some(k) => r.with_header("authorization", &format!("Bearer {k}")), None => r }))
+    };
+    assert_eq!(post(serde_json::json!({ "bills": { "modal": { "metered": 1.0, "billed": 0.0 } } }), None).status, 404);
+    p.mem.0.borrow_mut().insert("dkey:DEVICE_KEY_X".into(), serde_json::json!({ "device": "A laptop" }).to_string());
+    assert_eq!(post(serde_json::json!({ "bills": {
+        "modal": { "metered": 3.0, "billed": 1.0, "superci": 1.5 }, "modal-two": { "metered": 2.0, "billed": 0.0 },
+        "No Word": { "metered": 1.0, "billed": 1.0 }, "cloudflare": { "metered": -1.0, "billed": 1.0 }, "aws": { "metered": 1.0 }, "aws-on-demand": { "metered": 1.0, "billed": 1e10 },
+    } }), Some("dashboard-session-key-1")).status, 200);
+    let bills = p.status()["bills"].clone();
+    assert_eq!(bills.as_object().unwrap().keys().collect::<Vec<_>>(), ["modal", "modal-two"], "{bills}");
+    assert_eq!((&bills["modal"]["superci"], &bills["modal"]["device"], bills["modal-two"].get("superci")), (&serde_json::json!(1.5), &serde_json::json!("A laptop"), None), "{bills}");
+    assert_eq!(bills["modal"]["at_ms"], 1_790_000_000_000u64);
+    // Another's write of one account leaves the other's.
+    assert_eq!(post(serde_json::json!({ "bills": { "modal": { "metered": 4.0, "billed": 2.0 } } }), Some("dashboard-session-key-1")).status, 200);
+    let bills = p.status()["bills"].clone();
+    assert_eq!((&bills["modal"]["metered"], &bills["modal-two"]["metered"]), (&serde_json::json!(4.0), &serde_json::json!(2.0)));
+    // A key that is no device's, and nothing at all to keep.
+    assert_eq!(post(serde_json::json!({}), Some("dashboard-session-key-1")).status, 200);
+    // A key with no name: kept with no device.
+    assert_eq!(post(serde_json::json!({ "bills": { "modal-two": { "metered": 5.0, "billed": 0.0 } } }), Some("a-key-of-no-name-given-0001")).status, 200);
+    assert_eq!(p.status()["bills"]["modal-two"]["device"], "");
+    p.later(40 * 86_400_000);
+    assert_eq!(p.status()["bills"], serde_json::json!({}), "last month's");
+}
+
+/// An AWS machine's job, over and begun, a day ago: cared for while its sent data is still to be added to its cost.
+#[test]
+fn a_jobs_sent_data_still_to_be_added_keeps_it_cared_for() {
+    let now = 1_790_000_000_000u64;
+    let j = |sent: Option<f64>| serde_json::from_value::<superci_core::plane::Job>(serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "installation_id": 42, "cloud": "aws", "runner": null, "runner_id": null, "machine_id": null, "machine_type": null, "error": null, "seen_in_progress": true, "state": "done", "at_ms": now - 86_400_000, "ended_ms": now - 86_400_000,
+        "began": true, "region": "us-east-1", "cost_from": "2026-09-20T00:00:00Z", "sent_gb": sent })).unwrap();
+    assert!(superci_core::plane::needs_care(&j(None), now) && !superci_core::plane::needs_care(&j(Some(0.5)), now));
+}
+
+/// A further AWS account: connected with the role made there, its two runners under its word, a job's machine started
+/// and stopped with that account's role. The first account's notes are not its; the first's connection stays as it was.
+#[test]
+fn a_further_aws_account_runs_jobs_with_its_own_role_and_notes() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true, "error": null }).to_string());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let post = |path: &str, body: serde_json::Value| block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}{path}")).with_body(body.to_string()))));
+    // Refused: what is no word, no account or no region; and the first's word.
+    for body in [serde_json::json!({ "name": "Bad", "accountId": "222222222222", "region": "us-east-1" }), serde_json::json!({ "name": "aws", "accountId": "222222222222", "region": "us-east-1" }), serde_json::json!({ "name": "aws-acme", "accountId": "2222", "region": "eu-west-1" }), serde_json::json!({ "name": "aws-acme", "accountId": "22222222222x", "region": "eu-west-1" }), serde_json::json!({ "name": "aws-acme", "accountId": "222222222222" })] {
+        assert_eq!(post("/aws/accounts", body.clone()).status, 400, "{body}");
+    }
+    // Its records, then its connection; connected with the role in that account, its regions as said.
+    let record = |name: &str, on_demand: bool| serde_json::json!({ "name": name, "account": "aws-acme", "on_demand": on_demand });
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [
+        set(&["accounts", "aws-acme"], serde_json::json!({ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }), None),
+        set(&["runners", "aws-acme"], record("aws-acme", false), None),
+        set(&["runners", "aws-acme-on-demand"], record("aws-acme-on-demand", true), None),
+        set(&["routing", "order", "aws-acme"], serde_json::json!({ "cloud": "aws-acme" }), None),
+        set(&["routing", "order", "aws-acme-on-demand"], serde_json::json!({ "cloud": "aws-acme-on-demand" }), None),
+        set(&["routing", "order", "aws"], serde_json::json!({ "cloud": "aws", "off": true }), None),
+        set(&["routing", "order", "aws-on-demand"], serde_json::json!({ "cloud": "aws-on-demand", "off": true }), None),
+    ] })).status, 200);
+    let connected = post("/aws/accounts", serde_json::json!({ "name": "aws-acme", "accountId": "222222222222", "region": "us-east-1", "regions": ["us-east-1"] }));
+    assert_eq!((connected.status, json(&connected)["connected"].as_bool()), (200, Some(true)), "{}", String::from_utf8_lossy(&connected.body));
+    let status = json(&block_on(plane.handle(key(get("/status")))));
+    assert_eq!((&status["aws_further"][0]["name"], &status["aws_further"][0]["regions"], &status["aws"]["account_id"]), (&serde_json::json!("aws-acme"), &serde_json::json!(["us-east-1"]), &serde_json::json!("123456789012")), "{status}");
+    let assumed = |account: &str| clouds.calls.borrow().iter().any(|c| c.1.contains("sts.") && c.1.contains(account));
+    assert!(assumed("222222222222"));
+    // A job: on the further account's spot machines, in its region, by its word; its spend under that word.
+    clouds.calls.borrow_mut().clear();
+    block_on(plane.handle(job_event("queued", 1, "acme/app", None)));
+    let first = job(&store, 1);
+    assert_eq!((first["cloud"].as_str(), first["region"].as_str(), first["on_demand"].as_bool().unwrap_or(false)), (Some("aws-acme"), Some("us-east-1"), false), "{first}");
+    assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=RunInstances")));
+    // A label asking for an on-demand machine: its on-demand runner.
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/spot=false")));
+    let second = job(&store, 2);
+    assert_eq!((second["cloud"].as_str(), second["on_demand"].as_bool()), (Some("aws-acme-on-demand"), Some(true)), "{second}");
+    // A label naming AWS means its runners too, the first's being taken out.
+    // (With nothing kept from before: only its own role is asked for. A cache's bucket is the first's, reached by links.)
+    let fresh = Cache::default();
+    clouds.calls.borrow_mut().clear();
+    block_on(ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &fresh, containers: None }.handle(labelled("queued", 3, "acme/app", None, "superci/provider=aws")));
+    assert_eq!(job(&store, 3)["cloud"], "aws-acme");
+    assert!(assumed("222222222222"), "with its own role");
+    // Stopped with its own role, in its own region.
+    clouds.calls.borrow_mut().clear();
+    block_on(plane.handle(job_event("completed", 1, "acme/app", Some(&format!("superci-{PLANE_ID}-1")))));
+    assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=TerminateInstances")), "{:?}", clouds.calls.borrow().iter().map(|c| c.1.clone()).collect::<Vec<_>>());
+    // A note of AWS's on it is its own account's: the first's keys stay empty.
+    assert!(store.0.borrow().keys().all(|k| !k.starts_with("aws:pool:") && !k.starts_with("aws:unoffered:")));
+    // Forgotten: no job goes there; the first's connection stays.
+    assert_eq!(post("/aws/forget", serde_json::json!({ "account": "aws-acme" })).status, 200);
+    assert!(store.0.borrow().contains_key("aws") && !store.0.borrow().contains_key("aws:connection:aws-acme"));
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci")));
+    assert!(job(&store, 4)["cloud"] != "aws-acme", "{}", job(&store, 4));
+    assert_eq!(post("/aws/forget", serde_json::json!({})).status, 200);
+    assert!(!store.0.borrow().contains_key("aws"), "with no account named: the first's");
+}
+
+/// A further AWS account's machine keeps Docker's images in the CI's one cache: the store from its start after a job
+/// used them, the bucket looked for with the first account's role, whichever account the machine is in. A refusal of
+/// its role is noted under its word, not the first's. With no first account connected: no cache, and it still starts.
+#[test]
+fn a_further_aws_accounts_machine_uses_the_one_cache_and_its_refusals_are_its_own() {
+    let http = WithLayers { clouds: FakeClouds::default(), objects: Default::default(), converted: Default::default(), deleted: Default::default() };
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.records = superci_core::plane::Records {
+        accounts: vec![superci_core::plane::Account { name: "aws-acme".into(), provider: "aws".into(), cloud_id: Some("222222222222".into()) }],
+        runners: vec![superci_core::plane::RunnerRecord { name: "aws-acme".into(), account: "aws-acme".into(), gone: false, on_demand: false, function: false }, superci_core::plane::RunnerRecord { name: "aws-acme-on-demand".into(), account: "aws-acme".into(), gone: false, on_demand: true, function: false }] };
+    config.routing.order = vec![Pool::of("aws-acme"), Pool::of("aws-acme-on-demand"), Pool { off: true, ..Pool::of("aws") }, Pool { off: true, ..Pool::of("aws-on-demand") }];
+    let connection = |name: &str, id: &str| { let mut c = serde_json::json!({ "account_id": id, "region": "us-east-1", "role_arn": role_arn(id, PLANE_ID), "connected": true, "error": null }); if !name.is_empty() { (c["name"], c["regions"]) = (name.into(), serde_json::json!(["us-east-1"])) } c.to_string() };
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222"));
+    store.0.borrow_mut().insert("aws".into(), connection("", "123456789012"));
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let script = |id: u64| { let launch = launches(&http.clouds).pop().expect("a machine"); let _ = id; String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap() };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26/docker-cache=true")));
+    assert_eq!((job(&store, 1)["cloud"].as_str(), job(&store, 1)["layers"].as_bool()), (Some("aws-acme"), Some(true)), "{}", job(&store, 1));
+    assert!(script(1).contains("/layers|bash"), "the store from its start");
+    let sts: Vec<String> = http.clouds.calls.borrow().iter().filter(|c| c.1.contains("sts.")).map(|c| c.1.clone()).collect();
+    assert!(sts.iter().any(|u| u.contains("222222222222")) && sts.iter().any(|u| u.contains("123456789012")), "its own role for its machine, the first's for the cache: {sts:?}");
+    // No first account: the machine starts, with GitHub's cache.
+    store.0.borrow_mut().remove("aws");
+    let cache = Cache::default();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/image=ubuntu26/docker-cache=true")));
+    assert_eq!((job(&store, 2)["state"].as_str(), job(&store, 2)["layers"].as_bool().unwrap_or(false)), (Some("launched"), false), "{}", job(&store, 2));
+    assert!(!script(2).contains("/layers|bash"));
+    // A refusal of its role: under its word, and the first's left clean.
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| body.contains("Action=DescribeVpcs").then(|| { let _ = r; Response::new(403, "text/xml", "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::222222222222:assumed-role/x is not authorized to perform: ec2:DescribeVpcs</Message></Error></Errors></Response>") }));
+    let (store, cache) = (Mem::default(), Cache::default());
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222"));
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci")));
+    assert!(store.0.borrow().contains_key("denied:aws-acme:ReadNetwork") && !store.0.borrow().keys().any(|k| k.starts_with("denied:aws:")), "{:?}", store.0.borrow().keys().filter(|k| k.starts_with("denied")).collect::<Vec<_>>());
+}
+
+/// What a CI of several AWS accounts does in each case, a job at a time: the first account as it always was beside a
+/// further one; an account's limit over both its runners, and on to the next account; a runner deleted and a connection
+/// that does not hold; its machine's cost settled with its own role; its notes under its own word.
+#[test]
+fn several_aws_accounts_each_case_a_job_at_a_time() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let word = |w: &str, a: &str, on_demand: bool| superci_core::plane::RunnerRecord { name: w.into(), account: a.into(), gone: false, on_demand, function: false };
+    config.records = superci_core::plane::Records {
+        accounts: vec![superci_core::plane::Account { name: "aws-acme".into(), provider: "aws".into(), cloud_id: Some("222222222222".into()) }],
+        runners: vec![word("aws-acme", "aws-acme", false), word("aws-acme-on-demand", "aws-acme", true)] };
+    let connection = |name: &str, id: &str, connected: bool| { let mut c = serde_json::json!({ "account_id": id, "region": "us-east-1", "role_arn": role_arn(id, PLANE_ID), "connected": connected, "error": null }); if !name.is_empty() { (c["name"], c["regions"]) = (name.into(), serde_json::json!(["us-east-1"])) } c.to_string() };
+    store.0.borrow_mut().insert("aws".into(), connection("", "123456789012", true));
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222", true));
+    let plane = |c: &Config, f: &dyn Fn(&ControlPlane)| { let cache = Cache::default(); f(&ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: c, cache: &cache, containers: None }) };
+    let _ = &cache;
+    let queued = |c: &Config, id: u64, label: &str| { plane(c, &|p| { block_on(p.handle(labelled("queued", id, "acme/app", None, label))); }); job(&store, id) };
+    // The first account first in the order: its job says `aws`, as ever, on-demand by its flag, its spend as ever.
+    config.routing.order = vec![Pool::of("aws"), Pool::of("aws-on-demand"), Pool::of("aws-acme"), Pool::of("aws-acme-on-demand")];
+    let j = queued(&config, 1, "superci");
+    assert_eq!((j["cloud"].as_str(), j["on_demand"].as_bool().unwrap_or(false)), (Some("aws"), false), "{j}");
+    let j = queued(&config, 2, "superci/spot=false");
+    assert_eq!((j["cloud"].as_str(), j["on_demand"].as_bool()), (Some("aws"), Some(true)), "{j}");
+    // The first's runners at their limit: on to the further account's, in order.
+    config.routing.order = vec![Pool { max_jobs: Some(1), ..Pool::of("aws") }, Pool { max_jobs: Some(1), ..Pool::of("aws-on-demand") }, Pool::of("aws-acme"), Pool::of("aws-acme-on-demand")];
+    let j = queued(&config, 3, "superci");
+    assert_eq!(j["cloud"], "aws-acme", "{j}");
+    // That account's limit counts both its runners; at it, nothing of it is asked, and a job with nowhere else says why.
+    let day = format!("day:{:06}", 1_790_000_000_000u64 / 86_400_000);
+    store.0.borrow_mut().insert("indexed".into(), "1".into());
+    store.0.borrow_mut().insert(day.clone(), serde_json::json!({ "spend": { "aws-acme": 2.0, "aws-acme-on-demand": 2.0 }, "hours": [] }).to_string());
+    config.routing.account_usd.insert("aws-acme".into(), 3.0);
+    config.routing.order = vec![Pool::of("aws-acme"), Pool::of("aws-acme-on-demand"), Pool { off: true, ..Pool::of("aws") }, Pool { off: true, ..Pool::of("aws-on-demand") }];
+    let j = queued(&config, 4, "superci");
+    assert!(j["error"].as_str().unwrap_or_default().contains("the aws-acme account reached its $3 a month (`superci accounts update aws-acme --monthly-usd=N` raises it)"), "{j}");
+    // The first's limit is not that one's: spending in one is no limit on the other.
+    config.routing.order = vec![Pool::of("aws-acme"), Pool::of("aws-acme-on-demand"), Pool::of("aws"), Pool::of("aws-on-demand")];
+    assert_eq!(queued(&config, 5, "superci")["cloud"], "aws");
+    config.routing.account_usd.clear();
+    // A runner deleted: no job goes to it, what it spent still counts toward its account.
+    config.routing.account_usd.insert("aws-acme".into(), 3.0);
+    config.records.runners.iter_mut().for_each(|r| r.gone = true);
+    config.routing.order = vec![Pool::of("aws")];
+    assert_eq!(queued(&config, 6, "superci")["cloud"], "aws");
+    let status = { let s = std::cell::RefCell::new(serde_json::Value::Null); plane(&config, &|p| { *s.borrow_mut() = json(&block_on(p.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")))); }); s.into_inner() };
+    assert_eq!(status["spend"]["aws-acme"], 2.0, "{status}");
+    config.records.runners.iter_mut().for_each(|r| r.gone = false);
+    config.routing.account_usd.clear();
+    // A connection that does not hold: passed over, the first takes it.
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222", false));
+    config.routing.order = vec![Pool::of("aws-acme"), Pool::of("aws")];
+    assert_eq!(queued(&config, 7, "superci")["cloud"], "aws");
+    // Named only by its own, unconnected, and nothing else: said as not connected, not run elsewhere.
+    config.routing.order = vec![Pool::of("aws-acme")];
+    store.0.borrow_mut().remove("aws");
+    let j = queued(&config, 8, "superci");
+    assert!(j["error"].as_str().unwrap_or_default().contains("aws-acme"), "{j}");
+    // Back, alone with no first account: its machine starts, and its cost is settled with its own role.
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222", true));
+    let j = queued(&config, 9, "superci");
+    assert_eq!((j["cloud"].as_str(), j["state"].as_str()), (Some("aws-acme"), Some("launched")), "{j}");
+    clouds.calls.borrow_mut().clear();
+    plane(&config, &|p| { block_on(p.handle(job_event("completed", 9, "acme/app", Some(&format!("superci-{PLANE_ID}-9"))))); });
+    let asked = clouds.calls.borrow().iter().filter(|c| c.1.contains("sts.")).map(|c| c.1.clone()).collect::<Vec<_>>();
+    assert!(!asked.is_empty() && asked.iter().all(|u| u.contains("222222222222")), "{asked:?}");
+    // Its spot notice: the pool noted under its own word; and a template left: asked to go with its own role, by its word.
+    let token = "a-notice-token-of-a-spot-machine";
+    let mut noticed = job(&store, 9);
+    (noticed["state"], noticed["notice"], noticed["region"], noticed["machine_type"], noticed["zone"], noticed["runner"]) = ("running".into(), token.into(), "us-east-1".into(), "c8a.xlarge".into(), "us-east-1a".into(), format!("superci-{PLANE_ID}-9").into());
+    noticed["ended_ms"] = serde_json::Value::Null;
+    store.0.borrow_mut().insert("job:9".into(), noticed.to_string());
+    store.0.borrow_mut().insert(format!("runner:superci-{PLANE_ID}-9"), "9".into());
+    plane(&config, &|p| { block_on(p.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner=superci-{PLANE_ID}-9&t={token}")))); });
+    assert!(store.0.borrow().contains_key("aws:aws-acme:pool:us-east-1:c8a.xlarge:us-east-1a") && !store.0.borrow().contains_key("aws:pool:us-east-1:c8a.xlarge:us-east-1a"), "{:?}", store.0.borrow().keys().filter(|k| k.starts_with("aws:")).collect::<Vec<_>>());
+}
+
+/// A run from a computer whose Function Modal preempted: nothing more comes from its runner, so it is over at once and
+/// started again on a sandbox, as seen live (a Function's container stopped under its job). GitHub's jobs wait for GitHub.
+#[test]
+fn a_preempted_function_of_a_run_from_a_computer_is_over_at_once() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let token = "a-notice-token-of-a-function-call";
+    for (id, provider) in [(1u64, "local"), (2, "github")] {
+        let runner = format!("superci-{PLANE_ID}-{id}");
+        store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": 1_790_000_000_000u64, "runner": runner, "installation_id": 42, "cloud": "modal", "seen_in_progress": true, "notice": token, "provider": provider, "machine_id": "fc-1", "machine_type": "function", "error": null, "machine": null, "runner_id": null, "local": "t" }).to_string());
+        store.0.borrow_mut().insert(format!("runner:{runner}"), id.to_string());
+        let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={token}"))));
+        assert_eq!(r.status, 200);
+    }
+    let (local, github) = (job(&store, 1), job(&store, 2));
+    assert_eq!(local["state"], "failed", "{local}");
+    assert!(local["error"].as_str().is_some_and(|e| e.contains("Modal preempted its Function; SuperCI starts the job again by itself, further down the order")) && local["ended_ms"].is_u64(), "{local}");
+    assert_eq!((github["state"].as_str(), github["interrupted"].as_bool()), (Some("running"), Some(true)), "{github}");
+    assert!(store.0.borrow().keys().any(|k| k.starts_with("modal:preempted:")) && !store.0.borrow().keys().any(|k| k.starts_with("spot:interrupted:")));
+}
+
+/// What is left of each edge of a further AWS account and of the words kept: asked with no device's key; no regions of
+/// its own; a runner deleted still in the order; an account with no runners taken out; a template left in it swept; an
+/// image's address and a Secret's name at their limits.
+#[test]
+fn the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be() {
+    use superci_core::plane::{valid_image_reference, valid_modal_secret, valid_word};
+    assert!(valid_word("aw") && valid_word("a1-b2") && !valid_word("a") && !valid_word(&"a".repeat(33)) && valid_word(&"a".repeat(32)) && !valid_word("A1") && !valid_word("-a1") && !valid_word("a1-") && !valid_word("a_1"));
+    for (r, ok) in [("ghcr.io/acme/ci:1", true), ("", false), (&"a".repeat(256), false), ("a b", false), ("-acme/ci", false), ("acme/ci-", false), ("https://ghcr.io/acme", false), ("acme/ci@sha256:0f", true)] { assert_eq!(valid_image_reference(r), ok, "{r}") }
+    for (n, ok) in [("ghcr-read", true), ("", false), (&"s".repeat(65), false), ("a secret", false), ("a_b.c-1", true)] { assert_eq!(valid_modal_secret(n), ok, "{n}") }
+
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true, "error": null }).to_string());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let post = |path: &str, body: serde_json::Value, key: bool| { let r = Request::new("POST", &format!("{PLANE_URL}{path}")).with_body(body.to_string()); block_on(plane.handle(if key { r.with_header("authorization", "Bearer dashboard-session-key-1") } else { r })) };
+    assert_eq!(post("/aws/accounts", serde_json::json!({ "name": "aws-acme", "accountId": "222222222222", "region": "us-east-1" }), false).status, 404);
+    // No regions said: its own region alone, not the first account's list.
+    assert_eq!(json(&post("/aws/accounts", serde_json::json!({ "name": "aws-acme", "accountId": "222222222222", "region": "us-east-1" }), true))["connected"], true);
+    let word = |w: &str, on_demand: bool, gone: bool| serde_json::json!({ "name": w, "account": "aws-acme", "on_demand": on_demand, "gone": gone });
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [
+        set(&["accounts", "aws-acme"], serde_json::json!({ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }), None),
+        set(&["accounts", "aws-unused"], serde_json::json!({ "name": "aws-unused", "provider": "aws" }), None),
+        set(&["runners", "aws-acme"], word("aws-acme", false, false), None),
+        set(&["runners", "aws-acme-on-demand"], word("aws-acme-on-demand", true, false), None),
+        set(&["routing", "order", "aws-acme"], serde_json::json!({ "cloud": "aws-acme" }), None),
+        set(&["routing", "order", "aws"], serde_json::json!({ "cloud": "aws" }), None),
+    ] }), true).status, 200);
+    block_on(plane.handle(job_event("queued", 1, "acme/app", None)));
+    assert_eq!((job(&store, 1)["cloud"].as_str(), job(&store, 1)["region"].as_str()), (Some("aws-acme"), Some("us-east-1")), "{}", job(&store, 1));
+    // An account with no runner on it comes out; a runner deleted, left in the order, takes no job.
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [set(&["accounts", "aws-unused"], serde_json::Value::Null, None)] }), true).status, 200);
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [set(&["runners", "aws-acme"], word("aws-acme", false, true), None)] }), true).status, 200);
+    block_on(plane.handle(job_event("queued", 2, "acme/app", None)));
+    assert_eq!(job(&store, 2)["cloud"], "aws", "{}", job(&store, 2));
+    // A template left behind in it: taken away by the upkeep, with its own role, once a day has gone by whatever it answers.
+    let key = "aws:aws-acme:template:us-east-1:superci-lt-old";
+    store.0.borrow_mut().insert(key.into(), (1_790_000_000_000u64 - 2 * 86_400_000).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key(key), "gone");
+    // A machine measured by Cloudflare, no region of AWS's, has nothing more to wait for.
+    let mut measured = job(&store, 1);
+    (measured["region"], measured["cost_from"], measured["state"], measured["ended_ms"]) = (serde_json::Value::Null, "measured".into(), "done".into(), 1_789_999_000_000u64.into());
+    store.0.borrow_mut().insert("job:1".into(), measured.to_string());
+    block_on(plane.alarm()).unwrap();
 }
 
 /// In the order and connected to nothing: said as that, the job failing rather than running elsewhere.
@@ -6947,6 +7492,13 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         online_only_public_documents_and_a_yes_no_health,
         a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account,
         a_provider_in_the_order_that_is_not_connected_is_said,
+        bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
+        a_jobs_sent_data_still_to_be_added_keeps_it_cared_for,
+        a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
+        several_aws_accounts_each_case_a_job_at_a_time,
+        the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be,
+        a_preempted_function_of_a_run_from_a_computer_is_over_at_once,
+        a_further_aws_accounts_machine_uses_the_one_cache_and_its_refusals_are_its_own,
         aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
         routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_token_for_it_alone,
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,
@@ -6967,6 +7519,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission,
         gpus_and_windows_get_their_own_images_types_and_prices,
         a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price,
+        an_image_of_the_control_planes_own_goes_to_modals_sandbox_by_its_name_and_elsewhere_is_refused,
+        an_image_of_ones_own_goes_to_a_further_modal_workspaces_launcher_too,
         an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise,
         the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it,
         limits_make_jobs_wait_or_move_down_the_order,
@@ -7106,7 +7660,10 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
         a_change_is_made_only_by_a_way_through_objects_and_lists,
-        an_edit_is_the_changes_of_its_fields_and_they_apply_over_others
+        an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,
+        a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted,
+        functions_are_a_row_a_label_and_a_preemption_go_past,
+        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

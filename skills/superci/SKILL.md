@@ -41,6 +41,12 @@ Keep the job's size as `key=value` pairs after the label. Memory follows CPUs at
 
 https://superci.dev/docs/labels.md lists every key (`disk=`, `image=ubuntu26`, `provider=aws`, ...). A label SuperCI does not understand fails the job at once, saying why.
 
+A job that installs the same tools at each run can start from an image that has them, on Modal: an image `FROM ghcr.io/actions/actions-runner`, named once with `superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG` (a tag of its own for each build, or a digest), then `runs-on: superci/image=NAME`. A new build: `superci runner_images update NAME --reference=REGISTRY/IMAGE:NEWTAG`, one change, never a delete and a create. Only Modal runs it; on AWS or Cloudflare, keep the install steps.
+
+`provider=modal` (or `aws`, `cloudflare`) means every runner of that provider, in the order's order: a CI may have several accounts of one provider, and a workflow does not name which. Do not add one to a label to pick an account.
+
+On Modal, `modal-functions` is a row of its own, like `aws-on-demand`: preemptible Modal Functions at a third of a sandbox's price, taken out until put in (`superci runners order modal-functions modal`; a further runner's is `WORD-functions`). A preempted job fails on GitHub and is run again by itself further down the order once its run has finished; `superci status` says how many this month.
+
 ## 4. Replace vendor actions
 
 | Before | After |

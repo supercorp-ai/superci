@@ -271,6 +271,47 @@ pub fn make_networks(creds: &Credentials, plane_id: &str, regions: &[String]) ->
     made.into_iter().collect()
 }
 
+/// The control plane's own network in each region of a further account: no cache bucket there. A CI has one cache, in
+/// its first AWS account, and a bucket's name is the same in every account: one made here would keep the first out.
+pub fn make_further_networks(creds: &Credentials, plane_id: &str, regions: &[String]) -> Result<()> {
+    let made: Vec<Result<()>> = std::thread::scope(|s| {
+        let each: Vec<_> = regions.iter().map(|r| s.spawn(move || futures::executor::block_on(aws::make_network(&Blocking::new(), r, creds, plane_id, now_ms())).map(|_| ()).map_err(|e| format!("{r}: {e}")))).collect();
+        each.into_iter().map(|h| h.join().unwrap_or(Err("making a network stopped".into()))).collect()
+    });
+    made.into_iter().collect()
+}
+
+/// The cache bucket in each of these regions, in the first account (a further account's machines start there too).
+pub fn make_caches(creds: &Credentials, plane_id: &str, regions: &[String]) -> Result<()> {
+    let http = Blocking::new();
+    regions.iter().try_for_each(|r| make_cache(&http, r, creds, plane_id).map_err(|e| format!("{r}: {e}")))
+}
+
+/// A further account's role given what this version asks for, and its networks (no cache there: see `make_further_networks`).
+pub fn give_further_role(creds: &Credentials, account_id: &str, plane_id: &str, regions: &[String]) -> Result<()> {
+    let http = Blocking::new();
+    futures::executor::block_on(aws::iam(&http, creds, "PutRolePolicy", serde_json::json!({ "RoleName": format!("superci-plane-{plane_id}"), "PolicyName": "runner-machines",
+        "PolicyDocument": aws::runner_policy(account_id, plane_id).to_string() }), now_ms()))?;
+    make_further_networks(creds, plane_id, regions)
+}
+
+/// Removes the control plane's machines and networks in a further account's regions (its cache is the first account's).
+pub fn delete_further_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) -> Result<()> {
+    let sleep = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+    let others: Vec<String> = connected_planes(creds)?.into_iter().map(|p| p.plane_id).filter(|p| p != plane_id).collect();
+    let others = &others;
+    let done: Vec<Result<()>> = std::thread::scope(|s| {
+        let each: Vec<_> = regions.iter().map(|r| s.spawn(move || {
+            match futures::executor::block_on(aws::delete_network(&Blocking::new(), r, creds, plane_id, others, &now_ms, &sleep)) {
+                Err(e) if kept_out_by_organization(&e) => Ok(()),
+                done => done.map_err(|e| format!("{r}: {e}")),
+            }
+        })).collect();
+        each.into_iter().map(|h| h.join().unwrap_or(Err("removing a network stopped".into()))).collect()
+    });
+    done.into_iter().collect()
+}
+
 fn make_cache(http: &Blocking, region: &str, creds: &Credentials, plane_id: &str) -> Result<()> {
     futures::executor::block_on(aws::make_bucket(http, region, creds, plane_id, now_ms()))?;
     let put = |key: String, program: &[u8]| futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &key, program, now_ms()));

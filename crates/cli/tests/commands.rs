@@ -353,7 +353,7 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
         (&["keys", "create", "agent", "--days=many"], "--days is a number of days"),
         (&["keys", "create", "agent", "--runs", "--max-cpu=8"], "A key has no limits of its own"),
         (&["keys", "delete"], "Say which: `superci keys delete NAME`"),
-        (&["accounts", "update", "gcp", "--monthly-usd=5"], "Say which cloud's"),
+        (&["accounts", "update", "gcp", "--monthly-usd=5"], "gcp is not an account of this CI"),
         (&["accounts", "update", "aws"], "Say what to change: `superci accounts update aws"),
         (&["accounts", "update", "aws", "--aws-budget=maybe"], "--aws-budget is none, emails, stops or lift"),
         (&["deliveries", "retrieve", "x1"], "Say which: `superci deliveries retrieve ID`"),
@@ -2930,7 +2930,7 @@ fn a_layer_larger_than_a_chunk_is_copied_into_cloudflares_registry_a_chunk_at_a_
 fn every_command_with_no_control_plane_yet_says_to_set_one_up() {
     let account = superci_testkit::Aws::serve();
     let home = common::aws_only(&account);
-    let lines: [&[&str]; 39] = [&["jobs", "list"], &["jobs", "retrieve", "7"], &["runs", "list"], &["runs", "retrieve", "7"], &["runs", "cancel", "7"], &["runs", "wait", "7"], &["usage", "retrieve"],
+    let lines: [&[&str]; 42] = [&["runner_images", "create", "own-ci", "--reference=ghcr.io/acme/ci:1"], &["runner_images", "update", "own-ci", "--reference=ghcr.io/acme/ci:2"], &["runner_images", "delete", "own-ci"], &["jobs", "list"], &["jobs", "retrieve", "7"], &["runs", "list"], &["runs", "retrieve", "7"], &["runs", "cancel", "7"], &["runs", "wait", "7"], &["usage", "retrieve"],
             &["artifacts", "list", "--run=7"], &["caches", "retrieve"], &["caches", "update", "--days=3"], &["caches", "delete", "--repo=acme/app", "--confirm"], &["secrets", "list"],
             &["secrets", "delete", "NPM_TOKEN", "--confirm"], &["keys", "list"], &["keys", "create", "agent"], &["keys", "delete", "agent"], &["accounts", "update", "aws", "--monthly-usd=5"],
             &["deliveries", "list"], &["planes", "allow"], &["planes", "update"], &["runners", "create", "aws"], &["runners", "delete", "aws", "--confirm"], &["runners", "order", "aws"],
@@ -3001,4 +3001,45 @@ fn a_control_plane_with_a_store_as_slow_as_modals_has_its_status_read_in_time() 
     let (code, status) = json(&home, &["status"]);
     let read = asked.elapsed();
     assert!(code == 0 && status["status"]["jobs"].as_array().is_some_and(|j| j.len() == 50) && read < std::time::Duration::from_secs(10), "{read:?}: {status}");
+}
+
+#[test]
+fn an_image_of_ones_own_moves_to_a_new_tag_in_one_write_and_an_unknown_name_is_refused() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let ok = |args: &[&str]| { let (code, v) = json(&home, args); assert_eq!(code, 0, "{args:?}: {v}"); v };
+    // (Kept by the control plane, each change a version of its settings.)
+    let kept = || serde_json::from_str::<serde_json::Value>(served.store.0.lock().unwrap().get("settings").map_or("{}", String::as_str)).unwrap();
+    let images = || kept()["routing"]["images"].clone();
+    let writes = || kept()["version"].as_u64().unwrap_or(0);
+
+    ok(&["runner_images", "create", "rust-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=ghcr-read"]);
+    assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:1", "modal_secret": "ghcr-read" } }));
+    // A new tag: one write of the routing, the Secret kept as it was.
+    let before = writes();
+    let said = ok(&["runner_images", "update", "rust-ci", "--reference=ghcr.io/acme/ci:2"]);
+    assert_eq!(said["said"], "Jobs on Modal start from ghcr.io/acme/ci:2 (Modal Secret ghcr-read) when their label says image=rust-ci (runs-on: superci/image=rust-ci).");
+    assert_eq!(writes() - before, 1);
+    assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2", "modal_secret": "ghcr-read" } }));
+    // The Secret taken off (a public image now); the address kept.
+    ok(&["runner_images", "update", "rust-ci", "--modal-secret="]);
+    assert_eq!(images(), serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2" } }));
+    assert_eq!(ok(&["runner_images", "list"])["runner_images"], images());
+    // With --dry-run, what it would do, and nothing done.
+    let before = writes();
+    let would = ok(&["runner_images", "update", "rust-ci", "--reference=ghcr.io/acme/ci:3", "--dry-run"]);
+    assert_eq!((would["dry_run"].as_bool(), would["would"].as_str(), would["form"]["fields"]["action"].as_str(), would["form"]["fields"].get("modal_secret")),
+        (Some(true), Some("let jobs on Modal whose label says image=rust-ci start from ghcr.io/acme/ci:3, in place of ghcr.io/acme/ci:2"), Some("image_update"), None), "{would}");
+    assert_eq!((writes(), images()["rust-ci"]["reference"].as_str()), (before, Some("ghcr.io/acme/ci:2")));
+    // A name the control plane does not have: refused, with or without --dry-run, and nothing written.
+    for dry in [&[][..], &["--dry-run"]] {
+        let (code, refused) = json(&home, &[&["runner_images", "update", "gone", "--reference=ghcr.io/acme/ci:3"][..], dry].concat());
+        assert_eq!((code, refused["error"].as_str()), (1, Some("There is no image gone here (`superci runner_images list`). `superci runner_images create gone --reference=REGISTRY/IMAGE:TAG` adds it.")), "{refused}");
+    }
+    assert_eq!((writes(), images()), (before, serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2" } })));
+    // Deleted: gone from the control plane.
+    let said = ok(&["runner_images", "delete", "rust-ci"]);
+    assert_eq!((said["said"].as_str(), images()), (Some("rust-ci is no longer an image here."), serde_json::Value::Null));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
 }

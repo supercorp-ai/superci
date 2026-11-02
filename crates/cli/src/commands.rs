@@ -20,7 +20,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("dashboard", "  superci dashboard                 Opens your dashboard in the browser (on this machine only, while it runs).",
         "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it. With several workspaces it opens on the\none shown last, and the name at the top of its sidebar switches between them.\n\n  --no-browser    Prints its link without opening it."),
     ("login", "  superci login [CLOUD]             Signs in with a cloud in the browser (aws, cloudflare, modal), and ends.",
-        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci, by workspace) and commands use it\nfrom then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account.\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account, beside those signed in to."),
+        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci, by workspace) and commands use it\nfrom then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account, `superci login modal --add` to one more Modal workspace.\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account, beside those signed in to."),
     ("logout", "  superci logout                    Removes SuperCI's sign-ins from this machine (the workspace's).",
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
@@ -32,26 +32,28 @@ const HELP: &[(&str, &str, &str)] = &[
           it is of, when the checkout's origin is not GitHub's (else its cache is its own, apart from GitHub's jobs').\n          It waits for the run and prints its jobs' lines, then each step's result and time and what its machines cost;\n          it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\ncancel    Stops a run, as GitHub's Cancel does: its jobs not started end (one whose `if` holds after a cancel, as\n          `always()`, runs), and a running one is told to stop (its steps have five minutes), then its machine ends. A GitHub run is cancelled by GitHub, asked with your App's token.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
-    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
-        "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's settings: jobs at once, dollars a month (`none` lifts one), and where it starts machines:\n          --regions for aws and aws-on-demand (each its own; aws's spot machines start where a job costs least, the\n          first counted 15% cheaper; aws-on-demand's in order), --location for cloudflare. --networks (AWS's, a\n          network of your own per region; give it once per region) and --image (Cloudflare's) are the account's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal: the ones named, in that order; any not named is\n          taken out (its settings kept). A job goes to the first that can run it and is within its limits; when one\n          cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
+    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] [--account=ID --name=WORD] | cloudflare [--account=ID] [--name=WORD] | modal [--account=WORKSPACE] [--name=WORD]\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
+        "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's settings: jobs at once, dollars a month (`none` lifts one), and where it starts machines:\n          --regions for aws and aws-on-demand (each its own; aws's spot machines start where a job costs least, the\n          first counted 15% cheaper; aws-on-demand's in order), --location for cloudflare.\n          --networks (AWS's, a\n          network of your own per region; give it once per region) and --image (Cloudflare's) are the account's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal (its sandboxes), modal-functions (preemptible, a third of a sandbox's price; deployed when put in, taken out until then): the ones named, in that order; any not named is\n          taken out (its settings kept). A job goes to the first that can run it and is within its limits; when one\n          cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
     ("labels", "  superci labels list\n  superci labels create NAME\n  superci labels delete NAME --confirm",
         "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci/cpu=8`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
     ("name", "  superci name retrieve\n  superci name update NAME",
         "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"AcmeCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
-    ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--disk-speed=MIBS] [--disk-iops=N] [--arch=x64|arm64]\n                         [--os=linux|windows] [--image=ubuntu26|ubuntu24] [--gpu=any|NAME] [--family=m8a+r8a] [--scratch=ramdisk|localdisk]\n                         [--provider=aws|cloudflare|modal] [--spot=true|false] [--docker-cache=true|false]",
+    ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--disk-speed=MIBS] [--disk-iops=N] [--arch=x64|arm64]\n                         [--os=linux|windows] [--image=ubuntu26|ubuntu24|NAME] [--gpu=any|NAME] [--family=m8a+r8a] [--scratch=ramdisk|localdisk]\n                         [--provider=aws|cloudflare|modal] [--spot=true|false] [--docker-cache=true|false]",
         "The machine `runs-on: superci` alone gets. A job's label says another with the same keys, as key=value pairs\nafter its name: `superci/cpu=8/arch=arm64`. What a label leaves out is the default machine's.\n\nEach flag is a key (see superci.dev/docs/labels). `--KEY=default` leaves one to each provider's standard again.\n\n--disk-speed  On AWS a disk's speed follows the machine's size (31.25 MiB a second for each CPU, up to 1,000; the\n              extra is in a job's price). 125 is what AWS includes at no extra price; a number sets it (125 to\n              2000).\n--spot        false: never a spot machine. --scratch: a job's files in memory or on a machine's own disk.\n--family      Only these AWS machine families. --provider: only this provider.\n--docker-cache  false: Docker as it comes, no images from the cache or kept for it; true: from the cache from a\n              job's start, even one whose last run used no images (Ubuntu 26.04 machines)."),
     ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N] [--monthly-usd=N|none] [--daily-usd=N|none]",
         "--monthly-usd The most the CI may spend on machines in a month, all providers together (no limit unless set).\n              At it no job starts until next month or a higher limit. A cloud account's own limit is\n              `superci accounts update aws --monthly-usd=N`; a provider's, `superci runners update`.\n--daily-usd   The same for a day (UTC): a day that runs away stops that day.\n--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
     ("public_repos", "  superci public_repos list\n  superci public_repos create OWNER/REPO\n  superci public_repos delete OWNER/REPO",
         "Public repositories allowed to run here. Jobs from public repositories are refused unless the repository is allowed.\nEven then, a fork's pull request and `pull_request_target` runs are refused."),
+    ("runner_images", "  superci runner_images list\n  superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG [--modal-secret=SECRET]\n  superci runner_images update NAME [--reference=REGISTRY/IMAGE:TAG] [--modal-secret=SECRET|--modal-secret=]\n  superci runner_images delete NAME",
+        "Images of your own for jobs on Modal, with a repository's tools in them already: a job names one by its name in its\nlabel (`runs-on: superci/image=NAME`) and its sandbox starts from it in place of GitHub's runner image. Other providers\nrefuse such a job, saying why. A label is split at each /, so it says the name; the control plane keeps the address.\n\ncreate    NAME: 2 to 32 lowercase letters, digits and dashes (not beginning with ubuntu). --reference: where the image\n          is, as `docker pull` takes it. Make it FROM ghcr.io/actions/actions-runner: GitHub's runner\n          (/home/runner/run.sh) starts the job, and a job whose image has none fails, saying so. Modal keeps an\n          image by its address and does not fetch a tag pushed again: give each build a tag of its own, or its\n          digest (…@sha256:…). A public image needs nothing more. For a private registry, --modal-secret names a\n          Secret with REGISTRY_USERNAME and REGISTRY_PASSWORD (for ghcr.io, a token that reads packages), in each\n          Modal workspace that runs jobs (each reads its own); only its name is kept here.\nupdate    The same name, a new --reference (a new build's tag) or --modal-secret (empty: none), in one change:\n          a job that names it starts from the new image, and none finds the name missing meanwhile. What it does\n          not say stays as it is. A name there is not is refused.\ndelete    Jobs that still name it fail, saying so."),
     ("connections", "  superci connections list\n  superci connections create github OWNER [--host=https://github.example.com]\n  superci connections create gitlab --url=https://gitlab.com [--gitlab=ID|new]\n  superci connections delete github OWNER --confirm\n  superci connections delete gitlab [ID] --confirm",
         "Where jobs come from: the GitHub accounts and the GitLabs connected.\n\nlist      Each GitHub account with where its App is installed, and each GitLab.\ncreate    github: opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your\n          own name) and chooses its repositories. GitHub offers that nowhere else. It ends when the App is\n          installed. --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\n          gitlab: the token is read from SUPERCI_GITLAB_TOKEN (--token-env=NAME for another variable): a project,\n          group or personal access token with the scopes api, create_runner and manage_runner. It goes to your\n          control plane and is not kept on this machine. --gitlab=new: a further connection beside the first.\ndelete    github: a further organization; its App is uninstalled and forgotten (the first one goes with\n          `superci leave`). gitlab: its projects stop sending jobs here, and its token is forgotten."),
     ("deliveries", "  superci deliveries list\n  superci deliveries retrieve ID",
         "What GitHub says of the events it sent your control plane lately: for a job that never got a machine.\n\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
     ("projects", "  superci projects list [--gitlab=ID]\n  superci projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci projects update --all --enabled=true [--gitlab=ID]",
         "The projects a GitLab connection's token reaches (on GitHub, repositories are chosen where the App is installed).\n\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
-    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update aws [--monthly-usd=N|none] [--daily-usd=N|none]\n                              [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
-        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month and in a day (UTC), its spot and on-demand\n          machines together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
+    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update ACCOUNT [--monthly-usd=N|none] [--daily-usd=N|none]\n                                  [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
+        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most an account (aws, cloudflare, modal, or a further one by its word) may spend on machines in a month\n          and in a day (UTC), its runners together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
     ("usage", "  superci usage retrieve [--period=day|week|month]",
         "What jobs used in the last 24 hours (day, unless given), 7 days or 30 days: how many ran, their machines' minutes and\nthe minutes GitHub or GitLab would bill (each job rounded up to a minute), what they cost, and what the code host's\nown runners of the same sizes would have charged."),
     ("artifacts", "  superci artifacts list --run=ID\n  superci artifacts retrieve NAME --run=ID [--out=DIR]",
@@ -115,7 +117,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "secrets", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "secrets", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "runner_images", "labels", "name", "machine", "limits", "caches"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -148,7 +150,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 58] = ["label", "input", "event-payload", "docker-cache", "branch", "environment", "value-env", "images", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 61] = ["reference", "modal-secret", "label", "input", "event-payload", "docker-cache", "branch", "environment", "value-env", "images", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "name", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -995,23 +997,32 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         // An account's limit for a month, its providers together (AWS: spot and on-demand machines).
         ("accounts", "update") => {
-            if w(2) != "aws" { return usage("Say which cloud's: `superci accounts update aws --monthly-usd=200`. Another provider's limit is its own: `superci runners update CLOUD --monthly-usd=N`.") }
+            let account = w(2);
+            if account.is_empty() { return usage("Say which: `superci accounts update aws --monthly-usd=200` (or cloudflare, modal, or a further account's word).") }
             if !["monthly-usd", "daily-usd", "aws-budget"].iter().any(|f| args.has(f)) { return usage("Say what to change: `superci accounts update aws --monthly-usd=200` (see `superci help accounts`).") }
             let budget = args.get("aws-budget");
+            if account != "aws" && (budget.is_some() || args.has("email")) { return usage("--aws-budget and --email are for aws: a budget in the account itself is AWS's.") }
             if budget.is_some_and(|b| !["none", "emails", "stops", "lift"].contains(&b)) { return usage("--aws-budget is none, emails, stops or lift (see `superci help accounts`).") }
             let mut d = signed_in();
             to_set(&mut d)?;
             in_use(&d)?;
-            let now = view(&mut d)?.routing();
-            let (month, day) = (given_dollars(args, "monthly-usd", now.account_usd.get("aws").copied())?, given_dollars(args, "daily-usd", now.account_daily_usd.get("aws").copied())?);
-            let mut fields = vec![field("action", "account_usd"), field("account", "aws"), field("usd", month.clone()), field("daily", day.clone())];
+            let seen = view(&mut d)?;
+            if account != "aws" && !CLOUDS.contains(&account) && !seen.records().accounts.iter().any(|a| a.name == account) { return usage(format!("{account} is not an account of this CI.")) }
+            let now = seen.routing();
+            let (month, day) = (given_dollars(args, "monthly-usd", now.account_usd.get(account).copied())?, given_dollars(args, "daily-usd", now.account_daily_usd.get(account).copied())?);
+            let mut fields = vec![field("action", "account_usd"), field("account", account), field("usd", month.clone()), field("daily", day.clone())];
             if let Some(b) = budget { fields.push(field("budget", b)) }
             if let Some(email) = args.get("email") { fields.push(field("email", email)) }
             let in_aws = match budget { Some("none") => "; no budget in AWS itself", Some("emails") => "; AWS emails at 80% and 100% of it", Some("stops") => "; AWS emails, and stops new machines at 100% of it", Some("lift") => "; AWS's rule taken off the control plane's role", _ => "" };
-            apply!(d, args, format!("let the AWS account spend on machines {} a month and {} a day (spot and on-demand together){in_aws}", or_no_limit(&month), or_no_limit(&day)), "/routing", &fields);
+            let whose = if account == "aws" { "The AWS account".to_string() } else if CLOUDS.contains(&account) { format!("The {} account", superci_core::plane::cloud_name(account)) } else { account.to_string() };
+            let together = if account == "aws" { "spot and on-demand together" } else { "its runners together" };
+            apply!(d, args, format!("let {} spend on machines {} a month and {} a day ({together}){in_aws}", whose.replacen("The", "the", 1), or_no_limit(&month), or_no_limit(&day)), "/routing", &fields);
             let v = view(&mut d)?;
             let routing = v.routing();
-            let (spent, cap, today, day_cap) = (v.spend_account("aws"), routing.account_usd.get("aws").copied(), v.spend_today_account("aws"), routing.account_daily_usd.get("aws").copied());
+            let (spent, cap, today, day_cap) = (v.spend_account(account), routing.account_usd.get(account).copied(), v.spend_today_account(account), routing.account_daily_usd.get(account).copied());
+            if account != "aws" {
+                return Ok(Done { said: vec![month_line(&whose, spent, cap), day_line(today, day_cap)], data: json!({ "ok": true, "cloud": account, "monthly_usd": cap, "spent_usd": spent, "daily_usd": day_cap, "spent_today_usd": today }) })
+            }
             let said_budget = match &routing.aws_budget { None => "No budget in AWS itself.", Some(b) if b.stop => "In AWS itself: emails at 80% and 100% of the month's limit, and no new machines at 100%.", Some(_) => "In AWS itself: emails at 80% and 100% of the month's limit." };
             Ok(Done { said: vec![month_line("The AWS account", spent, cap), day_line(today, day_cap), said_budget.to_string()],
                 data: json!({ "ok": true, "cloud": "aws", "monthly_usd": cap, "spent_usd": spent, "daily_usd": day_cap, "spent_today_usd": today, "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) }) })
@@ -1221,19 +1232,32 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             // As the Add runners page does: a control plane starts machines in its own cloud itself; elsewhere it is
             // connected (AWS: a role it may assume; Cloudflare, Modal: a small launcher there).
             let (path, fields) = match (cloud, &plane) {
+                // (A further account signed in to: by its id, with a region and perhaps its word.)
+                ("aws", _) if args.has("account") => match args.get("region") {
+                    Some(r) => ("/runners/aws", [Some(field("account", args.get("account").unwrap_or_default())), Some(field("region", r)), args.get("name").map(|n| field("name", n))].into_iter().flatten().collect()),
+                    None => return usage("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."),
+                },
                 ("aws", Plane::Aws { .. }) => ("/runners/aws-own", vec![]),
                 ("aws", _) => match args.get("region") { Some(r) => ("/aws/connect", vec![field("region", r)]), None => return usage("Say where its machines start: `superci runners create aws --region=us-east-1`.") },
-                ("modal", Plane::Modal { .. }) => ("/runners/modal-own", vec![]),
-                ("modal", _) => ("/runners/modal", vec![]),
-                _ => ("/runners/cloudflare", args.get("account").map(|a| vec![field("account", a)]).unwrap_or_default()),
+                ("modal", Plane::Modal { workspace, .. }) if args.get("account").is_none_or(|a| a == workspace) => ("/runners/modal-own", vec![]),
+                ("modal", _) => ("/runners/modal", [args.get("account").map(|a| field("account", a)), args.get("name").map(|n| field("name", n))].into_iter().flatten().collect()),
+                _ => ("/runners/cloudflare", [args.get("account").map(|a| field("account", a)), args.get("name").map(|n| field("name", n))].into_iter().flatten().collect()),
             };
             // (Done, it says nothing of its own.)
             apply!(d, args, format!("let {cloud} run jobs for the control plane in use ({})", plane.place()), path, &fields);
-            Ok(Done::said(format!("{cloud} runs jobs now.")))
+            // (A further one goes by a word of its own.)
+            // (A control plane that stops answering here leaves its view without a status: said by the provider.)
+            let word = args.get("account").and_then(|a| view(&mut d).ok().and_then(|v| {
+                let records = v.records();
+                records.accounts.iter().find(|c| c.cloud_id.as_deref() == Some(a)).map(|c| c.name.clone())
+                    .or_else(|| v.launchers().into_iter().find(|l| l.url.starts_with(&format!("https://{a}--"))).map(|l| l.cloud))
+            })).unwrap_or_else(|| cloud.to_string());
+            Ok(Done::said(format!("{word} runs jobs now.")))
         }
         ("runners", "delete") => {
             let cloud = w(2);
-            if !CLOUDS.contains(&cloud) { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal).") }
+            let further = |word: &str| view(&mut signed_in()).is_ok_and(|v| v.records().runners.iter().any(|r| r.name == word && !r.gone));
+            if !CLOUDS.contains(&cloud) && !further(cloud) { return usage("Say which: `superci runners delete aws --confirm` (or cloudflare, modal, or a further runner's word).") }
             let would = format!("remove {cloud} as a runner provider{}", if args.has("only-here") { ", leaving what SuperCI made for it there" } else { " and delete what SuperCI made for it there" });
             confirmed(args, &would)?;
             let mut d = ready()?;
@@ -1262,11 +1286,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         }
         ("runners", "update") => {
             let cloud = w(2);
+            // Modal's jobs as Functions (preemptible, a third of a sandbox's price) or as sandboxes.
             let mut d = signed_in();
-            let order = view(&mut d)?.order();
+            let v = view(&mut d)?;
+            let order = v.order();
             let Some(pool) = order.iter().find(|p| p.cloud == cloud) else { return usage(format!("Say which: `superci runners update CLOUD …`, one of {}.", order.iter().map(|p| p.cloud.clone()).collect::<Vec<_>>().join(", "))) };
             if args.has("enabled") { return usage(format!("The order says what is used: `superci runners order …` without {cloud} takes it out, with it puts it back.")) }
-            if args.has("regions") && superci_core::plane::account_of(cloud) != "aws" { return usage("--regions is for aws and aws-on-demand.") }
+            if args.has("regions") && superci_core::plane::account_of(cloud) != "aws" && v.records().provider_of(cloud) != "aws" { return usage("--regions is for aws and aws-on-demand.") }
             // The form's fields as they stand, with what was given in their place (the page sends them all).
             let limit = |flag: &str, now: Option<String>| match args.get(flag) { Some("none") => String::new(), Some(v) => v.to_string(), None => now.unwrap_or_default() };
             let regions: Vec<String> = args.get("regions").map(|r| r.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect()).unwrap_or_default();
@@ -1362,6 +1388,45 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("public_repos", "list") => {
             let allowed = view(&mut signed_in())?.routing().public_repos;
             Ok(Done { said: if allowed.is_empty() { vec!["No public repository is allowed to run here. Allow one: `superci public_repos create OWNER/REPO`.".into()] } else { allowed.clone() }, data: json!({ "public_repos": allowed }) })
+        }
+        ("runner_images", "list") => {
+            let images = view(&mut signed_in())?.routing().images;
+            let said = if images.is_empty() { vec!["No image of your own. Add one: `superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG`.".into()] }
+                else { images.iter().map(|(name, i)| format!("{name}  {}{}", i.reference, i.modal_secret.as_ref().map(|s| format!("  (Modal Secret {s})")).unwrap_or_default())).collect() };
+            Ok(Done { said, data: json!({ "runner_images": images }) })
+        }
+        ("runner_images", "create") => {
+            let Some(reference) = args.get("reference").filter(|_| !w(2).is_empty()) else { return usage("Say which and where: `superci runner_images create NAME --reference=REGISTRY/IMAGE:TAG`.") };
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            apply!(d, args, format!("let jobs on Modal start from {reference} when their label says image={}", w(2)), "/routing",
+                &[field("action", "image_add"), field("name", w(2)), field("reference", reference), field("modal_secret", args.get("modal-secret").unwrap_or_default())]);
+            Ok(Done::said(format!("Jobs on Modal start from {reference} when their label says image={} (runs-on: superci/image={}).", w(2), w(2))))
+        }
+        // One write of the routing (see the dashboard's `image_update`): never a delete and a create, between which a
+        // job naming it would fail as an unknown image.
+        ("runner_images", "update") => {
+            let (to, secret_to) = (args.get("reference"), args.get("modal-secret"));
+            if w(2).is_empty() || (to.is_none() && secret_to.is_none()) { return usage("Say which and what: `superci runner_images update NAME --reference=REGISTRY/IMAGE:TAG` (or --modal-secret=SECRET, empty for none).") }
+            if to.is_some_and(|r| !superci_core::plane::valid_image_reference(r)) { return usage("Check the image's address: as `docker pull` takes it, ghcr.io/acme/ci:2026-10, or by its digest (ghcr.io/acme/ci@sha256:…).") }
+            if secret_to.is_some_and(|s| !s.is_empty() && !superci_core::plane::valid_modal_secret(s)) { return usage("Check the Modal Secret's name: letters, digits, dashes, underscores and dots, as Modal names a Secret.") }
+            let mut d = ready_to_set()?;
+            let Some(had) = view(&mut d)?.routing().images.remove(w(2)) else { return Err(Fail::Failed(crate::dashboard::no_image(w(2)))) };
+            let reference = to.unwrap_or(&had.reference).to_string();
+            let secret = secret_to.map(str::to_string).or(had.modal_secret).filter(|s| !s.is_empty());
+            let with = secret.as_ref().map(|s| format!(" (Modal Secret {s})")).unwrap_or_default();
+            let mut fields = vec![field("action", "image_update"), field("name", w(2))];
+            if let Some(r) = to { fields.push(field("reference", r)) }
+            if let Some(s) = secret_to { fields.push(field("modal_secret", s)) }
+            apply!(d, args, format!("let jobs on Modal whose label says image={} start from {reference}{with}, in place of {}", w(2), had.reference), "/routing", &fields[..]);
+            Ok(Done::said(format!("Jobs on Modal start from {reference}{with} when their label says image={} (runs-on: superci/image={}).", w(2), w(2))))
+        }
+        ("runner_images", "delete") => {
+            if w(2).is_empty() { return usage("Say which: `superci runner_images delete NAME`.") }
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            apply!(d, args, format!("forget the image {}: jobs that name it fail", w(2)), "/routing", &[field("action", "image_remove"), field("name", w(2))]);
+            Ok(Done::said(format!("{} is no longer an image here.", w(2))))
         }
         ("public_repos", operation @ ("create" | "delete")) => {
             let action = if operation == "create" { "add" } else { "remove" };
@@ -1467,12 +1532,19 @@ fn other_limits(v: &crate::view::PlaneView) -> (Vec<String>, Value) {
             Some(_) => "In AWS itself: a budget that emails at 80% and 100% of the account's monthly limit.".to_string(),
         });
     }
+    // Every other account with a limit.
+    let accounts: Vec<Value> = routing.account_usd.keys().chain(routing.account_daily_usd.keys()).filter(|a| *a != "aws").collect::<std::collections::BTreeSet<_>>().into_iter().map(|a| {
+        let (month, day) = (routing.account_usd.get(a).copied(), routing.account_daily_usd.get(a).copied());
+        said.push(format!("{} (`superci accounts update {a} --monthly-usd=N --daily-usd=N`)", month_line(&format!("The account {a}"), v.spend_account(a), month).trim_end_matches('.')));
+        if day.is_some() { said.push(format!("  {}", day_line(v.spend_today_account(a), day))) }
+        json!({ "account": a, "monthly_usd": month, "daily_usd": day, "spent_usd": v.spend_account(a), "spent_today_usd": v.spend_today_account(a) })
+    }).collect();
     let pools: Vec<Value> = routing.order.iter().filter_map(|p| p.monthly_usd.map(|cap| {
         said.push(format!("{} spent ${:.2} this month, of {} allowed (`superci runners update {} --monthly-usd=N`).", superci_core::plane::cloud_name(&p.cloud), v.spend(&p.cloud), superci_core::plane::dollars(cap), p.cloud));
         json!({ "cloud": p.cloud, "monthly_usd": cap, "spent_usd": v.spend(&p.cloud) })
     })).collect();
     let data = json!({ "aws_account": aws.then(|| json!({ "monthly_usd": month, "daily_usd": day, "spent_usd": v.spend_account("aws"), "spent_today_usd": v.spend_today_account("aws"),
-        "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) })), "providers": pools });
+        "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) })), "accounts": accounts, "providers": pools });
     (said, data)
 }
 
@@ -1507,11 +1579,11 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
                 c => match CLOUDS.iter().find(|k| **k == c) { Some(k) => Some(*k), None => return Some(usage("Say which: `superci login aws`, `cloudflare` or `modal`.")) },
             };
             let mut d = signed_in();
-            // `--add`: one more AWS account beside those signed in to (a sign-in adds an account; it replaces none).
-            let add = args.has("add") && cloud == Some("aws");
+            // `--add`: one more AWS account or Modal workspace beside those signed in to (it replaces none).
+            let add = args.has("add") && matches!(cloud, Some("aws" | "modal"));
             let there = match cloud { Some(c) => d.signed_in_as().is_some_and(|s| s.to_lowercase().contains(c)), None => d.signed_in_as().is_some() };
             if there && !add {
-                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), if cloud == Some("aws") { " `superci login aws --add` signs in to another AWS account beside it." } else { "" });
+                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), match cloud { Some("aws") => " `superci login aws --add` signs in to another AWS account beside it.", Some("modal") => " `superci login modal --add` signs in to another Modal workspace beside it.", _ => "" });
                 return Some(Ok(()))
             }
             d.adding = add;
@@ -1605,7 +1677,17 @@ fn status_lines(v: &Value) -> Vec<String> {
     for c in st["cloud_says"].as_array().into_iter().flatten() {
         out.push(format!("{:<14}{} (a newer SuperCI answers it: update it, then `superci planes update`)", format!("{} says", superci_core::plane::cloud_name(c["cloud"].as_str().unwrap_or_default())), c["said"].as_str().unwrap_or_default()));
     }
+    // Modal's Functions (`superci runners order modal-functions modal`): what their preemptions came to this month.
+    if let Some(line) = preempted_words(st) { out.push(format!("Preempted     {line}")) }
     out
+}
+
+/// Modal Functions preempted this month and jobs run again for it, when Modal runs any as Functions or one was.
+fn preempted_words(st: &Value) -> Option<String> {
+    let records = crate::view::records_in(st);
+    let functions = st["routing"]["order"].as_array().is_some_and(|o| o.iter().any(|p| p["off"] != true && p["cloud"].as_str().is_some_and(|c| records.modal_function(c))));
+    let (month, rerun) = (st["preempted"]["month"].as_u64()?, st["preempted"]["rerun"].as_u64().unwrap_or(0));
+    (functions || month > 0).then(|| format!("{month} Modal Function{} this month · {rerun} job{} run again", if month == 1 { "" } else { "s" }, if rerun == 1 { "" } else { "s" }))
 }
 
 /// `superci workspaces …`: the workspaces kept on this machine. Each is read from its own folder; no cloud is asked.
@@ -1726,7 +1808,7 @@ fn runners_of(d: &mut Dashboard) -> Result<Done> {
     let st = view.status.clone().unwrap_or_default();
     let pools = view.order();
     let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "monthly_usd": p.monthly_usd,
-        "regions": if superci_core::plane::account_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
+        "regions": if view.records().provider_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
         "running": st["active"][&p.cloud].as_u64().unwrap_or(0), "spent_usd": st["spend"][&p.cloud].as_f64().unwrap_or(0.0) })).collect();
     let line = |p: &Value| [p["regions"].as_array().map(|r| format!("in {}", r.iter().filter_map(|r| r.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default(),
         p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]
@@ -1735,6 +1817,7 @@ fn runners_of(d: &mut Dashboard) -> Result<Done> {
     let out: Vec<&str> = order.iter().filter(|p| p["taken_out"] == true).filter_map(|p| p["cloud"].as_str()).collect();
     if !out.is_empty() { said.push(format!("Taken out of the order: {} (`superci runners order` with it named puts it back).", out.join(", "))) }
     if said.is_empty() { said.push("No runner provider yet: `superci runners create aws` (or cloudflare, or modal).".into()) }
+    if let Some(line) = preempted_words(&st) { said.push(format!("Preempted: {line}.")) }
     let machine = serde_json::to_value(view.machine()).unwrap_or_default();
     // (By the label workflows name here: the first of the control plane's.)
     said.push(format!("`runs-on: {}` gets: {}.", view.label(), machine_words(&machine)));
@@ -1860,7 +1943,7 @@ mod tests {
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci connections list", "superci connections create github OWNER", 
             "superci deliveries list", "superci deliveries retrieve ID", "superci connections create gitlab", "superci connections delete github OWNER", "superci connections delete gitlab", "superci projects list", "superci projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
-            "superci accounts list", "superci accounts retrieve aws", "superci deliveries list", "superci projects update PROJECT_ID",
+            "superci runner_images list", "superci runner_images create NAME", "superci runner_images update NAME", "superci runner_images delete NAME", "superci accounts list", "superci accounts retrieve aws", "superci deliveries list", "superci projects update PROJECT_ID",
             "superci workspaces list", "superci workspaces create NAME", "superci workspaces update ID --id=NEW", "superci workspaces delete ID --confirm"] {
             assert!(all.contains(command), "{command}");
         }
@@ -1889,7 +1972,7 @@ mod tests {
         for line in ["status", "jobs list", "jobs retrieve 7", "runs list", "runs retrieve 7", "deliveries list", "deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "connections list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "projects list", "projects update 7 --enabled=true", "projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
-            "planes update --dry-run", "runners create cloudflare --dry-run"] {
+            "planes update --dry-run", "runners create cloudflare --dry-run", "runner_images list", "runner_images create rust-ci --reference=ghcr.io/acme/ci:1", "runner_images update rust-ci --reference=ghcr.io/acme/ci:2", "runner_images update rust-ci --modal-secret=", "runner_images delete rust-ci"] {
             assert_eq!(run(line), signed_out, "{line}");
         }
         for line in ["planes delete abcdef123456", "leave", "runners delete aws", "labels delete superci", "connections delete github acme", "connections delete gitlab"] {
@@ -1898,7 +1981,8 @@ mod tests {
             assert_eq!(run(&format!("{line} --dry-run")), signed_out, "{line}: a dry run checks the sign-in too");
         }
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
-            ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("connections create gitlab", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("connections create gitlab --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
+            ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("runner_images create rust-ci", "Say which and where:"), ("runner_images create --reference=ghcr.io/acme/ci:1", "Say which and where:"), ("runner_images delete", "Say which:"), ("runner_images update rust-ci", "Say which and what:"), ("runner_images update --reference=ghcr.io/acme/ci:2", "Say which and what:"),
+            ("runner_images update rust-ci --reference=https://ghcr.io/acme/ci", "Check the image's address:"), ("runner_images update rust-ci --modal-secret=a!secret", "Check the Modal Secret's name:"), ("connections create gitlab", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("connections create gitlab --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
             ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("runs retrieve", "Say which: `superci runs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
             ("projects update 7", "Say which way:"), ("projects update --all --enabled=false", "Projects are switched off one at a time"),
             ("planes", "`superci planes` takes an operation."), ("limits", "`superci limits` takes an operation."), ("runners frob", "`frob` is not an operation of `superci runners`."), ("limits set", "`set` is not an operation of `superci limits`."),

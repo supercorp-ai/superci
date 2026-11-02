@@ -1,0 +1,30 @@
+Modal did not answer (Modal AuthTokenGet: the test kit's Modal has no answer for it).
+What is there is not shown; it is asked again on the next page.
+Settings Name What your CI is called.
+SuperCI Change Labels What workflows name in runs-on .
+superci Change Labels A workflow may name any of them in runs-on .
+superci Add Name Shown in the dashboard and on GitHub.
+Save Limits Largest machine A label asking for more is refused.
+CPUs Save Longest job Its machine is ended after this.
+Cloudflare allows 6 hours, Modal 24.
+hours Save Cache In your AWS account On.
+Jobs on AWS keep GitHub's cache in a bucket of yours, in their region.
+Turn off Each repository The least recently used go first.
+About $0.023 a GB a month in S3.
+GB Save Unused for An entry goes after this.
+One saved 30 days ago is saved anew.
+days Save Docker images On.
+A job's next run reads the images it pulled from your bucket instead of the internet (Ubuntu 26.04 machines).
+Turn off Kept now Nothing kept yet.
+Secrets For runs from a computer.
+Jobs GitHub sends get GitHub's own.
+Add None kept A run from a computer gets the secrets its workflow names.
+One not kept is empty, as on GitHub.
+Add a secret Kept in your control plane's cloud, never shown again.
+Name Value Where it may be used Repository Branch Workflow Environment Add Keys Who reaches this CI: each device's key, and read and run keys made for coding agents and scripts.
+Anyone signed in to its cloud account can add their own.
+THIS COMPUTER Device key · made N seconds ago · last used N seconds ago This device A device Device key · made N seconds ago · last used N seconds ago Remove agent Run key: reads and starts runs from a computer · N more days Remove Workspace Its id: what --workspace takes in commands.
+default Change This device Signed in: AWS account 111111111111, AWS account 222222222222, Modal workspace acme-two, Modal workspace acmeorg.
+Signing out removes this workspace's sign-ins from it; your runners keep working.
+Sign out Workspace id What --workspace takes in commands.
+Save D default AWS · 111111111111 · us-east-1 New workspace…
