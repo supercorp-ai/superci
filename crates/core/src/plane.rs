@@ -2769,7 +2769,7 @@ impl<'a> ControlPlane<'a> {
             Some(given) => aws::given_network(self.http, region, creds, given, now).await.map(Some),
             None => aws::find_network(self.http, region, creds, &self.config.plane_id, now).await,
         };
-        self.note_permission("aws", "ReadNetwork", &found).await;
+        self.note_permission(a.account(), "ReadNetwork", &found).await;
         let n = match found {
             Ok(n) => n,
             Err(e) if !self.config.aws_networks.contains_key(region) && ["AccessDenied", "UnauthorizedOperation", "not authorized"].iter().any(|d| e.contains(d)) => None,
@@ -2919,10 +2919,10 @@ impl<'a> ControlPlane<'a> {
         let spec = self.config.parse(&j.label).and_then(|s| s.ok()).map(|s| s.or(&self.config.machine)).unwrap_or_default();
         let machine = match j.zone.as_deref() {
             Some(zone) if !(spec.on_demand() || j.on_demand) => aws::spot_cost(self.http, &region, zone, &creds, &kind, spec.os(), from, end, now).await,
-            _ => { let p = aws::on_demand_price(self.http, &creds, &region, &kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.map(|p| p * hours) }
+            _ => { let p = aws::on_demand_price(self.http, &creds, &region, &kind, spec.os(), now).await; self.note_permission(a.account(), "Prices", &p).await; p.map(|p| p * hours) }
         };
         let disk = aws::disk_price(self.http, &creds, &region, now).await;
-        self.note_permission("aws", "Prices", &disk).await;
+        self.note_permission(a.account(), "Prices", &disk).await;
         let gb_month = disk.unwrap_or_else(|_| aws::disk_gb_month(&region));
         if let Ok(machine) = machine {
             j.cost_usd = Some(j.earlier_usd + machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers && !(j.ramdisk || j.local_disk))) * hours);
@@ -2937,7 +2937,7 @@ impl<'a> ControlPlane<'a> {
         let Ok(Some(a)) = self.aws_connection_of(&j.cloud).await else { return false };
         let Ok(creds) = self.aws_creds(plane_url, &a).await else { return false };
         let sent = aws::bytes_sent(self.http, &region, &creds, &id, j.launched_ms.unwrap_or(j.at_ms), end, self.clock.now_ms()).await;
-        self.note_permission("aws", "MachineTraffic", &sent).await;
+        self.note_permission(a.account(), "MachineTraffic", &sent).await;
         let bytes = match sent {
             Ok(b) => b,
             // A role from before it could read CloudWatch: not known (-1), not asked again.
@@ -3577,7 +3577,7 @@ impl<'a> ControlPlane<'a> {
                             if let Some(e) = told.fleet_refused.take() {
                                 let _ = self.store.put(&format!("{notes}{NO_FLEET_KEY}"), now.to_string()).await;
                                 self.note_permission::<()>("aws", "AskSpotPoolsAtOnce", &Err(e)).await;
-                            } else if fleet && told.asked.iter().any(|a| a.4 > 0) { self.note_permission("aws", "AskSpotPoolsAtOnce", &Ok(())).await }
+                            } else if fleet && told.asked.iter().any(|a| a.4 > 0) { self.note_permission(a.account(), "AskSpotPoolsAtOnce", &Ok(())).await }
                             // The launch template of a request for many pools is removed: after the request at hand
                             // is answered where the runtime can do that (it is in the way of nothing, and the job's
                             // machine is the sooner known), else now. Noted first, so that one not removed for any
@@ -3625,7 +3625,7 @@ impl<'a> ControlPlane<'a> {
                                 let _ = self.store.put(BUDGET_STOPPED_KEY, now.to_string()).await;
                                 return Err(format!("{BUDGET_STOPPED}: raise the account's limit on Runners in the {} dashboard (that lifts it), or wait for next month", self.config.name()))
                             }
-                            self.note_permission("aws", "LaunchOnlyTaggedMachines", &machine).await;
+                            self.note_permission(a.account(), "LaunchOnlyTaggedMachines", &machine).await;
                             match machine {
                                 Ok(m) => {
                                     // (A machine started: the budget's rule, if it was on the role, is off it.)
@@ -3661,7 +3661,7 @@ impl<'a> ControlPlane<'a> {
                         if !on_demand { job.spot_refused = None }
                         job.private = private;
                         // Spot: its zone's price now. On-demand: AWS's list price. Settled at the prices in effect when it ends.
-                        let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
+                        let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission(a.account(), "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
                         job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && spec.scratch.is_none()));

@@ -2928,7 +2928,7 @@ impl Dashboard {
                     match &creds {
                         Some(creds) => {
                             if let Err(e) = aws::disconnect_runners(creds, &id, plane.url(), &plane_id) { left.push(format!("its role ({e})")) }
-                            if let Err(e) = aws::delete_networks(creds, &plane_id, &REGIONS).or_else(|_| aws::delete_networks(creds, &plane_id, &REGIONS)) { left.push(format!("its machines' network ({e})")) }
+                            if let Err(e) = aws::delete_further_networks(creds, &plane_id, &REGIONS).or_else(|_| aws::delete_further_networks(creds, &plane_id, &REGIONS)) { left.push(format!("its machines' network ({e})")) }
                         }
                         None => left.push(format!("in AWS account {id}: the role superci-plane-{plane_id}, and its machines' network (none cost anything)")),
                     }
@@ -3467,6 +3467,8 @@ impl Dashboard {
                     let id = a["account_id"].as_str()?;
                     Some((id.to_string(), aws_all.iter().find(|(s, _)| s == id)?.1.clone(), a["regions"].as_array()?.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()))
                 }).collect();
+                let first_creds = aws_all.iter().find(|(id, _)| status["aws"]["account_id"].as_str() == Some(id.as_str())).map(|(_, c)| c.clone());
+                let further_given: Vec<String> = status["aws_further"].as_array().into_iter().flatten().filter(|a| further_aws.iter().any(|(id, _, _)| a["account_id"].as_str() == Some(id.as_str()))).filter_map(|a| a["name"].as_str().map(str::to_string)).collect();
                 let aws_missing_further: Vec<&str> = status["aws_further"].as_array().into_iter().flatten().filter(|a| !further_aws.iter().any(|(id, _, _)| a["account_id"].as_str() == Some(id.as_str()))).filter_map(|a| a["name"].as_str()).collect();
                 let modal_sessions: Vec<modal::Session> = modal_launchers.iter().filter_map(|(_, url)| self.modal_of_launcher(url).cloned()).collect();
                 let modal_missing: Vec<&str> = modal_launchers.iter().filter(|(_, url)| self.modal_of_launcher(url).is_none()).map(|(word, _)| word.as_str()).collect();
@@ -3509,7 +3511,11 @@ impl Dashboard {
                             Deploying::Modal { session, plane_id, label, recreate } => modal::deploy_plane(session, plane_id, label, *recreate, &step)?,
                         };
                         // A separate Cloudflare launcher (for a control plane elsewhere) is updated with it.
-                        for (account, creds, regions) in &further_aws { aws::give_runner_role(creds, account, plane.plane_id(), regions)?; }
+                        for (account, creds, regions) in &further_aws { aws::give_further_role(creds, account, plane.plane_id(), regions)?; }
+                        // (The cache in their regions, in the first account, when that one is signed in to; and the
+                        // refusals noted of each role just given what it lacked go.)
+                        if let Some(c) = &first_creds { let regions: Vec<String> = further_aws.iter().flat_map(|(_, _, r)| r.clone()).collect(); if !regions.is_empty() { let _ = aws::make_caches(c, plane.plane_id(), &regions); } }
+                        for word in &further_given { let _ = cloudflare::plane_post(&url, &key, "/permissions/given", &serde_json::json!({ "cloud": word })); }
                         if let Some(cf) = &cf { for account in &cf_accounts_of { cf.deploy_runners(account, plane.url(), plane.plane_id())?; } }
                         // (And a Modal launcher, at the address it has: its name stays.)
                         for session in &modal_sessions { plane_keys(&url).and_then(|keys| modal::deploy_runners(session, plane.url(), plane.plane_id(), &keys))?; }
@@ -3669,7 +3675,15 @@ impl Dashboard {
                 let creds = self.aws_creds()?;
                 aws::connect_runners(&creds, &account_id, plane.url(), plane.plane_id(), AUDIENCE)?;
                 let regions: Vec<String> = std::iter::once(region.as_str()).chain(nearby_regions(&region).iter().copied()).map(str::to_string).collect();
-                aws::make_networks(&creds, plane.plane_id(), &regions)?;
+                aws::make_further_networks(&creds, plane.plane_id(), &regions)?;
+                // One cache for a CI, in its first account: there in these regions too, when that one is signed in to.
+                let first = status["aws"]["account_id"].as_str().unwrap_or_default().to_string();
+                let cached = self.aws_all().into_iter().find(|(id, _)| *id == first).map(|(_, c)| aws::make_caches(&c, plane.plane_id(), &regions));
+                let cache_note = match cached {
+                    Some(Ok(())) => None,
+                    Some(Err(e)) => Some(format!("Its jobs run without the cache in some regions: {e}")),
+                    None => Some(format!("Sign in to AWS account {first} and update the control plane to give its jobs the cache in these regions.")),
+                };
                 let mut now = records.clone();
                 if !now.accounts.iter().any(|a| a.name == word) { now.accounts.push(Account { name: word.clone(), provider: "aws".into(), cloud_id: Some(account_id.clone()) }) }
                 now.runners.retain(|r| r.name != word && r.name != on_demand);
@@ -3686,6 +3700,7 @@ impl Dashboard {
                 }
                 if said["connected"] != true { return Ok(message(502, "AWS did not let the control plane use the role yet", &esc(said["error"].as_str().unwrap_or("Try again in a minute.")))) }
                 self.views = None;
+                self.flash = cache_note;
                 Ok(Response::redirect("/?p=runners"))
             }
             // `account`: which Modal workspace signed in to (none: the one in hand); `name`: its word, chosen once for good.
@@ -4083,7 +4098,12 @@ impl Dashboard {
                                 let id = kept["account_id"].as_str().unwrap_or_default().to_string();
                                 if !self.hold_account(&id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} to set up its new regions.", esc(&id)))) }
                                 let new: Vec<String> = all.iter().filter(|r| !have.contains(r)).cloned().collect();
-                                if !new.is_empty() { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &new)?; }
+                                if !new.is_empty() {
+                                    aws::make_further_networks(&self.aws_creds()?, plane.plane_id(), &new)?;
+                                    // (Its cache there is the first account's, when that one is signed in to.)
+                                    let first = status.as_ref().and_then(|s| s["aws"]["account_id"].as_str()).unwrap_or_default().to_string();
+                                    if let Some((_, c)) = self.aws_all().into_iter().find(|(s, _)| *s == first) { let _ = aws::make_caches(&c, plane.plane_id(), &new); }
+                                }
                                 cloudflare::plane_post(plane.url(), &self.status_key, "/aws/accounts", &serde_json::json!({ "name": account, "accountId": id, "region": all.first().cloned().unwrap_or_default(), "regions": all }))?;
                             }
                         }
@@ -5363,7 +5383,7 @@ mark();load()})();</script>"#;
             let id = a["account_id"].as_str().unwrap_or_default();
             match aws_all.iter().find(|(s, _)| s == id) {
                 Some((_, creds)) => {
-                    if let Err(e) = aws::delete_networks(creds, plane.plane_id(), &REGIONS) { left.push(format!("Its machines' network in AWS account {id} ({e}).")) }
+                    if let Err(e) = aws::delete_further_networks(creds, plane.plane_id(), &REGIONS) { left.push(format!("Its machines' network in AWS account {id} ({e}).")) }
                     let _ = aws::disconnect_runners(creds, id, plane.url(), plane.plane_id());
                 }
                 None => left.push(format!("Its role in AWS account {id} (sign in with AWS to remove it).")),
@@ -5470,6 +5490,14 @@ mark();load()})();</script>"#;
                 }
                 (false, _) => (match &other { Some(o) => format!("Signed in to account {o}; its role is in {account}"), None => "Sign in to check its role".to_string() }, signin("aws")),
             };
+            rows.push_str(&row("aws", &sub, end));
+        }
+        // Each further AWS account's refusals, by its word: its role is made right with its own sign-in.
+        for a in st["aws_further"].as_array().into_iter().flatten() {
+            let word = a["name"].as_str().unwrap_or_default();
+            let refused = perms["denied"].as_object().into_iter().flatten().filter(|(k, _)| k.strip_prefix(word).is_some_and(|r| r.starts_with(':'))).count();
+            let end = if refused == 0 { ok() } else { pill("bad", "Refused") };
+            let sub = if refused == 0 { format!("Its role in account {}", a["account_id"].as_str().unwrap_or_default()) } else { format!("AWS refused {refused} permission{} in account {}: sign in there and update the control plane", if refused == 1 { "" } else { "s" }, a["account_id"].as_str().unwrap_or_default()) };
             rows.push_str(&row("aws", &sub, end));
         }
         // Cloudflare and Modal: what each sign-in asks for (nothing kept in the account to fall behind).
@@ -7741,7 +7769,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
             Some((_, creds)) => {
                 aws::connect_runners(creds, id, to.url(), to.plane_id(), AUDIENCE)?;
                 let regions: Vec<String> = a["regions"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
-                aws::make_networks(creds, to.plane_id(), &regions)?;
+                aws::make_further_networks(creds, to.plane_id(), &regions)?;
                 aws_after.push(serde_json::json!({ "name": word, "accountId": id, "region": a["region"], "regions": regions }));
             }
             None => left.push(format!("{word} stayed behind: sign in to AWS account {id} (`superci login aws --add`) and add it again.")),

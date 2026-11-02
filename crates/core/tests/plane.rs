@@ -7149,6 +7149,45 @@ fn a_further_aws_account_runs_jobs_with_its_own_role_and_notes() {
     assert!(!store.0.borrow().contains_key("aws"), "with no account named: the first's");
 }
 
+/// A further AWS account's machine keeps Docker's images in the CI's one cache: the store from its start after a job
+/// used them, the bucket looked for with the first account's role, whichever account the machine is in. A refusal of
+/// its role is noted under its word, not the first's. With no first account connected: no cache, and it still starts.
+#[test]
+fn a_further_aws_accounts_machine_uses_the_one_cache_and_its_refusals_are_its_own() {
+    let http = WithLayers { clouds: FakeClouds::default(), objects: Default::default(), converted: Default::default(), deleted: Default::default() };
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.records = superci_core::plane::Records {
+        accounts: vec![superci_core::plane::Account { name: "aws-acme".into(), provider: "aws".into(), cloud_id: Some("222222222222".into()) }],
+        runners: vec![superci_core::plane::RunnerRecord { name: "aws-acme".into(), account: "aws-acme".into(), gone: false, on_demand: false }, superci_core::plane::RunnerRecord { name: "aws-acme-on-demand".into(), account: "aws-acme".into(), gone: false, on_demand: true }] };
+    config.routing.order = vec![Pool::of("aws-acme"), Pool::of("aws-acme-on-demand"), Pool { off: true, ..Pool::of("aws") }, Pool { off: true, ..Pool::of("aws-on-demand") }];
+    let connection = |name: &str, id: &str| { let mut c = serde_json::json!({ "account_id": id, "region": "us-east-1", "role_arn": role_arn(id, PLANE_ID), "connected": true, "error": null }); if !name.is_empty() { (c["name"], c["regions"]) = (name.into(), serde_json::json!(["us-east-1"])) } c.to_string() };
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222"));
+    store.0.borrow_mut().insert("aws".into(), connection("", "123456789012"));
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let script = |id: u64| { let launch = launches(&http.clouds).pop().expect("a machine"); let _ = id; String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap() };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26/docker-cache=true")));
+    assert_eq!((job(&store, 1)["cloud"].as_str(), job(&store, 1)["layers"].as_bool()), (Some("aws-acme"), Some(true)), "{}", job(&store, 1));
+    assert!(script(1).contains("/layers|bash"), "the store from its start");
+    let sts: Vec<String> = http.clouds.calls.borrow().iter().filter(|c| c.1.contains("sts.")).map(|c| c.1.clone()).collect();
+    assert!(sts.iter().any(|u| u.contains("222222222222")) && sts.iter().any(|u| u.contains("123456789012")), "its own role for its machine, the first's for the cache: {sts:?}");
+    // No first account: the machine starts, with GitHub's cache.
+    store.0.borrow_mut().remove("aws");
+    let cache = Cache::default();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/image=ubuntu26/docker-cache=true")));
+    assert_eq!((job(&store, 2)["state"].as_str(), job(&store, 2)["layers"].as_bool().unwrap_or(false)), (Some("launched"), false), "{}", job(&store, 2));
+    assert!(!script(2).contains("/layers|bash"));
+    // A refusal of its role: under its word, and the first's left clean.
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| body.contains("Action=DescribeVpcs").then(|| { let _ = r; Response::new(403, "text/xml", "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::222222222222:assumed-role/x is not authorized to perform: ec2:DescribeVpcs</Message></Error></Errors></Response>") }));
+    let (store, cache) = (Mem::default(), Cache::default());
+    store.0.borrow_mut().insert("aws:connection:aws-acme".into(), connection("aws-acme", "222222222222"));
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci")));
+    assert!(store.0.borrow().contains_key("denied:aws-acme:ReadNetwork") && !store.0.borrow().keys().any(|k| k.starts_with("denied:aws:")), "{:?}", store.0.borrow().keys().filter(|k| k.starts_with("denied")).collect::<Vec<_>>());
+}
+
 /// In the order and connected to nothing: said as that, the job failing rather than running elsewhere.
 #[test]
 fn a_provider_in_the_order_that_is_not_connected_is_said() {
@@ -7257,6 +7296,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_provider_in_the_order_that_is_not_connected_is_said,
         bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
         a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
+        a_further_aws_accounts_machine_uses_the_one_cache_and_its_refusals_are_its_own,
         aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
         routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_token_for_it_alone,
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,

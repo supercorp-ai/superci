@@ -281,6 +281,9 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     assert_eq!(record["runners"], serde_json::json!([{ "name": "aws-acme", "account": "aws-acme" }, { "name": "aws-acme-on-demand", "account": "aws-acme", "on_demand": true }]), "{record}");
     let (ok, said) = run(&["runners", "list"]);
     assert!(ok && said.contains("aws-acme") && said.contains("aws-acme-on-demand") && said.contains("eu-west-1"), "{said}");
+    // Its networks only: a bucket's name is the same in every account, and the CI's one cache is in the first.
+    let buckets: Vec<(String, String)> = served.aws.asked.lock().unwrap().iter().filter(|x| x["method"] == "PUT" && x["url"].as_str().is_some_and(|u| u.contains(".s3.") && u.contains("lifecycle"))).map(|x| (x["url"].as_str().unwrap().to_string(), x["target"].as_str().unwrap_or_default().to_string())).collect();
+    assert!(buckets.iter().all(|(u, _)| u.contains(&format!("superci-plane-{PLANE}-eu-"))), "{buckets:?}");
     let (ok, said) = run(&["runners", "update", "aws-acme", "--max-jobs=3"]);
     assert!(ok, "{said}");
     // Its regions, its own: its connection says them, and the first's stay.
