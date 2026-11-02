@@ -1215,7 +1215,7 @@ fn a_further_aws_accounts_region_the_control_plane_will_not_record_is_said() {
 }
 
 /// Every page that says further runners, with one of each cloud beside the first ones, as a whole: kept as
-/// `fixtures/further/pages/<page>.txt` (its words, this computer's address and times taken out), so any change to
+/// `fixtures/further/pages/<page>.txt` (its words, this computer's address, name and version and times taken out), so any change to
 /// what a page says of them shows. (`SUPERCI_WRITE_FIXTURES=1` writes them anew.)
 #[test]
 fn every_page_says_further_runners_of_each_cloud_as_it_said_before() {
@@ -1260,6 +1260,8 @@ fn every_page_says_further_runners_of_each_cloud_as_it_said_before() {
         let name = ["scutil --get ComputerName", "hostname"].iter().find_map(|c| { let mut p = c.split(' '); std::process::Command::new(p.next()?).args(p).output().ok().filter(|o| o.status.success()) })
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().chars().take(64).collect::<String>()).unwrap_or_default();
         if !name.is_empty() { out = out.replace(&name, "THIS COMPUTER") }
+        // (And this version, which each release changes.)
+        let out = out.replace(env!("CARGO_PKG_VERSION"), "VERSION");
         let words: Vec<&str> = out.split(' ').collect();
         let out = words.iter().enumerate().map(|(i, w)| {
             let next = words.get(i + 1).copied().unwrap_or_default();
