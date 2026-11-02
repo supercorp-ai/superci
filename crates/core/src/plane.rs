@@ -2559,7 +2559,6 @@ impl<'a> ControlPlane<'a> {
     async fn aws_connection_of(&self, runner: &str) -> Result<Option<AwsConnection>> {
         let records = &self.config.records;
         match records.account_of(runner) {
-            _ if records.provider_of(runner) != "aws" => Ok(None),
             "aws" => self.aws_connection().await,
             account => get_json(self.store, &format!("aws:connection:{account}")).await,
         }
@@ -2568,7 +2567,7 @@ impl<'a> ControlPlane<'a> {
     /// Every further AWS account's connection.
     async fn further_aws(&self) -> Result<Vec<AwsConnection>> {
         let mut all = vec![];
-        let mut each = self.config.records.accounts.iter().filter(|a| a.provider == "aws" && a.name != "aws");
+        let mut each = self.config.records.accounts.iter().filter(|a| a.provider == "aws");
         loop {
             let Some(a) = each.next() else { return Ok(all) };
             if let Some(c) = get_json::<AwsConnection>(self.store, &format!("aws:connection:{}", a.name)).await? { all.push(c) }
@@ -3777,7 +3776,7 @@ impl<'a> ControlPlane<'a> {
                     // every refusal was for the account's limits, or every on-demand one was (spot may have said
                     // something else: a type a zone does not have).
                     let no_quota = quota_only || (on_demand_refused && on_demand_quota_only);
-                    if spec.gpu.is_some() && no_quota && !answers.is_empty() && !self.gpu_machines_up(if job.cloud.is_empty() { "aws" } else { self.config.records.account_of(&job.cloud) }, job.job_id).await {
+                    if spec.gpu.is_some() && no_quota && !answers.is_empty() && !self.gpu_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await {
                         let (spot, od) = ("“All G and VT Spot Instance Requests” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-3819A6DF)", "“Running On-Demand G and VT instances” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-DB2E81BA)");
                         let why = format!("{NO_GPU_QUOTA}{}{}", match (tried_spot && quota_only, tried_on_demand) { (true, true) => format!("{spot} or {od}"), (true, false) => spot.to_string(), _ => od.to_string() }, " in each region it uses");
                         if failures.is_empty() { return Err(why) }
@@ -3868,7 +3867,7 @@ impl<'a> ControlPlane<'a> {
             let e = match e.strip_prefix(AT_LIMIT) {
                 None => e,
                 Some(said) => {
-                    let (ours, ended) = self.aws_machines_up(if job.cloud.is_empty() { "aws" } else { self.config.records.account_of(&job.cloud) }, job.job_id).await;
+                    let (ours, ended) = self.aws_machines_up(self.config.records.account_of(&job.cloud), job.job_id).await;
                     if ours > 0 {
                         job.state = "waiting".into();
                         job.error = Some(format!("waiting: your AWS account's limit of running CPUs is in use by {ours} of your job{} there; it starts when one ends ({})", if ours == 1 { "" } else { "s" }, said.chars().take(160).collect::<String>()));
@@ -5493,7 +5492,7 @@ impl<'a> ControlPlane<'a> {
         // A launch template left behind by a request for many spot pools (it could not be removed at the time):
         // removed now; given up on after a day.
         // (Each account's, its connection gone or not: given up on after a day all the same.)
-        let accounts: Vec<String> = std::iter::once("aws".to_string()).chain(self.config.records.accounts.iter().filter(|a| a.provider == "aws" && a.name != "aws").map(|a| a.name.clone())).collect();
+        let accounts: Vec<String> = std::iter::once("aws".to_string()).chain(self.config.records.accounts.iter().filter(|a| a.provider == "aws").map(|a| a.name.clone())).collect();
         let mut left = vec![];
         for account in &accounts { let notes = aws_notes(account); for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((account.clone(), notes.clone(), k, at)) } }
         for (account, notes, k, at) in left {

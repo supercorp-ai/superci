@@ -10578,7 +10578,7 @@ mod rest_tests {
         assert_eq!(mode(&mut d, "modal-initech", "function").err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
         assert_eq!(mode(&mut d, "modal", "function").err().as_deref(), Some("Sign in with Modal to the workspace acme first: `superci login modal --add`."));
         let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech", "function": true }] }, "function_mode": true })));
-        assert_eq!(mode(&mut d, "modal-initech", "sandbox").err().as_deref(), Some("Sign in with Modal first."));
+        assert!(mode(&mut d, "modal-initech", "sandbox").is_err_and(|e| e.contains("not here")), "straight to the write");
         // An image added while a workspace runs Functions: its Function there first.
         let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech", "function": true }] }, "runner_images": true, "function_mode": true })));
         let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
@@ -10973,6 +10973,159 @@ mod rest_tests {
         // (A Modal launcher is no Cloudflare one, whatever its address.)
         assert_eq!(cloudflare_word(&first, &none, false, "a2", "Globex", "acme", ""), Ok("cloudflare".to_string()));
         assert_eq!((launcher_workspace("https://nothing.modal.run"), launcher_workspace("nothing")), ("", ""));
+    }
+
+    /// A status with further Modal, Cloudflare and AWS runners, for the pages and forms below.
+    fn with_further_all(more: serde_json::Value) -> serde_json::Value {
+        let mut status = serde_json::json!({
+            "settings": true, "function_mode": true, "account_limits": true, "daily_limits": true, "runner_images": true, "own_cloud": "cloudflare", "containers": false, "jobs": [],
+            "aws": { "account_id": "123456789012", "region": "us-east-1", "connected": true },
+            "accounts": [{ "name": "modal-two", "provider": "modal", "cloud_id": "two" }, { "name": "cf-two", "provider": "cloudflare", "cloud_id": "a2" }, { "name": "aws-two", "provider": "aws", "cloud_id": "222222222222" }],
+            "runners": [{ "name": "modal-two", "account": "modal-two" }, { "name": "cf-two", "account": "cf-two" }, { "name": "aws-two", "account": "aws-two" }, { "name": "aws-two-on-demand", "account": "aws-two", "on_demand": true }, { "name": "modal-old", "account": "modal-two", "gone": true }],
+            "aws_further": [{ "name": "aws-two", "account_id": "222222222222", "region": "us-east-1", "regions": ["us-east-1"], "role_arn": "r", "connected": true, "error": null }, { "name": "aws-down", "account_id": "333333333333", "region": "us-east-1", "regions": [], "role_arn": "r", "connected": false, "error": "no" }],
+            "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners-p2.modal.run" }, { "cloud": "modal-two", "url": "https://two--superci-runners-p2.modal.run" }, { "cloud": "cf-two", "url": "https://superci-runners-p2.two.workers.dev" }],
+            "routing": { "order": [{ "cloud": "aws" }, { "cloud": "aws-two" }, { "cloud": "modal-two", "function": true }, { "cloud": "modal" }, { "cloud": "cf-two" }] },
+            "permissions": { "denied": {} } });
+        more.as_object().unwrap().iter().for_each(|(k, v)| status[k] = v.clone());
+        status
+    }
+
+    /// What each page and word says of further runners, whichever cloud its control plane is in.
+    #[test]
+    fn further_runners_on_each_page_and_in_each_word() {
+        // A job on a further AWS account's machine is AWS's, by its region; one elsewhere is not.
+        assert!(job_disk(&serde_json::json!({ "cloud": "aws-two", "region": "us-east-1", "disk_gb": 60 })).is_object());
+        assert!(job_disk(&serde_json::json!({ "cloud": "modal-two", "disk_gb": 60 })).is_null());
+        // A run with its first attempt taken back and nothing after it yet is going; with its next, as that one is.
+        let taken = serde_json::json!({ "job_id": 1, "run_id": 7, "repo": "acme/a", "provider": "local", "state": "failed", "interrupted": true, "at_ms": now_ms(), "ended_ms": now_ms() });
+        assert_eq!(runs_of(std::slice::from_ref(&taken))[0]["state"], "running");
+        let next = serde_json::json!({ "job_id": 2, "run_id": 7, "repo": "acme/a", "provider": "local", "state": "done", "conclusion": "success", "no_spot": true, "at_ms": now_ms(), "ended_ms": now_ms() });
+        assert_eq!(runs_of(&[taken.clone(), next])[0]["state"], "passed");
+        // Words: a name with capitals and digits made safe; taken by a runner with no account, or a kept one.
+        let none = Records::default();
+        assert_eq!(modal_word(&[Launcher { cloud: "modal".into(), url: "https://acme--x.modal.run".into() }], &none, false, "Two2", ""), Ok("modal-two2".to_string()));
+        let runner_only = Records { accounts: vec![], runners: vec![RunnerRecord { name: "modal-two".into(), account: "modal".into(), gone: false, on_demand: false }] };
+        assert!(modal_word(&[Launcher { cloud: "modal".into(), url: "https://acme--x.modal.run".into() }], &runner_only, false, "two", "").is_ok_and(|w| w.starts_with("modal-two-")));
+        let other_provider = Records { accounts: vec![Account { name: "cf-two".into(), provider: "cloudflare".into(), cloud_id: Some("two".into()) }], runners: vec![] };
+        assert_eq!(modal_word(&[], &other_provider, false, "two", ""), Ok("modal".to_string()), "an id of another provider's is not this one's");
+        // A pool's name: a further runner's; a deleted one's no more.
+        let records = view::records_in(&with_further_all(serde_json::json!({})));
+        assert!(pool_name_ok("modal-two", &records) && !pool_name_ok("modal-old", &records) && !pool_name_ok("nothing", &records));
+        // What is connected: a further AWS account by its connection.
+        let status = with_further_all(serde_json::json!({}));
+        assert!(provider_connected(&status, "aws-two") && !provider_connected(&status, "aws-down") && provider_connected(&status, "modal-two") && !provider_connected(&status, "cloudflare"));
+        // Bills, by word: each Modal workspace's and Cloudflare account's; a workspace it has no launcher in, none; Cloudflare's first with what has no record.
+        let v = seen_as(aws_plane("p2", NOWHERE), status.clone());
+        let month = modal::Month { metered: 1.0, billed: 0.5, superci: 0.25 };
+        let bills = bills_of(&v, &status, &[("two".to_string(), month.clone()), ("elsewhere".to_string(), month.clone())], &[("a2".to_string(), (2.0, 1.0)), ("a9".to_string(), (3.0, 1.0))]);
+        assert_eq!((bills.get("modal-two").map(|b| b["superci"].clone()), bills.get("cf-two").map(|b| b["metered"].clone()), bills.contains_key("cloudflare")), (Some(serde_json::json!(0.25)), Some(serde_json::json!(2.0)), false), "{bills:?}");
+        let own = with_further_all(serde_json::json!({ "containers": true, "own_cloud": "modal", "launchers": [{ "cloud": "cloudflare", "url": "https://superci-runners-p2.acme.workers.dev" }] }));
+        let v = seen_as(modal_plane("p2", NOWHERE), own.clone());
+        let bills = bills_of(&v, &own, &[("acme".to_string(), month.clone()), ("other".to_string(), month.clone())], &[("a9".to_string(), (3.0, 1.0))]);
+        assert_eq!((bills.len(), bills["modal"]["superci"].clone(), bills["cloudflare"]["metered"].clone()), (2, serde_json::json!(0.25), serde_json::json!(3.0)), "{bills:?}");
+        let cf_own = with_further_all(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [] }));
+        let v = seen_as(cf_plane("p2", NOWHERE), cf_own.clone());
+        assert!(bills_of(&v, &cf_own, &[("acme".to_string(), month.clone())], &[("a1".to_string(), (1.0, 0.0))]).contains_key("cloudflare"));
+        // The Runners and Add pages, on a control plane in each cloud, with every kind of sign-in beside it.
+        let mut status = status;
+        status["launchers"].as_array_mut().unwrap().push(serde_json::json!({ "cloud": "cloudflare", "url": "https://superci-runners-p2.acme.workers.dev" }));
+        for (plane, say) in [(aws_plane("p2", &plane_answering(status.clone())), "Runner providers"), (cf_plane("p2", &plane_answering(status.clone())), "Runner providers"), (modal_plane("p2", &plane_answering(status.clone())), "Runner providers")] {
+            let mut d = Dashboard::new();
+            d.modal = Some(modal_session("two"));
+            d.modal_others = vec![modal_session("three")];
+            d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": 4102444800000u64 })).unwrap());
+            d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Two".into()), ("a3".into(), "Three".into())];
+            d.aws = Some(aws::Session::for_test("123456789012"));
+            d.aws_others = vec![aws::Session::for_test("222222222222"), aws::Session::for_test("444444444444")];
+            d.planes = vec![plane.clone()];
+            let mut v = seen_as(plane.clone(), status.clone());
+            v.aws = true;
+            let page = plain(&d.runners_page(Some(&v)));
+            assert!(page.contains(say) && page.contains("aws-two: AWS account 222222222222") && page.contains("modal-two"), "{page}");
+            let adds = plain(&d.add_runners_page(Some(&v)));
+            assert!(adds.contains("in account 444444444444") && !adds.contains("in account 222222222222") && adds.contains("Cloudflare account Three") && !adds.contains("Cloudflare account Two") && adds.contains("Modal workspace three"), "{adds}");
+        }
+        // A further account's refusals, on the permissions page.
+        let d = Dashboard::new();
+        for (denied, says) in [(serde_json::json!({}), "Its role in account 222222222222"), (serde_json::json!({ "aws-two:Prices": {} }), "AWS refused 1 permission in account 222222222222"), (serde_json::json!({ "aws-two:Prices": {}, "aws-two:ReadNetwork": {} }), "AWS refused 2 permissions in account 222222222222")] {
+            let st = with_further_all(serde_json::json!({ "permissions": { "denied": denied } }));
+            let v = seen_as(aws_plane("p2", NOWHERE), st);
+            let (a, b) = d.permissions_card(&v);
+            let page = plain(&format!("{a}{b}"));
+            assert!(page.contains(says), "{says}: {page}");
+        }
+    }
+
+    /// The forms of further runners, each stopping where it should; what each sign-in needs.
+    #[test]
+    fn further_runners_forms_stop_where_they_should() {
+        // A Modal sign-in with none in hand; one taken in hand with none in hand before.
+        let mut d = Dashboard::new();
+        d.came_modal(modal_session("one"));
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("one"));
+        d.modal = None;
+        d.modal_others = vec![modal_session("two")];
+        d.hold_workspace("two");
+        assert_eq!((d.modal.as_ref().map(|m| m.workspace.as_str()), d.modal_others.len()), (Some("two"), 0));
+        // Removing: a deleted one's word is no runner; jobs on it; and a sign-in that does not reach its account.
+        let remove = |d: &mut Dashboard, cloud: &str, more: &[(&str, &str)]| send(d, "/runners/remove", &[&[("cloud", cloud)][..], more].concat());
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        let r = remove(&mut d, "modal-old", &[]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Unknown provider"), "{}", words_of(&r));
+        let r = remove(&mut d, "aws-two-on-demand", &[]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("goes with aws-two"), "{}", words_of(&r));
+        for (active, says) in [(serde_json::json!({ "aws-two": 1 }), "1 job is running on aws-two"), (serde_json::json!({ "aws-two": 2, "aws-two-on-demand": 1 }), "3 jobs are running on aws-two")] {
+            let mut d = modal_answering(with_further_all(serde_json::json!({ "active": active })));
+            let r = remove(&mut d, "aws-two", &[]).unwrap();
+            assert!(r.status == 409 && words_of(&r).contains(says), "{}", words_of(&r));
+            // Told to stop them, it goes on to what it needs next: its account's sign-in.
+            let r = remove(&mut d, "aws-two", &[("stop", "on")]).unwrap();
+            assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
+        }
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        let r = remove(&mut d, "cf-two", &[]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in with cf-two first"), "{}", words_of(&r));
+        d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": u64::MAX })).unwrap());
+        d.cf_accounts = vec![("a1".into(), "Acme".into())];
+        let r = remove(&mut d, "cf-two", &[]).unwrap();
+        assert_eq!(r.status, 403, "its account out of this sign-in's reach");
+        // A Modal runner with no launcher to find it by, not signed in: said with no workspace.
+        let mut d = modal_answering(with_further_all(serde_json::json!({ "launchers": [] })));
+        let r = remove(&mut d, "modal-two", &[]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to delete what SuperCI made there"), "{}", words_of(&r));
+        // Adding a further AWS account: with no first, on one that is the first, and not signed in to it.
+        let aws_add = |d: &mut Dashboard, account: &str| send(d, "/runners/aws", &[("account", account), ("region", "us-east-1")]);
+        let mut d = modal_answering(with_further_all(serde_json::json!({ "aws": null })));
+        let r = aws_add(&mut d, "222222222222").unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("A further account comes after the first"), "{}", words_of(&r));
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        let r = aws_add(&mut d, "123456789012").unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("runs jobs as aws"), "{}", words_of(&r));
+        let r = aws_add(&mut d, "555555555555").unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to account 555555555555"), "{}", words_of(&r));
+        // Its regions: not its account's sign-in; one it has no connection for.
+        let regions = |d: &mut Dashboard, cloud: &str, r: &[(&str, &str)]| send(d, "/routing", &[&[("action", "pool"), ("cloud", cloud), ("current", "aws-two,modal-two")][..], r].concat());
+        let r = regions(&mut d, "aws-two", &[("region_0", "eu-west-1")]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
+        let r = regions(&mut d, "aws-two", &[("region_0", "nowhere")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Choose a region"), "{}", words_of(&r));
+        let mut gone = with_further_all(serde_json::json!({}));
+        gone["aws_further"] = serde_json::json!([]);
+        let mut d = modal_answering(gone);
+        let r = regions(&mut d, "aws-two", &[("region_0", "eu-west-1")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Unknown provider"), "{}", words_of(&r));
+        // Function mode: its workspace's sign-in for the Functions, from the launcher's address; its own for a control plane in Modal.
+        let mode = |d: &mut Dashboard, cloud: &str| send(d, "/routing", &[("action", "pool"), ("cloud", cloud), ("mode", "function"), ("current", "modal-two,modal")]);
+        let mut d = modal_answering(with_further_all(serde_json::json!({ "launchers": [] })));
+        assert!(mode(&mut d, "modal").is_err_and(|e| e.starts_with("Sign in with Modal to the workspace")));
+        // Already on: nothing to deploy, what else the form says is written.
+        let mut d = modal_answering(with_further_all(serde_json::json!({})));
+        assert!(mode(&mut d, "modal-two").is_err_and(|e| e.contains("not here")), "straight to the write");
+        // An image added: only Modal's runners on Functions, and those with a launcher.
+        let on = serde_json::json!({ "routing": { "order": [{ "cloud": "modal-two", "function": true }, { "cloud": "aws-two", "function": true }, { "cloud": "modal" }, { "cloud": "modal-old", "function": true }] } });
+        let mut d = modal_answering(with_further_all(on));
+        let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
+        assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace two first: `superci login modal --add`."));
     }
 
     #[test]

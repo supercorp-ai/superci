@@ -374,6 +374,8 @@ fn a_move_brings_further_aws_accounts_and_deleting_the_old_control_plane_cleans_
     assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
+    let connected: serde_json::Value = serde_json::from_str(new.store.0.lock().unwrap().get("aws:connection:aws-acme").map_or("{}", String::as_str)).unwrap();
+    assert_eq!(connected["account_id"], "222222222222", "{connected}");
     let theirs: serde_json::Value = serde_json::from_str(&new.store.0.lock().unwrap()["settings"]).unwrap();
     assert_eq!(theirs["runners"].as_array().unwrap().len(), 4, "{theirs}");
     assert!(new.store.0.lock().unwrap().contains_key("aws:connection:aws-acme"), "its connection, in the new one");
@@ -665,6 +667,73 @@ fn further_runners_on_control_planes_from_before_and_in_each_cloud() {
     let (status, _, said) = common::post(&link, "/runners/modal", &[("account", "acme-two")]);
     assert!(status == 409 && words(&said).contains("A further runner needs a newer control plane"), "{status} {}", words(&said));
     assert_eq!(sandboxes_made(&served), 0, "nothing deployed");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Removing a second AWS account when AWS answers: nothing left over. When AWS refuses: said, and by the organization's
+/// rule for a region: that region has nothing to remove. Its regions: the same again changes nothing; a repeat counts once.
+#[test]
+fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    let answers = || for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1", "us-east-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) };
+    answers();
+    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
+    assert!(ok, "{said}");
+    let regions = || { let c: serde_json::Value = serde_json::from_str(&served.store.0.lock().unwrap()["aws:connection:aws-acme"]).unwrap(); c["regions"].clone() };
+    // Its spot runner's regions; a repeat counted once; its on-demand runner keeps what it had, so the account has both.
+    let (ok, said) = run(&["runners", "update", "aws-acme", "--regions=eu-west-1,eu-west-1"]);
+    assert!(ok, "{said}");
+    let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=eu-west-2"]);
+    assert!(ok, "{said}");
+    let both = regions();
+    assert!(both.as_array().unwrap().iter().any(|r| r == "eu-west-2"), "{both}");
+    // The same again: nothing asked of AWS.
+    served.aws.asked.lock().unwrap().clear();
+    let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=eu-west-2"]);
+    assert!(ok && regions() == both, "{said}");
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2."))), "no network made");
+    // AWS refusing what removing it asks: said as left; the record marked gone all the same.
+    served.aws.fail("Action=DeleteRole", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not delete roles</Message></Error></ErrorResponse>", None);
+    served.aws.fail("Action=DeleteVpc", 400, "<Response><Errors><Error><Code>DependencyViolation</Code><Message>still in use</Message></Error></Errors></Response>", None);
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
+    assert!(ok && said.contains("Removed aws-acme.") && said.contains("Left:"), "{said}");
+    served.aws.fail_none();
+    // Added again, its word back; then removed with AWS answering each thing, and an organization keeping it out of regions.
+    answers();
+    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1"]);
+    assert!(ok && said.contains("aws-acme runs jobs now."), "{said}");
+    served.aws.fail("ec2.", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::222222222222:assumed-role/x is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy</Message></Error></Errors></Response>", None);
+    let removal: Vec<&str> = include_str!("../fixtures/runners/10-cf-remove-aws.jsonl").lines().filter(|l| l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")).collect();
+    served.aws.replaying(&removal.join("\n"), &[]);
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
+    assert!(ok && said.contains("Removed aws-acme."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further runner on a control plane in Modal: never `modal`, that being its own.
+#[test]
+fn a_further_runner_on_a_control_plane_in_modal() {
+    let (served, home) = two_workspaces();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Modal": { "workspace": "acmeorg", "url": served.url, "plane_id": PLANE, "label": "superci" } });
+    kept["key"]["planes"] = serde_json::json!([PLANE]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), "[]");
+    let (mut child, link) = common::dashboard(&home);
+    deploy_answers(&served);
+    let (status, _, said) = common::post(&link, "/runners/modal", &[("account", "acme-two")]);
+    assert_eq!(status, 303, "{}", words(&said));
+    let record = stored(&served);
+    assert!(record["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two"), "{record}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

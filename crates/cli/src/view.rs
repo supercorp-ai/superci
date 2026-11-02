@@ -125,7 +125,7 @@ impl PlaneView {
         if let Some(at) = places.iter().position(|c| c == "aws") { places.insert(at + 1, AWS_ON_DEMAND.to_string()) }
         let records = self.records();
         let further: Vec<String> = places.iter().filter(|c| records.provider_of(c) == "aws" && *c != "aws" && *c != AWS_ON_DEMAND).cloned().collect();
-        for word in further { if let Some(at) = places.iter().position(|c| *c == word) { places.insert(at + 1, format!("{word}-on-demand")) } }
+        for word in further { let at = places.iter().position(|c| *c == word).map_or(places.len(), |at| at + 1); places.insert(at, format!("{word}-on-demand")) }
         let mut order: Vec<_> = routing.order.into_iter().filter(|p| places.contains(&p.cloud)).collect();
         for c in places {
             if order.iter().any(|p| p.cloud == c) { continue }

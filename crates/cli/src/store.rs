@@ -307,6 +307,8 @@ mod tests {
 
     #[test]
     fn keeps_and_removes() {
+        // (Further Modal workspaces alone are still a sign-in.)
+        assert!(Kept { modal_more: vec![modal::Session { token_id: "a".into(), token_secret: "b".into(), workspace: "w".into() }], ..Default::default() }.signed_in());
         let dir = std::env::temp_dir().join(format!("superci-store-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
         let store = Store::at(&dir);
         assert!(!store.read().signed_in() && !store.remove().unwrap());

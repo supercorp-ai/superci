@@ -7289,6 +7289,54 @@ fn a_preempted_function_of_a_run_from_a_computer_is_over_at_once() {
     assert!(store.0.borrow().keys().any(|k| k.starts_with("modal:preempted:")) && !store.0.borrow().keys().any(|k| k.starts_with("spot:interrupted:")));
 }
 
+/// What is left of each edge of a further AWS account and of the words kept: asked with no device's key; no regions of
+/// its own; a runner deleted still in the order; an account with no runners taken out; a template left in it swept; an
+/// image's address and a Secret's name at their limits.
+#[test]
+fn the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be() {
+    use superci_core::plane::{valid_image_reference, valid_modal_secret, valid_word};
+    assert!(valid_word("aw") && valid_word("a1-b2") && !valid_word("a") && !valid_word(&"a".repeat(33)) && valid_word(&"a".repeat(32)) && !valid_word("A1") && !valid_word("-a1") && !valid_word("a1-") && !valid_word("a_1"));
+    for (r, ok) in [("ghcr.io/acme/ci:1", true), ("", false), (&"a".repeat(256), false), ("a b", false), ("-acme/ci", false), ("acme/ci-", false), ("https://ghcr.io/acme", false), ("acme/ci@sha256:0f", true)] { assert_eq!(valid_image_reference(r), ok, "{r}") }
+    for (n, ok) in [("ghcr-read", true), ("", false), (&"s".repeat(65), false), ("a secret", false), ("a_b.c-1", true)] { assert_eq!(valid_modal_secret(n), ok, "{n}") }
+
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true, "error": null }).to_string());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let post = |path: &str, body: serde_json::Value, key: bool| { let r = Request::new("POST", &format!("{PLANE_URL}{path}")).with_body(body.to_string()); block_on(plane.handle(if key { r.with_header("authorization", "Bearer dashboard-session-key-1") } else { r })) };
+    assert_eq!(post("/aws/accounts", serde_json::json!({ "name": "aws-acme", "accountId": "222222222222", "region": "us-east-1" }), false).status, 404);
+    // No regions said: its own region alone, not the first account's list.
+    assert_eq!(json(&post("/aws/accounts", serde_json::json!({ "name": "aws-acme", "accountId": "222222222222", "region": "us-east-1" }), true))["connected"], true);
+    let word = |w: &str, on_demand: bool, gone: bool| serde_json::json!({ "name": w, "account": "aws-acme", "on_demand": on_demand, "gone": gone });
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [
+        set(&["accounts", "aws-acme"], serde_json::json!({ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }), None),
+        set(&["accounts", "aws-unused"], serde_json::json!({ "name": "aws-unused", "provider": "aws" }), None),
+        set(&["runners", "aws-acme"], word("aws-acme", false, false), None),
+        set(&["runners", "aws-acme-on-demand"], word("aws-acme-on-demand", true, false), None),
+        set(&["routing", "order", "aws-acme"], serde_json::json!({ "cloud": "aws-acme" }), None),
+        set(&["routing", "order", "aws"], serde_json::json!({ "cloud": "aws" }), None),
+    ] }), true).status, 200);
+    block_on(plane.handle(job_event("queued", 1, "acme/app", None)));
+    assert_eq!((job(&store, 1)["cloud"].as_str(), job(&store, 1)["region"].as_str()), (Some("aws-acme"), Some("us-east-1")), "{}", job(&store, 1));
+    // An account with no runner on it comes out; a runner deleted, left in the order, takes no job.
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [set(&["accounts", "aws-unused"], serde_json::Value::Null, None)] }), true).status, 200);
+    assert_eq!(post("/settings", serde_json::json!({ "changes": [set(&["runners", "aws-acme"], word("aws-acme", false, true), None)] }), true).status, 200);
+    block_on(plane.handle(job_event("queued", 2, "acme/app", None)));
+    assert_eq!(job(&store, 2)["cloud"], "aws", "{}", job(&store, 2));
+    // A template left behind in it: taken away by the upkeep, with its own role, once a day has gone by whatever it answers.
+    let key = "aws:aws-acme:template:us-east-1:superci-lt-old";
+    store.0.borrow_mut().insert(key.into(), (1_790_000_000_000u64 - 2 * 86_400_000).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key(key), "gone");
+    // A machine measured by Cloudflare, no region of AWS's, has nothing more to wait for.
+    let mut measured = job(&store, 1);
+    (measured["region"], measured["cost_from"], measured["state"], measured["ended_ms"]) = (serde_json::Value::Null, "measured".into(), "done".into(), 1_789_999_000_000u64.into());
+    store.0.borrow_mut().insert("job:1".into(), measured.to_string());
+    block_on(plane.alarm()).unwrap();
+}
+
 /// In the order and connected to nothing: said as that, the job failing rather than running elsewhere.
 #[test]
 fn a_provider_in_the_order_that_is_not_connected_is_said() {
@@ -7398,6 +7446,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
         a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
         several_aws_accounts_each_case_a_job_at_a_time,
+        the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be,
         a_preempted_function_of_a_run_from_a_computer_is_over_at_once,
         a_further_aws_accounts_machine_uses_the_one_cache_and_its_refusals_are_its_own,
         aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
