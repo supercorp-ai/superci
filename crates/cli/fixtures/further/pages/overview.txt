@@ -1,0 +1,5 @@
+Modal did not answer (Modal AuthTokenGet: the test kit's Modal has no answer for it).
+What is there is not shown; it is asked again on the next page.
+Overview Set up 4 steps Control plane Running AWS · 111111111111 · us-east-1 · http://HOST 2 Connect GitHub or GitLab Where your jobs come from; one is enough, both work.
+Connect repositories Runners Added AWS, Modal, modal-acme-two, cf-globex, aws-acme 4 Use it in a workflow Set runs-on: superci in a workflow; nothing else changes.
+Needs GitHub or GitLab, and runners first Usage 24 hours 7 days 30 days 0 jobs Hour by hour, once jobs run 0 min machine minutes Beside what GitHub or GitLab would bill — median wait for a machine From queued to running $0.00 spent Beside what GitHub or GitLab would charge Latest No jobs yet Every job with your label shows up here, with the machine it ran on, how long it took and what it cost: jobs: test: runs-on: superci D default AWS · 111111111111 · us-east-1 New workspace…

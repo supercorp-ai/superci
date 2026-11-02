@@ -1,0 +1,17 @@
+Modal did not answer (Modal AuthTokenGet: the test kit's Modal has no answer for it).
+What is there is not shown; it is asked again on the next page.
+Control plane GitHub and GitLab send their jobs to the control plane in use.
+To move it, set one up in another cloud and Move here: everything comes along.
+aws AWS · 111111111111 · us-east-1 http://HOST 0.19.21 In use Stop using SuperCI… Cloudflare A Worker with its own storage Connect aws AWS A Lambda function with a table · account 222222222222 · US East (N.
+Virginia) Change region US East (N.
+Virginia) · us-east-1 · closest to GitHub US East (Ohio) · us-east-2 US West (Oregon) · us-west-2 Europe (Ireland) · eu-west-1 Europe (London) · eu-west-2 Europe (Frankfurt) · eu-central-1 Asia Pacific (Mumbai) · ap-south-1 Asia Pacific (Tokyo) · ap-northeast-1 Asia Pacific (Singapore) · ap-southeast-1 Asia Pacific (Sydney) · ap-southeast-2 Set up Modal A web endpoint with a Dict · workspace acmeorg Set up More clouds Google Cloud, Azure, Vercel and 6 more, coming soon Google Cloud Cloud Run with Firestore Soon Azure Azure Functions with Table Storage Soon Vercel A Vercel Function with KV Soon Netlify Netlify Functions with Blobs Soon Deno Deploy Deno Deploy with KV Soon Fly.io A Fly Machine with a volume Soon Render A web service with Key Value Soon Railway A service with a volume Soon DigitalOcean App Platform with a managed database Soon AWS account aws 111111111111 Nothing SuperCI does there is refused.
+Nothing refused Refresh Regions N.
+Virginia us-east-1 Spot 96 spot CPUs Canada ca-central-1 Not used: the runner image is not here Copy into Canada Stockholm eu-north-1 Not used: the runner image is not here Copy into Stockholm All 12 SuperCI works in are allowed: add more on Runners.
+Spot machines Allowed On-demand machines Allowed CPUs at once 64 on-demand · 96 spot 24 jobs of the default size at a time, in N.
+Virginia.
+Ask AWS for more Spot CPUs ↗ 96 now, in N.
+Virginia On-demand CPUs ↗ 64 now, in N.
+Virginia Permissions aws AWS Role in account 111111111111 Up to date aws AWS Its role in account 222222222222 Up to date Modal Your sign-in covers it Up to date Stop using SuperCI? For good, from every cloud – GitHub's App is uninstalled and GitLab's projects stop sending jobs here (their webhooks and SuperCI's runners are removed).
+– Every control plane is deleted, with its history, and the launchers and AWS roles made for them.
+– Jobs with runs-on: superci then wait for a runner: change them back first.
+Type superci to confirm Cancel Stop using SuperCI D default AWS · 111111111111 · us-east-1 New workspace…

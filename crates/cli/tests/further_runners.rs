@@ -238,6 +238,9 @@ fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind
     assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two" && a["url"].as_str().unwrap().contains("acme-two--superci-runners-testplane0002")), "{theirs}");
     assert!(!theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-globex"), "{theirs}");
     assert_eq!(theirs["runners"].as_array().unwrap().len(), 7, "{theirs}");
+    // (Its records as they were, whatever stayed behind: a launcher made again later finds its word.)
+    let ours = stored(&served);
+    assert_eq!((&theirs["accounts"], &theirs["runners"]), (&ours["accounts"], &ours["runners"]), "{theirs}");
     assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "cf-globex"), "{theirs}");
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("modal-globex stayed behind")).unwrap_or_default();
     assert!(page.contains("sign in to the Modal workspace globex") && page.contains("cf-lost stayed behind"), "{page}");
@@ -1208,5 +1211,72 @@ fn a_further_aws_accounts_region_the_control_plane_will_not_record_is_said() {
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && said.contains("500"), "{said}");
     assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2.eu-north-1"))), "its network made first");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Every page that says further runners, with one of each cloud beside the first ones, as a whole: kept as
+/// `fixtures/further/pages/<page>.txt` (its words, this computer's address and times taken out), so any change to
+/// what a page says of them shows. (`SUPERCI_WRITE_FIXTURES=1` writes them anew.)
+#[test]
+fn every_page_says_further_runners_of_each_cloud_as_it_said_before() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let (second, account) = ("2222222222222222222222222222222b", "222222222222");
+    let launchers = serde_json::json!([{ "cloud": "modal", "url": format!("https://acmeorg--superci-runners-{PLANE}.modal.run") },
+        { "cloud": "modal-acme-two", "url": format!("https://acme-two--superci-runners-{PLANE}.modal.run") }, { "cloud": "cf-globex", "url": format!("https://superci-runners-{PLANE}.globex.workers.dev") }]);
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &launchers.to_string());
+    served.store.0.lock().unwrap().insert("settings".into(), serde_json::json!({ "version": 1, "launchers": launchers,
+        "routing": {},
+        "accounts": [{ "name": "aws-acme", "provider": "aws", "cloud_id": account }, { "name": "modal-acme-two", "provider": "modal", "cloud_id": "acme-two" }, { "name": "cf-globex", "provider": "cloudflare", "cloud_id": second }],
+        "runners": [{ "name": "aws-acme", "account": "aws-acme" }, { "name": "aws-acme-on-demand", "account": "aws-acme", "on_demand": true }, { "name": "modal-acme-two", "account": "modal-acme-two" },
+            { "name": "modal-acme-two-functions", "account": "modal-acme-two", "function": true }, { "name": "cf-globex", "account": "cf-globex" }, { "name": "modal-old", "account": "modal-acme-two", "gone": true }] }).to_string());
+    served.store.0.lock().unwrap().insert("aws:connection:aws-acme".into(), serde_json::json!({ "account_id": account, "region": "eu-west-1", "regions": ["eu-west-1", "eu-west-2"],
+        "role_arn": format!("arn:aws:iam::{account}:role/superci-plane-{PLANE}"), "connected": true, "error": null, "name": "aws-acme" }).to_string());
+    served.store.0.lock().unwrap().insert("aws:aws-acme:pool:eu-west-1:c7i.large".into(), "1".into());
+    let home = signed_in_two_aws(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let session = |w: &str| serde_json::json!({ "token_id": format!("ak-{w}"), "token_secret": format!("as-{w}"), "workspace": w });
+    (kept["modal"], kept["modal_more"]) = (session("acmeorg"), serde_json::json!([session("acme-two")]));
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // (The order, and limits of its own for a further runner and a further account, set as a person sets them.)
+    for args in [&["runners", "order", "aws", "aws-acme", "modal-acme-two", "cf-globex", "modal"][..], &["runners", "update", "aws-acme", "--max-jobs=4"], &["runners", "update", "modal-acme-two", "--monthly-usd=50"],
+        &["accounts", "update", "aws-acme", "--monthly-usd=300"]] {
+        let o = common::command(&home).args(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    let (mut child, link) = common::dashboard(&home);
+    let plain = |text: &str| {
+        // (This computer's address, by its port: HOST.)
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("127.0.0.1:") {
+            out.push_str(&rest[..at]);
+            out.push_str("HOST");
+            rest = rest[at + "127.0.0.1:".len()..].trim_start_matches(|c: char| c.is_ascii_digit());
+        }
+        out.push_str(rest);
+        // (This computer's name, as the dashboard reads it; a key's days left and when it was made and used.)
+        let name = ["scutil --get ComputerName", "hostname"].iter().find_map(|c| { let mut p = c.split(' '); std::process::Command::new(p.next()?).args(p).output().ok().filter(|o| o.status.success()) })
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().chars().take(64).collect::<String>()).unwrap_or_default();
+        if !name.is_empty() { out = out.replace(&name, "THIS COMPUTER") }
+        let words: Vec<&str> = out.split(' ').collect();
+        let out = words.iter().enumerate().map(|(i, w)| {
+            let next = words.get(i + 1).copied().unwrap_or_default();
+            if w.chars().all(|c| c.is_ascii_digit()) && !w.is_empty() && (next == "more" || next.starts_with("minute") || next.starts_with("second")) { "N" } else { w }
+        }).collect::<Vec<_>>().join(" ").replace("just now", "N seconds ago").replace("a minute ago", "N minutes ago");
+        out.split(". ").collect::<Vec<_>>().join(".\n")
+    };
+    for page in ["runners", "add-runners", "planes", "settings", "overview"] {
+        // (Read until it has read the clouds: the first look takes a moment.)
+        let said = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); plain(&words(&part(&link, &format!("/?p={page}&fragment=1")).1)) })
+            .find(|p| !p.contains("Reading your control plane")).unwrap_or_default();
+        let at = format!("{}/fixtures/further/pages/{page}.txt", env!("CARGO_MANIFEST_DIR"));
+        if std::env::var_os("SUPERCI_WRITE_FIXTURES").is_some() { std::fs::create_dir_all(std::path::Path::new(&at).parent().unwrap()).unwrap(); std::fs::write(&at, &said).unwrap() }
+        let want = std::fs::read_to_string(&at).unwrap_or_default();
+        for (n, (w, g)) in want.lines().zip(said.lines()).enumerate() { assert_eq!(w, g, "{page}, line {}", n + 1) }
+        assert_eq!(want.lines().count(), said.lines().count(), "{page}");
+    }
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

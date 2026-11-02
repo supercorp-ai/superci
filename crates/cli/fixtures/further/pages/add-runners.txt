@@ -1,0 +1,16 @@
+Modal did not answer (Modal AuthTokenGet: the test kit's Modal has no answer for it).
+What is there is not shown; it is asked again on the next page.
+Add a provider Back to runners Where runners come from: each provider starts a fresh one for every job.
+Add one or more.
+Cloudflare Containers, one per job, through a small launcher in your Cloudflare.
+Connect aws AWS Spot machines, one per job, in your AWS account.
+Added Modal Sandboxes, one per job, in your Modal workspace.
+The first add builds a small image.
+Added More clouds Your own computer, Google Cloud, Azure and 7 more, coming soon Your own computer Your own Mac or Linux machine, a clean VM per job Soon Google Cloud Compute Engine spot VMs, one per job Soon Azure Spot virtual machines, one per job Soon Hetzner Cloud servers by the hour, one per job Soon DigitalOcean Droplets, one per job Soon Fly.io Fly Machines, one per job Soon Scaleway Instances, one per job Soon Vultr Cloud compute, one per job Soon Akamai (Linode) Linode instances, one per job Soon Kubernetes Pods in your own cluster, one per job Soon AWS account aws 111111111111 Nothing SuperCI does there is refused.
+Nothing refused Refresh Regions All 12 SuperCI works in Spot machines Allowed On-demand machines Allowed CPUs at once 64 on-demand · 96 spot 24 jobs of the default size at a time, in N.
+Virginia.
+Ask AWS for more Spot CPUs ↗ 96 now, in N.
+Virginia On-demand CPUs ↗ 64 now, in N.
+Virginia Runner image In 10 of the 12 regions it may use Not in Canada, Stockholm, which this account may also use.
+To run jobs there too, copy it in: about ten minutes, and about $1.50 a month for the copy's storage.
+Copy into Canada Copy into Stockholm D default AWS · 111111111111 · us-east-1 New workspace…
