@@ -874,6 +874,15 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     served.aws.fail("Action=ListRoles", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not list roles</Message></Error></ErrorResponse>", None);
     let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
     assert!(ok && said.contains("Removed aws-acme.") && said.contains("may not list roles"), "{said}");
+    // Added once more and removed with AWS answering everything: nothing left.
+    served.aws.fail_none();
+    answers();
+    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1"]);
+    assert!(ok, "{said}");
+    served.aws.fail("ec2.", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::222222222222:assumed-role/x is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy</Message></Error></Errors></Response>", None);
+    served.aws.replaying(&removal.join("\n"), &[]);
+    let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
+    assert!(ok && said.contains("Removed aws-acme.") && !said.contains("Left:"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
