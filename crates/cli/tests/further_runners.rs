@@ -151,17 +151,26 @@ fn an_update_deploys_each_modal_launcher_with_its_own_workspaces_sign_in_and_nam
 fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind() {
     let (served, home) = two_workspaces();
     with_further(&served, PLANE, &["modal-acme-two", "modal-globex"]);
-    // (And one removed: no launcher to bring.)
+    // (And one removed: no launcher to bring. A Cloudflare runner in a second account, made again in its account for the
+    // new one; one whose account is not kept stays behind.)
+    let second = "2222222222222222222222222222222b";
     let mut record = stored(&served);
-    record["runners"].as_array_mut().unwrap().push(serde_json::json!({ "name": "modal-old", "account": "modal-globex", "gone": true }));
+    record["runners"].as_array_mut().unwrap().extend([serde_json::json!({ "name": "modal-old", "account": "modal-globex", "gone": true }), serde_json::json!({ "name": "cf-globex", "account": "cf-globex" }), serde_json::json!({ "name": "cf-lost", "account": "cf-lost" })]);
+    record["accounts"].as_array_mut().unwrap().extend([serde_json::json!({ "name": "cf-globex", "provider": "cloudflare", "cloud_id": second }), serde_json::json!({ "name": "cf-lost", "provider": "cloudflare" })]);
+    record["launchers"].as_array_mut().unwrap().push(serde_json::json!({ "cloud": "cf-globex", "url": format!("https://superci-runners-{PLANE}.globex.workers.dev") }));
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &record["launchers"].to_string());
     served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+    let cf_calls: Vec<String> = include_str!("../fixtures/runners/03-cf-agent.jsonl").lines().filter(|l| !l.contains("/accounts?per_page") && !l.contains("iam.amazonaws.com") && !l.contains("api.modal.com")).map(str::to_string).collect();
+    served.aws.replaying(&cf_calls.join("\n"), &[("1111111111111111111111111111111a", second), ("awsplane0001", "testplane0002"), ("subdomain\\\":\\\"acme", "subdomain\\\":\\\"globex")]);
+    served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{second}","name":"Globex","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
     let aws = served.aws.clone();
     let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
     for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
     served.aws.put("/superci/testplane0002/CONTAINERS", "off");
-    { let mut w = served.aws.workers.lock().unwrap(); for workspace in ["acmeorg", "acme-two"] { w.insert(format!("{workspace}--superci-runners-testplane0002.modal.run"), new.url.clone()); } }
+    { let mut w = served.aws.workers.lock().unwrap(); for workspace in ["acmeorg", "acme-two"] { w.insert(format!("{workspace}--superci-runners-testplane0002.modal.run"), new.url.clone()); } w.insert("superci-runners-testplane0002.globex.workers.dev".into(), new.url.clone()); }
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
     kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
     kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
     std::fs::write(&file, kept.to_string()).unwrap();
@@ -171,13 +180,15 @@ fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind
     let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
     assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved: {}", words(&part(&link, "/?p=planes&fragment=1").1)); std::thread::sleep(std::time::Duration::from_millis(100)) }
     let theirs: serde_json::Value = serde_json::from_str(&new.store.0.lock().unwrap()["settings"]).unwrap();
     assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two" && a["url"].as_str().unwrap().contains("acme-two--superci-runners-testplane0002")), "{theirs}");
     assert!(!theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-globex"), "{theirs}");
-    assert_eq!(theirs["runners"].as_array().unwrap().len(), 5, "{theirs}");
+    assert_eq!(theirs["runners"].as_array().unwrap().len(), 7, "{theirs}");
+    assert!(theirs["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "cf-globex"), "{theirs}");
     let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("modal-globex stayed behind")).unwrap_or_default();
-    assert!(page.contains("sign in to the Modal workspace globex"), "{page}");
+    assert!(page.contains("sign in to the Modal workspace globex") && page.contains("cf-lost stayed behind"), "{page}");
+    served.aws.fail("/workers/scripts/superci-runners", 200, r#"{"result":null,"success":true,"errors":[],"messages":[]}"#, None);
     // The old one deleted: what is in a workspace not signed in to is said as left.
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
     let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
@@ -241,6 +252,11 @@ fn a_second_cloudflare_account_gets_a_runner_of_its_own_and_only_its_launcher_is
     served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{first}","name":"Acme","type":"standard"}},{{"id":"{second}","name":"Globex Inc","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
     let (ok, said) = run(&["runners", "create", "cloudflare", &format!("--account={second}")]);
     assert!(ok && said.contains("cloudflare-globex-inc runs jobs now."), "{said}");
+    // (Beside them, a Cloudflare runner removed before and a Modal one: neither's account counts.)
+    let mut record = stored(&served);
+    record["accounts"].as_array_mut().unwrap().extend([serde_json::json!({ "name": "cf-old", "provider": "cloudflare", "cloud_id": first }), serde_json::json!({ "name": "modal-x", "provider": "modal", "cloud_id": "x" })]);
+    record["runners"].as_array_mut().unwrap().extend([serde_json::json!({ "name": "cf-old", "account": "cf-old", "gone": true }), serde_json::json!({ "name": "modal-x", "account": "modal-x" })]);
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
     served.aws.asked.lock().unwrap().clear();
     served.aws.fail("/workers/scripts/superci-runners", 200, r#"{"result":null,"success":true,"errors":[],"messages":[]}"#, None);
     let (ok, said) = run(&["runners", "delete", "cloudflare", "--confirm"]);
@@ -355,6 +371,49 @@ fn an_update_gives_each_further_aws_role_its_permissions_and_names_those_it_cann
     let o = common::command(&home).args(["planes", "update"]).output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success() && said.contains("The roles of aws-globex were not updated: sign in to their AWS accounts"), "{said}");
+    // AWS refusing a further account's role its permissions: the update stops, saying so.
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let asked = served.aws.asked.lock().unwrap().len();
+    served.aws.during("Action=PutRolePolicy", || {});
+    served.aws.fail("Action=PutRolePolicy", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not put role policies</Message></Error></ErrorResponse>", None);
+    let o = common::command(&home).args(["planes", "update"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    let puts: Vec<String> = served.aws.asked.lock().unwrap()[asked..].iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("PutRolePolicy")).map(|a| a.to_string().chars().take(300).collect()).collect();
+    assert!(!o.status.success() && said.contains("may not put role policies"), "{said}\n{puts:#?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move whose new control plane cannot use a further account's role (AWS refuses it there): moved all the same, and
+/// the account said with what AWS answered.
+#[test]
+fn a_move_whose_new_control_plane_cannot_use_a_further_accounts_role_says_so() {
+    let served = serve(own_aws);
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    with_further_aws(&served, &[("aws-acme", "222222222222"), ("aws-globex", "333333333333")]);
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| { c.read_settings(&aws.settings("testplane0002")); own_aws(c) });
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/CONTAINERS", "off");
+    let home = signed_in_two_aws(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", "ec2.eu-west-1"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    // (The new one's AWS refusing it the role.)
+    new.aws.fail("Action=DescribeImages", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>may not see images</Message></Error></Errors></Response>", None);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
+    let page = (0..120).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("AWS did not let the new control plane use its role")).unwrap_or_else(|| words(&part(&link, "/?p=planes&fragment=1").1));
+    assert!(page.contains("aws-acme"), "{page}");
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -638,6 +697,9 @@ fn functions_by_command_on_each_modal_runner_and_their_preemptions_said() {
     for cloud in ["modal-functions", "modal-acme-two-functions"] { assert_eq!(row(&data, cloud)["taken_out"], true, "{data}") }
     let made = |served: &superci_testkit::Served| sandboxes_made(served);
     let before = made(&served);
+    // (The first workspace named: the first Modal runner, by the launcher's address.)
+    let (ok, said) = run(&["runners", "create", "modal", "--account=acmeorg"]);
+    assert!(ok && said.contains("modal runs jobs now."), "{said}");
     let (ok, said) = run(&["runners", "order", "modal-acme-two-functions", "modal-acme-two", "modal"]);
     assert!(ok && said.contains("Order: modal-acme-two-functions, modal-acme-two, modal."), "{said}");
     assert!(made(&served) > before, "its Functions deployed");
@@ -682,6 +744,12 @@ fn functions_by_command_on_each_modal_runner_and_their_preemptions_said() {
     assert!(said.contains("Preempted: 2 Modal Functions this month"), "{said}");
     let (ok, said) = run(&["runners", "delete", "modal-acme-two-functions", "--confirm"]);
     assert!(!ok && said.contains("goes with modal-acme-two"), "{said}");
+    // Signed in to Modal already: how to add another workspace. A control plane that says no preemptions: none said.
+    let (ok, said) = run(&["login", "modal"]);
+    assert!(ok && said.contains("`superci login modal --add` signs in to another Modal workspace beside it."), "{said}");
+    served.answer_as("0.19.21", &["preempted"]);
+    let (ok, said) = run(&["status"]);
+    assert!(ok && !said.contains("Preempted"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -734,9 +802,21 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]);
     assert!(ok && regions().as_array().unwrap().iter().any(|r| r == "eu-north-1"), "{said}");
     assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2.eu-north-1"))), "its network made");
+    // A region AWS will not make a network in: said, nothing kept. One whose cache bucket in the first account fails: made
+    // all the same (the cache waits).
+    served.aws.fail("ec2.eu-central-1", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>may not make networks</Message></Error></Errors></Response>", None);
+    let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=eu-central-1"]);
+    assert!(!ok && said.contains("eu-central-1: ") && said.contains("may not make networks"), "{said}");
+    served.aws.fail_none();
+    served.aws.fail("s3.us-east-1", 403, "<Error><Code>AccessDenied</Code><Message>may not make buckets</Message></Error>", None);
+    let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=us-east-1"]);
+    assert!(ok, "{said}");
+    served.aws.fail_none();
     // AWS refusing what removing it asks: said as left; the record marked gone all the same.
     served.aws.fail("Action=DeleteRole", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not delete roles</Message></Error></ErrorResponse>", None);
     served.aws.fail("Action=DeleteVpc", 400, "<Response><Errors><Error><Code>DependencyViolation</Code><Message>still in use</Message></Error></Errors></Response>", None);
+    // (Its machine still ending at first: waited for.)
+    served.aws.fail("Action=DescribeInstances", 200, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></item></reservationSet></DescribeInstancesResponse>", Some(1));
     let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
     assert!(ok && said.contains("Removed aws-acme.") && said.contains("Left:"), "{said}");
     served.aws.fail_none();
@@ -747,8 +827,10 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     served.aws.fail("ec2.", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::222222222222:assumed-role/x is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy</Message></Error></Errors></Response>", None);
     let removal: Vec<&str> = include_str!("../fixtures/runners/10-cf-remove-aws.jsonl").lines().filter(|l| l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")).collect();
     served.aws.replaying(&removal.join("\n"), &[]);
+    // (Nor may it list its roles: what is left there is said.)
+    served.aws.fail("Action=ListRoles", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not list roles</Message></Error></ErrorResponse>", None);
     let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
-    assert!(ok && said.contains("Removed aws-acme."), "{said}");
+    assert!(ok && said.contains("Removed aws-acme.") && said.contains("may not list roles"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

@@ -10931,6 +10931,13 @@ mod rest_tests {
         d.take_in();
         assert_eq!(d.modal_accounts().len(), 4);
         assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        // Only another workspace beside the one in hand, written by another process: taken in all the same.
+        let mut here = Dashboard::signed_in(Some(store.clone()));
+        let mut beside: crate::store::Kept = serde_json::from_str(&here.kept_as).unwrap();
+        beside.modal_more.push(modal_session("acme-five"));
+        store.write(&beside).unwrap();
+        here.take_in();
+        assert_eq!(here.modal_accounts().len(), 5);
         // A control plane in a workspace kept: its sign-in in hand; in one not kept: as it was.
         d.hold_workspace("globex");
         assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
@@ -10998,6 +11005,9 @@ mod rest_tests {
     /// What each page and word says of further runners, whichever cloud its control plane is in.
     #[test]
     fn further_runners_on_each_page_and_in_each_word() {
+        // Spend a control plane says that is not a number: none.
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "spend": { "aws": "a lot", "modal": 1.0 }, "spend_today": { "aws": null, "modal": 2.0 } }));
+        assert_eq!((v.spend_account("modal"), v.spend_today_account("modal"), v.spend_account("aws")), (1.0, 2.0, 0.0));
         // A second Cloudflare account beside a control plane in Cloudflare: not its own Worker's containers, but a launcher
         // under a word of its own, which a control plane from before cannot keep.
         let mut d = Dashboard::new();

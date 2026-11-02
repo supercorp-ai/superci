@@ -2930,7 +2930,7 @@ fn a_layer_larger_than_a_chunk_is_copied_into_cloudflares_registry_a_chunk_at_a_
 fn every_command_with_no_control_plane_yet_says_to_set_one_up() {
     let account = superci_testkit::Aws::serve();
     let home = common::aws_only(&account);
-    let lines: [&[&str]; 39] = [&["jobs", "list"], &["jobs", "retrieve", "7"], &["runs", "list"], &["runs", "retrieve", "7"], &["runs", "cancel", "7"], &["runs", "wait", "7"], &["usage", "retrieve"],
+    let lines: [&[&str]; 42] = [&["runner_images", "create", "own-ci", "--reference=ghcr.io/acme/ci:1"], &["runner_images", "update", "own-ci", "--reference=ghcr.io/acme/ci:2"], &["runner_images", "delete", "own-ci"], &["jobs", "list"], &["jobs", "retrieve", "7"], &["runs", "list"], &["runs", "retrieve", "7"], &["runs", "cancel", "7"], &["runs", "wait", "7"], &["usage", "retrieve"],
             &["artifacts", "list", "--run=7"], &["caches", "retrieve"], &["caches", "update", "--days=3"], &["caches", "delete", "--repo=acme/app", "--confirm"], &["secrets", "list"],
             &["secrets", "delete", "NPM_TOKEN", "--confirm"], &["keys", "list"], &["keys", "create", "agent"], &["keys", "delete", "agent"], &["accounts", "update", "aws", "--monthly-usd=5"],
             &["deliveries", "list"], &["planes", "allow"], &["planes", "update"], &["runners", "create", "aws"], &["runners", "delete", "aws", "--confirm"], &["runners", "order", "aws"],

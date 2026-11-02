@@ -5503,9 +5503,14 @@ impl<'a> ControlPlane<'a> {
         // A launch template left behind by a request for many spot pools (it could not be removed at the time):
         // removed now; given up on after a day.
         // (Each account's, its connection gone or not: given up on after a day all the same.)
-        let accounts: Vec<String> = std::iter::once("aws".to_string()).chain(self.config.records.accounts.iter().filter(|a| a.provider == "aws").map(|a| a.name.clone())).collect();
-        let mut left = vec![];
-        for account in &accounts { let notes = aws_notes(account); for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((account.clone(), notes.clone(), k, at)) } }
+        // (The first account's always; then each further one's, as long as there are any.)
+        let mut further = self.config.records.accounts.iter().filter(|a| a.provider == "aws").map(|a| a.name.clone());
+        let (mut left, mut next) = (vec![], Some("aws".to_string()));
+        while let Some(account) = next {
+            let notes = aws_notes(&account);
+            for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((account.clone(), notes.clone(), k, at)) }
+            next = further.next();
+        }
         for (account, notes, k, at) in left {
             let mut parts = k.trim_start_matches(&format!("{notes}template:")).splitn(2, ':');
             let (Some(region), Some(name)) = (parts.next(), parts.next()) else { continue };

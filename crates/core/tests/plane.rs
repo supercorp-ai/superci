@@ -630,6 +630,7 @@ impl Containers for OwnContainers {
         Ok(name.to_string())
     }
     async fn start_function(&self, name: &str, work: &superci_core::io::Work, _max: u32, size: superci_core::spec::Size, image: Option<(&str, Option<&str>)>, notice: &str) -> io::Result<String> {
+        faults::container(name)?;
         let superci_core::io::Work::GitHub { jit } = work else { return Err("not a GitHub job".into()) };
         self.0.borrow_mut().push(format!("function {name} {jit} {}cpu {}gb {} {notice}", size.cpu, size.ram_gb, image.map_or("github".into(), |(r, s)| format!("{r}|{}", s.unwrap_or("public")))));
         Ok(format!("fc-{name}"))
@@ -1480,6 +1481,10 @@ fn a_failing_runner_that_would_not_start_is_started_by_the_next_sweep() {
     let j = job(&store, 1);
     assert_eq!((j["failed_fast"].as_bool(), j.get("fail_pending")), (Some(true), None));
     assert_eq!(flaky.starts.get(), 2);
+    // Containers other than Modal's start no image of one's own and no Function (placement sends them none).
+    let (work, size) = (superci_core::io::Work::GitHub { jit: "j".into() }, superci_core::spec::Size { cpu: 2, ram_gb: 8, disk_gb: 14, gpu: None });
+    assert!(block_on(flaky.start_from("n", &work, 10, size.clone(), "ghcr.io/acme/ci:1", None)).is_err_and(|e| e.contains("no image of your own")));
+    assert!(block_on(flaky.start_function("n", &work, 10, size, None, "https://plane.example/interrupted")).is_err_and(|e| e.contains("no Modal Functions")));
 }
 
 #[test]
@@ -7091,7 +7096,7 @@ fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
 /// what is no figure or no account's word left out; last month's said no more; refused without a device's key.
 #[test]
 fn bills_are_kept_as_a_computer_read_them_and_said_for_this_month() {
-    let p = Settled::new(|c| c.device_key_names = vec![("DEVICE_KEY_X".into(), "dashboard-session-key-1".into())]);
+    let p = Settled::new(|c| { c.device_key_names = vec![("DEVICE_KEY_X".into(), "dashboard-session-key-1".into())]; c.device_keys.push((u64::MAX, "a-key-of-no-name-given-0001".into())) });
     let post = |body: serde_json::Value, key: Option<&str>| {
         let r = Request::new("POST", &format!("{PLANE_URL}/bills")).with_body(body.to_string());
         block_on(p.plane().handle(match key { Some(k) => r.with_header("authorization", &format!("Bearer {k}")), None => r }))
@@ -7112,8 +7117,20 @@ fn bills_are_kept_as_a_computer_read_them_and_said_for_this_month() {
     assert_eq!((&bills["modal"]["metered"], &bills["modal-two"]["metered"]), (&serde_json::json!(4.0), &serde_json::json!(2.0)));
     // A key that is no device's, and nothing at all to keep.
     assert_eq!(post(serde_json::json!({}), Some("dashboard-session-key-1")).status, 200);
+    // A key with no name: kept with no device.
+    assert_eq!(post(serde_json::json!({ "bills": { "modal-two": { "metered": 5.0, "billed": 0.0 } } }), Some("a-key-of-no-name-given-0001")).status, 200);
+    assert_eq!(p.status()["bills"]["modal-two"]["device"], "");
     p.later(40 * 86_400_000);
     assert_eq!(p.status()["bills"], serde_json::json!({}), "last month's");
+}
+
+/// An AWS machine's job, over and begun, a day ago: cared for while its sent data is still to be added to its cost.
+#[test]
+fn a_jobs_sent_data_still_to_be_added_keeps_it_cared_for() {
+    let now = 1_790_000_000_000u64;
+    let j = |sent: Option<f64>| serde_json::from_value::<superci_core::plane::Job>(serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "installation_id": 42, "cloud": "aws", "runner": null, "runner_id": null, "machine_id": null, "machine_type": null, "error": null, "seen_in_progress": true, "state": "done", "at_ms": now - 86_400_000, "ended_ms": now - 86_400_000,
+        "began": true, "region": "us-east-1", "cost_from": "2026-09-20T00:00:00Z", "sent_gb": sent })).unwrap();
+    assert!(superci_core::plane::needs_care(&j(None), now) && !superci_core::plane::needs_care(&j(Some(0.5)), now));
 }
 
 /// A further AWS account: connected with the role made there, its two runners under its word, a job's machine started
@@ -7476,6 +7493,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account,
         a_provider_in_the_order_that_is_not_connected_is_said,
         bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
+        a_jobs_sent_data_still_to_be_added_keeps_it_cared_for,
         a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
         several_aws_accounts_each_case_a_job_at_a_time,
         the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be,

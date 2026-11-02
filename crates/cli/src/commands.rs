@@ -1288,10 +1288,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let cloud = w(2);
             // Modal's jobs as Functions (preemptible, a third of a sandbox's price) or as sandboxes.
             let mut d = signed_in();
-            let order = view(&mut d)?.order();
+            let v = view(&mut d)?;
+            let order = v.order();
             let Some(pool) = order.iter().find(|p| p.cloud == cloud) else { return usage(format!("Say which: `superci runners update CLOUD …`, one of {}.", order.iter().map(|p| p.cloud.clone()).collect::<Vec<_>>().join(", "))) };
             if args.has("enabled") { return usage(format!("The order says what is used: `superci runners order …` without {cloud} takes it out, with it puts it back.")) }
-            if args.has("regions") && superci_core::plane::account_of(cloud) != "aws" && view(&mut d)?.records().provider_of(cloud) != "aws" { return usage("--regions is for aws and aws-on-demand.") }
+            if args.has("regions") && superci_core::plane::account_of(cloud) != "aws" && v.records().provider_of(cloud) != "aws" { return usage("--regions is for aws and aws-on-demand.") }
             // The form's fields as they stand, with what was given in their place (the page sends them all).
             let limit = |flag: &str, now: Option<String>| match args.get(flag) { Some("none") => String::new(), Some(v) => v.to_string(), None => now.unwrap_or_default() };
             let regions: Vec<String> = args.get("regions").map(|r| r.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect()).unwrap_or_default();
@@ -1410,7 +1411,6 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if to.is_some_and(|r| !superci_core::plane::valid_image_reference(r)) { return usage("Check the image's address: as `docker pull` takes it, ghcr.io/acme/ci:2026-10, or by its digest (ghcr.io/acme/ci@sha256:…).") }
             if secret_to.is_some_and(|s| !s.is_empty() && !superci_core::plane::valid_modal_secret(s)) { return usage("Check the Modal Secret's name: letters, digits, dashes, underscores and dots, as Modal names a Secret.") }
             let mut d = ready_to_set()?;
-            in_use(&d)?;
             let Some(had) = view(&mut d)?.routing().images.remove(w(2)) else { return Err(Fail::Failed(crate::dashboard::no_image(w(2)))) };
             let reference = to.unwrap_or(&had.reference).to_string();
             let secret = secret_to.map(str::to_string).or(had.modal_secret).filter(|s| !s.is_empty());
