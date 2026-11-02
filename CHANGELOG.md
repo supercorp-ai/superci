@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.22
+## 0.20.0 — 2026-11-02
 - Several AWS accounts run one CI's jobs too: `superci login aws --add`, then `superci runners create aws --account=ID --region=R [--name=WORD]`. Each has its own role, machines, regions, spot notes and limits; a CI keeps one cache, in its first account, which machines elsewhere reach by links. Limits for any account: `superci accounts update WORD`. Each account's bill is kept in the control plane, so every computer of a CI shows it.
 - A Modal launcher that has not been used for a while is woken before a job's machine is asked of it. Starting from nothing took longer than a control plane waits, and the job then showed no machine with a note left over from waiting.
 - Several Modal workspaces run one CI's jobs, each its own runner with its own limits and spend: `superci login modal --add` signs in to one more, and `superci runners create modal --account=WORKSPACE [--name=WORD]` adds it. A runner's word stays for good. Deleting one keeps what it spent counting toward its account's limit, and its word comes back only for the same workspace. Updating, moving and deleting a control plane handle each launcher with its own workspace's sign-in and say which they could not reach. Sign-ins by Taras Kornichuk (github.com/artile).
