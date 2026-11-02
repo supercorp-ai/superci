@@ -145,6 +145,49 @@ fn an_update_deploys_each_modal_launcher_with_its_own_workspaces_sign_in_and_nam
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A move whose new control plane had its runners changed by another computer as they were written: stopped, saying so.
+#[test]
+fn a_move_whose_new_control_plane_changed_its_runners_meanwhile_says_so() {
+    let (served, home) = two_workspaces();
+    with_further(&served, PLANE, &["modal-acme-two", "modal-globex"]);
+    // (And one removed: no launcher to bring. A Cloudflare runner in a second account, made again in its account for the
+    // new one; one whose account is not kept stays behind.)
+    let second = "2222222222222222222222222222222b";
+    let mut record = stored(&served);
+    record["runners"].as_array_mut().unwrap().extend([serde_json::json!({ "name": "modal-old", "account": "modal-globex", "gone": true }), serde_json::json!({ "name": "cf-globex", "account": "cf-globex" }), serde_json::json!({ "name": "cf-lost", "account": "cf-lost" })]);
+    record["accounts"].as_array_mut().unwrap().extend([serde_json::json!({ "name": "cf-globex", "provider": "cloudflare", "cloud_id": second }), serde_json::json!({ "name": "cf-lost", "provider": "cloudflare" })]);
+    record["launchers"].as_array_mut().unwrap().push(serde_json::json!({ "cloud": "cf-globex", "url": format!("https://superci-runners-{PLANE}.globex.workers.dev") }));
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &record["launchers"].to_string());
+    served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+    let cf_calls: Vec<String> = include_str!("../fixtures/runners/03-cf-agent.jsonl").lines().filter(|l| !l.contains("/accounts?per_page") && !l.contains("iam.amazonaws.com") && !l.contains("api.modal.com")).map(str::to_string).collect();
+    served.aws.replaying(&cf_calls.join("\n"), &[("1111111111111111111111111111111a", second), ("awsplane0001", "testplane0002"), ("subdomain\\\":\\\"acme", "subdomain\\\":\\\"globex")]);
+    served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{second}","name":"Globex","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/CONTAINERS", "off");
+    { let mut w = served.aws.workers.lock().unwrap(); for workspace in ["acmeorg", "acme-two"] { w.insert(format!("{workspace}--superci-runners-testplane0002.modal.run"), new.url.clone()); } w.insert("superci-runners-testplane0002.globex.workers.dev".into(), new.url.clone()); }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    // (The new one's runners changed by another computer as they are written.)
+    let front = superci_testkit::front(&new.url, |method, target, status, body| {
+        if method == "POST" && target.starts_with("/settings") { (409, br#"{"conflicts":[{"path":["runners"],"now":[]}]}"#.to_vec()) } else { (status, body) }
+    });
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": front, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    deploy_answers(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
+    let page = (0..120).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("Changed on another computer meanwhile")).unwrap_or_else(|| words(&part(&link, "/?p=planes&fragment=1").1));
+    assert!(page.contains("Changed on another computer meanwhile"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A move brings the further runners along: each launcher deployed again for the new control plane in its own workspace,
 /// the records with them; one whose workspace is not signed in to stays behind, said.
 #[test]
@@ -881,5 +924,27 @@ fn further_runners_side_by_side_keep_each_others_records() {
     let (ok, said) = run(&["runners", "delete", "modal-acme-two", "--confirm"]);
     assert!(ok, "{said}");
     assert_eq!(names(&served), ["modal-globex", "modal-globex-functions"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further runner made as the control plane stops answering: made all the same, said by the provider it is.
+#[test]
+fn a_further_runner_made_as_the_control_plane_stops_answering_is_said_by_its_provider() {
+    let (served, home) = two_workspaces();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = written.clone();
+    let front = superci_testkit::front(&served.url, move |method, target, status, body| {
+        if method == "POST" && target.starts_with("/settings") { seen.store(true, std::sync::atomic::Ordering::SeqCst) }
+        if method == "GET" && target.starts_with("/status") && seen.load(std::sync::atomic::Ordering::SeqCst) { (500, b"down".to_vec()) } else { (status, body) }
+    });
+    *served.aws.plane_url.lock().unwrap() = front.clone();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = front.clone().into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    deploy_answers(&served);
+    let o = common::command(&home).args(["runners", "create", "modal", "--account=acme-two"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(written.load(std::sync::atomic::Ordering::SeqCst) && said.contains("modal runs jobs now."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
