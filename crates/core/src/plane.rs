@@ -5505,11 +5505,11 @@ impl<'a> ControlPlane<'a> {
         // (Each account's, its connection gone or not: given up on after a day all the same.)
         // (The first account's always; then each further one's, as long as there are any.)
         let mut further = self.config.records.accounts.iter().filter(|a| a.provider == "aws").map(|a| a.name.clone());
-        let (mut left, mut next) = (vec![], Some("aws".to_string()));
-        while let Some(account) = next {
+        let (mut left, mut account) = (vec![], "aws".to_string());
+        loop {
             let notes = aws_notes(&account);
             for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((account.clone(), notes.clone(), k, at)) }
-            next = further.next();
+            match further.next() { Some(next) => account = next, None => break }
         }
         for (account, notes, k, at) in left {
             let mut parts = k.trim_start_matches(&format!("{notes}template:")).splitn(2, ':');

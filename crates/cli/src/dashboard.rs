@@ -3452,30 +3452,31 @@ impl Dashboard {
                 let records_now = view::records_in(&status);
                 // Its Cloudflare launchers' accounts: a further one's as kept; the first's, the one account reached, or
                 // of several the one whose subdomain its address has (never just the first: another's would get one).
-                let cf_launchers: Vec<(String, String)> = launchers.as_array().into_iter().flatten().filter_map(|a| Some((a["cloud"].as_str()?.to_string(), a["url"].as_str()?.to_string()))).filter(|(word, _)| records_now.provider_of(word) == "cloudflare").collect();
+                let typed: Vec<Launcher> = serde_json::from_value(launchers.clone()).unwrap_or_default();
+                let cf_launchers: Vec<(String, String)> = typed.iter().map(|a| (a.cloud.clone(), a.url.clone())).filter(|(word, _)| records_now.provider_of(word) == "cloudflare").collect();
                 let cf_launcher = !cf_launchers.is_empty();
                 let mut cf_accounts_of: Vec<String> = vec![];
                 let mut cf_missing: Vec<String> = vec![];
                 if let (Some(cf), false) = (&cf, matches!(plane, Plane::Cloudflare { .. }) && cf_launchers.iter().all(|(w, _)| w == "cloudflare")) {
-                    for (word, url) in &cf_launchers {
+                    // (There is one at least: a sign-in to Cloudflare is asked for only then.)
+                    cf_launchers.iter().for_each(|(word, url)| {
                         let id = records_now.accounts.iter().find(|a| a.name == records_now.account_of(word)).and_then(|a| a.cloud_id.clone())
                             .or_else(|| if self.cf_accounts.len() == 1 { cf_account.clone() } else { self.cf_accounts.iter().find(|(a, _)| cf.subdomain(a).is_ok_and(|s| url.contains(&format!(".{s}.workers.dev")))).map(|(a, _)| a.clone()) });
                         match id.filter(|id| self.cf_accounts.iter().any(|c| c.0 == *id)) { Some(id) => cf_accounts_of.push(id), None => cf_missing.push(word.clone()) }
-                    }
+                    });
                 }
                 // Its launcher in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
                 // that is over stops nothing else, and is said with the result.
                 // Its Modal launcher likewise, with Modal's sign-in: it keeps the Modal client it was deployed with, and
                 // Modal stops taking old ones (see `modal::heard`).
                 let records = view::records_in(&status);
-                let modal_launchers: Vec<(String, String)> = launchers.as_array().into_iter().flatten().filter_map(|a| Some((a["cloud"].as_str()?.to_string(), a["url"].as_str()?.to_string()))).filter(|(word, _)| records.provider_of(word) == "modal").collect();
+                let modal_launchers: Vec<(String, String)> = typed.iter().map(|a| (a.cloud.clone(), a.url.clone())).filter(|(word, _)| records.provider_of(word) == "modal").collect();
                 // (Each with a sign-in to the workspace it is in: another's would get a second one.)
                 // Each further AWS account's role gets what this version asks for, with its own sign-in.
                 let aws_all = self.aws_all();
-                let further_aws: Vec<(String, superci_core::aws::Credentials, Vec<String>)> = status["aws_further"].as_array().into_iter().flatten().filter_map(|a| {
-                    let id = a["account_id"].as_str()?;
-                    Some((id.to_string(), aws_all.iter().find(|(s, _)| s == id)?.1.clone(), a["regions"].as_array()?.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()))
-                }).collect();
+                let connections: Vec<superci_core::plane::AwsConnection> = serde_json::from_value(status["aws_further"].clone()).unwrap_or_default();
+                let further_aws: Vec<(String, superci_core::aws::Credentials, Vec<String>)> = connections.into_iter()
+                    .filter_map(|a| Some((a.account_id.clone(), aws_all.iter().find(|(s, _)| *s == a.account_id)?.1.clone(), a.regions))).collect();
                 let first_creds = aws_all.iter().find(|(id, _)| status["aws"]["account_id"].as_str() == Some(id.as_str())).map(|(_, c)| c.clone());
                 let further_given: Vec<String> = status["aws_further"].as_array().into_iter().flatten().filter(|a| further_aws.iter().any(|(id, _, _)| a["account_id"].as_str() == Some(id.as_str()))).filter_map(|a| a["name"].as_str().map(str::to_string)).collect();
                 let aws_missing_further: Vec<&str> = status["aws_further"].as_array().into_iter().flatten().filter(|a| !further_aws.iter().any(|(id, _, _)| a["account_id"].as_str() == Some(id.as_str()))).filter_map(|a| a["name"].as_str()).collect();
@@ -3700,12 +3701,13 @@ impl Dashboard {
                 self.put_as_said(&plane, &status, serde_json::json!({ "accounts": records.accounts, "runners": records.runners }), serde_json::json!({ "accounts": now.accounts, "runners": now.runners }))?;
                 // (Its role takes a moment to be seen by AWS everywhere.)
                 let body = serde_json::json!({ "name": word, "accountId": account_id, "region": region, "regions": regions });
-                let mut said = serde_json::Value::Null;
-                for _ in 0..12 {
-                    said = cloudflare::plane_post(plane.url(), &self.status_key, "/aws/accounts", &body)?;
-                    if said["connected"] == true { break }
+                let mut asked = 0;
+                let said = loop {
+                    let said = cloudflare::plane_post(plane.url(), &self.status_key, "/aws/accounts", &body)?;
+                    asked += 1;
+                    if said["connected"] == true || asked == 12 { break said }
                     aws::pause(5000);
-                }
+                };
                 if said["connected"] != true { return Ok(message(502, "AWS did not let the control plane use the role yet", &esc(said["error"].as_str().unwrap_or("Try again in a minute.")))) }
                 self.views = None;
                 self.flash = cache_note;
@@ -9407,7 +9409,7 @@ mod tests {
         assert!(renames(&serde_json::json!({ "agents": [] }), &[]).0.is_empty());
         // What a control plane from before steered jobs by: said with its update, with the label that does it now.
         let said = |routing: serde_json::Value| steered_before(&serde_json::json!({ "label": "acmeci", "routing": routing }));
-        assert_eq!(said(serde_json::json!({ "rules": [{ "repo": "acme/*", "cloud": "cloudflare" }, { "repo": "broken" }], "default": "aws", "order": [{ "cloud": "aws" }] })), "Repository rules are gone. acme/* only used Cloudflare: a workflow says that now with `runs-on: acmeci/provider=cloudflare`.");
+        assert_eq!(said(serde_json::json!({ "rules": [{ "repo": "acme/*", "cloud": "cloudflare" }, { "repo": "broken" }, { "cloud": "aws" }], "default": "aws", "order": [{ "cloud": "aws" }] })), "Repository rules are gone. acme/* only used Cloudflare: a workflow says that now with `runs-on: acmeci/provider=cloudflare`.");
         assert_eq!(said(serde_json::json!({ "default": "modal", "order": [] })), "Repository rules are gone. Every repository only used Modal: a workflow says that now with `runs-on: acmeci/provider=modal`.");
         assert_eq!(said(serde_json::json!({ "default": "modal" })), "Repository rules are gone. Every repository only used Modal: a workflow says that now with `runs-on: acmeci/provider=modal`.");
         assert_eq!(steered_before(&serde_json::json!({ "routing": { "rules": [{ "repo": "a/b", "cloud": "modal" }] } })), "Repository rules are gone. a/b only used Modal: a workflow says that now with `runs-on: superci/provider=modal`.");
@@ -11005,6 +11007,15 @@ mod rest_tests {
     /// What each page and word says of further runners, whichever cloud its control plane is in.
     #[test]
     fn further_runners_on_each_page_and_in_each_word() {
+        // A further AWS account asked of no control plane, or of one that does not answer.
+        assert!(send(&mut Dashboard::new(), "/runners/aws", &[("account", "222222222222"), ("region", "eu-west-1")]).is_err());
+        let mut d = Dashboard::new();
+        d.planes = vec![aws_plane("p0", NOWHERE)];
+        let r = send(&mut d, "/runners/aws", &[("account", "222222222222"), ("region", "eu-west-1")]).unwrap();
+        assert!(r.status == 503 && words_of(&r).contains("The control plane did not answer yet"), "{}", words_of(&r));
+        // Limits with AWS alone: no other account's row.
+        let card = plain(&spending_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "account_limits": true, "aws": { "account_id": "123456789012" }, "routing": { "order": [{ "cloud": "aws" }] } })), 0));
+        assert!(card.contains("All providers together") && !card.contains("Modal account") && !card.contains("Cloudflare account"), "{card}");
         // Spend a control plane says that is not a number: none.
         let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "spend": { "aws": "a lot", "modal": 1.0 }, "spend_today": { "aws": null, "modal": 2.0 } }));
         assert_eq!((v.spend_account("modal"), v.spend_today_account("modal"), v.spend_account("aws")), (1.0, 2.0, 0.0));

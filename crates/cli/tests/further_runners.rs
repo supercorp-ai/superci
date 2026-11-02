@@ -841,6 +841,12 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
     let answers = || for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1", "us-east-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) };
     answers();
+    // The control plane not let to use the role (AWS refusing it what it checks with): asked a few times, then said.
+    served.aws.fail("Action=DescribeImages", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>may not see images</Message></Error></Errors></Response>", None);
+    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
+    assert!(!ok && said.contains("AWS did not let the control plane use the role yet") && said.contains("may not see images"), "{said}");
+    served.aws.fail_none();
+    answers();
     // (Beside a further runner elsewhere, whose record stays.)
     served.store.0.lock().unwrap().insert("settings".into(), serde_json::json!({ "version": 1, "routing": {}, "launchers": [], "accounts": [{ "name": "modal-x", "provider": "modal", "cloud_id": "x" }], "runners": [{ "name": "modal-x", "account": "modal-x" }] }).to_string());
     let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
@@ -973,4 +979,100 @@ fn a_further_runner_made_as_the_control_plane_stops_answering_is_said_by_its_pro
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(written.load(std::sync::atomic::Ordering::SeqCst) && said.contains("modal runs jobs now."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A command run with `fault` armed (see `superci_testkit::sweep`): it never panics, says what failed when it fails, and
+/// `superci status` still answers after.
+fn swept(fault: superci_testkit::Fault, served: superci_testkit::Served, home: &std::path::Path, command: &[&str]) -> superci_testkit::Outcome {
+    served.arm(fault);
+    let o = common::command(home).args(command).env("SUPERCI_PAUSE_MS", "1").env("SUPERCI_MOVE_PAUSE_MS", "50").output().unwrap();
+    served.faults().stop();
+    let (code, said) = (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr));
+    let out = superci_testkit::Outcome::new(served);
+    out.check(code >= 0 && !said.contains("panicked"), || format!("`{}` panicked or was killed: {said}", command.join(" ")));
+    out.check(code == 0 || said.trim().trim_start_matches("superci:").trim().len() > 8, || format!("`{}` failed ({code}) without saying what: {said}", command.join(" ")));
+    if std::env::var("SUPERCI_SWEEP_ONLY").is_ok() { eprintln!("$ superci {} → {code}\n{said}", command.join(" ")) }
+    let after = common::command(home).args(["status", "--json"]).output().unwrap();
+    // (A move stopped halfway leaves two control planes live: status asks which, as it should.)
+    let which = String::from_utf8_lossy(&after.stdout).contains("Name one: --plane=ID");
+    out.check(after.status.success() || which, || format!("`superci status` fails after the fault: {}{}", String::from_utf8_lossy(&after.stdout).chars().take(400).collect::<String>(), String::from_utf8_lossy(&after.stderr)));
+    let _ = std::fs::remove_dir_all(home);
+    out
+}
+
+/// A second AWS account's runners made, given a region, updated with the control plane, removed and moved, and a second
+/// Modal workspace's and Cloudflare account's made, with each of the clouds' answers failing in turn.
+#[test]
+fn every_further_runner_command_holds_with_each_call_and_store_operation_failing() {
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    let connect = connect.join("\n");
+    let aws = |further: bool| {
+        let served = serve(own_aws);
+        served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+        if further { with_further_aws(&served, &[("aws-acme", "222222222222")]) }
+        for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1", "us-east-1"] { served.aws.replaying(&connect.replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) }
+        let home = signed_in_two_aws(&served);
+        (served, home)
+    };
+    let organization = "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::222222222222:assumed-role/x is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy</Message></Error></Errors></Response>";
+    let removal: Vec<&str> = include_str!("../fixtures/runners/10-cf-remove-aws.jsonl").lines().filter(|l| l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")).collect();
+    let removal = removal.join("\n");
+    let cases: Vec<(&str, Box<dyn Fn() -> (superci_testkit::Served, std::path::PathBuf) + Sync>, Vec<&str>)> = vec![
+        ("aws create", Box::new(|| aws(false)), vec!["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]),
+        ("aws regions", Box::new(|| aws(true)), vec!["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]),
+        ("aws delete", Box::new(|| { let (served, home) = aws(true); served.aws.replaying(&removal, &[]); served.aws.fail("ec2.", 403, organization, None); (served, home) }), vec!["runners", "delete", "aws-acme", "--confirm"]),
+        ("planes update", Box::new(|| {
+            let (served, home) = aws(true);
+            served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+            (served, home)
+        }), vec!["planes", "update"]),
+        ("modal create", Box::new(|| { let (served, home) = two_workspaces(); deploy_answers(&served); (served, home) }), vec!["runners", "create", "modal", "--account=acme-two"]),
+        // (Moved: its role made for the new control plane in the further account; the new one lives on with it.)
+        ("aws move", Box::new(|| {
+            let (served, home) = aws(true);
+            served.connect_github();
+            let kept = served.aws.clone();
+            let new = superci_testkit::serve_as("testplane0002", move |c| { c.read_settings(&kept.settings("testplane0002")); own_aws(c) });
+            for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+            served.aws.put("/superci/testplane0002/CONTAINERS", "off");
+            let file = home.join("workspaces/default/sign-ins.json");
+            let mut signed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            signed["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+            signed["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+            std::fs::write(&file, signed.to_string()).unwrap();
+            served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+            std::mem::forget(new);
+            (served, home)
+        }), vec!["planes", "move", "testplane0002"]),
+        // (Made again with its Functions in the order: deployed with it.)
+        ("modal again", Box::new(|| {
+            let (served, home) = two_workspaces();
+            with_further(&served, PLANE, &["modal-acme-two"]);
+            let mut record = stored(&served);
+            record["routing"] = serde_json::json!({ "order": [{ "cloud": "modal-acme-two-functions" }, { "cloud": "modal-acme-two" }] });
+            served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+            deploy_answers(&served);
+            (served, home)
+        }), vec!["runners", "create", "modal", "--account=acme-two"]),
+        ("cloudflare create", Box::new(|| {
+            let served = serve(|_| {});
+            served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+            let (first, second) = ("1111111111111111111111111111111a", "2222222222222222222222222222222b");
+            served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), &format!(r#"[{{"cloud":"cloudflare","url":"https://superci-runners-{PLANE}.acme.workers.dev"}}]"#));
+            let home = common::signed_in(&served);
+            let file = home.join("workspaces/default/sign-ins.json");
+            let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+            std::fs::write(&file, kept.to_string()).unwrap();
+            let cf_calls: Vec<String> = include_str!("../fixtures/runners/03-cf-agent.jsonl").lines().filter(|l| !l.contains("/accounts?per_page") && !l.contains("iam.amazonaws.com") && !l.contains("api.modal.com")).map(str::to_string).collect();
+            served.aws.replaying(&cf_calls.join("\n"), &[(first, second), ("awsplane0001", PLANE), ("subdomain\\\":\\\"acme", "subdomain\\\":\\\"globex")]);
+            served.aws.replaying(&cf_calls.join("\n"), &[("awsplane0001", PLANE)]);
+            served.aws.fail("/accounts?per_page", 200, &format!(r#"{{"result":[{{"id":"{first}","name":"Acme","type":"standard"}},{{"id":"{second}","name":"Globex Inc","type":"standard"}}],"success":true,"errors":[],"messages":[]}}"#), None);
+            { let mut w = served.aws.workers.lock().unwrap(); w.insert(format!("superci-runners-{PLANE}.globex.workers.dev"), served.url.clone()); }
+            (served, home)
+        }), vec!["runners", "create", "cloudflare", "--account=2222222222222222222222222222222b"]),
+    ];
+    for (name, setup, command) in &cases {
+        superci_testkit::sweep(&format!("further runners: {name}"), |fault| { let (served, home) = setup(); swept(fault, served, &home, command) });
+    }
 }

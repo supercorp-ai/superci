@@ -3037,6 +3037,9 @@ fn an_image_of_ones_own_moves_to_a_new_tag_in_one_write_and_an_unknown_name_is_r
         assert_eq!((code, refused["error"].as_str()), (1, Some("There is no image gone here (`superci runner_images list`). `superci runner_images create gone --reference=REGISTRY/IMAGE:TAG` adds it.")), "{refused}");
     }
     assert_eq!((writes(), images()), (before, serde_json::json!({ "rust-ci": { "reference": "ghcr.io/acme/ci:2" } })));
+    // Deleted: gone from the control plane.
+    let said = ok(&["runner_images", "delete", "rust-ci"]);
+    assert_eq!((said["said"].as_str(), images()), (Some("rust-ci is no longer an image here."), serde_json::Value::Null));
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
