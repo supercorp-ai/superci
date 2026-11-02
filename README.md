@@ -2,6 +2,8 @@
 
 # SuperCI
 
+[![awesome-runners](https://img.shields.io/badge/listed%20on-awesome--runners-blue.svg)](https://github.com/jonico/awesome-runners)
+
 The cheapest way to run GitHub Actions: each job runs on an AWS spot machine in your own account, at AWS's price with nothing added. A 2 vCPU job costs $0.0008 a minute, against $0.006 on GitHub's runners. One command sets it up; there are no servers or Kubernetes to run. Free and open source (MIT), and an alternative to RunsOn, Blacksmith and Actions Runner Controller.
 
 It also runs GitLab CI jobs, and can start them in Cloudflare or Modal instead of AWS.
