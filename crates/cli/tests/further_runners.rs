@@ -651,10 +651,23 @@ fn functions_by_command_on_each_modal_runner_and_their_preemptions_said() {
     served.store.0.lock().unwrap().insert(format!("modal:preempted:{now}:2"), now.to_string());
     let (_, said) = run(&["runners", "list"]);
     assert!(said.contains("Preempted: 2 Modal Functions this month · 1 job run again."), "{said}");
-    // Back to sandboxes: nothing deployed. Removed with its runner, not by itself.
+    // Made again with its row on: its Functions too.
+    deploy_answers(&served);
+    let before = made(&served);
+    let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
+    assert!(ok && made(&served) > before + 1, "{said}");
+    // A good Secret's name for an image there is; an email is only for AWS's budget.
+    let (ok, said) = run(&["runner_images", "update", "own-ci", "--modal-secret=ghcr-other"]);
+    assert!(ok, "{said}");
+    let (ok, said) = run(&["accounts", "update", "modal-acme-two", "--monthly-usd=5", "--email=a@example.com"]);
+    assert!(!ok && said.contains("--aws-budget and --email are for aws"), "{said}");
+    // Back to sandboxes: nothing deployed; this month's preemptions still said. Removed with its runner, not by itself.
+    deploy_answers(&served);
     let before = made(&served);
     let (ok, _) = run(&["runners", "order", "modal-acme-two", "modal"]);
     assert!(ok && made(&served) == before);
+    let (_, said) = run(&["runners", "list"]);
+    assert!(said.contains("Preempted: 2 Modal Functions this month"), "{said}");
     let (ok, said) = run(&["runners", "delete", "modal-acme-two-functions", "--confirm"]);
     assert!(!ok && said.contains("goes with modal-acme-two"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
@@ -737,6 +750,36 @@ fn a_further_runner_on_a_control_plane_in_modal() {
     assert_eq!(status, 303, "{}", words(&said));
     let record = stored(&served);
     assert!(record["launchers"].as_array().unwrap().iter().any(|a| a["cloud"] == "modal-acme-two"), "{record}");
+    // By command: another workspace named goes as a further runner.
     let _ = child.kill();
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    deploy_answers(&served);
+    let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
+    assert!(ok && said.contains("modal-acme-two"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further runner beside another further runner: each record kept whole when the other is made and removed.
+#[test]
+fn further_runners_side_by_side_keep_each_others_records() {
+    let (served, home) = two_workspaces();
+    with_further(&served, PLANE, &["modal-globex"]);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    deploy_answers(&served);
+    let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
+    assert!(ok, "{said}");
+    let names = |served: &superci_testkit::Served| stored(served)["runners"].as_array().unwrap().iter().filter(|r| r["gone"] != true).map(|r| r["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(names(&served), ["modal-globex", "modal-globex-functions", "modal-acme-two", "modal-acme-two-functions"]);
+    let removed: Vec<&str> = include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().filter(|l| l.contains("/AppList") || l.contains("/AppStop") || l.contains("/AppDelete")).collect();
+    served.aws.replaying(&removed.join("\n"), &[("mdplane00002", PLANE)]);
+    let (ok, said) = run(&["runners", "delete", "modal-acme-two", "--confirm"]);
+    assert!(ok, "{said}");
+    assert_eq!(names(&served), ["modal-globex", "modal-globex-functions"]);
     let _ = std::fs::remove_dir_all(&home);
 }

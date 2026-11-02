@@ -1159,7 +1159,7 @@ fn modal_price(size: Size, function: bool) -> f64 {
 /// What a job's runner that was lost is said as, by its cloud: AWS took its spot machine back, or Modal preempted its
 /// Function; and what runs it again (`no_spot`: AWS's on-demand machines, Modal's sandboxes).
 fn lost_said(provider: &str) -> (&'static str, &'static str) {
-    if provider == "modal" { ("Modal preempted its Function", "on a sandbox") } else { ("AWS took back its spot machine", "off spot machines") }
+    if provider == "modal" { ("Modal preempted its Function", "further down the order") } else { ("AWS took back its spot machine", "off spot machines") }
 }
 
 fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }

@@ -10580,6 +10580,10 @@ mod rest_tests {
         let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech-functions" }] }, "runner_images": true, "function_mode": true })));
         let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
         assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
+        // Its own sandboxes switched on again, with the row on: its Functions first.
+        let own = serde_json::json!({ "routing": { "order": [{ "cloud": "modal-functions" }] }, "function_mode": true });
+        let mut d = modal_answering(own);
+        assert!(send(&mut d, "/runners/modal-own", &[]).is_err_and(|e| e.contains("Sign in with Modal to the workspace")));
         // Its row goes with its runner.
         let mut d = modal_answering(on());
         let r = send(&mut d, "/runners/remove", &[("cloud", "modal-initech-functions")]).unwrap();
@@ -10994,6 +10998,36 @@ mod rest_tests {
     /// What each page and word says of further runners, whichever cloud its control plane is in.
     #[test]
     fn further_runners_on_each_page_and_in_each_word() {
+        // A second Cloudflare account beside a control plane in Cloudflare: not its own Worker's containers, but a launcher
+        // under a word of its own, which a control plane from before cannot keep.
+        let mut d = Dashboard::new();
+        d.planes = vec![cf_plane("p1", &plane_answering(serde_json::json!({ "routing": {}, "launchers": [] })))];
+        d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": 4102444800000u64 })).unwrap());
+        d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Globex".into())];
+        let r = send(&mut d, "/runners/cloudflare", &[("account", "a2")]).unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("A further runner needs a newer control plane"), "{}", words_of(&r));
+        // Modal's Functions: their row says this month's preemptions; a word too long for a second row is refused only
+        // where a runner has one; Cloudflare's has none.
+        let v = seen_as(modal_plane("p2", NOWHERE), with_further_all(serde_json::json!({ "preempted": { "month": 2, "rerun": 1 } })));
+        let card = plain(&pools_card(&v, &HashMap::new(), None, &HashMap::new(), None));
+        assert!(card.contains("2 preempted · 1 run again"), "{card}");
+        assert!(!plain(&machines_card(&v).1).contains("modal-two-functions"));
+        let (long, none) = ("a-word-of-twenty-three-c", Records::default());
+        assert_eq!(cloudflare_word(&[], &none, true, "a2", "Globex", "", long), Ok(long.to_string()));
+        assert!(modal_word(&[], &none, false, "two", long).is_err_and(|e| e.contains("no room for its second runner")));
+        // Bills: a workspace's only by a Modal runner of it; a control plane's own only when it runs in Modal.
+        let month = modal::Month { metered: 1.0, billed: 1.0, superci: 1.0 };
+        let elsewhere = serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "cf-two", "url": "https://acme--superci-runners-p2.modal.run" }],
+            "accounts": [{ "name": "cf-two", "provider": "cloudflare", "cloud_id": "a2" }], "runners": [{ "name": "cf-two", "account": "cf-two" }] });
+        assert!(bills_of(&seen_as(modal_plane("p2", NOWHERE), elsewhere.clone()), &elsewhere, &[("acme".to_string(), month)], &[]).is_empty());
+        // A further AWS account's machine started in its region is said as AWS's, by that.
+        assert!(job_start(&serde_json::json!({ "cloud": "aws-two", "region": "us-east-1", "machine_id": "i-1", "at_ms": 1, "asked_ms": 2, "launched_ms": 3 })).to_string().contains("AWS gave a machine"));
+        // The same workspace signed in again: one sign-in, none left over.
+        let session = || modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() };
+        let mut d = Dashboard::new();
+        d.came_modal(session());
+        d.came_modal(session());
+        assert!(d.modal_others.is_empty());
         // A job on a further AWS account's machine is AWS's, by its region; one elsewhere is not.
         assert!(job_disk(&serde_json::json!({ "cloud": "aws-two", "region": "us-east-1", "disk_gb": 60 })).is_object());
         assert!(job_disk(&serde_json::json!({ "cloud": "modal-two", "disk_gb": 60 })).is_null());
@@ -11030,20 +11064,26 @@ mod rest_tests {
         // The Runners and Add pages, on a control plane in each cloud, with every kind of sign-in beside it.
         let mut status = status;
         status["launchers"].as_array_mut().unwrap().push(serde_json::json!({ "cloud": "cloudflare", "url": "https://superci-runners-p2.acme.workers.dev" }));
+        // (Accounts whose runners were removed are offered again; one not signed in to is not.)
+        for (word, provider, id) in [("aws-gone", "aws", "555555555555"), ("cf-gone", "cloudflare", "a4"), ("aws-far", "aws", "999999999999")] {
+            status["accounts"].as_array_mut().unwrap().push(serde_json::json!({ "name": word, "provider": provider, "cloud_id": id }));
+            status["runners"].as_array_mut().unwrap().push(serde_json::json!({ "name": word, "account": word, "gone": true }));
+        }
         for (plane, say) in [(aws_plane("p2", &plane_answering(status.clone())), "Runner providers"), (cf_plane("p2", &plane_answering(status.clone())), "Runner providers"), (modal_plane("p2", &plane_answering(status.clone())), "Runner providers")] {
             let mut d = Dashboard::new();
             d.modal = Some(modal_session("two"));
             d.modal_others = vec![modal_session("three")];
             d.cf = Some(serde_json::from_value(serde_json::json!({ "access": "t", "refresh": null, "expires_at_ms": 4102444800000u64 })).unwrap());
-            d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Two".into()), ("a3".into(), "Three".into())];
+            d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Two".into()), ("a3".into(), "Three".into()), ("a4".into(), "Four".into())];
             d.aws = Some(aws::Session::for_test("123456789012"));
-            d.aws_others = vec![aws::Session::for_test("222222222222"), aws::Session::for_test("444444444444")];
+            d.aws_others = vec![aws::Session::for_test("222222222222"), aws::Session::for_test("444444444444"), aws::Session::for_test("555555555555")];
             d.planes = vec![plane.clone()];
             let mut v = seen_as(plane.clone(), status.clone());
             v.aws = true;
             let page = plain(&d.runners_page(Some(&v)));
             assert!(page.contains(say) && page.contains("aws-two: AWS account 222222222222") && page.contains("modal-two"), "{page}");
             let adds = plain(&d.add_runners_page(Some(&v)));
+            assert!(adds.contains("in account 555555555555") && adds.contains("Cloudflare account Four") && !adds.contains("in account 999999999999"), "{adds}");
             assert!(adds.contains("in account 444444444444") && !adds.contains("in account 222222222222") && adds.contains("Cloudflare account Three") && !adds.contains("Cloudflare account Two") && adds.contains("Modal workspace three"), "{adds}");
         }
         // A further account's refusals, on the permissions page.

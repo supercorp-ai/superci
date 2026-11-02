@@ -1815,13 +1815,13 @@ fn a_preempted_modal_function_is_run_again_once_on_a_sandbox_and_counted() {
     run(webhook("completed", Some(&runner)));
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j["rerun"]["state"].as_str()), (Some("failed"), Some("pending")));
-    assert_eq!(j["error"], "Modal preempted its Function; SuperCI runs the job again by itself, on a sandbox, once its run has finished (GitHub runs a job again only then)");
+    assert_eq!(j["error"], "Modal preempted its Function; SuperCI runs the job again by itself, further down the order, once its run has finished (GitHub runs a job again only then)");
     block_on(plane.alarm()).unwrap();
     assert!(!clouds.clouds.calls.borrow().iter().any(|c| c.1.ends_with("/rerun")));
     clouds.done.set(true);
     block_on(plane.alarm()).unwrap();
     assert_eq!(clouds.clouds.calls.borrow().iter().filter(|c| c.0 == "POST" && c.1 == "https://api.github.com/repos/acme/app/actions/jobs/7/rerun").count(), 1);
-    assert_eq!((job(&store, 7)["rerun"]["state"].as_str(), job(&store, 7)["error"].as_str()), (Some("asked"), Some("Modal preempted its Function; SuperCI ran the job again by itself, on a sandbox (the run's next attempt)")));
+    assert_eq!((job(&store, 7)["rerun"]["state"].as_str(), job(&store, 7)["error"].as_str()), (Some("asked"), Some("Modal preempted its Function; SuperCI ran the job again by itself, further down the order (the run's next attempt)")));
     block_on(plane.alarm()).unwrap();
     assert_eq!(status()["preempted"], serde_json::json!({ "month": 1, "rerun": 1 }), "asked once");
 
@@ -1836,6 +1836,38 @@ fn a_preempted_modal_function_is_run_again_once_on_a_sandbox_and_counted() {
     // Stopped by its call's id.
     run(labelled("completed", 9, "acme/app", Some(&format!("superci-{PLANE_ID}-9")), "superci/cpu=8/ram=16"));
     assert_eq!(own.0.borrow().last().cloned(), Some(format!("stop fc-superci-{PLANE_ID}-9")));
+}
+
+/// A label that asks for no preemptible machine (`spot=false`) goes past Functions, and with nothing after them says why.
+/// A job Modal preempted goes past them too, unless nothing else can take it: then a Function it is.
+#[test]
+fn functions_are_a_row_a_label_and_a_preemption_go_past() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true }, Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "modal".into());
+    config.routing.order = vec![Pool::of("modal-functions"), Pool::of("modal")];
+    {
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/cpu=4/spot=false")));
+        assert_eq!(job(&store, 1)["cloud"], "modal", "{}", job(&store, 1));
+        block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=4")));
+        assert_eq!(job(&store, 2)["cloud"], "modal-functions", "{}", job(&store, 2));
+    }
+    // Functions alone in the order.
+    config.routing.order = vec![Pool::of("modal-functions"), Pool { off: true, ..Pool::of("modal") }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/cpu=4/spot=false")));
+    assert!(job(&store, 3)["error"].as_str().is_some_and(|e| e.contains("Modal's Functions are not asked for (spot=false)")), "{}", job(&store, 3));
+    let runner = format!("superci-{PLANE_ID}-4");
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/cpu=4")));
+    let token = job(&store, 4)["notice"].as_str().unwrap().to_string();
+    block_on(plane.handle(webhook("in_progress", Some(&runner)).clone()));
+    block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={token}"))));
+    block_on(plane.handle(webhook("completed", Some(&runner))));
+    block_on(plane.alarm()).unwrap();
+    block_on(plane.handle(labelled("queued", 5, "acme/app", None, "superci/cpu=4")));
+    assert_eq!(job(&store, 5)["cloud"], "modal-functions", "{}", job(&store, 5));
 }
 
 /// A further Modal workspace's launcher is told a Function, with the link; one from before Functions
@@ -7284,7 +7316,7 @@ fn a_preempted_function_of_a_run_from_a_computer_is_over_at_once() {
     }
     let (local, github) = (job(&store, 1), job(&store, 2));
     assert_eq!(local["state"], "failed", "{local}");
-    assert!(local["error"].as_str().is_some_and(|e| e.contains("Modal preempted its Function; SuperCI starts the job again by itself, on a sandbox")) && local["ended_ms"].is_u64(), "{local}");
+    assert!(local["error"].as_str().is_some_and(|e| e.contains("Modal preempted its Function; SuperCI starts the job again by itself, further down the order")) && local["ended_ms"].is_u64(), "{local}");
     assert_eq!((github["state"].as_str(), github["interrupted"].as_bool()), (Some("running"), Some(true)), "{github}");
     assert!(store.0.borrow().keys().any(|k| k.starts_with("modal:preempted:")) && !store.0.borrow().keys().any(|k| k.starts_with("spot:interrupted:")));
 }

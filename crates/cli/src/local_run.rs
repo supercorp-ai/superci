@@ -520,7 +520,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     None if j["start"]["keeps"] == true && j["start"]["images"].is_null() => if let Some(id) = j["job_id"].as_str() { say(&format!("{}  Docker images: not said yet by its machine (`superci jobs retrieve {id}` says them once it has).", crate::commands::JOB_LINE)) },
                     None => {}
                 }
-                if let Some(first) = j["restarted"]["job_id"].as_str() { say(&format!("{}  Started again {}: {} (its first attempt was job {first}).", crate::commands::JOB_LINE, if j["restarted"]["why"].as_str().is_some_and(|w| w.starts_with("Modal")) { "on a sandbox" } else { "on an on-demand machine" }, j["restarted"]["why"].as_str().unwrap_or("its machine ended"))) }
+                if let Some(first) = j["restarted"]["job_id"].as_str() { say(&format!("{}  Started again {}: {} (its first attempt was job {first}).", crate::commands::JOB_LINE, if j["restarted"]["why"].as_str().is_some_and(|w| w.starts_with("Modal")) { "further down the order" } else { "on an on-demand machine" }, j["restarted"]["why"].as_str().unwrap_or("its machine ended"))) }
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
                 // Each step's whole log is read for its tests (its own log, else what its machine sent of it).
