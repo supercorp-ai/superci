@@ -307,7 +307,7 @@ pub fn deploy_runners(session: &Session, plane_url: &str, plane_id: &str, keys: 
 pub fn deploy_jobs(session: &Session, plane_id: &str, images: &std::collections::BTreeMap<String, superci_core::plane::RunnerImage>) -> Result<()> {
     use base64::Engine;
     let images: Vec<(&str, Option<&str>)> = images.values().map(|i| (i.reference.as_str(), i.modal_secret.as_deref())).collect();
-    let script = include_str!("modal_jobs.py").replace("__NAME__", &functions_app(plane_id)).replace("__IMAGES__", &base64::engine::general_purpose::STANDARD.encode(serde_json::json!(images).to_string()));
+    let script = include_str!("modal_jobs.py").replace("__NAME__", &functions_app(plane_id)).replace("__IMAGE_BUILDER__", IMAGE_BUILDER).replace("__IMAGES__", &base64::engine::general_purpose::STANDARD.encode(serde_json::json!(images).to_string()));
     modal_deploy(session, &script, None).map(|_| ())
 }
 
@@ -782,7 +782,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &b64.encode("{}")).replace("__NAME__", "superci-runners-abc");
         let plane = include_str!("modal_plane.py").replace("__PLANE_ID__", "abc");
-        let jobs = include_str!("modal_jobs.py").replace("__NAME__", &super::functions_app("abc")).replace("__IMAGES__", &b64.encode(r#"[["ghcr.io/acme/ci:1", "ghcr-read"]]"#));
+        let jobs = include_str!("modal_jobs.py").replace("__NAME__", &super::functions_app("abc")).replace("__IMAGE_BUILDER__", IMAGE_BUILDER).replace("__IMAGES__", &b64.encode(r#"[["ghcr.io/acme/ci:1", "ghcr-read"]]"#));
         for (kind, source) in [("launcher", launcher.as_str()), ("plane", plane.as_str()), ("jobs", jobs.as_str())] {
             let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/job-functions.py"), kind]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
             let Ok(mut python) = python else { return };

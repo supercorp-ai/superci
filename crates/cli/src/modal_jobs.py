@@ -13,6 +13,9 @@ import subprocess
 import time
 import urllib.request
 
+import os
+
+os.environ["MODAL_IMAGE_BUILDER_VERSION"] = "__IMAGE_BUILDER__"
 import modal
 
 NAME = "__NAME__"

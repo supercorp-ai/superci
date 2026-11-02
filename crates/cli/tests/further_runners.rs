@@ -603,3 +603,68 @@ fn a_second_cloudflare_accounts_refusals_are_each_said() {
     assert!(ok && said.contains("cf-globex runs jobs now."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Function mode by command, on the first runner and a further one: Functions deployed first, by each one's own workspace;
+/// an image added while it is on, deployed again; what its preemptions came to said in the status and the list.
+#[test]
+fn function_mode_by_command_on_each_modal_runner_and_its_preemptions_said() {
+    let (served, home) = two_workspaces();
+    with_further(&served, PLANE, &["modal-acme-two"]);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    deploy_answers(&served);
+    let (ok, said) = run(&["runner_images", "list"]);
+    assert!(ok && said.contains("No image of your own"), "{said}");
+    for (args, why) in [(&["runners", "update", "modal", "--mode=fast"][..], "--mode is function or sandbox"), (&["runners", "update", "aws", "--mode=function"], "--mode is for a Modal runner"), (&["runner_images", "create", "own-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=not a secret"], "Modal Secret")] {
+        let (ok, said) = run(args);
+        assert!(!ok && said.contains(why), "{args:?}: {said}");
+    }
+    let made = |served: &superci_testkit::Served| sandboxes_made(served);
+    let before = made(&served);
+    let (ok, said) = run(&["runners", "update", "modal-acme-two", "--mode=function"]);
+    assert!(ok && said.contains("Preempted: 0 Modal Functions this month · 0 jobs run again."), "{said}");
+    assert!(made(&served) > before, "its Functions deployed");
+    let order = stored(&served)["routing"]["order"].clone();
+    assert!(order.as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two" && p["function"] == true), "{order}");
+    let (_, data) = common::json(&home, &["runners", "list"]);
+    assert!(data["order"].as_array().unwrap().iter().any(|p| p["cloud"] == "modal-acme-two" && p["mode"] == "function") && data["order"].as_array().unwrap().iter().any(|p| p["cloud"] == "modal" && p["mode"] == "sandbox"), "{data}");
+    // An image added while it runs Functions: its Function first, in that workspace; with a Secret by a good name.
+    deploy_answers(&served);
+    let before = made(&served);
+    let (ok, said) = run(&["runner_images", "create", "own-ci", "--reference=ghcr.io/acme/ci:1", "--modal-secret=ghcr-read"]);
+    assert!(ok && said.contains("Jobs on Modal start from ghcr.io/acme/ci:1"), "{said}");
+    assert_eq!(stored(&served)["routing"]["images"]["own-ci"]["modal_secret"], "ghcr-read");
+    assert!(made(&served) > before);
+    let (ok, said) = run(&["runner_images", "list"]);
+    assert!(ok && said.contains("own-ci"), "{said}");
+    // A first preempted and a first run again: said in the one; then several, in the plural.
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert(format!("modal:preempted:{now}:1"), now.to_string());
+    served.store.0.lock().unwrap().insert(format!("modal:rerun:{now}:1"), now.to_string());
+    let (_, said) = run(&["status"]);
+    assert!(said.contains("Preempted     1 Modal Function this month · 1 job run again"), "{said}");
+    served.store.0.lock().unwrap().insert(format!("modal:preempted:{now}:2"), now.to_string());
+    let (_, said) = run(&["runners", "list"]);
+    assert!(said.contains("Preempted: 2 Modal Functions this month · 1 job run again."), "{said}");
+    // Back to sandboxes: nothing deployed.
+    let before = made(&served);
+    let (ok, _) = run(&["runners", "update", "modal-acme-two", "--mode=sandbox"]);
+    assert!(ok && made(&served) == before);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further runner on a control plane from before them is refused for each provider, nothing deployed; and on control
+/// planes in Modal and in Cloudflare, a further one is what any launcher is, beside their own machines.
+#[test]
+fn further_runners_on_control_planes_from_before_and_in_each_cloud() {
+    let (served, home) = two_workspaces();
+    let (mut child, link) = common::dashboard(&home);
+    served.answer_as("0.19.21", &["settings", "settings_version"]);
+    let (status, _, said) = common::post(&link, "/runners/modal", &[("account", "acme-two")]);
+    assert!(status == 409 && words(&said).contains("A further runner needs a newer control plane"), "{status} {}", words(&said));
+    assert_eq!(sandboxes_made(&served), 0, "nothing deployed");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
