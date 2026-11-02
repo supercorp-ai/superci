@@ -716,6 +716,10 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=eu-west-2"]);
     assert!(ok && regions() == both, "{said}");
     assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2."))), "no network made");
+    // A region it has nothing in: its network made there first, then the account has it.
+    let (ok, said) = run(&["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]);
+    assert!(ok && regions().as_array().unwrap().iter().any(|r| r == "eu-north-1"), "{said}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2.eu-north-1"))), "its network made");
     // AWS refusing what removing it asks: said as left; the record marked gone all the same.
     served.aws.fail("Action=DeleteRole", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not delete roles</Message></Error></ErrorResponse>", None);
     served.aws.fail("Action=DeleteVpc", 400, "<Response><Errors><Error><Code>DependencyViolation</Code><Message>still in use</Message></Error></Errors></Response>", None);
