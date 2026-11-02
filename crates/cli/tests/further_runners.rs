@@ -171,8 +171,11 @@ fn a_move_whose_new_control_plane_changed_its_runners_meanwhile_says_so() {
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
     // (The new one's runners changed by another computer as they are written.)
-    let front = superci_testkit::front(&new.url, |method, target, status, body| {
-        if method == "POST" && target.starts_with("/settings") { (409, br#"{"conflicts":[{"path":["runners"],"now":[]}]}"#.to_vec()) } else { (status, body) }
+    // (Its third write of settings, its runners' records: refused as changed meanwhile.)
+    let posts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let front = superci_testkit::front(&new.url, move |method, target, status, body| {
+        let refused = method == "POST" && target.starts_with("/settings") && posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2;
+        if refused { (409, br#"{"conflicts":[{"path":["runners"],"now":[]}]}"#.to_vec()) } else { (status, body) }
     });
     kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": front, "plane_id": "testplane0002", "label": "superci" } }]);
     kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
@@ -314,6 +317,11 @@ fn a_second_cloudflare_account_gets_a_runner_of_its_own_and_only_its_launcher_is
     served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", PLANE), ("http://new-plane.test", &served.url)]);
     let (ok, said) = run(&["planes", "update"]);
     assert!(ok && said.contains("Its Cloudflare launchers cloudflare-globex-inc were not updated: this sign-in does not reach their accounts"), "{said}");
+    // SuperCI left: its control plane deleted, its launchers in Cloudflare with it, a further one's among them.
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.fail("/workers/scripts/superci-runners", 200, r#"{"result":null,"success":true,"errors":[],"messages":[]}"#, None);
+    let (ok, said) = run(&["leave", "--confirm"]);
+    assert!(ok, "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -456,6 +464,12 @@ fn a_move_whose_new_control_plane_cannot_use_a_further_accounts_role_says_so() {
     while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
     let page = (0..120).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("AWS did not let the new control plane use its role")).unwrap_or_else(|| words(&part(&link, "/?p=planes&fragment=1").1));
     assert!(page.contains("aws-acme"), "{page}");
+    // The old one deleted, AWS answering everything: its part in the further account taken away, nothing said left there.
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
+    assert!(status == 303, "{status} {to} {}", words(&said));
+    let page = (0..80).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("Its role in AWS account 333333333333")).unwrap_or_default();
+    assert!(page.contains("Its role in AWS account 333333333333") && !page.contains("Its machines' network in AWS account 222222222222"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -644,6 +658,9 @@ fn a_second_aws_account_needs_a_control_plane_that_keeps_it_and_says_when_its_ca
     let o = common::command(&home).args(["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme", "--plane=testplane0001"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == "PUT" && a["url"].as_str().is_some_and(|u| u.contains(&format!("superci-plane-{PLANE}-eu-")))), "no bucket made by a further account");
+    // A region added: its network made; no cache there, the first account not signed in to.
+    let o = common::command(&home).args(["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1", "--plane=testplane0001"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let _ = std::fs::remove_dir_all(&home);
 }
 

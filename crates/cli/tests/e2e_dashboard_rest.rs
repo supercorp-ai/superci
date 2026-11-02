@@ -833,7 +833,12 @@ fn aws_runners_for_a_control_plane_in_cloudflare_connect_or_say_what_stopped_the
 #[test]
 fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_for() {
     let served = serve(|_| {});
-    let cf = superci_testkit::serve_as("cfplane00003", move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role())));
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role()));
+        // (And a further Cloudflare runner, in an account this sign-in does not reach: left as it is, and said.)
+        c.launchers = vec![superci_core::plane::Launcher { cloud: "cf-two".into(), url: "https://superci-runners-cfplane00003.two.workers.dev".into() }];
+        c.records = serde_json::from_value(serde_json::json!({ "accounts": [{ "name": "cf-two", "provider": "cloudflare", "cloud_id": "2222222222222222222222222222222b" }], "runners": [{ "name": "cf-two", "account": "cf-two" }] })).unwrap();
+    });
     let home = common::signed_in(&served);
     let url = cf.url.clone();
     kept_as(&home, |k| {
@@ -845,9 +850,6 @@ fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_fo
     // (Its role, as AWS answered for a control plane in Cloudflare.)
     served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &cf.url)]);
     cf.store.0.lock().unwrap().insert("denied:aws:ec2:RunInstances".into(), r#"{"at":1}"#.into());
-    // (And a further Cloudflare runner, in an account this sign-in does not reach: left as it is, and said.)
-    cf.store.0.lock().unwrap().insert("settings".into(), serde_json::json!({ "version": 1, "routing": {}, "launchers": [{ "cloud": "cf-two", "url": "https://superci-runners-cfplane00003.two.workers.dev" }],
-        "accounts": [{ "name": "cf-two", "provider": "cloudflare", "cloud_id": "2222222222222222222222222222222b" }], "runners": [{ "name": "cf-two", "account": "cf-two" }] }).to_string());
     // (Its address as Cloudflare gives it after the deploy, served here.)
     served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
