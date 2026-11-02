@@ -24,6 +24,8 @@ On Modal, a job can start from an image of your own with its tools in it already
 
 Modal's jobs can run as Modal Functions, at a third of a sandbox's price: `superci runners update modal --mode=function`. Modal may preempt a Function; SuperCI then runs its job again by itself on a sandbox once its run has finished, and `superci status` counts the preemptions of the month.
 
+One CI can run jobs in several AWS accounts, Cloudflare accounts or Modal workspaces, each its own runner with its own limits and spend: `superci login modal --add`, then `superci runners create modal --account=WORKSPACE`. Workflows do not change: `provider=modal` means every Modal runner, in the order's order.
+
 Without Node, the same program installs as `superci`:
 
 ```sh
