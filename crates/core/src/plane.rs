@@ -5480,15 +5480,17 @@ impl<'a> ControlPlane<'a> {
         }
         // A launch template left behind by a request for many spot pools (it could not be removed at the time):
         // removed now; given up on after a day.
-        let accounts: Vec<AwsConnection> = self.aws_connection().await.ok().flatten().into_iter().chain(self.further_aws().await.unwrap_or_default()).collect();
+        // (Each account's, its connection gone or not: given up on after a day all the same.)
+        let accounts: Vec<String> = std::iter::once("aws".to_string()).chain(self.config.records.accounts.iter().filter(|a| a.provider == "aws" && a.name != "aws").map(|a| a.name.clone())).collect();
         let mut left = vec![];
-        for a in &accounts { let notes = aws_notes(a.account()); for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((a.clone(), notes.clone(), k, at)) } }
-        for (a, notes, k, at) in left {
+        for account in &accounts { let notes = aws_notes(account); for (k, at) in self.store.list(&format!("{notes}template:")).await? { left.push((account.clone(), notes.clone(), k, at)) } }
+        for (account, notes, k, at) in left {
             let mut parts = k.trim_start_matches(&format!("{notes}template:")).splitn(2, ':');
             let (Some(region), Some(name)) = (parts.next(), parts.next()) else { continue };
             // (Not one of a moment ago: its removal may be on its way.)
             if at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 30_000) { continue }
-            let removed = match Some(&a) { Some(a) => match self.aws_creds(&plane_url, a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
+            let connection = if account == "aws" { self.aws_connection().await } else { get_json::<AwsConnection>(self.store, &format!("aws:connection:{account}")).await };
+            let removed = match connection { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
             if removed.is_ok() || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
         }
         // Runs from a computer with jobs still going: moved on (a job whose machine never came has ended).
