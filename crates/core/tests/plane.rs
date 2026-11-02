@@ -11,7 +11,7 @@ use futures::executor::block_on;
 use sha2::{Digest, Sha256};
 use superci_core::crypto::{hex, hmac_sha256};
 use superci_core::github::App;
-use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule};
+use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing};
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
 /// The store: kept in memory. `1`: what another request does meanwhile, run before each operation (its name and
@@ -382,7 +382,6 @@ fn routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_toke
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing = Routing { default: Some("cloudflare".into()), rules: vec![Rule { repo: "acme/heavy".into(), cloud: "modal".into() }], order: vec![], ..Default::default() };
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     assert_eq!(json(&run(get("/health")))["runners"], true, "an agent counts as a connected cloud");
@@ -398,12 +397,6 @@ fn routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_toke
     assert!(!calls.iter().any(|c| c.2.contains("Action=RunInstances")), "nothing on AWS");
     let job: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:8"]).unwrap();
     assert_eq!((job["cloud"].as_str(), job["machine_id"].as_str(), job["state"].as_str()), (Some("cloudflare"), Some("container-7"), Some("launched")));
-
-    // A rule naming a cloud that is not connected fails with a reason instead of running elsewhere.
-    run(job_event("queued", 9, "acme/heavy", None));
-    let failed: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:9"]).unwrap();
-    assert_eq!(failed["state"], "failed");
-    assert!(failed["error"].as_str().unwrap().contains("Modal is not connected"), "{}", failed["error"]);
 
     let runner = format!("superci-{PLANE_ID}-8");
     run(job_event("completed", 8, "acme/app", Some(&runner)));
@@ -6744,6 +6737,122 @@ fn machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gi
     assert_eq!(job(&store, 20)["state"], "swept");
 }
 
+/// A second runner of a provider, in an account of its own: it takes jobs under its own word, by its own limits and its
+/// account's, and is that provider's in everything else (what its machines cost and may live, what a label means). An
+/// older SuperCI's whole write of the rest leaves it be. Nothing here makes one yet: its records are written as they are.
+#[test]
+fn a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| match r.url.as_str() {
+        "https://first.modal.example/launch" => Some(Response::new(200, "application/json", r#"{"id":"sb-first","kind":"sandbox"}"#)),
+        "https://second.modal.example/launch" => Some(Response::new(200, "application/json", r#"{"id":"sb-second","kind":"sandbox"}"#)),
+        _ => None,
+    });
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://first.modal.example".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let write = |changes: serde_json::Value| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/settings")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(serde_json::json!({ "changes": changes }).to_string())));
+    let queued = |id: u64, label: &str| { block_on(plane.handle(labelled("queued", id, "acme/app", None, label))); job(&store, id) };
+
+    let added = write(serde_json::json!([
+        set(&["accounts", "modal-staging"], serde_json::json!({ "name": "modal-staging", "provider": "modal" }), None),
+        set(&["runners", "modal-staging"], serde_json::json!({ "name": "modal-staging", "account": "modal-staging" }), None),
+        set(&["launchers", "modal-staging"], serde_json::json!({ "cloud": "modal-staging", "url": "https://second.modal.example" }), None),
+        set(&["routing", "order", "modal-staging"], serde_json::json!({ "cloud": "modal-staging", "max_jobs": 1 }), None),
+        set(&["routing", "order", "modal"], serde_json::json!({ "cloud": "modal" }), None),
+        set(&["routing", "max_minutes"], 2000.into(), None),
+    ]));
+    assert_eq!(added.status, 200, "{}", String::from_utf8_lossy(&added.body));
+    let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert_eq!((&status["accounts"][0]["provider"], &status["runners"][0]["account"]), (&serde_json::json!("modal"), &serde_json::json!("modal-staging")));
+
+    // First in the order: its launcher starts the machine, the job says its word, it costs and lives as Modal's do.
+    let first = queued(1, "superci");
+    assert_eq!((first["cloud"].as_str(), first["machine_id"].as_str()), (Some("modal-staging"), Some("sb-second")), "{first}");
+    let launch = clouds.0.calls.borrow().iter().find(|c| c.1 == "https://second.modal.example/launch").map(|c| serde_json::from_str::<serde_json::Value>(&c.2).unwrap()).expect("its launcher");
+    assert_eq!(launch["max_minutes"], 1440, "what Modal lets a machine live, not a longer one");
+    // At its own limit of jobs at once: the next runner, priced alike. A label naming the provider means either.
+    let second = queued(2, "superci");
+    assert_eq!((second["cloud"].as_str(), second["machine_id"].as_str()), (Some("modal"), Some("sb-first")), "{second}");
+    assert_eq!(first["usd_per_hour"], second["usd_per_hour"]);
+    assert_eq!(queued(3, "superci/provider=modal")["cloud"], "modal");
+    // A provider with no runner here is said as that.
+    assert!(queued(4, "superci/provider=cloudflare")["error"].as_str().is_some_and(|e| e.contains("its label needs Cloudflare runners")), "{}", job(&store, 4));
+
+    // Its account's limits, by the account's word and the command that raises them.
+    assert_eq!(write(serde_json::json!([set(&["routing", "order", "modal", "off"], true.into(), None), set(&["routing", "account_usd", "modal-staging"], 0.0.into(), None)])).status, 200);
+    let said = queued(5, "superci")["error"].as_str().unwrap_or_default().to_string();
+    assert!(said.contains("Modal is turned off") && said.contains("the modal-staging account reached its $0 a month (`superci accounts update modal-staging --monthly-usd=N` raises it)"), "{said}");
+    assert_eq!(write(serde_json::json!([set(&["routing", "account_usd", "modal-staging"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], 0.0.into(), None)])).status, 200);
+    let said = queued(6, "superci")["error"].as_str().unwrap_or_default().to_string();
+    assert!(said.contains("the modal-staging account reached its $0 a day (`superci accounts update modal-staging --daily-usd=N` raises it)"), "{said}");
+
+    // A runner in a provider's first account spends in it: what it spent counts against that account's limit.
+    let day = format!("day:{:06}", 1_790_000_000_000u64 / 86_400_000);
+    store.0.borrow_mut().insert(day, serde_json::json!({ "spend": { "modal-spot": 5.0 }, "hours": [] }).to_string());
+    store.0.borrow_mut().insert("indexed".into(), "1".into());
+    assert_eq!(write(serde_json::json!([
+        set(&["runners", "modal-spot"], serde_json::json!({ "name": "modal-spot", "account": "modal" }), None),
+        set(&["routing", "order", "modal", "off"], serde_json::Value::Null, None),
+        set(&["routing", "account_usd", "modal"], 3.0.into(), None),
+    ])).status, 200);
+    let said = queued(7, "superci")["error"].as_str().unwrap_or_default().to_string();
+    assert!(said.contains("the Modal account reached its $3 a month"), "{said}");
+
+    // Refused, each saying why, nothing written: words that cannot be, and records that do not hold together.
+    let refused = |changes: serde_json::Value, why: &str| {
+        let r = write(changes);
+        assert_eq!(r.status, 400, "{why}");
+        assert!(String::from_utf8_lossy(&r.body).contains(why), "{why}: {}", String::from_utf8_lossy(&r.body));
+    };
+    let account = |name: &str, provider: &str| set(&["accounts", name], serde_json::json!({ "name": name, "provider": provider }), None);
+    let runner = |name: &str, account: &str| set(&["runners", name], serde_json::json!({ "name": name, "account": account }), None);
+    for bad in ["x", "Modal-two", "-modal", "modal-", "modal_two", &"m".repeat(33)] {
+        refused(serde_json::json!([account(bad, "modal")]), "a word is 2 to 32");
+        refused(serde_json::json!([runner(bad, "modal")]), "a word is 2 to 32");
+    }
+    refused(serde_json::json!([account("gcp-one", "gcp")]), "no provider called gcp");
+    refused(serde_json::json!([account("modal", "aws")]), "that provider's first account");
+    refused(serde_json::json!([runner("aws-on-demand", "aws")]), "needs no record");
+    refused(serde_json::json!([runner("modal-three", "modal-prod")]), "no account called modal-prod");
+    refused(serde_json::json!([set(&["accounts", "modal-staging"], serde_json::Value::Null, None)]), "no account called modal-staging");
+    let two = serde_json::json!({ "name": "modal-two", "provider": "modal" });
+    refused(serde_json::json!([set(&["accounts"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
+    let two = serde_json::json!({ "name": "modal-two", "account": "modal" });
+    refused(serde_json::json!([set(&["runners"], serde_json::json!([two, two]), None)]), "modal-two is named twice");
+    assert_eq!(write(serde_json::json!([account("modal", "modal")])).status, 200, "a provider's first account may have a record");
+    assert_eq!(write(serde_json::json!([set(&["accounts", "modal"], serde_json::Value::Null, None), set(&["routing", "account_usd", "modal"], serde_json::Value::Null, None), set(&["routing", "account_daily_usd", "modal-staging"], serde_json::Value::Null, None)])).status, 200);
+
+    // A provider's other runner not added here, first in the order: passed over, said as not connected only if nothing runs it.
+    assert_eq!(write(serde_json::json!([
+        set(&["launchers", "modal"], serde_json::Value::Null, None),
+        { "op": "arrange", "path": ["routing", "order"], "keys": ["modal", "modal-staging"] },
+    ])).status, 200);
+    block_on(plane.handle(job_event("completed", 1, "acme/app", Some(&format!("superci-{PLANE_ID}-1")))));
+    assert_eq!(queued(8, "superci/provider=modal")["cloud"], "modal-staging", "{}", job(&store, 8));
+
+    // An older SuperCI's write of what it knows, in its cloud's own settings: taken whole, the records left as they are.
+    let mut older = config.clone();
+    older.routing.max_cpu = Some(4);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &older, cache: &Cache::default(), containers: None };
+    let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert_eq!((&status["routing"]["max_cpu"], &status["runners"][0]["name"], &status["accounts"][0]["name"]), (&serde_json::json!(4), &serde_json::json!("modal-staging"), &serde_json::json!("modal-staging")), "{status}");
+}
+
+/// In the order and connected to nothing: said as that, the job failing rather than running elsewhere.
+#[test]
+fn a_provider_in_the_order_that_is_not_connected_is_said() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.routing.order = vec![Pool::of("modal")];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 9, "acme/app", None)));
+    assert!(job(&store, 9)["error"].as_str().unwrap_or_default().contains("Modal is not connected"), "{}", job(&store, 9));
+}
+
 #[test]
 fn launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not() {
     // A failing runner started by Cloudflare's launcher; a job on Modal's, priced as Modal prices it.
@@ -6836,6 +6945,8 @@ macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())
 fn every_test_here_holds_with_each_call_and_store_operation_failing() {
     let tests: &[Swept] = tests![
         online_only_public_documents_and_a_yes_no_health,
+        a_further_modal_runner_takes_jobs_under_its_own_word_limits_and_account,
+        a_provider_in_the_order_that_is_not_connected_is_said,
         aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
         routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_token_for_it_alone,
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,
@@ -7457,9 +7568,9 @@ fn a_change_is_made_only_by_a_way_through_objects_and_lists() {
 fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     use superci_core::settings::{apply, diff, get as at, keyed, Change};
     let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let before = serde_json::json!({ "routing": { "max_cpu": 16, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }], "public_repos": ["acme/a"], "rules": [] }, "launchers": [] });
+    let before = serde_json::json!({ "routing": { "max_cpu": 16, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }], "public_repos": ["acme/a"], "zones": [] }, "launchers": [] });
     let after = serde_json::json!({ "routing": { "max_cpu": 16, "monthly_usd": 30.0, "order": [{ "cloud": "modal" }, { "cloud": "aws", "max_jobs": 6 }], "public_repos": ["acme/a", "acme/b"],
-        "rules": [{ "repo": "x", "cloud": "aws" }] }, "launchers": [{ "cloud": "modal", "url": "u" }] });
+        "zones": [{ "repo": "x", "cloud": "aws" }] }, "launchers": [{ "cloud": "modal", "url": "u" }] });
     let changes = diff(&before, &after, true);
     assert_eq!(changes, vec![
         Change::Set { path: path(&["launchers", "modal"]), value: serde_json::json!({ "cloud": "modal", "url": "u" }), from: Some(serde_json::Value::Null) },
@@ -7469,7 +7580,7 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
         Change::Set { path: path(&["routing", "order", "modal"]), value: serde_json::json!({ "cloud": "modal" }), from: Some(serde_json::Value::Null) },
         Change::Arrange { path: path(&["routing", "order"]), keys: vec!["modal".into(), "aws".into()] },
         Change::Add { path: path(&["routing", "public_repos"]), value: "acme/b".into() },
-        Change::Add { path: path(&["routing", "rules"]), value: serde_json::json!({ "repo": "x", "cloud": "aws" }) },
+        Change::Add { path: path(&["routing", "zones"]), value: serde_json::json!({ "repo": "x", "cloud": "aws" }) },
     ]);
     assert_eq!(apply(&before, &changes), Ok(after.clone()));
     assert!(diff(&before, &after, false).iter().all(|c| !matches!(c, Change::Set { from: Some(_), .. })));
@@ -7482,7 +7593,7 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     // (Items without their key are not items of the keyed list: passed over.)
     assert!(diff(&serde_json::json!({ "launchers": [{ "url": "u" }] }), &serde_json::json!({ "launchers": [{ "url": "v" }] }), true).is_empty());
     // Applied over others' changes: theirs kept.
-    let meanwhile = serde_json::json!({ "routing": { "max_cpu": 32, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }, { "cloud": "gcp" }], "public_repos": ["acme/a", "acme/c"], "rules": [] }, "launchers": [] });
+    let meanwhile = serde_json::json!({ "routing": { "max_cpu": 32, "order": [{ "cloud": "aws", "max_jobs": 5 }, { "cloud": "cloudflare" }, { "cloud": "gcp" }], "public_repos": ["acme/a", "acme/c"], "zones": [] }, "launchers": [] });
     let made = apply(&meanwhile, &changes).unwrap();
     assert_eq!((&made["routing"]["max_cpu"], &made["routing"]["order"], &made["routing"]["public_repos"]), (&serde_json::json!(32), &serde_json::json!([{ "cloud": "modal" }, { "cloud": "aws", "max_jobs": 6 }, { "cloud": "gcp" }]), &serde_json::json!(["acme/a", "acme/c", "acme/b"])));
     // Where a change has no way: not made, said as nothing there.

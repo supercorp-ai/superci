@@ -19,7 +19,7 @@ use superci_core::github::{self, app_manifest, manifest_target, Owner};
 use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
 use superci_core::settings::Conflict;
-use superci_core::plane::{AwsBudget, Launcher, Pool, Routing, Rule, AWS_ON_DEMAND, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
+use superci_core::plane::{AwsBudget, Launcher, Pool, Routing, AWS_ON_DEMAND, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
 use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, region_short, REGIONS};
 
@@ -569,6 +569,17 @@ fn renames(status: &serde_json::Value, names: &[String]) -> (Vec<(String, String
     let puts = status["agents"].as_array().filter(|a| !a.is_empty()).map(|a| vec![("LAUNCHERS".to_string(), serde_json::Value::Array(a.clone()).to_string())]).unwrap_or_default();
     let drops = names.iter().filter(|n| *n == "AGENTS" || n.starts_with("DASHBOARD_KEY_")).cloned().collect();
     (puts, drops)
+}
+
+/// What a control plane from before steers jobs by and the new version no longer has, from its status: its repository
+/// rules, and the one default provider of a control plane with no order. Said with the update: its jobs may go elsewhere.
+fn steered_before(status: &serde_json::Value) -> String {
+    let routing = &status["routing"];
+    let label = status["label"].as_str().unwrap_or("superci");
+    let rule = |repo: &str, provider: &str| format!("{repo} only used {}: a workflow says that now with `runs-on: {label}/provider={provider}`.", cloud_name(provider));
+    let mut said: Vec<String> = routing["rules"].as_array().into_iter().flatten().filter_map(|r| Some(rule(r["repo"].as_str()?, r["cloud"].as_str()?))).collect();
+    if let (Some(d), false) = (routing["default"].as_str(), routing["order"].as_array().is_some_and(|o| !o.is_empty())) { said.push(rule("Every repository", d)) }
+    if said.is_empty() { String::new() } else { format!("Repository rules are gone. {}", said.join(" ")) }
 }
 
 fn ago(at_ms: u64) -> String {
@@ -2813,12 +2824,10 @@ impl Dashboard {
                 let cf = if cloud == "cloudflare" && !only && !own_containers { Some(self.cloudflare()?) } else { None };
                 // (Signed in to Modal, above, for its part.)
                 let md = if cloud == "modal" && !only && !own_containers { self.modal.clone() } else { None };
-                // 1. Forgotten: out of the order (and any rule naming it), then its connection.
+                // 1. Forgotten: out of the order, then its connection.
                 let was: Routing = serde_json::from_value(status["routing"].clone()).unwrap_or_default();
                 let mut routing = was.clone();
                 routing.order.retain(|p| p.cloud != cloud && !(cloud == "aws" && p.cloud == AWS_ON_DEMAND));
-                routing.rules.retain(|r| r.cloud != cloud);
-                if routing.default.as_deref() == Some(cloud.as_str()) { routing.default = None }
                 // (AWS's own budget for the account goes with AWS: see below.)
                 let had_budget = cloud == "aws" && routing.aws_budget.take().is_some();
                 // (Its launcher, when it has one, out of the launchers in the same write.)
@@ -3281,7 +3290,8 @@ impl Dashboard {
                 let modal_for_launcher = self.modal.clone().filter(|m| modal_launcher.as_deref().is_some_and(|u| u.starts_with(&format!("https://{}--", m.workspace))));
                 let modal_note = if modal_launcher.is_some() && modal_for_launcher.is_none() { "Its Modal launcher was not updated: Modal is not signed in to here, or to another workspace. Sign in to its own (`superci login modal`) and update once more." } else { "" };
                 let note = if cf_launcher && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare launcher was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
-                let note = [note.as_str(), modal_note].iter().filter(|n| !n.is_empty()).copied().collect::<Vec<_>>().join(" ");
+                let gone = steered_before(&status);
+                let note = [note.as_str(), modal_note, gone.as_str()].iter().filter(|n| !n.is_empty()).copied().collect::<Vec<_>>().join(" ");
                 *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
@@ -3666,15 +3676,6 @@ impl Dashboard {
                         }
                         routing.aws_budget = want;
                     }
-                    "default" => routing.default = Some(field("cloud")).filter(|c| !c.is_empty()),
-                    "add" => {
-                        let repo = field("repo");
-                        let ok = repo == "*" || { let mut p = repo.split('/'); matches!((p.next(), p.next(), p.next()), (Some(o), Some(r), None) if github::valid_login(o) && !r.is_empty()) };
-                        if !ok { return Ok(message(400, "A repository is owner/name, owner/* or *", "")) }
-                        routing.rules.retain(|r| r.repo != repo);
-                        routing.rules.push(Rule { repo, cloud: field("cloud") });
-                    }
-                    "remove" => { let repo = field("repo"); routing.rules.retain(|r| r.repo != repo) }
                     // Limits: the largest machine a label may ask for; public repositories allowed to run here.
                     "max_cpu" => routing.max_cpu = field("max_cpu").parse().ok().filter(|n: &u32| *n >= 1 && *n <= 192 && *n != MAX_CPU),
                     // The longest a job may run, in hours: up to five days (what AWS's machines may live; Modal's
@@ -3729,8 +3730,6 @@ impl Dashboard {
                         if order.iter().all(|p| p.off) { return Ok(message(400, "Keep one provider in the order", "With none, no job could start.")) }
                         for p in &routing.order { if !order.iter().any(|o| o.cloud == p.cloud) { order.push(p.clone()) } }
                         routing.order = order;
-                        // The order replaces the one default cloud from before.
-                        routing.default = None;
                     }
                     // A place taken out of the order (its settings kept, nothing deleted anywhere), or put back, at its end.
                     "take_out" | "put_back" => {
@@ -3745,7 +3744,6 @@ impl Dashboard {
                         let end = order.iter().position(|o| o.off).unwrap_or(order.len());
                         order.insert(if p.off { order.len() } else { end }, p);
                         routing.order = order;
-                        routing.default = None;
                     }
                     // A place's settings (jobs at once, a monthly budget, where it starts machines), or an account's
                     // (AWS's own network, Cloudflare's image). The order shown (`current`) is kept as it was.
@@ -3829,7 +3827,6 @@ impl Dashboard {
                             });
                         }
                         routing.order = order;
-                        routing.default = None;
                     }
                     _ => return Ok(message(400, "Unknown change", "")),
                 }
@@ -6045,10 +6042,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         format!(r#"{waiting}<div class="waiting">{} {} {} not added to this control plane yet · <a href="/?p=add-runners">Add {}</a></div>"#, pill("open", "Not added"),
             esc(&missing.iter().map(|c| cloud_name(c)).collect::<Vec<_>>().join(", ")), if missing.len() == 1 { "is" } else { "are" }, if missing.len() == 1 { "it" } else { "them" })
     };
-    // Rules by repository from before (a workflow now picks a provider in its label): shown, so nothing steers jobs unseen.
-    let rules = v.routing().rules.iter().map(|r| format!(r#"<form method="post" action="/routing" class="rule"><input type="hidden" name="action" value="remove"><input type="hidden" name="repo" value="{}"><span class="note"><code>{}</code> only uses {} (a rule from before; a workflow can say <code>runs-on: {}/provider={}</code> instead)</span><button class="chip">Remove</button></form>"#,
-        esc(&r.repo), esc(&r.repo), esc(cloud_name(&r.cloud)), esc(&v.label()), esc(&r.cloud))).collect::<String>();
-    format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{}{rules}{dialogs}</section>"#, esc(&shown), if out.is_empty() { String::new() } else { format!(r#"<div class="limits out">{out}</div>"#) })
+    format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{}{dialogs}</section>"#, esc(&shown), if out.is_empty() { String::new() } else { format!(r#"<div class="limits out">{out}</div>"#) })
 }
 
 /// The cloud accounts jobs run in, each with what belongs to the account rather than to a place in the order: AWS's
@@ -7445,7 +7439,7 @@ fn changed_meanwhile(conflicts: &[Conflict], fields: &[(String, String)]) -> Res
 fn setting_name(path: &[String]) -> String {
     let what = |field: &str| match field {
         "max_jobs" => "jobs at once", "monthly_usd" => "monthly limit", "daily_usd" => "daily limit", "regions" => "regions", "off" => "taken out of the order",
-        "max_cpu" => "the largest machine", "max_minutes" => "the longest job", "public_repos" => "public repositories", "aws_budget" => "AWS's budget", "cache" => "the cache", "rules" => "repository rules", "order" => "the order",
+        "max_cpu" => "the largest machine", "max_minutes" => "the longest job", "public_repos" => "public repositories", "aws_budget" => "AWS's budget", "cache" => "the cache", "order" => "the order",
         "launchers" => "the launchers", other => other,
     }.to_string();
     match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -8327,7 +8321,7 @@ mod tests {
         let status = serde_json::json!({
             "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners-p1.modal.run" }],
             "aws": { "account_id": "123456789012", "region": "us-east-1", "connected": true }, "aws_regions": ["us-east-1"],
-            "routing": { "rules": [], "order": [{ "cloud": "aws" }, { "cloud": "cloudflare" }, { "cloud": "modal" }] },
+            "routing": { "order": [{ "cloud": "aws" }, { "cloud": "cloudflare" }, { "cloud": "modal" }] },
             "jobs": [{ "job_id": 7, "run_id": 70, "repo": "acme/app", "state": "running", "cloud": "modal", "at_ms": 1 }],
         });
         let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status.clone()) };
@@ -8394,7 +8388,7 @@ mod tests {
             "aws": { "account_id": "123456789012", "region": "us-east-1" }, "aws_regions": ["us-east-1", "us-east-2"], "cloudflare_location": "auto",
             "aws_networks": { "us-east-2": { "subnets": ["subnet-0aaaaaaaa"], "security_groups": ["sg-0cccccccc"], "private": true } },
             // An order from before computers were set aside: their pools are left out.
-            "routing": { "rules": [], "order": [{ "cloud": "machine:m1", "max_jobs": 2 }, { "cloud": "cloudflare", "max_jobs": 10 }, { "cloud": "aws", "monthly_usd": 50.0 }] },
+            "routing": { "order": [{ "cloud": "machine:m1", "max_jobs": 2 }, { "cloud": "cloudflare", "max_jobs": 10 }, { "cloud": "aws", "monthly_usd": 50.0 }] },
             "machine": { "cpu": 4, "disk_gb": 100 },
             "spend": { "aws": 12.4, "cloudflare": 0.82 },
             "jobs": [
@@ -8673,7 +8667,7 @@ mod tests {
     fn public_repositories_are_chosen_in_a_dialog() {
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         let v = PlaneView { plane, online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
-            status: Some(serde_json::json!({ "routing": { "rules": [], "public_repos": ["acme/site", "acme/gone"] } })) };
+            status: Some(serde_json::json!({ "routing": { "public_repos": ["acme/site", "acme/gone"] } })) };
         let list: Vec<String> = ["docs", "site", "a", "b", "c", "d", "e", "f", "g"].iter().map(|n| format!("acme/{n}")).collect();
         let html = limits_card(&v, Some(list.clone()));
         preview("limits", &format!(r#"<div class="cards">{html}</div>"#));
@@ -8684,7 +8678,7 @@ mod tests {
         assert!(html.contains(r#"class="dlg-search""#) && html.contains("9 public · pull requests from forks never run"));
         assert!(html.find(r#"value="acme/gone""#).unwrap() < html.find(r#"value="acme/a""#).unwrap(), "allowed ones first");
         let mut none = v.clone();
-        none.status = Some(serde_json::json!({ "routing": { "rules": [] } }));
+        none.status = Some(serde_json::json!({ "routing": {} }));
         assert!(limits_card(&none, Some(vec![])).contains("None of its repositories is public") && limits_card(&none, Some(list)).contains("None allowed"));
         // Not known (an older control plane): typed in.
         assert!(limits_card(&v, None).contains(r#"placeholder="owner/name""#));
@@ -8924,6 +8918,13 @@ mod tests {
         assert_eq!(drops, ["AGENTS", "DASHBOARD_KEY_4102444800_AB12CD"]);
         // None to move: nothing written.
         assert!(renames(&serde_json::json!({ "agents": [] }), &[]).0.is_empty());
+        // What a control plane from before steered jobs by: said with its update, with the label that does it now.
+        let said = |routing: serde_json::Value| steered_before(&serde_json::json!({ "label": "acmeci", "routing": routing }));
+        assert_eq!(said(serde_json::json!({ "rules": [{ "repo": "acme/*", "cloud": "cloudflare" }, { "repo": "broken" }], "default": "aws", "order": [{ "cloud": "aws" }] })), "Repository rules are gone. acme/* only used Cloudflare: a workflow says that now with `runs-on: acmeci/provider=cloudflare`.");
+        assert_eq!(said(serde_json::json!({ "default": "modal", "order": [] })), "Repository rules are gone. Every repository only used Modal: a workflow says that now with `runs-on: acmeci/provider=modal`.");
+        assert_eq!(said(serde_json::json!({ "default": "modal" })), "Repository rules are gone. Every repository only used Modal: a workflow says that now with `runs-on: acmeci/provider=modal`.");
+        assert_eq!(steered_before(&serde_json::json!({ "routing": { "rules": [{ "repo": "a/b", "cloud": "modal" }] } })), "Repository rules are gone. a/b only used Modal: a workflow says that now with `runs-on: superci/provider=modal`.");
+        assert_eq!(said(serde_json::json!({ "order": [{ "cloud": "aws" }] })), "");
         assert_eq!(old_key_name("DEVICE_KEY_4102444800_AB12CD"), "DASHBOARD_KEY_4102444800_AB12CD");
         assert_eq!(key_until("DEVICE_KEY_4102444800_AB12CD"), 4_102_444_800);
         assert_eq!(key_until("DASHBOARD_KEY_4102444800_AB12CD"), 0, "a key kept under the old name is made anew");
@@ -9630,7 +9631,7 @@ mod rest_tests {
         for (field, said) in [("max_jobs", "jobs at once"), ("monthly_usd", "monthly limit"), ("daily_usd", "daily limit"), ("regions", "regions"), ("off", "taken out of the order"), ("other", "other")] {
             assert_eq!(name(&["routing", "order", "modal", field]), format!("Modal's {said}"));
         }
-        for (field, said) in [("max_cpu", "the largest machine"), ("max_minutes", "the longest job"), ("public_repos", "public repositories"), ("aws_budget", "AWS's budget"), ("cache", "the cache"), ("rules", "repository rules"), ("order", "the order")] {
+        for (field, said) in [("max_cpu", "the largest machine"), ("max_minutes", "the longest job"), ("public_repos", "public repositories"), ("aws_budget", "AWS's budget"), ("cache", "the cache"), ("order", "the order")] {
             assert_eq!(name(&["routing", field]), said);
         }
         assert_eq!(name(&["routing", "account_usd", "aws"]), "AWS's monthly limit");
@@ -10328,9 +10329,8 @@ mod rest_tests {
     }
 
     #[test]
-    fn a_rule_replaces_the_one_for_its_repository_and_a_place_not_in_the_order_is_none_to_take_out() {
-        let mut d = modal_answering(serde_json::json!({ "routing": { "rules": [{ "repo": "acme/web", "cloud": "aws" }], "order": [{ "cloud": "aws" }] } }));
-        assert_eq!(send(&mut d, "/routing", &[("action", "add"), ("repo", "acme/web"), ("cloud", "modal")]).err().as_deref(), Some("Sign in with Modal first."));
+    fn a_place_not_in_the_order_is_none_to_take_out() {
+        let mut d = modal_answering(serde_json::json!({ "routing": { "order": [{ "cloud": "aws" }] } }));
         let r = send(&mut d, "/routing", &[("action", "take_out"), ("cloud", "modal"), ("current", "aws")]).unwrap();
         assert!(r.status == 400 && words_of(&r).contains("Unknown provider"));
         // A run whose jobs are over, said by no conclusion: done.

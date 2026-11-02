@@ -282,7 +282,6 @@ a.prompt-modal-copy{box-sizing:border-box;text-decoration:none}
 .button.danger,:root[data-theme=dark] .button.danger{color:var(--bad);background:var(--card);border:1px solid var(--rule)}.button.danger:hover{background:var(--bad-soft)}
 input[type=number]{height:32px;padding:0 10px;border:1px solid var(--rule);border-radius:9px;background:var(--card);color:var(--ink);font-variant-numeric:tabular-nums}
 /* Machines: pick one, get its label. */
-.rule{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .default-machine{display:grid;grid-template-columns:36px minmax(0,1fr) auto auto;gap:14px;align-items:center;padding:14px 14px 14px 12px;border:1px solid var(--rule-soft);border-radius:12px}
 .dm-main{display:grid;gap:2px;min-width:0}.dm-main strong{font-size:13.5px;letter-spacing:-.015em}.dm-main small{color:var(--muted);font-size:12px}.dm-spec{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
 .picker-head{display:grid;gap:4px;padding-top:6px}.picker-head h3{font-size:13.5px;letter-spacing:-.01em}
