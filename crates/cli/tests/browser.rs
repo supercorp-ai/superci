@@ -18061,8 +18061,19 @@ fn a_modal_control_plane_is_deployed_given_sandboxes_and_deleted_from_the_dashbo
     until_page(&mut b, "p=planes", "acmeorg--superci-plane-mdplane00001");
     step("03-use");
     until_page(&mut b, "c=mdplane00001&p=planes", "Modal · acmeorg");
+    // Its Functions put in the order first (deployed then), so its own sandboxes deploy them again as they go on.
+    let functions = || {
+        served.aws.replaying(include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+        let deploy: Vec<&str> = include_str!("../fixtures/modal/further/01-add.jsonl").lines().filter(|l| !l.contains("/AppList\"")).collect();
+        served.aws.replaying(&deploy.join("\n"), &[("mdplane00002", "mdplane00001")]);
+    };
+    functions();
+    quiet(&mut b);
+    let (got, text) = post(&mut b, "/routing?c=mdplane00001", &[("action", "put_back"), ("cloud", "modal-functions"), ("current", "modal-functions")]);
+    assert!(got < 400, "{got} {text}");
     // Its own sandboxes, switched on.
     step("04-sandboxes");
+    functions();
     quiet(&mut b);
     assert!(post(&mut b, "/runners/modal-own?c=mdplane00001", &[]).0 < 400);
     step("05-dashboard");

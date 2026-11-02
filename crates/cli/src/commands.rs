@@ -1246,12 +1246,12 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             // (Done, it says nothing of its own.)
             apply!(d, args, format!("let {cloud} run jobs for the control plane in use ({})", plane.place()), path, &fields);
             // (A further one goes by a word of its own.)
-            let word = args.get("account").and_then(|a| {
-                let v = view(&mut d).ok()?;
+            // (A control plane that stops answering here leaves its view without a status: said by the provider.)
+            let word = args.get("account").and_then(|a| view(&mut d).ok().and_then(|v| {
                 let records = v.records();
                 records.accounts.iter().find(|c| c.cloud_id.as_deref() == Some(a)).map(|c| c.name.clone())
                     .or_else(|| v.launchers().into_iter().find(|l| l.url.starts_with(&format!("https://{a}--"))).map(|l| l.cloud))
-            }).unwrap_or_else(|| cloud.to_string());
+            })).unwrap_or_else(|| cloud.to_string());
             Ok(Done::said(format!("{word} runs jobs now.")))
         }
         ("runners", "delete") => {

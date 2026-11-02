@@ -3034,7 +3034,7 @@ impl Dashboard {
                     // (Each account's launcher has the same name: only this runner's account's is deleted.)
                     (_, _, _, Some(cf), _) => {
                         let its = records.accounts.iter().find(|a| a.name == records.account_of(&cloud)).and_then(|a| a.cloud_id.clone());
-                        let others: Vec<&str> = records.runners.iter().filter(|r| !r.gone && r.name != cloud && records.provider_of(&r.name) == "cloudflare").filter_map(|r| records.accounts.iter().find(|a| a.name == r.account)?.cloud_id.as_deref()).collect();
+                        let others: Vec<&str> = records.runners.iter().filter(|r| !r.gone && r.name != cloud && records.provider_of(&r.name) == "cloudflare").filter_map(|r| records.accounts.iter().find(|a| a.name == r.account).and_then(|a| a.cloud_id.as_deref())).collect();
                         for (a, _) in self.cf_accounts.clone().iter().filter(|(a, _)| its.as_ref().map_or(!others.contains(&a.as_str()), |i| i == a)) { if let Err(e) = cf.delete_runners(a, &id) { left.push(format!("its Cloudflare launcher ({e})")) } }
                     }
                     (_, _, _, None, None) if own_containers => {}

@@ -191,10 +191,9 @@ fn a_move_whose_new_control_plane_changed_its_runners_meanwhile_says_so() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A move brings the further runners along: each launcher deployed again for the new control plane in its own workspace,
-/// the records with them; one whose workspace is not signed in to stays behind, said.
-#[test]
-fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind() {
+/// A control plane with further Modal and Cloudflare runners (one removed, one whose account is not kept), a second
+/// one in the same account to move to, and this computer signed in to both workspaces and Cloudflare.
+fn moving_further_runners() -> (superci_testkit::Served, superci_testkit::Served, std::path::PathBuf) {
     let (served, home) = two_workspaces();
     with_further(&served, PLANE, &["modal-acme-two", "modal-globex"]);
     // (And one removed: no launcher to bring. A Cloudflare runner in a second account, made again in its account for the
@@ -222,6 +221,14 @@ fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind
     std::fs::write(&file, kept.to_string()).unwrap();
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
     deploy_answers(&served);
+    (served, new, home)
+}
+
+/// A move brings the further runners along: each launcher deployed again for the new control plane in its own workspace,
+/// the records with them; one whose workspace is not signed in to stays behind, said.
+#[test]
+fn a_move_brings_further_runners_with_their_records_and_says_which_stayed_behind() {
+    let (served, new, home) = moving_further_runners();
     let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
     let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
     assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
@@ -449,21 +456,26 @@ fn a_move_whose_new_control_plane_cannot_use_a_further_accounts_role_says_so() {
     let home = signed_in_two_aws(&served);
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    // (The new one saying AWS does not let it use the role: AWS refusing it what it checks with.)
+    // (Then, asked again, failing outright.)
+    let asked = std::sync::atomic::AtomicU32::new(0);
+    let front = superci_testkit::front(&new.url, move |method, target, status, body| {
+        if method != "POST" || !target.starts_with("/aws/accounts") { return (status, body) }
+        if asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { (200, br#"{"connected":false,"error":"UnauthorizedOperation: may not see images"}"#.to_vec()) } else { (500, br#"{"error":"may not see images"}"#.to_vec()) }
+    });
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": front, "plane_id": "testplane0002", "label": "superci" } }]);
     kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
     std::fs::write(&file, kept.to_string()).unwrap();
     let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
     served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", "ec2.eu-west-1"), &[]);
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
-    // (The new one's AWS refusing it the role.)
-    new.aws.fail("Action=DescribeImages", 403, "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>may not see images</Message></Error></Errors></Response>", None);
     let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
     let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
     assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", words(&said));
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "never moved"); std::thread::sleep(std::time::Duration::from_millis(100)) }
     let page = (0..120).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=planes&fragment=1").1) }).find(|p| p.contains("AWS did not let the new control plane use its role")).unwrap_or_else(|| words(&part(&link, "/?p=planes&fragment=1").1));
-    assert!(page.contains("aws-acme"), "{page}");
+    assert!(page.contains("aws-acme: AWS did not let the new control plane use its role yet (the control plane answered 500"), "{page}");
     // The old one deleted, AWS answering everything: its part in the further account taken away, nothing said left there.
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
     let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
@@ -882,7 +894,8 @@ fn a_second_aws_accounts_regions_and_removal_as_aws_answers() {
     served.aws.fail("Action=DeleteRole", 403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>may not delete roles</Message></Error></ErrorResponse>", None);
     served.aws.fail("Action=DeleteVpc", 400, "<Response><Errors><Error><Code>DependencyViolation</Code><Message>still in use</Message></Error></Errors></Response>", None);
     // (Its machine still ending at first: waited for.)
-    served.aws.fail("Action=DescribeInstances", 200, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></item></reservationSet></DescribeInstancesResponse>", Some(1));
+    served.aws.fail("TerminateInstances|ec2.eu-west-1", 200, "<TerminateInstancesResponse><instancesSet></instancesSet></TerminateInstancesResponse>", Some(1));
+    served.aws.fail("DescribeInstances|ec2.eu-west-1", 200, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></item></reservationSet></DescribeInstancesResponse>", Some(2));
     let (ok, said) = run(&["runners", "delete", "aws-acme", "--confirm"]);
     assert!(ok && said.contains("Removed aws-acme.") && said.contains("Left:"), "{said}");
     served.aws.fail_none();
@@ -1044,13 +1057,14 @@ fn every_further_runner_command_holds_with_each_call_and_store_operation_failing
             std::mem::forget(new);
             (served, home)
         }), vec!["planes", "move", "testplane0002"]),
+        ("modal move", Box::new(|| { let (served, new, home) = moving_further_runners(); std::mem::forget(new); (served, home) }), vec!["planes", "move", "testplane0002"]),
         // (Made again with its Functions in the order: deployed with it.)
         ("modal again", Box::new(|| {
             let (served, home) = two_workspaces();
             with_further(&served, PLANE, &["modal-acme-two"]);
-            let mut record = stored(&served);
-            record["routing"] = serde_json::json!({ "order": [{ "cloud": "modal-acme-two-functions" }, { "cloud": "modal-acme-two" }] });
-            served.store.0.lock().unwrap().insert("settings".into(), record.to_string());
+            deploy_answers(&served);
+            let o = common::command(&home).args(["runners", "order", "modal-acme-two-functions", "modal-acme-two", "modal"]).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
             deploy_answers(&served);
             (served, home)
         }), vec!["runners", "create", "modal", "--account=acme-two"]),
@@ -1075,4 +1089,60 @@ fn every_further_runner_command_holds_with_each_call_and_store_operation_failing
     for (name, setup, command) in &cases {
         superci_testkit::sweep(&format!("further runners: {name}"), |fault| { let (served, home) = setup(); swept(fault, served, &home, command) });
     }
+}
+
+/// A further AWS account's sign-in that AWS will not renew: adding it, giving it a region and removing it each stop,
+/// asking for the sign-in again, and nothing is changed in the control plane.
+#[test]
+fn a_further_aws_accounts_sign_in_aws_will_not_renew_stops_each_change() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws_more"][0]["creds"]["expires_at_ms"] = 0.into();
+    kept["aws_more"][0]["refresh_token"] = "refresh-for-tests".into();
+    kept["aws_more"][0]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    let due = kept.to_string();
+    served.aws.fail("signin.aws.amazon.com/v1/token", 400, r#"{"error":"INSUFFICIENT_PERMISSIONS"}"#, None);
+    for (further, args) in [(false, &["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"][..]),
+        (true, &["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]), (true, &["runners", "delete", "aws-acme", "--confirm"])] {
+        std::fs::write(&file, &due).unwrap();
+        if further { with_further_aws(&served, &[("aws-acme", "222222222222")]) }
+        let before = stored_or_none(&served);
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("Sign in"), "{args:?}: {said}");
+        assert_eq!(stored_or_none(&served), before, "{args:?}: nothing changed");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What the control plane keeps of where jobs run, its runners and accounts (none: no settings yet).
+fn stored_or_none(served: &superci_testkit::Served) -> Option<serde_json::Value> {
+    let kept: serde_json::Value = serde_json::from_str(served.store.0.lock().unwrap().get("settings")?).ok()?;
+    Some(serde_json::json!({ "routing": kept["routing"], "launchers": kept["launchers"], "accounts": kept["accounts"], "runners": kept["runners"] }))
+}
+
+/// A further AWS account removed while the control plane will not forget its connection: said, and its role and
+/// network left where they are.
+#[test]
+fn a_further_aws_account_the_control_plane_will_not_forget_is_said() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    with_further_aws(&served, &[("aws-acme", "222222222222")]);
+    let home = signed_in_two_aws(&served);
+    let front = superci_testkit::front(&served.url, |method, target, status, body| {
+        if method == "POST" && target.starts_with("/aws/forget") { (500, br#"{"error":"the store is down"}"#.to_vec()) } else { (status, body) }
+    });
+    *served.aws.plane_url.lock().unwrap() = front.clone();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = front.into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let o = common::command(&home).args(["runners", "delete", "aws-acme", "--confirm"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("500"), "{said}");
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|b| b.contains("DeleteRole"))), "its role left");
+    let _ = std::fs::remove_dir_all(&home);
 }
