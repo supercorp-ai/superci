@@ -1091,8 +1091,8 @@ fn every_further_runner_command_holds_with_each_call_and_store_operation_failing
     }
 }
 
-/// A further AWS account's sign-in that AWS will not renew: adding it, giving it a region and removing it each stop,
-/// asking for the sign-in again, and nothing is changed in the control plane.
+/// A further AWS account's sign-in that AWS stops renewing as a change is made: adding it, giving it a region and
+/// removing it each stop, asking for the sign-in again, and nothing is changed in the control plane.
 #[test]
 fn a_further_aws_accounts_sign_in_aws_will_not_renew_stops_each_change() {
     let served = serve(own_aws);
@@ -1101,18 +1101,22 @@ fn a_further_aws_accounts_sign_in_aws_will_not_renew_stops_each_change() {
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     kept["aws_more"][0]["creds"]["expires_at_ms"] = 0.into();
-    kept["aws_more"][0]["refresh_token"] = "refresh-for-tests".into();
+    kept["aws_more"][0]["refresh_token"] = "refresh-for-tests-1".into();
+    kept["aws_more"][0]["who"] = "arn:aws:iam::222222222222:user/acme".into();
     kept["aws_more"][0]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
     let due = kept.to_string();
-    served.aws.fail("signin.aws.amazon.com/v1/token", 400, r#"{"error":"INSUFFICIENT_PERMISSIONS"}"#, None);
-    for (further, args) in [(false, &["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"][..]),
-        (true, &["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]), (true, &["runners", "delete", "aws-acme", "--confirm"])] {
+    // (Each renewed as often as the command reads its control planes first; refused at the change itself.)
+    for (further, renewed, args) in [(false, 4, &["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"][..]),
+        (true, 2, &["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]), (true, 4, &["runners", "delete", "aws-acme", "--confirm"])] {
         std::fs::write(&file, &due).unwrap();
+        let mut answers: Vec<String> = (0..renewed).map(|_| aws_renews("refresh-for-tests-1", Some((60, "refresh-for-tests-1")))).collect();
+        answers.push(aws_renews("refresh-for-tests-1", None));
+        served.aws.replaying(&answers.join("\n"), &[]);
         if further { with_further_aws(&served, &[("aws-acme", "222222222222")]) }
         let before = stored_or_none(&served);
         let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-        assert!(!o.status.success() && said.contains("Sign in"), "{args:?}: {said}");
+        assert!(!o.status.success() && said.contains("SuperCI's AWS sign-in has ended"), "{args:?}: {said}");
         assert_eq!(stored_or_none(&served), before, "{args:?}: nothing changed");
     }
     let _ = std::fs::remove_dir_all(&home);
@@ -1144,5 +1148,65 @@ fn a_further_aws_account_the_control_plane_will_not_forget_is_said() {
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success() && said.contains("500"), "{said}");
     assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|b| b.contains("DeleteRole"))), "its role left");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS's sign-in renewing with `refresh`: credentials good for `secs`, renewed next with `next`; or, `secs` none,
+/// refused as it refuses one that has ended.
+fn aws_renews(refresh: &str, answer: Option<(u64, &str)>) -> String {
+    let asked = serde_json::json!({ "clientId": "arn:aws:signin:::devtools/same-device", "grantType": "refresh_token", "refreshToken": refresh }).to_string();
+    let (status, answer) = match answer {
+        Some((secs, next)) => (200, serde_json::json!({ "accessToken": { "accessKeyId": "example-accessKeyId-9", "secretAccessKey": "example-secretAccessKey-9", "sessionToken": "example-sessionToken-9" },
+            "tokenType": "urn:aws:params:oauth:token-type:access_token_sigv4", "expiresIn": secs, "refreshToken": next })),
+        None => (400, serde_json::json!({ "error": "INVALID_REQUEST", "message": "The provided authorization grant is invalid, expired, revoked, or malformed" })),
+    };
+    serde_json::json!({ "answer": answer.to_string(), "asked": asked, "headers": [["content-type", "application/json"]], "method": "POST", "status": status, "target": "", "url": "https://us-east-1.signin.aws.amazon.com/v1/token" }).to_string()
+}
+
+/// A move whose new control plane will not give its keys a second time (each Modal launcher is deployed with them, a
+/// further one after the first): it fails outright, or answers what is no key set; either stops the move, saying so.
+#[test]
+fn a_move_whose_new_control_plane_gives_no_keys_stops_saying_so() {
+    for (status, said) in [(500u16, &b"down"[..]), (200, &b"not keys"[..])] {
+        let (served, new, home) = moving_further_runners();
+        // (The first Modal launcher's deploy reads them first; a further one's after it.)
+        let read = std::sync::atomic::AtomicU32::new(0);
+        let front = superci_testkit::front(&new.url, move |method, target, got, body| {
+            let keys = method == "GET" && target.starts_with("/.well-known/jwks.json");
+            if keys && read.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 { (status, said.to_vec()) } else { (got, body) }
+        });
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["planes_more"][0]["Aws"]["url"] = front.into();
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let o = common::command(&home).args(["planes", "move", "testplane0002"]).env("SUPERCI_PAUSE_MS", "1").env("SUPERCI_MOVE_PAUSE_MS", "50").output().unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && out.trim().len() > 8 && served.store.under("moved_to").is_empty(), "{status}: {out}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// A further AWS account given a region the control plane will not record: its network made there all the same, and
+/// what the control plane answered said.
+#[test]
+fn a_further_aws_accounts_region_the_control_plane_will_not_record_is_said() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    with_further_aws(&served, &[("aws-acme", "222222222222")]);
+    let connect: Vec<&str> = include_str!("../fixtures/runners/08-move.jsonl").lines().filter(|l| (l.contains("iam.amazonaws.com") && !l.contains("Action=ListRoles")) || l.contains("ec2.us-east-1")).collect();
+    served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", "ec2.eu-north-1"), &[]);
+    let home = signed_in_two_aws(&served);
+    let front = superci_testkit::front(&served.url, |method, target, status, body| {
+        if method == "POST" && target.starts_with("/aws/accounts") { (500, br#"{"error":"the store is down"}"#.to_vec()) } else { (status, body) }
+    });
+    *served.aws.plane_url.lock().unwrap() = front.clone();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = front.into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let o = common::command(&home).args(["runners", "update", "aws-acme-on-demand", "--regions=eu-north-1"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("500"), "{said}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2.eu-north-1"))), "its network made first");
     let _ = std::fs::remove_dir_all(&home);
 }
