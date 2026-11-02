@@ -32,7 +32,7 @@ Then `superci dashboard`.
 
 Documentation: [superci.dev/docs](https://superci.dev/docs).
 
-How it compares with GitHub's own runners, RunsOn, Actions Runner Controller and the hosted services: [superci.dev/compare](https://superci.dev/compare), including [Blacksmith alternatives](https://superci.dev/compare/blacksmith-alternatives). What a month of your jobs would cost: [the calculator](https://superci.dev/calculator).
+How it compares with [GitHub's own runners](https://superci.dev/compare/github-hosted-runners), [RunsOn](https://superci.dev/compare/runs-on), [Actions Runner Controller](https://superci.dev/compare/actions-runner-controller) and [the hosted services](https://superci.dev/compare/hosted-runner-services): [superci.dev/compare](https://superci.dev/compare), including [Blacksmith alternatives](https://superci.dev/compare/blacksmith-alternatives). What a month of your jobs would cost: [the calculator](https://superci.dev/calculator).
 
 To let a coding agent move a repository's jobs (from GitHub's runners, Blacksmith, Depot, Namespace, WarpBuild, Ubicloud, BuildJet or RunsOn), add the skill in [`skills/superci`](skills/superci/SKILL.md):
 
