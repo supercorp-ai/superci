@@ -10578,7 +10578,7 @@ mod rest_tests {
         assert_eq!(mode(&mut d, "modal-initech", "function").err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
         assert_eq!(mode(&mut d, "modal", "function").err().as_deref(), Some("Sign in with Modal to the workspace acme first: `superci login modal --add`."));
         let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech", "function": true }] }, "function_mode": true })));
-        assert!(mode(&mut d, "modal-initech", "sandbox").is_err_and(|e| e.contains("not here")), "straight to the write");
+        assert_eq!(mode(&mut d, "modal-initech", "sandbox").err().as_deref(), Some("Sign in with Modal first."));
         // An image added while a workspace runs Functions: its Function there first.
         let mut d = modal_answering(with(serde_json::json!({ "routing": { "order": [{ "cloud": "modal-initech", "function": true }] }, "runner_images": true, "function_mode": true })));
         let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
