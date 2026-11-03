@@ -20,10 +20,10 @@ path = "src/main.rs"
 
 [dependencies]
 rpassword = "7.3.1"
-superci-core = { path = "../core", version = "=0.20.0" }
-superci-programs-planes = { path = "../programs-planes", version = "=0.20.0" }
-superci-programs-cache = { path = "../programs-cache", version = "=0.20.0" }
-superci-programs-layers = { path = "../programs-layers", version = "=0.20.0" }
+superci-core = { path = "../core", version = "=0.20.1" }
+superci-programs-planes = { path = "../programs-planes", version = "=0.20.1" }
+superci-programs-cache = { path = "../programs-cache", version = "=0.20.1" }
+superci-programs-layers = { path = "../programs-layers", version = "=0.20.1" }
 url.workspace = true
 miniz_oxide = "0.9"
 ureq = { version = "3", features = ["json"] }
