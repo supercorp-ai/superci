@@ -730,7 +730,7 @@ fn an_aws_budget_is_made_with_the_sign_in_of_whoever_asks() {
 /// The account's own copy of the image jobs run on, while the list of builds its maker publishes cannot be read: what
 /// the account allows is still said.
 #[test]
-fn an_accounts_copy_is_looked_at_while_the_newest_build_cannot_be_read() {
+fn an_accounts_copy_is_looked_at_while_the_build_to_copy_cannot_be_read() {
     let served = serve(|_| {});
     let home = common::aws_only(&served.aws);
     served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "us-east-1")]);

@@ -1621,7 +1621,7 @@ fn an_accounts_copy_of_an_older_build_is_said_once_looked_at_and_the_newer_one_c
     account.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000"), ("ca-central-1", "us-east-1")]);
     let (mut child, link) = common::dashboard(&home);
     let copied = || account.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("us-east-1"))).count();
-    until("the copy said as behind", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Your copy in N. Virginia is the build of 1 January 2025. Its maker has one of"));
+    until("the copy said as behind", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Your copy in N. Virginia is the build of 1 January 2025. This SuperCI uses the build of"));
     let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
     assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 1, "{status} {to} {} {}", common::words(&said), copied());
     let _ = child.kill();
@@ -1819,7 +1819,7 @@ fn a_newer_image_asked_for_where_the_copy_is_the_newest_copies_nothing() {
     until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("N. Virginia"));
     let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
     assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 0, "{status} {to} {} {}", common::words(&said), copied());
-    assert!(!common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Its maker has one of"));
+    assert!(!common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("This SuperCI uses the build of"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
     let account = superci_testkit::Aws::serve();
@@ -1828,7 +1828,7 @@ fn a_newer_image_asked_for_where_the_copy_is_the_newest_copies_nothing() {
     let (mut child, link) = common::dashboard(&home);
     until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("N. Virginia"));
     let page = common::words(&common::part(&link, "/?p=plane&fragment=1").1);
-    assert!(!page.contains("Its maker has one of"), "{page}");
+    assert!(!page.contains("This SuperCI uses the build of"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -19971,6 +19971,26 @@ fn what_modal_says_beside_its_answers_is_a_line_above_the_pages() {
     until("the control plane's word", || page().contains("Modal says: “modal 1.6 is deprecated”"));
     let page = page();
     assert!(page.matches("modal-go 0.11 is deprecated").count() == 1 && page.contains(r#"href="/?p=planes">Control plane</a>"#), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A kind of image whose build this version pins RunsOn has deleted, as the control plane in use noted it: a line above
+/// every page with the build jobs boot instead and the way on (an update); nothing of another version's note, nor of a
+/// note without the build used.
+#[test]
+fn an_image_whose_pinned_build_runs_on_deleted_is_a_line_above_the_pages() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let page = || common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+    for (kind, used, version) in [("ubuntu26-full-x64", Some("20261120081426"), superci_core::plane::VERSION), ("ubuntu24-full-x64", Some("20261120081424"), "0.1.0"), ("ubuntu24-full-arm64", None, superci_core::plane::VERSION)] {
+        served.store.0.lock().unwrap().insert(format!("image:left:{kind}"), serde_json::json!({ "kind": kind, "pinned": "20261102081426", "used": used, "version": version }).to_string());
+    }
+    served.store.0.lock().unwrap().insert("image:left:windows25-full-x64".into(), serde_json::json!({ "pinned": "20261022175853", "used": "20261120175853", "version": superci_core::plane::VERSION }).to_string());
+    until("the line", || page().contains("RunsOn no longer has the Ubuntu 26.04 (x64) image this SuperCI was tested with. Jobs use its oldest one left, of 20 November 2026. Update SuperCI, then the control plane."));
+    let page = page();
+    assert!(page.matches("RunsOn no longer has").count() == 1, "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

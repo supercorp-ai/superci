@@ -67,7 +67,7 @@ fn an_older_copy_of_the_runner_image_is_said_beside_the_regions_in_use() {
     served.aws.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000"), ("ca-central-1", "us-east-1")]);
     let home = signed_in(&served);
     let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
-    let (words, html) = page_saying(&link, "planes", &["N. Virginia us-east-1 Spot, favoured", "Your copy in N. Virginia is the build of 1 January 2025. Its maker has one of"]);
+    let (words, html) = page_saying(&link, "planes", &["N. Virginia us-east-1 Spot, favoured", "Your copy in N. Virginia is the build of 1 January 2025. This SuperCI uses the build of"]);
     assert!(html.contains("<dt>Runner image</dt>") && words.contains("Copy the new one in"), "{words}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);

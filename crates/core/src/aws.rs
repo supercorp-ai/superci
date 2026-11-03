@@ -237,21 +237,59 @@ pub fn runner_policy(account_id: &str, plane_id: &str) -> serde_json::Value { cr
 
 /// The newest image of an owner matching a name pattern (RunsOn's public GitHub-compatible Ubuntu 24.04 by default).
 pub async fn latest_image(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, now_ms: u64) -> Result<String> {
-    latest_image_sized(http, region, creds, owner, name, now_ms).await.map(|(id, _)| id)
+    image_for(http, region, creds, owner, name, None, now_ms).await.map(|(id, ..)| id)
 }
 
-/// The newest image of an owner (or the account's own) matching a name pattern, and the size of its disk (a
-/// machine's may not be smaller).
-pub async fn latest_image_sized(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, now_ms: u64) -> Result<(String, u32)> {
+/// The build of each kind of image this version of SuperCI boots: the stamp its maker's image names end with
+/// (`runs-on-v2.2-ubuntu26-full-x64-20261102081426`). A build is never taken as it comes out: the maker's Ubuntu
+/// 26.04 build of 2 November 2026 came with a kernel under which every signal inside a container was denied, on every
+/// job at once. A release moves these to builds its own jobs ran on. The newest of a kind:
+/// `aws ec2 describe-images --region us-east-1 --owners 135269210855 --filters Name=name,Values=runs-on-v2.2-KIND-*`.
+pub const IMAGE_BUILDS: [(&str, &str); 7] = [
+    ("ubuntu24-full-x64", "20261102081424"), ("ubuntu24-full-arm64", "20261102081430"),
+    ("ubuntu26-full-x64", "20261102081426"), ("ubuntu26-full-arm64", "20261102081425"),
+    ("ubuntu24-gpu-x64", "20261022130417"), ("ubuntu26-gpu-x64", "20260821141648"), ("windows25-full-x64", "20261022175853"),
+];
+
+/// The maker's release of the pinned Ubuntu 24.04 build (the stamp of its tag, `linux-20261102081230`, a little before
+/// its images' own): where a copy into a region the maker does not publish in comes from.
+pub const IMAGE_RELEASE: &str = "20261102081230";
+
+/// The build this version boots of a kind of image (`ubuntu26-full-x64`; see `image_flavor`), when it pins one.
+pub fn pinned_build(kind: &str) -> Option<&'static str> { IMAGE_BUILDS.iter().find(|(k, _)| *k == kind).map(|(_, b)| *b) }
+
+/// The build an image is of, from the end of its name (`…-x64-20261006080949`); empty when it has none.
+pub fn build_of(name: &str) -> &str { name.rsplit('-').next().filter(|s| s.len() == 14 && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default() }
+
+/// An image as DescribeImages lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed { pub created: String, pub id: String, pub gb: u32, pub name: String }
+
+/// Of a kind's images in a region, the one jobs boot: the pinned build. Once its maker has deleted it (it keeps a
+/// kind's last three builds, a month or so), the oldest of the newer ones left: out the longest, so a fault in it has
+/// been met by others first; that build is said with it. With none newer (no pin; a copy of an older build in a region
+/// the maker does not publish in), the newest.
+pub fn pick_image<'a>(images: &'a [Listed], pinned: Option<&str>) -> Option<(&'a Listed, Option<&'a str>)> {
+    let newest = || images.iter().max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id))).map(|i| (i, None));
+    let Some(pin) = pinned else { return newest() };
+    if let Some(i) = images.iter().find(|i| build_of(&i.name) == pin) { return Some((i, None)) }
+    match images.iter().filter(|i| build_of(&i.name) > pin).min_by_key(|i| build_of(&i.name)) {
+        Some(i) => Some((i, Some(build_of(&i.name)))),
+        None => newest(),
+    }
+}
+
+/// The image of an owner (or the account's own) matching a name pattern that jobs boot (see `pick_image`), the size
+/// of its disk (a machine's may not be smaller), and the build taken in the pinned one's place, when it was.
+pub async fn image_for(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, pinned: Option<&str>, now_ms: u64) -> Result<(String, u32, Option<String>)> {
     // (Its owner's, or the account's own copy of it under the same name: a region the image is not published in
     // has it once it is copied there.)
     let xml = ec2(http, region, creds, "DescribeImages", serde_json::json!({ "Owner": [owner, "self"], "Filter": [{ "Name": "name", "Value": [name] }, { "Name": "state", "Value": ["available"] }] }), now_ms).await?;
-    let mut images: Vec<(String, String, u32)> = xml.split("<imageId>").skip(1).filter_map(|chunk| {
-        let id = upto_tag(chunk).to_string();
-        Some((xml_tag(chunk, "creationDate")?.to_string(), id, xml_tag(chunk, "volumeSize").and_then(|v| v.parse().ok()).unwrap_or(0)))
-    }).collect();
-    images.sort();
-    images.pop().map(|(_, id, gb)| (id, gb)).ok_or_else(|| format!("no image {owner}/{name} in {region}"))
+    let images: Vec<Listed> = xml.split("<imageId>").skip(1).filter_map(|chunk| Some(Listed {
+        created: xml_tag(chunk, "creationDate")?.to_string(), id: upto_tag(chunk).to_string(),
+        gb: xml_tag(chunk, "volumeSize").and_then(|v| v.parse().ok()).unwrap_or(0), name: xml_tag(chunk, "name").unwrap_or_default().to_string(),
+    })).collect();
+    pick_image(&images, pinned).map(|(i, instead)| (i.id.clone(), i.gb, instead.map(str::to_string))).ok_or_else(|| format!("no image {owner}/{name} in {region}"))
 }
 
 /// What AWS's spot prices call an operating system.
@@ -1353,7 +1391,20 @@ Start-Job -ArgumentList $dir -ScriptBlock { param($d)
 /// partition and filesystem keep the image's own (29 GB of Ubuntu's, 18 of them used) unless they are grown, which
 /// the image does not do by itself. Under two seconds on a mounted root; nothing here stops the job (`growpart`
 /// ends with an error when there is nothing to grow).
-const GROW_ROOT: &str = r#"root="$(findmnt -n -o SOURCE /)"; disk="$(lsblk -n -o PKNAME "$root" 2>/dev/null | head -n 1)"; part="$(echo "$root" | grep -o '[0-9]*$')"
+/// The kernel's settings on a Linux machine, before Docker or a job starts. Kept in /etc/sysctl.d too, so a job that
+/// installs or updates a package which loads the system's settings again (procps, apparmor) does not undo them.
+/// - As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
+/// - A container's processes may signal each other (Postgres's start, a build killing its workers). With Ubuntu's
+///   `apparmor_restrict_unprivileged_unconfined=1` and kernels from 7.0.0-1016-aws (Ubuntu 26.04 images from
+///   2026-11-02), runc's change to Docker's profile is stacked as `docker-default//&unconfined`, and the profile lets a
+///   process signal only `docker-default`: every signal inside a container is denied (moby/moby#54099). A machine
+///   runs one job and is thrown away, so this hardening of a shared host buys nothing here.
+/// - The ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) never handed out to the
+///   connections the machine opens (Linux hands those out from 32768-60999): one found its port taken now and then.
+/// (`-e`: a key a kernel does not have is passed over, the others still set.)
+const KERNEL_SETTINGS: &str = "printf '%s\\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999>/etc/sysctl.d/99-superci.conf\nsysctl -eqp /etc/sysctl.d/99-superci.conf||:\n";
+
+const GROW_ROOT: &str =r#"root="$(findmnt -n -o SOURCE /)"; disk="$(lsblk -n -o PKNAME "$root" 2>/dev/null | head -n 1)"; part="$(echo "$root" | grep -o '[0-9]*$')"
 if [ -n "$disk" ] && [ -n "$part" ]; then growpart "/dev/$disk" "$part" || true; resize2fs "$root" 2>/dev/null || xfs_growfs / 2>/dev/null || true; fi
 df -h / | tail -n 1
 "#;
@@ -1578,8 +1629,8 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
         crate::io::Work::GitLab { url, token } => {
             let safe = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b));
             if !safe(url) || !safe(token) { return Err("invalid GitLab runner settings".into()) }
-            return Ok(format!(concat!("#!/bin/bash\nexec > >(tee /var/log/superci.log > /dev/console) 2>&1\n", bound!(), "\n{grow}export GL_URL={url} GL_TOKEN={token} GL_RUNNER_FLAGS=--docker-privileged\nbash -c '{script}' || true\npoweroff\n"),
-                grow = GROW_ROOT, url = url, token = token, secs = max_minutes * 60, minutes = max_minutes + 1, script = crate::gitlab::RUNNER_SCRIPT.replace('\'', "'\\''")))
+            return Ok(format!(concat!("#!/bin/bash\nexec > >(tee /var/log/superci.log > /dev/console) 2>&1\n", bound!(), "\n{grow}{settings}export GL_URL={url} GL_TOKEN={token} GL_RUNNER_FLAGS=--docker-privileged\nbash -c '{script}' || true\npoweroff\n"),
+                grow = GROW_ROOT, settings = KERNEL_SETTINGS, url = url, token = token, secs = max_minutes * 60, minutes = max_minutes + 1, script = crate::gitlab::RUNNER_SCRIPT.replace('\'', "'\\''")))
         }
     };
     let base64 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
@@ -1593,11 +1644,7 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
     Ok(format!(concat!(r#"#!/bin/bash
 exec > >(tee /var/log/superci.log > /dev/console) 2>&1
 "#, bound!(), r#"
-{grow}# As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
-# And the ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) never handed out to the
-# connections the machine opens (Linux hands those out from 32768-60999): one found its port taken now and then.
-sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 net.ipv4.ip_local_reserved_ports=50000-59999||:
-# Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
+{grow}{settings}# Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
 # beside the runner, not at a job's first use of it (services, container jobs, docker steps).
 usermod -aG docker runner 2>/dev/null||:
 # Docker pulls sixteen of an image's layers at once (three unless told): a stack of many images (a local Supabase's
@@ -1609,7 +1656,7 @@ f=/etc/docker/daemon.json;[ -e $f ]||echo {{}}>$f;jq '.["max-concurrent-download
 find /home/runner/bin -type f -print0 2>/dev/null|xargs -0 -r -P 64 -n 16 cat &>/dev/null
 {wait}{hook}cd /home/runner && sudo -u runner -H {run} --jitconfig {jit_config}
 poweroff
-"#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1,
+"#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1, settings = KERNEL_SETTINGS,
         reach = if fail.is_some() { String::new() } else { reach_github(&runner_hosts(jit_config)) },
         wait = if fail.is_some() || runner_hosts(jit_config).is_empty() { "" } else { "wait $g\n" },
         // (Not for the runner that only says why a job failed: it uses no disk.)
@@ -1858,6 +1905,12 @@ mod tests {
         let grow = r#"growpart "/dev/$disk" "$part" || true; resize2fs "$root" 2>/dev/null || xfs_growfs / 2>/dev/null || true"#;
         assert!(script.contains(grow) && script.find("growpart").unwrap() < script.find("./run.sh").unwrap(), "{script}");
         assert!(gl.contains(grow) && gl.find("growpart").unwrap() < gl.find("export GL_URL=").unwrap(), "{gl}");
+        // The kernel's settings, before Docker restarts and before the runner (GitHub's) or GitLab's runner starts,
+        // kept in /etc/sysctl.d: among them, a container's processes may signal each other (moby/moby#54099).
+        let settings = "kernel.apparmor_restrict_unprivileged_unconfined=0";
+        assert!(script.contains(settings) && script.find(settings).unwrap() < script.find("systemctl restart docker").unwrap() && script.find(settings).unwrap() < script.find("./run.sh").unwrap(), "{script}");
+        assert!(gl.contains(settings) && gl.find(settings).unwrap() < gl.find("export GL_URL=").unwrap(), "{gl}");
+        assert!(compact(&script).contains("sysctl -eqp /etc/sysctl.d/99-superci.conf||:\n") && script.contains(">/etc/sysctl.d/99-superci.conf\n"));
         let win = runner_user_data_for(&gh("abc"), 70, "windows", None).unwrap();
         assert!(win.contains("Resize-Partition -DriveLetter C -Size $max") && win.find("Resize-Partition").unwrap() < win.find("run.cmd --jitconfig").unwrap(), "{win}");
         // (The runner that only says why a job failed uses no disk.)

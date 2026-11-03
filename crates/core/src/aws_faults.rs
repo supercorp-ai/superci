@@ -253,7 +253,7 @@ fn prices_images_and_quotas_read_hold_with_each_call_failing() {
     assert_eq!(swept(prices, |aws| futures::executor::block_on(cpu_quota(aws, "us-east-1", &creds(), SPOT_CPU_QUOTA, 0))), 5);
     let types = vec!["m7a.large".to_string(), "c7a.large".to_string()];
     assert_eq!(swept(prices, |aws| futures::executor::block_on(offered_types(aws, "us-east-1", &creds(), &types, 0))), ["m7a.large"]);
-    assert_eq!(swept(prices, |aws| futures::executor::block_on(latest_image_sized(aws, "us-east-1", &creds(), "1", "n-*", 0))), ("ami-2".to_string(), 0));
+    assert_eq!(swept(prices, |aws| futures::executor::block_on(image_for(aws, "us-east-1", &creds(), "1", "n-*", None, 0))), ("ami-2".to_string(), 0, None));
     assert_eq!(swept(prices, |aws| futures::executor::block_on(copy_image(aws, "eu-north-1", &creds(), "us-east-1", "ami-1", "n", 0))), "ami-copy");
     let copies = swept(prices, |aws| futures::executor::block_on(copied_images(aws, "us-east-1", &creds(), 0)));
     assert_eq!(copies.len(), 1);
@@ -275,7 +275,7 @@ fn answers_without_what_was_asked_for_are_said_as_that() {
     assert!(said(empty(), &|aws| futures::executor::block_on(on_demand_price(aws, &creds(), "us-east-1", "m7a.large", "linux", 0)).map(|p| p.to_string())).starts_with("no on-demand price"));
     assert!(said(empty(), &|aws| futures::executor::block_on(disk_price(aws, &creds(), "us-east-1", 0)).map(|p| p.to_string())).starts_with("no gp3 price"));
     assert_eq!(said(empty(), &|aws| futures::executor::block_on(cpu_quota(aws, "us-east-1", &creds(), SPOT_CPU_QUOTA, 0)).map(|p| p.to_string())), "Service Quotas answered without a value");
-    assert!(said(empty(), &|aws| futures::executor::block_on(latest_image_sized(aws, "us-east-1", &creds(), "1", "n", 0)).map(|p| p.0)).starts_with("no image 1/n"));
+    assert!(said(empty(), &|aws| futures::executor::block_on(image_for(aws, "us-east-1", &creds(), "1", "n", None, 0)).map(|p| p.0)).starts_with("no image 1/n"));
     assert_eq!(said(empty(), &|aws| futures::executor::block_on(copy_image(aws, "us-east-1", &creds(), "a", "b", "n", 0))), "CopyImage without an imageId");
     assert_eq!(said(empty(), &|aws| futures::executor::block_on(assume_role_with_web_identity(aws, "us-east-1", "arn", "t", "s", 0)).map(|c| c.access_key_id)), "STS response without AccessKeyId");
     let half: Answer = Box::new(|_, _| (200, "<AccessKeyId>A</AccessKeyId>".into()));

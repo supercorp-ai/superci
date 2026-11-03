@@ -891,7 +891,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let image_name = args.get("image").unwrap_or(&config.image_name).to_string();
             let script = match args.get("user-data") { Some(f) => std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?, None => "#!/bin/bash\npoweroff\n".to_string() };
             let keep = args.has("user-data");
-            let (image, image_gb) = block_on(aws::latest_image_sized(&http, region, &creds, &config.image_owner, &image_name, now()))?;
+            let (image, image_gb, _) = block_on(aws::image_for(&http, region, &creds, &config.image_owner, &image_name, aws::pinned_build(aws::image_flavor(&image_name)), now()))?;
             let network = block_on(aws::find_network(&http, region, &creds, &plane_id, now()))?;
             let types = block_on(aws::offered_types(&http, region, &creds, &types, now())).unwrap_or(types);
             let tags = vec![("Name".to_string(), "superci-probe".to_string()), ("superci-plane".to_string(), plane_id.clone()), ("superci-job".to_string(), "1".to_string()), ("superci-repo".to_string(), "acme/app".to_string())];
@@ -1054,10 +1054,10 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 let mut copies = crate::aws::copied_images(&creds, region).unwrap_or_default();
                 copies.sort_by(|a, b| crate::aws::build_of(&b.name).cmp(crate::aws::build_of(&a.name)));
                 // Its maker builds the image anew every week or two; a copy stays the build it was made of.
-                let behind = if copies.is_empty() { None } else { crate::aws::newest_build().and_then(|newest| crate::aws::behind(&copies, &newest).map(|have| (have.to_string(), newest))) };
+                let behind = if copies.is_empty() { None } else { crate::aws::build_to_copy().and_then(|newest| crate::aws::behind(&copies, &newest).map(|have| (have.to_string(), newest))) };
                 let state = match (copies.first(), there) {
                     (Some(c), _) if c.state == "available" => format!("your copy {} ({}){}{}", c.id, c.name,
-                        match &behind { Some((have, newest)) => format!(": the build of {}; one of {} is out, `superci images update {region}` copies it in", crate::aws::build_day(have), crate::aws::build_day(newest)), None => String::new() },
+                        match &behind { Some((have, newest)) => format!(": the build of {}; this SuperCI uses the build of {}, `superci images update {region}` copies it in", crate::aws::build_day(have), crate::aws::build_day(newest)), None => String::new() },
                         if tidied > 0 { format!(" (the copy before it is removed)") } else { String::new() }),
                     (Some(c), _) => format!("your copy {} is being made ({})", c.id, c.state),
                     (None, Some(true)) => "published".to_string(),
@@ -1094,8 +1094,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let copies = crate::aws::copied_images(&creds, region)?;
             if copies.is_empty() { return Err(format!("{region} has no copy of yours. `superci images create {region}` copies the image in, where it is not published.").into()) }
             if let Some(coming) = copies.iter().find(|c| c.state == "pending") { return Err(format!("A copy is on its way into {region} already: {} ({}).", coming.id, coming.name).into()) }
-            let newest = crate::aws::newest_build().ok_or("The list of runner images could not be read from GitHub.")?;
-            let Some(have) = crate::aws::behind(&copies, &newest).map(str::to_string) else { return Ok(Done { said: vec![format!("Your copy in {region} is of the newest build ({}).", crate::aws::build_day(&newest))], data: json!({ "ok": true, "region": region, "newest": true }) }) };
+            let newest = crate::aws::build_to_copy().ok_or("The list of runner images could not be read from GitHub.")?;
+            let Some(have) = crate::aws::behind(&copies, &newest).map(str::to_string) else { return Ok(Done { said: vec![format!("Your copy in {region} is of the build this SuperCI uses ({}).", crate::aws::build_day(&newest))], data: json!({ "ok": true, "region": region, "newest": true }) }) };
             let source = crate::aws::copy_source_for(region, None)?;
             let (from_region, from_image) = (source.1.clone(), source.2.clone());
             if let Some(done) = dry(args, &format!("copy the build of {} into {region}, from {from_region} ({from_image}), in place of your copy of {}", crate::aws::build_day(&newest), crate::aws::build_day(&have)), "images", &[]) { return Ok(done) }
@@ -1676,6 +1676,11 @@ fn status_lines(v: &Value) -> Vec<String> {
     // What a cloud said beside its answers: a client release it will stop taking, which a newer SuperCI answers.
     for c in st["cloud_says"].as_array().into_iter().flatten() {
         out.push(format!("{:<14}{} (a newer SuperCI answers it: update it, then `superci planes update`)", format!("{} says", superci_core::plane::cloud_name(c["cloud"].as_str().unwrap_or_default())), c["said"].as_str().unwrap_or_default()));
+    }
+    // A kind of image whose pinned build its maker deleted: jobs boot a build no SuperCI was tested with.
+    for i in st["images_left"].as_array().into_iter().flatten() {
+        out.push(format!("Image         RunsOn no longer has the {} image this SuperCI was tested with; jobs use its oldest one left, of {}. Update SuperCI, then `superci planes update`.",
+            crate::view::image_kind_name(i["kind"].as_str().unwrap_or_default()), crate::aws::build_day(i["used"].as_str().unwrap_or_default())));
     }
     // Modal's Functions (`superci runners order modal-functions modal`): what their preemptions came to this month.
     if let Some(line) = preempted_words(st) { out.push(format!("Preempted     {line}")) }
