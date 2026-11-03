@@ -8238,7 +8238,7 @@ mod tests {
         // and while that one is on its way.
         d.aws_behind.insert("111111111111".into(), vec![("eu-north-1".into(), "20261006080949".into(), "20261020070000".into(), false)]);
         let behind = d.plane_page();
-        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. This SuperCI uses the build of 20 October 2026 out.</small></dd><span class="acct-do"><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
+        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. This SuperCI uses the build of 20 October 2026.</small></dd><span class="acct-do"><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
         d.aws_behind.get_mut("111111111111").unwrap()[0].3 = true;
         let coming = d.plane_page();
         assert!(coming.contains("The build of 20 October 2026 is being copied into Stockholm: about ten minutes. Jobs start from your older copy until it is there.") && !coming.contains("Copy the new one in"), "{coming}");
