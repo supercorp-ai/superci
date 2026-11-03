@@ -5713,9 +5713,14 @@ fn gitlab_events_logs_runners_and_webhooks_are_read_as_gitlab_answers_them_each_
 fn keys_signatures_and_policies_are_taken_in_each_form_their_issuers_give_them() {
     // The App's key as GitHub gives it.
     let served = serve(|_| {});
-    let mut openssl = std::process::Command::new("openssl").args(["rsa", "-traditional"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().expect("openssl");
-    { use std::io::Write; openssl.stdin.take().unwrap().write_all(superci_testkit::GitHub::app()["pem"].as_str().unwrap().as_bytes()).unwrap(); }
-    let pkcs1 = String::from_utf8(openssl.wait_with_output().unwrap().stdout).unwrap();
+    // (OpenSSL 3 writes PKCS#1 with -traditional; LibreSSL, macOS's own, has no such flag and writes PKCS#1 as it is.)
+    let rsa = |args: &[&str]| {
+        let mut openssl = std::process::Command::new("openssl").arg("rsa").args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().expect("openssl");
+        // (One that refused its flag has ended before reading the key: nothing to say of that write.)
+        { use std::io::Write; let _ = openssl.stdin.take().unwrap().write_all(superci_testkit::GitHub::app()["pem"].as_str().unwrap().as_bytes()); }
+        String::from_utf8(openssl.wait_with_output().unwrap().stdout).unwrap()
+    };
+    let pkcs1 = Some(rsa(&["-traditional"])).filter(|k| k.contains("BEGIN RSA PRIVATE KEY")).unwrap_or_else(|| rsa(&[]));
     assert!(pkcs1.contains("BEGIN RSA PRIVATE KEY"), "{pkcs1}");
     let mut app = superci_testkit::GitHub::app();
     app["pem"] = pkcs1.into();
