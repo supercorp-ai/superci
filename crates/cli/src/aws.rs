@@ -1002,6 +1002,12 @@ mod answers {
         assert!(published_image(&listed(200, "not json")).unwrap_err().starts_with("The list of runner images from GitHub could not be read"));
         assert!(published_image(&listed(200, "[]")).unwrap_err().starts_with("The maker's list of runner images has no ubuntu24-full-x64 image now"));
         assert_eq!(published_image(&listed(200, &releases("us-east-1"))).unwrap(), ("20261006080949".to_string(), vec![("us-east-1".to_string(), "ami-0123456789abcdef0".to_string())]));
+        // The release this version pins, not a newer one; once it is no longer listed, the oldest newer one.
+        let release = |stamp: &str, ami: &str| serde_json::json!({ "tag_name": format!("linux-{stamp}"), "body": format!("### `ubuntu24-full-x64`\n| Region | AMI |\n| --- | --- |\n| eu-west-1 | `{ami}` |\n") });
+        let (pinned, newer, newest) = (aws::IMAGE_RELEASE.to_string(), format!("{}9", &aws::IMAGE_RELEASE[..13]), "29991231235959".to_string());
+        let of = |list: Vec<serde_json::Value>| published_image(&listed(200, &serde_json::Value::from(list).to_string())).unwrap().0;
+        assert_eq!(of(vec![release(&newest, "ami-0000000000000000c"), release(&pinned, "ami-0000000000000000a"), release("20250101000000", "ami-0000000000000000d")]), pinned);
+        assert_eq!(of(vec![release(&newest, "ami-0000000000000000c"), release(&newer, "ami-0000000000000000b"), release("20250101000000", "ami-0000000000000000d")]), newer);
         // Published only where the copy would go: nowhere to copy it from.
         with(&clouds::serve(|_, _, _| answer(200, &releases("us-east-1"))), || assert_eq!(copy_source_for("us-east-1", None).unwrap_err(), "The image is published in no other region to copy it from."));
     }

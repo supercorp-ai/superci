@@ -2981,6 +2981,24 @@ fn what_a_cloud_said_to_the_control_plane_is_said_with_its_status() {
     assert!(said.contains("Modal says    modal 1.6 is deprecated: upgrade by 2027-01-01 (a newer SuperCI answers it: update it, then `superci planes update`)"), "{said}");
 }
 
+/// A kind of image whose build this version pins RunsOn has deleted, as the control plane noted it: its status says
+/// the build jobs boot instead, by its day, with the way on (an update); nothing of another version's note.
+#[test]
+fn an_image_whose_pinned_build_runs_on_deleted_is_said_with_its_status() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let text = |args: &[&str]| String::from_utf8_lossy(&superci(&home, args).stdout).to_string();
+    assert!(!text(&["status"]).contains("RunsOn no longer has"), "nothing noted");
+    for (kind, version) in [("ubuntu24-gpu-x64", superci_core::plane::VERSION), ("ubuntu26-full-arm64", superci_core::plane::VERSION), ("windows25-full-x64", superci_core::plane::VERSION),
+        ("ubuntu2-gpu-x64", superci_core::plane::VERSION), ("macos15-full-arm64", superci_core::plane::VERSION), ("ubuntu24-full-x64", "0.1.0")] {
+        served.store.0.lock().unwrap().insert(format!("image:left:{kind}"), serde_json::json!({ "kind": kind, "pinned": "20261102081426", "used": "20261120081426", "version": version }).to_string());
+    }
+    let said = text(&["status"]);
+    let line = |name: &str| format!("Image         RunsOn no longer has the {name} image this SuperCI was tested with; jobs use its oldest one left, of 20 November 2026. Update SuperCI, then `superci planes update`.");
+    for name in ["Ubuntu 24.04 with GPUs", "Ubuntu 26.04 (arm64)", "Windows Server 2025", "ubuntu2-gpu-x64", "macos15-full-arm64"] { assert!(said.contains(&line(name)), "{name}: {said}") }
+    assert!(!said.contains("Ubuntu 24.04 (x64)"), "another version's note: {said}");
+}
+
 /// A control plane whose store is as slow as a Modal control plane's (some 120 ms a round trip), with the fifty jobs its
 /// status shows:
 /// `superci status` reads its status in good time, not nothing (its records read several at once; one by one, it was

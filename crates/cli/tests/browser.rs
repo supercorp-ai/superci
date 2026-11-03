@@ -19975,6 +19975,25 @@ fn what_modal_says_beside_its_answers_is_a_line_above_the_pages() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A kind of image whose build this version pins RunsOn has deleted, as the control plane in use noted it: a line above
+/// every page with the build jobs boot instead and the way on (an update); nothing of another version's note, nor of a
+/// note without the build used.
+#[test]
+fn an_image_whose_pinned_build_runs_on_deleted_is_a_line_above_the_pages() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let page = || common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+    for (kind, used, version) in [("ubuntu26-full-x64", Some("20261120081426"), superci_core::plane::VERSION), ("ubuntu24-full-x64", Some("20261120081424"), "0.1.0"), ("ubuntu24-full-arm64", None, superci_core::plane::VERSION)] {
+        served.store.0.lock().unwrap().insert(format!("image:left:{kind}"), serde_json::json!({ "kind": kind, "pinned": "20261102081426", "used": used, "version": version }).to_string());
+    }
+    until("the line", || page().contains("RunsOn no longer has the Ubuntu 26.04 (x64) image this SuperCI was tested with. Jobs use its oldest one left, of 20 November 2026. Update SuperCI, then the control plane."));
+    let page = page();
+    assert!(page.matches("RunsOn no longer has").count() == 1, "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A change a teammate makes on another computer, through the control plane (as their dashboard makes it).
 fn teammate_changes(served: &superci_testkit::Served, changes: serde_json::Value) {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();

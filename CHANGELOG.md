@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.20.1
+- A container's processes may signal each other again on AWS's Ubuntu 26.04 machines. RunsOn's image of 2 November 2026 boots a kernel (7.0.0-1016-aws) under which Docker's default AppArmor profile denied every signal inside a container (moby/moby#54099): Postgres never started, and builds that stop their workers failed with EACCES. Each Linux machine now sets `kernel.apparmor_restrict_unprivileged_unconfined=0` before Docker and the runner start, kept in `/etc/sysctl.d` so a package installed by a job does not undo it. A machine runs one job and is thrown away, so this hardening of a shared host buys nothing there. Update your control plane for it.
+- Jobs boot the build of RunsOn's image that this version of SuperCI was tested with, not each new one as it comes out: a new build reached every job at once before, as the one above did. Each kind of image (Ubuntu 24.04 and 26.04 on x64 and arm64, with GPUs, Windows Server 2025) is pinned to a build, and a release moves the pins. RunsOn keeps only its last three builds of each: once it has deleted the pinned one, jobs boot the oldest newer one left, and `superci status` and the dashboard say so and ask for an update. Your own copies of the image, in regions RunsOn does not publish in, are made of the pinned build too. Update your control plane for it.
+
 ## 0.20.0 — 2026-11-02
 - Several AWS accounts run one CI's jobs too: `superci login aws --add`, then `superci runners create aws --account=ID --region=R [--name=WORD]`. Each has its own role, machines, regions, spot notes and limits; a CI keeps one cache, in its first account, which machines elsewhere reach by links. Limits for any account: `superci accounts update WORD`. Each account's bill is kept in the control plane, so every computer of a CI shows it.
 - A Modal launcher that has not been used for a while is woken before a job's machine is asked of it. Starting from nothing took longer than a control plane waits, and the job then showed no machine with a note left over from waiting.
