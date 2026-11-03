@@ -19987,6 +19987,7 @@ fn an_image_whose_pinned_build_runs_on_deleted_is_a_line_above_the_pages() {
     for (kind, used, version) in [("ubuntu26-full-x64", Some("20261120081426"), superci_core::plane::VERSION), ("ubuntu24-full-x64", Some("20261120081424"), "0.1.0"), ("ubuntu24-full-arm64", None, superci_core::plane::VERSION)] {
         served.store.0.lock().unwrap().insert(format!("image:left:{kind}"), serde_json::json!({ "kind": kind, "pinned": "20261102081426", "used": used, "version": version }).to_string());
     }
+    served.store.0.lock().unwrap().insert("image:left:windows25-full-x64".into(), serde_json::json!({ "pinned": "20261022175853", "used": "20261120175853", "version": superci_core::plane::VERSION }).to_string());
     until("the line", || page().contains("RunsOn no longer has the Ubuntu 26.04 (x64) image this SuperCI was tested with. Jobs use its oldest one left, of 20 November 2026. Update SuperCI, then the control plane."));
     let page = page();
     assert!(page.matches("RunsOn no longer has").count() == 1, "{page}");
