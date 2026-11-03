@@ -340,7 +340,10 @@ fn aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines() {
     let fields: Vec<(String, String)> = url::form_urlencoded::parse(launch.2.as_bytes()).into_owned().collect();
     let field = |n: &str| fields.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()).unwrap_or_default();
     assert_eq!((field("ImageId").as_str(), field("InstanceType").as_str(), field("InstanceMarketOptions.MarketType").as_str()), ("ami-new", "c8a.xlarge", "spot"));
-    assert!(String::from_utf8(STANDARD.decode(field("UserData")).unwrap()).unwrap().contains("./run.sh --jitconfig JITCONFIG+/="));
+    let script = String::from_utf8(STANDARD.decode(field("UserData")).unwrap()).unwrap();
+    assert!(script.contains("./run.sh --jitconfig JITCONFIG+/="));
+    // A container's processes may signal each other on the machine (moby/moby#54099), set before Docker restarts.
+    assert!(script.contains("kernel.apparmor_restrict_unprivileged_unconfined=0") && script.find("_unconfined=0").unwrap() < script.find("systemctl restart docker").unwrap(), "{script}");
     assert!(fields.iter().any(|(k, v)| k.starts_with("TagSpecification.1.Tag.") && v == PLANE_ID));
     // In AWS's console the machine is called by the CI's name, the repository and the job (nothing reads that name).
     assert!(fields.iter().any(|(k, v)| k.starts_with("TagSpecification.1.Tag.") && v == "superci-app-7"), "{fields:?}");

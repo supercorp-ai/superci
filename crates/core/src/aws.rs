@@ -1353,7 +1353,20 @@ Start-Job -ArgumentList $dir -ScriptBlock { param($d)
 /// partition and filesystem keep the image's own (29 GB of Ubuntu's, 18 of them used) unless they are grown, which
 /// the image does not do by itself. Under two seconds on a mounted root; nothing here stops the job (`growpart`
 /// ends with an error when there is nothing to grow).
-const GROW_ROOT: &str = r#"root="$(findmnt -n -o SOURCE /)"; disk="$(lsblk -n -o PKNAME "$root" 2>/dev/null | head -n 1)"; part="$(echo "$root" | grep -o '[0-9]*$')"
+/// The kernel's settings on a Linux machine, before Docker or a job starts. Kept in /etc/sysctl.d too, so a job that
+/// installs or updates a package which loads the system's settings again (procps, apparmor) does not undo them.
+/// - As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
+/// - A container's processes may signal each other (Postgres's start, a build killing its workers). With Ubuntu's
+///   `apparmor_restrict_unprivileged_unconfined=1` and kernels from 7.0.0-1016-aws (Ubuntu 26.04 images from
+///   2026-11-02), runc's change to Docker's profile is stacked as `docker-default//&unconfined`, and the profile lets a
+///   process signal only `docker-default`: every signal inside a container is denied (moby/moby#54099). A machine
+///   runs one job and is thrown away, so this hardening of a shared host buys nothing here.
+/// - The ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) never handed out to the
+///   connections the machine opens (Linux hands those out from 32768-60999): one found its port taken now and then.
+/// (`-e`: a key a kernel does not have is passed over, the others still set.)
+const KERNEL_SETTINGS: &str = "printf '%s\\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 net.ipv4.ip_local_reserved_ports=50000-59999>/etc/sysctl.d/99-superci.conf\nsysctl -eqp /etc/sysctl.d/99-superci.conf||:\n";
+
+const GROW_ROOT: &str =r#"root="$(findmnt -n -o SOURCE /)"; disk="$(lsblk -n -o PKNAME "$root" 2>/dev/null | head -n 1)"; part="$(echo "$root" | grep -o '[0-9]*$')"
 if [ -n "$disk" ] && [ -n "$part" ]; then growpart "/dev/$disk" "$part" || true; resize2fs "$root" 2>/dev/null || xfs_growfs / 2>/dev/null || true; fi
 df -h / | tail -n 1
 "#;
@@ -1578,8 +1591,8 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
         crate::io::Work::GitLab { url, token } => {
             let safe = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b));
             if !safe(url) || !safe(token) { return Err("invalid GitLab runner settings".into()) }
-            return Ok(format!(concat!("#!/bin/bash\nexec > >(tee /var/log/superci.log > /dev/console) 2>&1\n", bound!(), "\n{grow}export GL_URL={url} GL_TOKEN={token} GL_RUNNER_FLAGS=--docker-privileged\nbash -c '{script}' || true\npoweroff\n"),
-                grow = GROW_ROOT, url = url, token = token, secs = max_minutes * 60, minutes = max_minutes + 1, script = crate::gitlab::RUNNER_SCRIPT.replace('\'', "'\\''")))
+            return Ok(format!(concat!("#!/bin/bash\nexec > >(tee /var/log/superci.log > /dev/console) 2>&1\n", bound!(), "\n{grow}{settings}export GL_URL={url} GL_TOKEN={token} GL_RUNNER_FLAGS=--docker-privileged\nbash -c '{script}' || true\npoweroff\n"),
+                grow = GROW_ROOT, settings = KERNEL_SETTINGS, url = url, token = token, secs = max_minutes * 60, minutes = max_minutes + 1, script = crate::gitlab::RUNNER_SCRIPT.replace('\'', "'\\''")))
         }
     };
     let base64 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
@@ -1593,11 +1606,7 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
     Ok(format!(concat!(r#"#!/bin/bash
 exec > >(tee /var/log/superci.log > /dev/console) 2>&1
 "#, bound!(), r#"
-{grow}# As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
-# And the ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) never handed out to the
-# connections the machine opens (Linux hands those out from 32768-60999): one found its port taken now and then.
-sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 net.ipv4.ip_local_reserved_ports=50000-59999||:
-# Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
+{grow}{settings}# Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
 # beside the runner, not at a job's first use of it (services, container jobs, docker steps).
 usermod -aG docker runner 2>/dev/null||:
 # Docker pulls sixteen of an image's layers at once (three unless told): a stack of many images (a local Supabase's
@@ -1609,7 +1618,7 @@ f=/etc/docker/daemon.json;[ -e $f ]||echo {{}}>$f;jq '.["max-concurrent-download
 find /home/runner/bin -type f -print0 2>/dev/null|xargs -0 -r -P 64 -n 16 cat &>/dev/null
 {wait}{hook}cd /home/runner && sudo -u runner -H {run} --jitconfig {jit_config}
 poweroff
-"#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1,
+"#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1, settings = KERNEL_SETTINGS,
         reach = if fail.is_some() { String::new() } else { reach_github(&runner_hosts(jit_config)) },
         wait = if fail.is_some() || runner_hosts(jit_config).is_empty() { "" } else { "wait $g\n" },
         // (Not for the runner that only says why a job failed: it uses no disk.)
@@ -1858,6 +1867,12 @@ mod tests {
         let grow = r#"growpart "/dev/$disk" "$part" || true; resize2fs "$root" 2>/dev/null || xfs_growfs / 2>/dev/null || true"#;
         assert!(script.contains(grow) && script.find("growpart").unwrap() < script.find("./run.sh").unwrap(), "{script}");
         assert!(gl.contains(grow) && gl.find("growpart").unwrap() < gl.find("export GL_URL=").unwrap(), "{gl}");
+        // The kernel's settings, before Docker restarts and before the runner (GitHub's) or GitLab's runner starts,
+        // kept in /etc/sysctl.d: among them, a container's processes may signal each other (moby/moby#54099).
+        let settings = "kernel.apparmor_restrict_unprivileged_unconfined=0";
+        assert!(script.contains(settings) && script.find(settings).unwrap() < script.find("systemctl restart docker").unwrap() && script.find(settings).unwrap() < script.find("./run.sh").unwrap(), "{script}");
+        assert!(gl.contains(settings) && gl.find(settings).unwrap() < gl.find("export GL_URL=").unwrap(), "{gl}");
+        assert!(compact(&script).contains("sysctl -eqp /etc/sysctl.d/99-superci.conf||:\n") && script.contains(">/etc/sysctl.d/99-superci.conf\n"));
         let win = runner_user_data_for(&gh("abc"), 70, "windows", None).unwrap();
         assert!(win.contains("Resize-Partition -DriveLetter C -Size $max") && win.find("Resize-Partition").unwrap() < win.find("run.cmd --jitconfig").unwrap(), "{win}");
         // (The runner that only says why a job failed uses no disk.)
