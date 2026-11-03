@@ -973,6 +973,11 @@ const BILLS_AT_ONCE: usize = 64;
 /// each once. Its status says them, so the dashboard does, before the cloud stops taking it.
 pub const CLOUD_SAYS_KEY: &str = "cloud:says";
 
+/// Where the control plane notes, by kind of image (`ubuntu26-full-x64`), that its maker has deleted the build this
+/// version pins and jobs boot the oldest newer one: `{"kind", "pinned", "used", "version"}`. Its status says the ones
+/// of its own version, so the dashboard asks for an update (which brings a newer pin).
+const IMAGE_LEFT: &str = "image:left:";
+
 /// Where the control plane notes a spot pool (a machine type in a zone of a region) that had no machine or took one
 /// back, with when: the next jobs ask the other pools first.
 fn pool_key(account: &str, region: &str, kind: &str, zone: &str) -> String { format!("{}pool:{region}:{kind}:{zone}", aws_notes(account)) }
@@ -2166,6 +2171,9 @@ impl<'a> ControlPlane<'a> {
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // (What a cloud said beside its answers: a client release it will stop taking.)
             "cloud_says": self.store.get(CLOUD_SAYS_KEY).await.ok().flatten().and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_else(|| serde_json::json!([])),
+            // Kinds of image whose pinned build its maker deleted, with the one jobs boot instead (see `IMAGE_LEFT`).
+            "images_left": self.store.list(IMAGE_LEFT).await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok())
+                .filter(|v| v["version"] == VERSION).collect::<Vec<_>>(),
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
             "active": live.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
             // What the clouds and code hosts allow it (see permissions.rs): what the App asks for (each installation's
@@ -2654,7 +2662,15 @@ impl<'a> ControlPlane<'a> {
             else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base };
         let key = format!("{region}/{pattern}");
         if let Some((image, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| *until > now) { return Ok(image.clone()) }
-        let (id, gb) = aws::latest_image_sized(self.http, region, creds, &self.config.image_owner, &pattern, now).await?;
+        // The build this version pins; once its maker has deleted it, the oldest newer one, noted for the status.
+        let kind = aws::image_flavor(&pattern);
+        let pinned = aws::pinned_build(kind);
+        let (id, gb, instead) = aws::image_for(self.http, region, creds, &self.config.image_owner, &pattern, pinned, now).await?;
+        let note = format!("{IMAGE_LEFT}{kind}");
+        let _ = match (instead, pinned) {
+            (Some(used), Some(pinned)) => self.store.put(&note, serde_json::json!({ "kind": kind, "pinned": pinned, "used": used, "version": VERSION }).to_string()).await,
+            _ => self.store.delete(&note).await,
+        };
         self.cache.image.borrow_mut().insert(key, ((id.clone(), gb), now + 6 * 3_600_000));
         Ok((id, gb))
     }

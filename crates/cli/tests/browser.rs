@@ -1621,7 +1621,7 @@ fn an_accounts_copy_of_an_older_build_is_said_once_looked_at_and_the_newer_one_c
     account.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000"), ("ca-central-1", "us-east-1")]);
     let (mut child, link) = common::dashboard(&home);
     let copied = || account.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("us-east-1"))).count();
-    until("the copy said as behind", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Your copy in N. Virginia is the build of 1 January 2025. Its maker has one of"));
+    until("the copy said as behind", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Your copy in N. Virginia is the build of 1 January 2025. This SuperCI uses the build of"));
     let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
     assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 1, "{status} {to} {} {}", common::words(&said), copied());
     let _ = child.kill();
@@ -1819,7 +1819,7 @@ fn a_newer_image_asked_for_where_the_copy_is_the_newest_copies_nothing() {
     until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("N. Virginia"));
     let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
     assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 0, "{status} {to} {} {}", common::words(&said), copied());
-    assert!(!common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Its maker has one of"));
+    assert!(!common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("This SuperCI uses the build of"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
     let account = superci_testkit::Aws::serve();
@@ -1828,7 +1828,7 @@ fn a_newer_image_asked_for_where_the_copy_is_the_newest_copies_nothing() {
     let (mut child, link) = common::dashboard(&home);
     until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("N. Virginia"));
     let page = common::words(&common::part(&link, "/?p=plane&fragment=1").1);
-    assert!(!page.contains("Its maker has one of"), "{page}");
+    assert!(!page.contains("This SuperCI uses the build of"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

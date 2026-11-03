@@ -531,9 +531,10 @@ pub fn region_ready(creds: &Credentials, region: &str) -> Result<()> {
 /// Where the image's maker lists each build's images, by region (public, read with no sign-in).
 pub const IMAGE_LIST: &str = "https://api.github.com/repos/runs-on/runner-images-for-aws/releases?per_page=12";
 
-/// The newest build of the kind of image jobs run on, as its maker lists it: the build's stamp, and the image's id
-/// in each region it is published in. This is how a copy learns its source from an account that can ask no other
-/// region.
+/// The build of the kind of image jobs run on that a copy is made of, as its maker lists it: the build's stamp, and the
+/// image's id in each region it is published in. This is how a copy learns its source from an account that can ask no
+/// other region. The release this version pins (`aws::IMAGE_RELEASE`); once it is no longer listed, the oldest newer
+/// one listed, as jobs take where the image is published (`aws::pick_image`); with none newer, the newest.
 pub fn published_image<H: Http>(http: &H) -> Result<(String, Vec<(String, String)>)> {
     let config = superci_core::plane::Config::new(String::new());
     let flavor = aws::image_flavor(&config.image_name).to_string();
@@ -541,12 +542,15 @@ pub fn published_image<H: Http>(http: &H) -> Result<(String, Vec<(String, String
     let answer = futures::executor::block_on(http.send(request)).map_err(|e| format!("The list of runner images could not be read from GitHub: {e}"))?;
     if answer.status != 200 { return Err(format!("The list of runner images could not be read from GitHub (it answered {}).", answer.status)) }
     let releases: serde_json::Value = serde_json::from_slice(&answer.body).map_err(|e| format!("The list of runner images from GitHub could not be read: {e}"))?;
-    releases.as_array().into_iter().flatten().find_map(|r| {
+    // (Newest first, as GitHub lists them.)
+    let listed: Vec<(String, Vec<(String, String)>)> = releases.as_array().into_iter().flatten().filter_map(|r| {
         let published = aws::published_images(r["body"].as_str()?, &flavor);
         let tag = r["tag_name"].as_str()?;
         let stamp = tag.rsplit('-').next().unwrap_or(tag).to_string();
         (!published.is_empty() && stamp.len() >= 8 && stamp.bytes().all(|b| b.is_ascii_digit())).then_some((stamp, published))
-    }).ok_or_else(|| format!("The maker's list of runner images has no {flavor} image now. Name one yourself: --from=REGION:ami-…"))
+    }).collect();
+    let pinned = listed.iter().find(|(stamp, _)| stamp == aws::IMAGE_RELEASE).or_else(|| listed.iter().rfind(|(stamp, _)| stamp.as_str() > aws::IMAGE_RELEASE));
+    pinned.or(listed.first()).cloned().ok_or_else(|| format!("The maker's list of runner images has no {flavor} image now. Name one yourself: --from=REGION:ami-…"))
 }
 
 /// The name a copy of the image gets: the name its maker's images have, with the build's stamp, so that it is found
@@ -587,8 +591,7 @@ pub fn delete_copied_images(creds: &Credentials, region: &str) -> Result<usize> 
     Ok(copies.len())
 }
 
-/// The build an image is of, from the end of its name (`…-x64-20261006080949`); empty when it has none.
-pub fn build_of(name: &str) -> &str { name.rsplit('-').next().filter(|s| s.len() == 14 && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default() }
+pub use superci_core::aws::build_of;
 
 /// The build the account's copies hold, when its maker has a newer one out (the image is rebuilt every week or two,
 /// and a copy stays what it was): the newest build among the copies.
@@ -606,11 +609,12 @@ pub fn build_day(stamp: &str) -> String {
     }
 }
 
-/// The newest build last read, and when.
+/// The build to copy last read, and when.
 static NEWEST: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
 
-/// The newest build its maker lists (asked at most every six hours: the list is GitHub's, read with no sign-in).
-pub fn newest_build() -> Option<String> {
+/// The build a copy is made of (see `published_image`), as its maker lists it (asked at most every six hours: the list
+/// is GitHub's, read with no sign-in).
+pub fn build_to_copy() -> Option<String> {
     let mut known = NEWEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, stamp)) = known.as_ref().filter(|(at, _)| now_ms() < at + 6 * 3_600_000) { let _ = at; return Some(stamp.clone()) }
     let stamp = published_image(&Blocking::new()).ok()?.0;
@@ -993,7 +997,7 @@ mod answers {
     /// The maker's list of builds: not JSON, or with no build of the image, is said as that; a build without its
     /// notes or its tag is passed over.
     #[test]
-    fn the_makers_list_is_read_for_the_newest_build_of_the_image() {
+    fn the_makers_list_is_read_for_the_build_to_copy_of_the_image() {
         let listed = |status: u16, body: &str| Replay::of(&serde_json::json!({ "method": "GET", "url": IMAGE_LIST, "target": "", "asked": "", "status": status, "answer": body }).to_string());
         assert!(published_image(&listed(200, "not json")).unwrap_err().starts_with("The list of runner images from GitHub could not be read"));
         assert!(published_image(&listed(200, "[]")).unwrap_err().starts_with("The maker's list of runner images has no ubuntu24-full-x64 image now"));
@@ -1004,11 +1008,11 @@ mod answers {
 
     /// The newest build: not known while GitHub does not answer; once read, kept for six hours.
     #[test]
-    fn the_newest_build_is_kept_once_read() {
+    fn the_build_to_copy_is_kept_once_read() {
         *NEWEST.lock().unwrap() = None;
-        with(&clouds::closed(), || assert_eq!(newest_build(), None));
-        with(&clouds::serve(|_, _, _| answer(200, &releases("eu-west-1"))), || assert_eq!(newest_build().as_deref(), Some("20261006080949")));
-        with(&clouds::closed(), || assert_eq!(newest_build().as_deref(), Some("20261006080949")));
+        with(&clouds::closed(), || assert_eq!(build_to_copy(), None));
+        with(&clouds::serve(|_, _, _| answer(200, &releases("eu-west-1"))), || assert_eq!(build_to_copy().as_deref(), Some("20261006080949")));
+        with(&clouds::closed(), || assert_eq!(build_to_copy().as_deref(), Some("20261006080949")));
     }
 
     #[test]

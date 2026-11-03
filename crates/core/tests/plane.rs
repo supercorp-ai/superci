@@ -924,6 +924,60 @@ impl Http for Renamed {
     }
 }
 
+/// The fake clouds, where the maker lists these builds of Ubuntu 24.04 (x64) in us-east-1: (id, its name's stamp).
+struct Builds { clouds: FakeClouds, listed: std::cell::RefCell<Vec<(&'static str, String)>> }
+#[async_trait(?Send)]
+impl Http for Builds {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if r.url == "https://ec2.us-east-1.amazonaws.com/" && body.contains("Action=DescribeImages") {
+            self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
+            // (Each made the day its stamp says, as the maker's are.)
+            let items: String = self.listed.borrow().iter().map(|(id, stamp)| format!("<item><imageId>{id}</imageId><name>runs-on-v2.2-ubuntu24-full-x64-{stamp}</name><creationDate>{}-{}-{}T15:22:16.000Z</creationDate></item>", &stamp[0..4], &stamp[4..6], &stamp[6..8])).collect();
+            return Ok(Response::new(200, "text/xml", format!("<imagesSet>{items}</imagesSet>")));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+/// Jobs boot the build of the image this version pins, never a newer one as it comes out. Once the maker has deleted
+/// the pinned build (it keeps a kind's last three), they boot the oldest newer one, and the status says so for the
+/// dashboard to ask for an update; a note of another version's is not said, and one whose pin is back goes.
+#[test]
+fn jobs_boot_the_pinned_build_and_the_oldest_newer_one_once_it_is_gone() {
+    let pinned = superci_core::aws::pinned_build("ubuntu24-full-x64").unwrap().to_string();
+    let (older, newer, newest) = ("20250101000000".to_string(), format!("{}9", &pinned[..13]), "29991231235959".to_string());
+    assert!(newer > pinned && newest > newer && older < pinned);
+    let store = Mem::default();
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let wakes = Wakes::default();
+    // Each round as a control plane just started: nothing of the image kept from the round before.
+    let round = |listed: Vec<(&'static str, String)>, job_id: u64| {
+        let (clouds, cache) = (Builds { clouds: FakeClouds::default(), listed: listed.into() }, Cache::default());
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(labelled("queued", job_id, "acme/app", None, "superci")));
+        let image = launches(&clouds.clouds).last().map(|l| field(l, "ImageId")).unwrap_or_default();
+        let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+        (image, status["images_left"].clone())
+    };
+    // The pinned build, between an older one and two newer: the pinned one.
+    assert_eq!(round(vec![("ami-older", older.clone()), ("ami-pinned", pinned.clone()), ("ami-newer", newer.clone()), ("ami-newest", newest.clone())], 1), ("ami-pinned".into(), serde_json::json!([])));
+    // Deleted by its maker: the oldest of the newer ones, said with the build pinned.
+    let (image, left) = round(vec![("ami-newest", newest.clone()), ("ami-older", older.clone()), ("ami-newer", newer.clone())], 2);
+    assert_eq!(image, "ami-newer");
+    assert_eq!(left, serde_json::json!([{ "kind": "ubuntu24-full-x64", "pinned": pinned, "used": newer, "version": superci_core::plane::VERSION }]));
+    // Only older ones left (a copy of an older build where the maker publishes none): the newest of them, nothing said.
+    assert_eq!(round(vec![("ami-older", older.clone()), ("ami-oldest", "20240101000000".into())], 3), ("ami-older".into(), serde_json::json!([])));
+    // A note an earlier version kept is not this version's to say; one whose pinned build is there again goes.
+    store.0.borrow_mut().insert("image:left:ubuntu26-full-x64".into(), serde_json::json!({ "kind": "ubuntu26-full-x64", "pinned": "1", "used": "2", "version": "0.1.0" }).to_string());
+    assert_eq!(round(vec![("ami-pinned", pinned.clone())], 4), ("ami-pinned".into(), serde_json::json!([])));
+    assert!(store.0.borrow().contains_key("image:left:ubuntu26-full-x64") && !store.0.borrow().contains_key("image:left:ubuntu24-full-x64"));
+}
+
 #[test]
 fn an_app_renamed_on_github_is_known_by_its_new_address() {
     let (store, clouds, wakes, cache) = (Mem::default(), Renamed { clouds: FakeClouds::default() }, Wakes::default(), Cache::default());
@@ -7517,6 +7571,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_runner_that_takes_a_job_whose_machine_failed_leaves_its_own_job_a_new_machine,
         how_a_job_itself_ended_is_kept_apart_from_whether_a_machine_ran_it,
         an_app_renamed_on_github_is_known_by_its_new_address,
+        jobs_boot_the_pinned_build_and_the_oldest_newer_one_once_it_is_gone,
         a_machine_type_the_region_does_not_have_is_not_asked_for_with_every_job,
         a_machine_refused_by_the_accounts_own_budget_is_said_as_that_and_is_no_missing_permission,
         an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission,

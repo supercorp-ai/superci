@@ -101,6 +101,12 @@ impl PlaneView {
         self.status.as_ref().and_then(|s| s["cloud_says"].as_array().cloned()).unwrap_or_default().iter()
             .filter_map(|c| Some((superci_core::plane::cloud_name(c["cloud"].as_str()?).to_string(), c["said"].as_str()?.to_string()))).collect()
     }
+    /// The kinds of image whose build this version pins its maker has deleted, with the build jobs boot instead (the
+    /// oldest newer one): `ubuntu26-full-x64`, `20261120081426`.
+    pub fn images_left(&self) -> Vec<(String, String)> {
+        self.status.as_ref().and_then(|s| s["images_left"].as_array().cloned()).unwrap_or_default().iter()
+            .filter_map(|i| Some((i["kind"].as_str()?.to_string(), i["used"].as_str()?.to_string()))).collect()
+    }
     /// When AWS last refused a machine by its budget's rule, if it has.
     pub fn budget_stopped_ms(&self) -> Option<u64> { self.status.as_ref().and_then(|s| s["aws_budget_stopped_ms"].as_u64()) }
     /// Whether this control plane keeps a limit for the whole CI and for a cloud account (one from before does not).
@@ -295,4 +301,17 @@ mod tests {
 /// The further accounts and runners a control plane's status says (one from before them: none).
 pub fn records_in(status: &Value) -> superci_core::plane::Records {
     serde_json::from_value(serde_json::json!({ "accounts": status["accounts"], "runners": status["runners"] })).unwrap_or_default()
+}
+
+/// A kind of image as people say it: `ubuntu26-full-x64` is Ubuntu 26.04 (x64), `ubuntu24-gpu-x64` Ubuntu 24.04 with
+/// GPUs, `windows25-full-x64` Windows Server 2025.
+pub fn image_kind_name(kind: &str) -> String {
+    let mut parts = kind.split('-');
+    let (os, flavor, arch) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+    match os.strip_prefix("ubuntu") {
+        Some(v) if v.len() == 2 && flavor == "gpu" => format!("Ubuntu {v}.04 with GPUs"),
+        Some(v) if v.len() == 2 => format!("Ubuntu {v}.04 ({arch})"),
+        _ if os == "windows25" => "Windows Server 2025".to_string(),
+        _ => kind.to_string(),
+    }
 }

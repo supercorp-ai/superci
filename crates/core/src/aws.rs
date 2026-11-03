@@ -237,21 +237,59 @@ pub fn runner_policy(account_id: &str, plane_id: &str) -> serde_json::Value { cr
 
 /// The newest image of an owner matching a name pattern (RunsOn's public GitHub-compatible Ubuntu 24.04 by default).
 pub async fn latest_image(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, now_ms: u64) -> Result<String> {
-    latest_image_sized(http, region, creds, owner, name, now_ms).await.map(|(id, _)| id)
+    image_for(http, region, creds, owner, name, None, now_ms).await.map(|(id, ..)| id)
 }
 
-/// The newest image of an owner (or the account's own) matching a name pattern, and the size of its disk (a
-/// machine's may not be smaller).
-pub async fn latest_image_sized(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, now_ms: u64) -> Result<(String, u32)> {
+/// The build of each kind of image this version of SuperCI boots: the stamp its maker's image names end with
+/// (`runs-on-v2.2-ubuntu26-full-x64-20261102081426`). A build is never taken as it comes out: the maker's Ubuntu
+/// 26.04 build of 2 November 2026 came with a kernel under which every signal inside a container was denied, on every
+/// job at once. A release moves these to builds its own jobs ran on. The newest of a kind:
+/// `aws ec2 describe-images --region us-east-1 --owners 135269210855 --filters Name=name,Values=runs-on-v2.2-KIND-*`.
+pub const IMAGE_BUILDS: [(&str, &str); 7] = [
+    ("ubuntu24-full-x64", "20261102081424"), ("ubuntu24-full-arm64", "20261102081430"),
+    ("ubuntu26-full-x64", "20261102081426"), ("ubuntu26-full-arm64", "20261102081425"),
+    ("ubuntu24-gpu-x64", "20261022130417"), ("ubuntu26-gpu-x64", "20260821141648"), ("windows25-full-x64", "20261022175853"),
+];
+
+/// The maker's release of the pinned Ubuntu 24.04 build (the stamp of its tag, `linux-20261102081230`, a little before
+/// its images' own): where a copy into a region the maker does not publish in comes from.
+pub const IMAGE_RELEASE: &str = "20261102081230";
+
+/// The build this version boots of a kind of image (`ubuntu26-full-x64`; see `image_flavor`), when it pins one.
+pub fn pinned_build(kind: &str) -> Option<&'static str> { IMAGE_BUILDS.iter().find(|(k, _)| *k == kind).map(|(_, b)| *b) }
+
+/// The build an image is of, from the end of its name (`…-x64-20261006080949`); empty when it has none.
+pub fn build_of(name: &str) -> &str { name.rsplit('-').next().filter(|s| s.len() == 14 && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default() }
+
+/// An image as DescribeImages lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed { pub created: String, pub id: String, pub gb: u32, pub name: String }
+
+/// Of a kind's images in a region, the one jobs boot: the pinned build. Once its maker has deleted it (it keeps a
+/// kind's last three builds, a month or so), the oldest of the newer ones left: out the longest, so a fault in it has
+/// been met by others first; that build is said with it. With none newer (no pin; a copy of an older build in a region
+/// the maker does not publish in), the newest.
+pub fn pick_image<'a>(images: &'a [Listed], pinned: Option<&str>) -> Option<(&'a Listed, Option<&'a str>)> {
+    let newest = || images.iter().max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id))).map(|i| (i, None));
+    let Some(pin) = pinned else { return newest() };
+    if let Some(i) = images.iter().find(|i| build_of(&i.name) == pin) { return Some((i, None)) }
+    match images.iter().filter(|i| build_of(&i.name) > pin).min_by_key(|i| build_of(&i.name)) {
+        Some(i) => Some((i, Some(build_of(&i.name)))),
+        None => newest(),
+    }
+}
+
+/// The image of an owner (or the account's own) matching a name pattern that jobs boot (see `pick_image`), the size
+/// of its disk (a machine's may not be smaller), and the build taken in the pinned one's place, when it was.
+pub async fn image_for(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, pinned: Option<&str>, now_ms: u64) -> Result<(String, u32, Option<String>)> {
     // (Its owner's, or the account's own copy of it under the same name: a region the image is not published in
     // has it once it is copied there.)
     let xml = ec2(http, region, creds, "DescribeImages", serde_json::json!({ "Owner": [owner, "self"], "Filter": [{ "Name": "name", "Value": [name] }, { "Name": "state", "Value": ["available"] }] }), now_ms).await?;
-    let mut images: Vec<(String, String, u32)> = xml.split("<imageId>").skip(1).filter_map(|chunk| {
-        let id = upto_tag(chunk).to_string();
-        Some((xml_tag(chunk, "creationDate")?.to_string(), id, xml_tag(chunk, "volumeSize").and_then(|v| v.parse().ok()).unwrap_or(0)))
-    }).collect();
-    images.sort();
-    images.pop().map(|(_, id, gb)| (id, gb)).ok_or_else(|| format!("no image {owner}/{name} in {region}"))
+    let images: Vec<Listed> = xml.split("<imageId>").skip(1).filter_map(|chunk| Some(Listed {
+        created: xml_tag(chunk, "creationDate")?.to_string(), id: upto_tag(chunk).to_string(),
+        gb: xml_tag(chunk, "volumeSize").and_then(|v| v.parse().ok()).unwrap_or(0), name: xml_tag(chunk, "name").unwrap_or_default().to_string(),
+    })).collect();
+    pick_image(&images, pinned).map(|(i, instead)| (i.id.clone(), i.gb, instead.map(str::to_string))).ok_or_else(|| format!("no image {owner}/{name} in {region}"))
 }
 
 /// What AWS's spot prices call an operating system.

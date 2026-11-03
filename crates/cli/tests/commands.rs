@@ -830,7 +830,7 @@ fn the_runner_image_is_copied_in_listed_and_removed_as_aws_answered_a_real_copy(
     let said = step(include_str!("../fixtures/aws/images/04-list-there.jsonl"), &["images", "list"]);
     assert!(said.lines().any(|l| l.starts_with("ca-central-1") && l.contains("your copy ami-") && l.contains("runs-on-v2.2-ubuntu24-full-x64-")), "{said}");
     let said = step(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &["images", "update", "ca-central-1"]);
-    assert!(said.contains("Your copy in ca-central-1 is of the newest build"), "{said}");
+    assert!(said.contains("Your copy in ca-central-1 is of the build this SuperCI uses"), "{said}");
     let said = step(include_str!("../fixtures/aws/images/06-delete.jsonl"), &["images", "delete", "ca-central-1", "--confirm"]);
     assert!(said.contains("Removed your copy of the image from ca-central-1, with its storage."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
@@ -1232,9 +1232,9 @@ fn the_accounts_copies_of_the_image_are_said_by_their_builds_and_an_older_one_is
     let (code, listed) = said(&["images", "list"]);
     let line = |region: &str| listed.lines().find(|l| l.starts_with(region)).unwrap_or_default().to_string();
     assert_eq!(code, Some(0), "{listed}");
-    assert!(line("eu-west-2").contains("your copy ami-0a00000000000001 (runs-on-v2.2-ubuntu24-full-x64-20261002111320): the build of 2 October 2026; one of 6 October 2026 is out")
+    assert!(line("eu-west-2").contains("your copy ami-0a00000000000001 (runs-on-v2.2-ubuntu24-full-x64-20261002111320): the build of 2 October 2026; this SuperCI uses the build of 6 October 2026")
         && line("eu-west-2").ends_with("(the copy before it is removed)"), "{listed}");
-    assert!(line("eu-west-1").contains("the build of 2 October 2026; one of 6 October 2026 is out") && !line("eu-west-1").contains("removed"), "{listed}");
+    assert!(line("eu-west-1").contains("the build of 2 October 2026; this SuperCI uses the build of 6 October 2026") && !line("eu-west-1").contains("removed"), "{listed}");
     // (Only the older build is removed, with its snapshot: not those whose names carry none.)
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str().filter(|s| s.contains("DeregisterImage") || s.contains("DeleteSnapshot")).map(str::to_string)).collect();
     assert_eq!(asked, ["Action=DeregisterImage&Version=2016-11-15&ImageId=ami-0a00000000000002", "Action=DeleteSnapshot&Version=2016-11-15&SnapshotId=snap-0a00000000000002"]);

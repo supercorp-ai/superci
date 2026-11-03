@@ -146,8 +146,8 @@ pub struct Dashboard {
     aws_copying: HashMap<String, Vec<String>>,
     /// The AWS accounts being looked at again beside the pages just now (see `look_all`).
     aws_looking: std::collections::HashSet<String>,
-    /// Where an AWS account's own copy of the runner image is of an older build than its maker's newest, by account:
-    /// the region, the build held, the newest, and whether the newest is being copied in.
+    /// Where an AWS account's own copy of the runner image is of an older build than the one this SuperCI uses
+    /// (`aws::build_to_copy`), by account: the region, the build held, that one, and whether it is being copied in.
     aws_behind: HashMap<String, Vec<(String, String, String, bool)>>,
     /// When the rule of an AWS account's budget was last taken off a control plane's role here (by its id): what
     /// the control plane noted before that is no longer so.
@@ -2004,7 +2004,7 @@ impl Dashboard {
         let (usable, without) = (look.usable_regions(), look.regions_without_image());
         if !usable.is_empty() || !without.is_empty() {
             let copying = self.aws_copying.get(&account).cloned().unwrap_or_default();
-            // The account's own copy, of an older build than its maker's newest: said, with copying the new one in.
+            // The account's own copy, of an older build than the one this SuperCI uses: said, with copying that one in.
             let behind = self.aws_behind.get(&account).and_then(|b| b.first()).cloned();
             let being_copied = |r: &&str| copying.iter().any(|c| c == *r);
             let (more, end) = match (&behind, usable.is_empty()) {
@@ -2012,7 +2012,7 @@ impl Dashboard {
                 (_, true) if without.iter().any(being_copied) => ("It is being copied in: about ten minutes.".to_string(), String::new()),
                 (_, true) => (esc("No job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy's storage in your account."), String::new()),
                 (Some((region, _, newest, true)), _) => (esc(&format!("The build of {} is being copied into {}: about ten minutes. Jobs start from your older copy until it is there.", aws::build_day(newest), region_short(region))), String::new()),
-                (Some((region, have, newest, false)), _) => (esc(&format!("Your copy in {} is the build of {}. Its maker has one of {} out.", region_short(region), aws::build_day(have), aws::build_day(newest))),
+                (Some((region, have, newest, false)), _) => (esc(&format!("Your copy in {} is the build of {}. This SuperCI uses the build of {}.", region_short(region), aws::build_day(have), aws::build_day(newest))),
                     format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#, esc(&account), esc(region))),
                 // Where jobs run it is there. A region the account may also use lacks it: nothing is wrong, and it
                 // is copied in at a press by whoever wants jobs there too.
@@ -3245,7 +3245,7 @@ impl Dashboard {
                 // (One copy is enough: with one there or on its way, nothing more is asked for. But for a newer
                 // build, asked for where the copy is of an older one: copied in beside it, which then goes.)
                 let copies = aws::copied_images(&creds, &region)?;
-                let newer = field("newer") == "1" && !copies.iter().any(|c| c.state == "pending") && aws::newest_build().is_some_and(|newest| aws::behind(&copies, &newest).is_some());
+                let newer = field("newer") == "1" && !copies.iter().any(|c| c.state == "pending") && aws::build_to_copy().is_some_and(|newest| aws::behind(&copies, &newest).is_some());
                 if copies.is_empty() || newer {
                     let source = aws::copy_source_for(&region, None)?;
                     aws::copy_image_into(&creds, &region, &source)?;
@@ -4433,7 +4433,12 @@ mark();load()})();</script>"#;
     fn cloud_says_notice(views: &[PlaneView]) -> String {
         let mut said: Vec<(String, String)> = crate::modal::said().into_iter().map(|s| ("Modal".to_string(), s)).collect();
         for c in views.get(view::in_use(views)).map(|v| v.cloud_says()).unwrap_or_default() { if !said.contains(&c) { said.push(c) } }
-        said.iter().map(|(cloud, s)| format!(r#"<div class="notice warn"><span>{} says: “{}” A newer SuperCI answers it: update it, then the control plane.</span><a class="button secondary sm" href="/?p=planes">Control plane</a></div>"#, esc(cloud), esc(s))).collect()
+        let mut html: String = said.iter().map(|(cloud, s)| format!(r#"<div class="notice warn"><span>{} says: “{}” A newer SuperCI answers it: update it, then the control plane.</span><a class="button secondary sm" href="/?p=planes">Control plane</a></div>"#, esc(cloud), esc(s))).collect();
+        // A kind of image whose pinned build its maker deleted: jobs boot a build no SuperCI was tested with.
+        for (kind, used) in views.get(view::in_use(views)).map(|v| v.images_left()).unwrap_or_default() {
+            html.push_str(&format!(r#"<div class="notice warn"><span>RunsOn no longer has the {} image this SuperCI was tested with. Jobs use its oldest one left, of {}. Update SuperCI, then the control plane.</span><a class="button secondary sm" href="/?p=planes">Control plane</a></div>"#, esc(&view::image_kind_name(&kind)), esc(&aws::build_day(&used))));
+        }
+        html
     }
 
     /// A page's live part, with the workspace switcher's rows (see `workspaces_menu`).
@@ -6518,7 +6523,7 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
 }
 
 /// A look at an AWS account with all the pages say of it: what it allows (`aws::look_at`), where a copy of the
-/// runner image is on its way, and where the account's own copy is of an older build than its maker's newest.
+/// runner image is on its way, and where the account's own copy is of an older build than the one this SuperCI uses.
 /// About three seconds of asking AWS.
 fn look_all(creds: &superci_core::aws::Credentials) -> (aws::Look, Vec<String>, Vec<(String, String, String, bool)>) {
     let look = aws::look_at(creds);
@@ -6532,7 +6537,7 @@ fn look_all(creds: &superci_core::aws::Credentials) -> (aws::Look, Vec<String>, 
         let _ = aws::tidy_copies(creds, region);
         let Ok(copies) = aws::copied_images(creds, region) else { continue };
         if copies.is_empty() { continue }
-        let Some(newest) = aws::newest_build() else { break };
+        let Some(newest) = aws::build_to_copy() else { break };
         let have = copies.iter().filter(|c| c.state == "available").map(|c| aws::build_of(&c.name)).max().unwrap_or_default().to_string();
         if !have.is_empty() && have < newest { behind.push((region.to_string(), have, newest.clone(), aws::behind(&copies, &newest).is_none())) }
     }
@@ -8229,11 +8234,11 @@ mod tests {
         preview("plane-aws-management", &own);
         assert!(own.contains("<dt>Organization</dt><dd>o-example001<small>The organization&#39;s management account. A CI is better kept in an account of its own.</small></dd>") && own.contains("Another AWS account</button>"), "{own}");
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
-        // Its copy of the image is of an older build than its maker's newest: said, with copying the new one in;
+        // Its copy of the image is of an older build than the one this SuperCI uses: said, with copying that one in;
         // and while that one is on its way.
         d.aws_behind.insert("111111111111".into(), vec![("eu-north-1".into(), "20261006080949".into(), "20261020070000".into(), false)]);
         let behind = d.plane_page();
-        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. Its maker has one of 20 October 2026 out.</small></dd><span class="acct-do"><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
+        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. This SuperCI uses the build of 20 October 2026 out.</small></dd><span class="acct-do"><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
         d.aws_behind.get_mut("111111111111").unwrap()[0].3 = true;
         let coming = d.plane_page();
         assert!(coming.contains("The build of 20 October 2026 is being copied into Stockholm: about ten minutes. Jobs start from your older copy until it is there.") && !coming.contains("Copy the new one in"), "{coming}");
