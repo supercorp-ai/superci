@@ -11,7 +11,7 @@ const STYLE: &str = r#":root{color-scheme:light;--bg:#f2f1ed;--bg-deep:#e9e8e3;-
 --rule:rgba(16,20,28,.12);--rule-soft:rgba(16,20,28,.07);--accent:#0071e3;--accent-hover:#0062c4;--accent-soft:#e6f0fd;--open:#e0680a;--open-ink:#b44f00;--open-soft:#fbead9;
 --good:#1f8a4c;--good-fill:#2fb35f;--good-soft:#e3f5ea;--bad:#c8321f;--bad-fill:#e5442f;--bad-soft:#fde9e6;--pick-last:#eaf2fd;--sk:#ecebe6;--sk-hi:rgba(255,255,255,.65);
 --shadow:0 1px 2px rgba(16,20,28,.05),0 14px 34px rgba(16,20,28,.07);
---sans:"SF Pro Display",-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;
+--sans:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif;
 --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
 :root[data-theme=dark]{color-scheme:dark;--bg:#0b0b0c;--bg-deep:#050506;--card:#141415;--card-2:#1c1c1e;--ink:#f5f5f7;--muted:#a1a1a6;--faint:#8e8e93;
 --rule:rgba(255,255,255,.15);--rule-soft:rgba(255,255,255,.09);--accent:#2997ff;--accent-hover:#52abff;--accent-soft:rgba(41,151,255,.16);--open:#ff9f0a;--open-ink:#ffb340;--open-soft:rgba(255,159,10,.15);
