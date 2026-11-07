@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.20.2
+## 0.20.2 — 2026-11-07
 - A Modal control plane nobody uses for a week keeps everything it holds. Modal drops a Dict entry after seven days with no read or write of it, and such a control plane reads nothing: its sign-ins and device keys, its settings (the order, accounts and runners), its signing key, a moved control plane's standby mark, and the days' totals and the month's spend that limits count were all lost after an idle week. Once a day it now reads every entry of each of its Dicts, never writing one back. Found by Taras Kornichuk (github.com/artile), who also made the settings it reads at each request be read entry by entry. Update your control plane for it.
 
 ## 0.20.1 — 2026-11-03
