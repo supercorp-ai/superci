@@ -171,6 +171,40 @@ async def read_settings():
     return {k: v for k, v in zip(keys, values) if v is not None}
 
 
+# Modal drops a Dict entry after seven days with no read or write of it (its documentation: "An individual Dict entry
+# will expire after 7 days of inactivity"), and a listing is not said to count. A control plane nobody uses for a week
+# (no job, no request) reads nothing, so once a day every entry of each of its Dicts is read: the settings Dict, the
+# old one and each kind's, found by Modal's own listing (kinds made by an earlier version too). Read only, never
+# written back, so what is taken out meanwhile stays out. Records with an end still go at their end (`expire`).
+KEEP_ALIVE_EVERY = 24 * 3600
+KEEP_ALIVE_SIDE_BY_SIDE = 32
+
+
+def ours(name):
+    return name in (f"{NAME}-state", f"{NAME}-settings") or name.startswith(f"{NAME}-k-")
+
+
+async def keep_alive():
+    """Reads every entry of this control plane's Dicts when a day has passed since the last time; how many it read."""
+    last = await state.get.aio("__kept_alive_at")
+    if last is not None and time.time() - float(last) < KEEP_ALIVE_EVERY:
+        return 0
+    side_by_side = asyncio.Semaphore(KEEP_ALIVE_SIDE_BY_SIDE)
+
+    async def read(d, k):
+        async with side_by_side:
+            await d.get.aio(k)
+
+    read_now = 0
+    for d in await modal.Dict.objects.list.aio():
+        if ours(d.name):
+            keys = [k async for k in d.keys.aio()]
+            await asyncio.gather(*(read(d, k) for k in keys))
+            read_now += len(keys)
+    await state.put.aio("__kept_alive_at", str(time.time()))
+    return read_now
+
+
 # How many messages a container answers side by side: each by a control plane program of its own, as AWS's Lambda
 # answers its requests (each store operation atomic in itself; the upkeep already runs in a container of its own).
 SIDE_BY_SIDE = 8
@@ -462,8 +496,11 @@ async def sweep():
     """Has the control plane's sweep run when one is due (it asks for the next one itself): in the web container, where
     every request is answered, so the sweep's writes and the requests' are never made side by side by two containers
     (a Dict has no write over what was read). Not answered there: asked again at the next minute."""
-    # An idle CI still needs its credentials, pools and image aliases next week.
-    await read_settings()
+    # An idle CI still needs everything it keeps next week (see `keep_alive`).
+    try:
+        await keep_alive()
+    except Exception as e:
+        print(f"superci: its records were not kept alive ({e}): tried again in a minute")
     due = await state.get.aio("__wake_at")
     if due is None or due > time.time() * 1000:
         return
