@@ -740,16 +740,31 @@ mod tests {
         assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane store"), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
-    /// Settings stay alive through point reads, including an idle scheduled sweep.
-    #[test]
-    fn modal_settings_stay_alive_without_pending_jobs() {
+    /// A fixture run against modal_plane.py with the shared stand-ins for Modal (fixtures/modal/harness.py: Dicts that
+    /// keep Modal's rules, on a clock the fixture moves): it ends saying `said`. Checked with Python, which CI has: there
+    /// a missing Python fails, where elsewhere it skips.
+    fn fixture(lines: &str, said: &str) {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/settings-retention.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-        let Ok(mut python) = python else { return };
+        let source = format!("{}{lines}", include_str!("../fixtures/modal/harness.py"));
+        let python = Command::new("python3").args(["-I", "-c", &source]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let Ok(mut python) = python else { assert!(std::env::var_os("CI").is_none(), "CI has no python3 for the Modal fixtures"); return };
         python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
         let out = python.wait_with_output().unwrap();
-        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok settings retention"), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(said), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Settings stay alive through point reads, including an idle scheduled sweep (by Taras Kornichuk, #22).
+    #[test]
+    fn modal_settings_stay_alive_without_pending_jobs() {
+        fixture(include_str!("../fixtures/modal/settings-retention.py"), "ok settings retention");
+    }
+
+    /// A Modal control plane left alone for eight days keeps everything: Modal drops a Dict entry after seven days with
+    /// no read or write of it, so each entry of its Dicts is read once a day (see fixtures/modal/idle-week.py).
+    #[test]
+    fn a_modal_control_plane_left_alone_for_eight_days_keeps_everything() {
+        fixture(include_str!("../fixtures/modal/idle-week.py"), "ok idle week");
     }
 
     /// A Modal control plane's records with their ends, kept by plane.py as the control plane's `io::Ending` keeps them,
