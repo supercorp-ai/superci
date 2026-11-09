@@ -10223,6 +10223,34 @@ fn the_changelog_says_what_updating_asks_for_and_nothing_of_a_control_plane_that
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane whose spot machines start in two regions, each allowing 300 spot CPUs: its page, opened first (no
+/// Runners page before it), says 600 at once across both, and each region's own 300.
+#[test]
+fn the_control_plane_page_adds_up_the_spot_cpus_of_each_region_its_spot_machines_start_in() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/AWS_REGIONS"), r#"["us-east-1","us-east-2"]"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","regions":["us-east-1","us-east-2"]},{"cloud":"aws-on-demand","regions":["us-east-1"]}]}"#);
+    for region in ["us-east-1", "us-east-2"] {
+        served.aws.fail(&format!("ServiceQuotasV20190624.GetServiceQuota|servicequotas.{region}"), 200, r#"{"Quota":{"QuotaCode":"L-34B43A08","ServiceCode":"ec2","Value":300.0}}"#, None);
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let page = loop {
+        let page = common::words(&common::part(&link, "/?p=plane&fragment=1").1);
+        if page.contains("600 spot") { break page }
+        assert!(std::time::Instant::now() < end, "{page}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    };
+    assert!(page.contains("150 jobs of the default size at a time on spot, across N. Virginia, Ohio"), "{page}");
+    assert!(page.contains("Ohio us-east-2") && page.matches("300 spot CPUs").count() == 2, "each region's own: {page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn aws_spot_in_one_region_far_from_github_with_few_cpus_and_refused_by_the_role_is_said_in_its_settings() {
     let served = serve(|c| {

@@ -4268,10 +4268,11 @@ mark();load()})();</script>"#;
                 }
                 return format!(r#"<div class="bar"><h1 class="page-title">Could not reach your cloud</h1></div><div class="cards"><section class="card">{}</section></div>"#, empty_state(&icon("lock"), "Your cloud did not answer", &e, r#"<a class="button" href="">Try again</a>"#))
             }
-            // The AWS pages say what the account may run in each region: asked again after ten minutes.
+            // The AWS pages say what the account may run in each region: asked again after ten minutes. The control
+            // plane's page too: its account's spot CPUs at once are the sum of each region its spot machines start in.
             let account = d.aws.as_ref().map(|a| a.account_id.clone());
             let stale = account.as_ref().is_some_and(|a| d.quotas_for.as_ref().is_none_or(|(b, at)| b != a || now_ms() > at + 600_000));
-            let quota_creds = if stale && ["add-runners", "runners", "planes"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
+            let quota_creds = if stale && ["add-runners", "runners", "planes", "plane"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
             // Where a control plane or runners are set up: what the account in hand allows (its regions, spot).
             // Not looked at yet: the page waits for the look (there is nothing to show of the account before it).
             // Looked at more than twenty seconds ago: looked at again beside the page, each time such a page is
