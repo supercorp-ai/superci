@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.20.3
+## 0.20.3 — 2026-11-09
 - The control plane's page says how many spot CPUs its account may run at once across every region its spot machines start in (300 in N. Virginia and 300 in Ohio: 600, 150 jobs of the default size), and each region's own. Opened before the Runners page, it knew only its home region's and said that alone.
 
 ## 0.20.2 — 2026-11-07
