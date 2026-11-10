@@ -5393,7 +5393,10 @@ mark();load()})();</script>"#;
     /// Deletes a control plane from its cloud, and the launchers and AWS role made for it in other clouds (those
     /// this session is signed in to). Returns what could not be removed, in words.
     fn delete_plane(&mut self, plane: &Plane, status: &serde_json::Value) -> Result<Vec<String>> {
-        self.own().check(plane)?;
+        // (A Modal control plane in any workspace signed in to is deleted with that workspace's sign-in: one moved
+        // away from, in the workspace SuperCI was signed in to first, or one set up beside it.)
+        let modal_session = match plane { Plane::Modal { workspace, .. } => self.modal_for(workspace).cloned(), _ => None };
+        if modal_session.is_none() { self.own().check(plane)?; }
         let mut left = vec![];
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_plane(account_id, script, plane.plane_id())?,
@@ -5404,7 +5407,7 @@ mark();load()})();</script>"#;
                 aws_plane::delete(&creds, region, plane_id)?;
                 if let Err(e) = aws::delete_networks(&creds, plane_id, &REGIONS) { left.push(format!("Its machines' network in AWS ({e}).")) }
             }
-            Plane::Modal { plane_id, .. } => modal::delete_plane(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id)?,
+            Plane::Modal { plane_id, .. } => modal::delete_plane(modal_session.as_ref().or(self.modal.as_ref()).ok_or("Sign in with Modal first.")?, plane_id)?,
             Plane::Seen { .. } => return Err("Sign in where this control plane runs to delete it.".into()),
         }
         let records = view::records_in(&status);
@@ -10385,6 +10388,13 @@ mod rest_tests {
         assert_eq!(send(&mut d, "/plane/delete", &[("plane", "p4")]).err().as_deref(), Some("Sign in with AWS first."));
         d.modal = Some(modal_session("globex"));
         assert!(send(&mut d, "/plane/delete", &[("plane", "p2")]).unwrap_err().contains("the Modal workspace acme"));
+        // Signed in to its workspace too (`superci login modal --add`), as after a move between workspaces: deleted
+        // with that sign-in (Modal is not reached here, so it stops there), not refused.
+        d.modal_others = vec![modal_session("acme")];
+        crate::aws::clouds::with(&crate::aws::clouds::closed(), || {
+            let said = send(&mut d, "/plane/delete", &[("plane", "p2")]).err().unwrap_or_default();
+            assert!(!said.contains("the Modal workspace acme") && !said.contains("Sign in with Modal first"), "{said}");
+        });
     }
 
     #[test]
