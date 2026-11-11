@@ -2086,7 +2086,8 @@ impl Dashboard {
         match plane {
             Plane::Aws { account_id, .. } => self.aws.iter().chain(self.aws_others.iter()).any(|a| &a.account_id == account_id),
             Plane::Cloudflare { .. } => self.cf.is_some(),
-            Plane::Modal { workspace, .. } => self.modal_for(workspace).is_some(),
+            // (Signed in to Modal at all: one of another workspace is said by `Own::check`, with which.)
+            Plane::Modal { .. } => self.modal.is_some() || !self.modal_others.is_empty(),
             Plane::Seen { .. } => false,
         }
     }
@@ -9250,7 +9251,10 @@ mod tests {
         // Selecting a control plane takes its own account's sign-in in hand: what is written is written with that one.
         d.planes = vec![aws("aaaaaaaaaaaa", "111111111111"), aws("bbbbbbbbbbbb", "222222222222")];
         d.select(0);
-        assert!(d.aws.as_ref().unwrap().account_id == "111111111111" && d.own().check(&d.planes[0]).is_ok() && d.own().check(&d.planes[1]).is_err());
+        // (Each signed-in account's control plane may be changed whichever is in hand, with its own sign-in; one of an
+        // account not signed in to may not.)
+        assert!(d.aws.as_ref().unwrap().account_id == "111111111111" && d.own().check(&d.planes[0]).is_ok() && d.own().check(&d.planes[1]).is_ok());
+        assert!(d.own().check(&aws("cccccccccccc", "333333333333")).unwrap_err().contains("SuperCI is signed in to 111111111111, 222222222222"));
         d.select(1);
         assert!(d.aws.as_ref().unwrap().account_id == "222222222222" && d.own().check(&d.planes[1]).is_ok());
         assert!(d.hold_account("111111111111") && !d.hold_account("333333333333") && d.aws_accounts().len() == 2);
