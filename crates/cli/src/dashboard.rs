@@ -10017,7 +10017,7 @@ mod tests {
         assert_eq!(cf_runners_account(&aws_plane, &st, &both[..1], |_| None), Some("a1".to_string()));
         // A Cloudflare control plane's own; or as its records say.
         assert_eq!(cf_runners_account(&cf, &st, &both, |_| None), Some("a2".to_string()));
-        let recorded = serde_json::json!({ "launchers": [], "accounts": [{ "name": "cloudflare", "provider": "cloudflare", "cloud_id": "a2" }], "settings": true });
+        let recorded = serde_json::json!({ "launchers": [], "accounts": [{ "name": "cloudflare", "provider": "cloudflare", "cloud_id": "a2" }], "runners": [], "settings": true });
         assert_eq!(cf_runners_account(&aws_plane, &recorded, &both, |_| None), Some("a2".to_string()));
     }
 
