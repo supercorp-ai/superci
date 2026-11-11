@@ -165,6 +165,11 @@ fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_
     replay("02-deploy-modal");
     let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
     assert!(ok && said.contains("acme-two--superci-plane-mdplane00002.modal.run"), "{said}");
+    // (Modal listing the workspace's apps as it listed them after a real deploy: the new control plane's among them.)
+    served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    // A control plane not known here is refused by its id, never the one in use updated in its place.
+    let (ok, said) = run(&["planes", "update", "nosuchplane1"]);
+    assert!(!ok && said.contains("That control plane is not known here"), "{said}");
     // Updated by its id, the CI's own still in use (its AWS runners' role in the CI's AWS account too, as AWS answered
     // a real update).
     replay("02-deploy-modal");

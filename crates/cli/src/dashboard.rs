@@ -3478,7 +3478,12 @@ impl Dashboard {
                 let which = field("plane");
                 // Updating another one does not make it the one that later pages and commands act on.
                 let was = self.selected;
-                if let Some(i) = self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) { self.select(i) }
+                // (One named that is not known here is refused: never the one in use in its place.)
+                match self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) {
+                    Some(i) => self.select(i),
+                    None if !which.is_empty() => return Err("That control plane is not known here: its id is in `superci planes list`.".into()),
+                    None => {}
+                }
                 let plane = self.plane();
                 self.selected = was;
                 let plane = plane?;
