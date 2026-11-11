@@ -117,6 +117,34 @@ fn a_second_modal_workspace_gets_a_runner_of_its_own_word_kept_through_deleting_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn a_modal_control_plane_is_deployed_in_the_workspace_named_not_only_the_one_in_hand() {
+    let (served, home) = two_workspaces();
+    // (The new control plane, served here at the address Modal gives it in acme-two.)
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00002", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); });
+    served.aws.workers.lock().unwrap().insert("acme-two--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "mdplane00002").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // A dry run names the workspace: the one named, else the one in hand.
+    let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two", "--dry-run"]);
+    assert!(ok && said.contains("deploy a control plane to Modal, in workspace acme-two"), "{said}");
+    let (ok, said) = run(&["planes", "create", "modal", "--dry-run"]);
+    assert!(ok && said.contains("deploy a control plane to Modal, in workspace acmeorg"), "{said}");
+    // A workspace not signed in to: said, nothing deployed.
+    let (ok, said) = run(&["planes", "create", "modal", "--account=globex"]);
+    assert!(!ok && said.contains("Sign in with Modal to the workspace globex first: `superci login modal --add`."), "{said}");
+    // Deployed in acme-two, with its sign-in: its address is that workspace's.
+    served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/move/02-deploy-modal.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
+    assert!(ok && said.contains("The control plane is running: https://acme-two--superci-plane-mdplane00002.modal.run"), "{said}");
+    let (ok, said) = run(&["planes", "list"]);
+    assert!(ok && said.contains("Modal · acme-two"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Further runners already on the control plane: `words`, each in a workspace named after the word.
 fn with_further(served: &superci_testkit::Served, plane: &str, words: &[&str]) {
     let launcher = |word: &str, workspace: &str| serde_json::json!({ "cloud": word, "url": format!("https://{workspace}--superci-runners-{plane}.modal.run") });
