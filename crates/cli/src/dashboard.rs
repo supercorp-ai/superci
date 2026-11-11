@@ -1548,6 +1548,12 @@ impl Dashboard {
     pub fn plane_in_use(&self) -> Option<Plane> { self.plane().ok() }
     pub fn cloudflare_accounts(&self) -> &[(String, String)] { &self.cf_accounts }
 
+    /// The Modal workspace a control plane would be deployed in: the one named, when it is signed in to (None: not
+    /// signed in to), else the one in hand.
+    pub fn modal_workspace(&self, asked: Option<&str>) -> Option<String> {
+        match asked { Some(a) => self.modal_for(a).map(|m| m.workspace.clone()), None => self.modal.as_ref().map(|m| m.workspace.clone()) }
+    }
+
     /// Where SuperCI is signed in, in words (nothing: nowhere).
     pub fn signed_in_as(&self) -> Option<String> {
         let mut at = vec![];
@@ -2864,12 +2870,17 @@ impl Dashboard {
             }
             ("POST", "/plane/modal") => {
                 if self.deploy_running() { return Ok(Response::redirect("/?p=plane")) }
-                let session = self.modal.clone().ok_or("Sign in with Modal first.")?;
+                // In the workspace named (one of those signed in to), else the one in hand.
+                let asked = field("account");
+                let session = if asked.is_empty() { self.modal.clone().ok_or("Sign in with Modal first.")? }
+                    else { self.modal_for(&asked).cloned().ok_or_else(|| format!("Sign in with Modal to the workspace {asked} first: `superci login modal --add`."))? };
                 // Every control plane answers to the same label (one is in use at a time; workflows do not change on a move).
                 let label = "superci".to_string();
                 let again = field("plane");
                 let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { cloudflare::new_plane_id() };
-                self.start_deploy("modal", format!("workspace {}", session.workspace), &modal::DEPLOY_STEPS, vec![("plane", plane_id.clone())], move |step| {
+                // (Try again goes to the same workspace.)
+                let form = std::iter::once(("plane", plane_id.clone())).chain((!asked.is_empty()).then(|| ("account", asked.clone()))).collect();
+                self.start_deploy("modal", format!("workspace {}", session.workspace), &modal::DEPLOY_STEPS, form, move |step| {
                     let url = modal::deploy_plane(&session, &plane_id, &label, false, step)?;
                     step(2);
                     wait_online(&url);
@@ -10956,6 +10967,27 @@ mod rest_tests {
         assert!(said.iter().any(|s| s.contains("SuperCI's Modal token is removed here")) && d.modal_accounts().is_empty(), "{said:?}");
         d.modal_others = vec![modal_session("acme")];
         assert!(d.sign_out().unwrap().iter().any(|s| s.contains("SuperCI's Modal token is removed here")));
+    }
+
+    /// A Modal control plane goes into the workspace asked for (one signed in to), not only the one in hand; Try again
+    /// goes there too.
+    #[test]
+    fn a_modal_control_plane_is_deployed_in_the_workspace_asked_for() {
+        let mut d = Dashboard::signed_in(None);
+        d.modal = Some(modal_session("acme"));
+        d.modal_others = vec![modal_session("acme-two")];
+        // A workspace not signed in to: said, nothing started.
+        assert_eq!(send(&mut d, "/plane/modal", &[("account", "globex")]).err().as_deref(), Some("Sign in with Modal to the workspace globex first: `superci login modal --add`."));
+        assert!(!d.deploy_running());
+        // One signed in to, beside the one in hand: deployed there (Modal is not reached here, so it stops), and Try
+        // again names it.
+        crate::aws::clouds::with(&crate::aws::clouds::closed(), || {
+            assert!(send(&mut d, "/plane/modal", &[("account", "acme-two")]).is_ok());
+            while lock(&d.deploying).as_ref().is_some_and(|x| x.result.is_none()) { std::thread::sleep(std::time::Duration::from_millis(20)) }
+        });
+        let deploy = lock(&d.deploying).as_ref().map(|x| (x.place.clone(), x.form.clone())).unwrap();
+        assert_eq!(deploy.0, "workspace acme-two");
+        assert!(deploy.1.iter().any(|(k, v)| *k == "account" && v == "acme-two"), "{:?}", deploy.1);
     }
 
     /// A Modal workspace's word for its runner, and what cannot be one (see `Records`).
