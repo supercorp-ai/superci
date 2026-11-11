@@ -2,7 +2,7 @@
 # start and stop one, and what modal_jobs.py's Function does, run once and started again on the same input (Modal's
 # restart after a preemption). Run by `modal::tests` with the file's source on stdin and its kind ("launcher", "plane"
 # or "jobs") as the argument, against stand-ins for Modal and FastAPI: nothing reaches Modal or the network.
-import asyncio, hashlib, sys, types
+import asyncio, hashlib, signal, sys, types
 from unittest import mock
 
 modal = mock.MagicMock()
@@ -52,26 +52,65 @@ if kind == "jobs":
         kept[key] = value; return True
     ns["starts"] = mock.Mock(put=mock.Mock(side_effect=put))
     modal.current_function_call_id.return_value = "fc-1"
-    ns["subprocess"] = mock.Mock(); ns["subprocess"].run.return_value.returncode = 0
+    class Expired(Exception): pass
+    ns["subprocess"] = mock.Mock(TimeoutExpired=Expired); ns["subprocess"].Popen.return_value.wait.return_value = 0
     told = []
     ns["urllib"] = mock.Mock(); ns["urllib"].request.urlopen.side_effect = lambda r, timeout: told.append(r) or mock.Mock()
-    ns["time"] = mock.Mock(time=lambda: 1_790_000_000, sleep=lambda s: None)
+    clock = [0]
+    ns["time"] = mock.Mock(time=lambda: 1_790_000_000, sleep=lambda s: None, monotonic=lambda: clock[0])
     notice = "https://plane.example/interrupted?runner=superci-abc-7&t=0123456789abcdef"
     assert ns["run_job"]("J", None, notice) == {"exit": 0}
-    ns["subprocess"].run.assert_called_once_with(["/home/runner/run.sh", "--jitconfig", "J"], cwd="/home/runner")
+    ns["subprocess"].Popen.assert_called_once_with(["/home/runner/run.sh", "--jitconfig", "J"], cwd="/home/runner", start_new_session=True)
     assert told == []
     assert ns["run_job"]("J", None, notice) == {"preempted": True}
-    assert ns["subprocess"].run.call_count == 1, "no runner started again"
+    assert ns["subprocess"].Popen.call_count == 1, "no runner started again"
     ns["urllib"].request.Request.assert_called_once_with(notice, data=b"", method="POST")
     assert len(told) == 1
     # Another input runs its own runner (a failing one, with its hook); a control plane not answering is asked again.
     modal.current_function_call_id.return_value = "fc-2"
     assert ns["run_job"]("K", "d2h5", None) == {"exit": 0}
-    assert ns["subprocess"].run.call_args.args[0][:2] == ["bash", "-c"] and "ACTIONS_RUNNER_HOOK_JOB_STARTED" in ns["subprocess"].run.call_args.args[0][2]
+    assert ns["subprocess"].Popen.call_args.args[0][:2] == ["bash", "-c"] and "ACTIONS_RUNNER_HOOK_JOB_STARTED" in ns["subprocess"].Popen.call_args.args[0][2]
     ns["urllib"].request.urlopen.side_effect = [OSError("down"), OSError("down"), mock.Mock()]
     assert ns["tell"](notice) is True and ns["urllib"].request.urlopen.call_count == 4
     ns["urllib"].request.urlopen.side_effect = OSError("down")
     assert ns["tell"](notice) is False
+    # Modal stops a running Function (a preemption: SIGINT, here as KeyboardInterrupt): the control plane told at once,
+    # then the runner's listener interrupted (it stops its job, as on a spot machine taken back), its end waited for.
+    signals = []
+    ns["urllib"].request.urlopen.side_effect = lambda r, timeout: told.append(r) or signals.append(("told", timeout)) or mock.Mock()
+    told.clear()
+    ns["os"] = mock.Mock(kill=lambda pid, s: signals.append(("kill", pid, s)), killpg=lambda pid, s: signals.append(("killpg", pid, s)))
+    ns["listeners"] = lambda: [4242]
+    runner = ns["subprocess"].Popen.return_value
+    runner.pid = 99
+    modal.current_function_call_id.return_value = "fc-3"
+    runner.wait.side_effect = [KeyboardInterrupt(), Expired(), 130]
+    assert ns["run_job"]("L", None, notice) == {"exit": 130, "preempted": True}
+    assert signals == [("told", 5), ("kill", 4242, signal.SIGINT)], "told first, then the runner interrupted: %s" % signals
+    assert len(told) == 1 and told[0] is ns["urllib"].request.Request.return_value
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler, "its own signal handlers undone"
+    # A control plane that does not answer at once is told again while the runner stops (and waited for).
+    modal.current_function_call_id.return_value = "fc-3b"
+    signals.clear(); told.clear()
+    ns["urllib"].request.urlopen.reset_mock()
+    ns["urllib"].request.urlopen.side_effect = [OSError("down"), mock.Mock()]
+    runner.wait.side_effect = [KeyboardInterrupt(), 130]
+    assert ns["run_job"]("L", None, notice) == {"exit": 130, "preempted": True}
+    assert ns["urllib"].request.urlopen.call_count == 2 and signals == [("kill", 4242, signal.SIGINT)], signals
+    # A SIGTERM is the same; a runner that has not ended 25 s later is ended with its whole session.
+    def waits(timeout=None):
+        if timeout is None: return -9
+        clock[0] += timeout
+        if clock[0] == 1: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        raise Expired()
+    for listening, first in (([4242], ("kill", 4242, signal.SIGINT)), ([], ("killpg", 99, signal.SIGTERM))):
+        # (No listener yet, the runner still starting: no job to stop, its session is ended at once.)
+        signals.clear(); told.clear(); clock[0] = 0
+        ns["listeners"] = lambda: listening
+        modal.current_function_call_id.return_value = f"fc-{4 + len(listening)}"
+        runner.wait.side_effect = waits
+        assert ns["run_job"]("M", None, None) == {"exit": -9, "preempted": True}
+        assert signals == [first, ("killpg", 99, signal.SIGKILL)] and 25 < clock[0] <= 27 and told == [], (signals, clock)
     print("ok", kind)
     sys.exit(0)
 
