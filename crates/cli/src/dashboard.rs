@@ -270,6 +270,8 @@ impl Own {
 
 impl Writer {
     fn put(&self, plane: &Plane, name: &str, value: &str) -> Result<()> {
+        // A Modal control plane in a further workspace signed in to (a move between workspaces): with that sign-in.
+        if let Some((session, plane_id)) = self.further_modal(plane) { return modal::put_setting(session, plane_id, name, value) }
         self.own.check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.put_secret(account_id, script, name, value),
@@ -277,6 +279,14 @@ impl Writer {
             Plane::Modal { plane_id, .. } => modal::put_setting(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id, name, value),
             Plane::Seen { .. } => Err("Sign in where this control plane runs first.".into()),
         }
+    }
+
+    /// A Modal control plane in a workspace other than the one in hand that SuperCI is signed in to too (`superci login
+    /// modal --add`), with that workspace's sign-in: a move from one workspace to another writes to both.
+    fn further_modal<'a>(&'a self, plane: &'a Plane) -> Option<(&'a modal::Session, &'a str)> {
+        let Plane::Modal { workspace, plane_id, .. } = plane else { return None };
+        if self.modal.as_ref().is_some_and(|m| &m.workspace == workspace) { return None }
+        self.modals.iter().find(|m| &m.workspace == workspace).map(|m| (m, plane_id.as_str()))
     }
 
     /// The names of a control plane's settings, where its cloud lists them (Modal's Dict is not listed: none).
@@ -290,6 +300,7 @@ impl Writer {
 
     /// Removes a setting (Modal's is emptied: its settings are entries of one Dict).
     fn drop(&self, plane: &Plane, name: &str) -> Result<()> {
+        if let Some((session, plane_id)) = self.further_modal(plane) { return modal::put_setting(session, plane_id, name, "") }
         self.own.check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.delete_secret(account_id, script, name),
@@ -5382,7 +5393,10 @@ mark();load()})();</script>"#;
     /// Deletes a control plane from its cloud, and the launchers and AWS role made for it in other clouds (those
     /// this session is signed in to). Returns what could not be removed, in words.
     fn delete_plane(&mut self, plane: &Plane, status: &serde_json::Value) -> Result<Vec<String>> {
-        self.own().check(plane)?;
+        // (A Modal control plane in any workspace signed in to is deleted with that workspace's sign-in: one moved
+        // away from, in the workspace SuperCI was signed in to first, or one set up beside it.)
+        let modal_session = match plane { Plane::Modal { workspace, .. } => self.modal_for(workspace).cloned(), _ => None };
+        if modal_session.is_none() { self.own().check(plane)?; }
         let mut left = vec![];
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_plane(account_id, script, plane.plane_id())?,
@@ -5393,7 +5407,7 @@ mark();load()})();</script>"#;
                 aws_plane::delete(&creds, region, plane_id)?;
                 if let Err(e) = aws::delete_networks(&creds, plane_id, &REGIONS) { left.push(format!("Its machines' network in AWS ({e}).")) }
             }
-            Plane::Modal { plane_id, .. } => modal::delete_plane(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id)?,
+            Plane::Modal { plane_id, .. } => modal::delete_plane(modal_session.as_ref().or(self.modal.as_ref()).ok_or("Sign in with Modal first.")?, plane_id)?,
             Plane::Seen { .. } => return Err("Sign in where this control plane runs to delete it.".into()),
         }
         let records = view::records_in(&status);
@@ -9387,6 +9401,13 @@ mod tests {
         // The dashboard's own writers carry it: a setting of another account's control plane is refused before any call.
         let writer = Writer { cf: None, aws: None, modal: None, modals: vec![], aws_all: vec![], own: own.clone() };
         assert!(writer.put(&theirs, "ROUTING", "{}").unwrap_err().starts_with("This control plane is in AWS account 222222222222") && writer.drop(&theirs, "ROUTING").is_err());
+        // A move between Modal workspaces writes to both: a further workspace signed in to is written with its own
+        // sign-in; one not signed in to is still refused.
+        let session = |w: &str| modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: w.into() };
+        let writer = Writer { cf: None, aws: None, modal: Some(session("acme")), modals: vec![session("acme"), session("other")], aws_all: vec![], own: own.clone() };
+        assert_eq!(writer.further_modal(&modal("other")).map(|(s, id)| (s.workspace.as_str(), id)), Some(("other", "eeeeeeeeeeee")));
+        assert!(writer.further_modal(&modal("acme")).is_none() && writer.further_modal(&ours).is_none());
+        assert!(writer.further_modal(&modal("globex")).is_none() && writer.put(&modal("globex"), "ROUTING", "{}").unwrap_err().contains("the Modal workspace globex, and SuperCI is signed in to acme"));
     }
 
     #[test]
@@ -10367,6 +10388,13 @@ mod rest_tests {
         assert_eq!(send(&mut d, "/plane/delete", &[("plane", "p4")]).err().as_deref(), Some("Sign in with AWS first."));
         d.modal = Some(modal_session("globex"));
         assert!(send(&mut d, "/plane/delete", &[("plane", "p2")]).unwrap_err().contains("the Modal workspace acme"));
+        // Signed in to its workspace too (`superci login modal --add`), as after a move between workspaces: deleted
+        // with that sign-in (Modal is not reached here, so it stops there), not refused.
+        d.modal_others = vec![modal_session("acme")];
+        crate::aws::clouds::with(&crate::aws::clouds::closed(), || {
+            let said = send(&mut d, "/plane/delete", &[("plane", "p2")]).err().unwrap_or_default();
+            assert!(!said.contains("the Modal workspace acme") && !said.contains("Sign in with Modal first"), "{said}");
+        });
     }
 
     #[test]
