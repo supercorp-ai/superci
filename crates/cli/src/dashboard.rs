@@ -1440,6 +1440,21 @@ impl Dashboard {
         if !self.aws_ended_in.iter().any(|a| a == account) { self.aws_ended_in.push(account.to_string()) }
     }
 
+    /// Several AWS accounts or Modal workspaces signed in to and none named for what is made: which one is asked,
+    /// never guessed (`how`: the command that names it). None: one or none signed in to, or one named.
+    fn which_aws(&self, named: &str, how: &str) -> Option<Response> {
+        let all: Vec<String> = self.aws_accounts().into_iter().map(|a| a.account_id).collect();
+        (named.is_empty() && all.len() > 1).then(|| message(409, "Which AWS account?", &format!("SuperCI is signed in to {}. Say which one: {}. Nothing has changed.", esc(&all.join(", ")), esc(how))))
+    }
+
+    fn which_modal(&self, named: &str, how: &str) -> Option<Response> {
+        let all: Vec<String> = self.modal_accounts().into_iter().map(|m| m.workspace).collect();
+        (named.is_empty() && all.len() > 1).then(|| message(409, "Which Modal workspace?", &format!("SuperCI is signed in to {}. Say which one: {}. Nothing has changed.", esc(&all.join(", ")), esc(how))))
+    }
+
+    /// The Modal workspaces signed in to, by name.
+    pub fn modal_workspaces(&self) -> Vec<String> { self.modal_accounts().into_iter().map(|m| m.workspace).collect() }
+
     /// AWS's sign-in to `account` is needed and not here: said as ended, by its account, when AWS ended it; else as
     /// `why` says.
     fn aws_needed(&self, account: &str, why: &str) -> Response {
@@ -3003,8 +3018,9 @@ impl Dashboard {
             }
             ("POST", "/plane/modal") => {
                 if self.deploy_running() { return Ok(Response::redirect("/?p=plane")) }
-                // In the workspace named (one of those signed in to), else the one in hand.
+                // In the workspace named (one of those signed in to), else the only one; with several, which is asked.
                 let asked = field("account");
+                if let Some(r) = self.which_modal(&asked, "`superci planes create modal --account=WORKSPACE`") { return Ok(r) }
                 let session = if asked.is_empty() { self.modal.clone().ok_or("Sign in with Modal first.")? }
                     else { self.modal_for(&asked).cloned().ok_or_else(|| self.modal_needed(&asked))? };
                 // Every control plane answers to the same label (one is in use at a time; workflows do not change on a move).
@@ -3346,7 +3362,8 @@ impl Dashboard {
                 if self.deploy_running() { return Ok(Response::redirect("/?p=plane")) }
                 let region = field("region");
                 if !REGIONS.contains(&region.as_str()) { return Ok(message(400, "Choose a region from the list", "")) }
-                // In the account named (one of those signed in to), else the one in hand.
+                // In the account named (one of those signed in to), else the only one; with several, which is asked.
+                if let Some(r) = self.which_aws(&field("account"), &format!("`superci planes create aws --account=ID --region={region}`")) { return Ok(r) }
                 if !field("account").is_empty() && !self.hold_account(&field("account")) { return Ok(self.aws_needed(&field("account"), &format!("Sign in to account {}.", esc(&field("account"))))) }
                 let account_id = self.aws.as_ref().ok_or("Sign in with AWS first.")?.account_id.clone();
                 // (It is called what the workspace is: another CI in the account called that first gets a name of its own.)
@@ -3805,6 +3822,10 @@ impl Dashboard {
                 let plane = self.plane()?;
                 let region = field("region");
                 if !REGIONS.contains(&region.as_str()) { return Ok(message(400, "Choose a region from the list", "")) }
+                // (In the account named; with several signed in to and none named, which is asked.)
+                let named = field("account");
+                if let Some(r) = self.which_aws(&named, &format!("`superci runners create aws --account=ID --region={region}`")) { return Ok(r) }
+                if !named.is_empty() && !self.hold_account(&named) { return Ok(self.aws_needed(&named, &format!("Sign in to account {} (`superci login aws --add`).", esc(&named)))) }
                 let session = self.aws.as_mut().ok_or("Sign in with AWS first")?;
                 let creds = session.credentials()?;
                 let account_id = session.account_id.clone();
@@ -3880,6 +3901,7 @@ impl Dashboard {
             ("POST", "/runners/modal") => {
                 let plane = self.plane()?;
                 let asked = field("account");
+                if let Some(r) = self.which_modal(&asked, "`superci runners create modal --account=WORKSPACE`") { return Ok(r) }
                 let session = if asked.is_empty() { self.modal.clone().ok_or("Sign in with Modal first.")? }
                     else { self.modal_for(&asked).cloned().ok_or_else(|| self.modal_needed(&asked))? };
                 let status = status_soon(plane.url(), &self.status_key).unwrap_or_default();
@@ -4834,7 +4856,8 @@ mark();load()})();</script>"#;
         };
         let modal = match &self.modal {
             Some(m) if planes.iter().any(|p| matches!(p, Plane::Modal { workspace, .. } if *workspace == m.workspace)) => None,
-            Some(_) => Some(row_form("/plane/modal", "", "Set up")),
+            // (With several signed in to, the workspace this row names, as it says.)
+            Some(m) => Some(row_form("/plane/modal", &if self.modal_accounts().len() > 1 { format!(r#"<input type="hidden" name="account" value="{}">"#, esc(&m.workspace)) } else { String::new() }, "Set up")),
             None => Some(connect_action("modal")),
         };
         vec![
@@ -5031,12 +5054,17 @@ mark();load()})();</script>"#;
             // A control plane in AWS whose AWS runners were removed: back in its own account.
             else if matches!(v.plane, Plane::Aws { .. }) { if self.aws.is_some() { row_form("/runners/aws-own", "", "Add") } else { connect_action("aws") } }
             else if self.aws.is_some() {
-            format!(r#"<form method="post" action="/aws/connect" class="aws-add"><details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Add</button></form>"#,
+            format!(r#"<form method="post" action="/aws/connect" class="aws-add">{}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Add</button></form>"#,
+                // (Several signed in to: the account this row names, as it says.)
+                if self.aws_accounts().len() > 1 { self.aws.as_ref().map(|a| format!(r#"<input type="hidden" name="account" value="{}">"#, esc(&a.account_id))).unwrap_or_default() } else { String::new() },
                 region_select_options("us-east-1", &self.quotas, &closest(Some(v)), self.aws_look()))
         } else { connect_action("aws") };
-        // A Modal control plane starts sandboxes itself; one elsewhere gets a small launcher in your Modal workspace.
+        // A Modal control plane starts sandboxes itself; one elsewhere gets a small launcher in your Modal workspace
+        // (with several signed in to, the one this row names, as it says).
         let own_modal = matches!(v.plane, Plane::Modal { .. });
-        let modal = if launcher("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if self.modal.is_some() { row_form("/runners/modal", "", "Add") }
+        let several_modal = self.modal_accounts().len() > 1;
+        let in_workspace = |m: &modal::Session| if several_modal { format!(r#"<input type="hidden" name="account" value="{}">"#, esc(&m.workspace)) } else { String::new() };
+        let modal = if launcher("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if let Some(m) = self.modal.as_ref() { row_form("/runners/modal", &in_workspace(m), "Add") }
             else if self.modal_pending.is_some() { format!(r#"{}<form method="post" action="/modal/signin"><input type="hidden" name="next"><button class="button secondary sm">Open again</button></form>"#, pill("open", "Waiting for Modal")) }
             else { connect_action("modal") };
         // Each further Modal workspace signed in to: its own runner, with its own limits.
@@ -5066,7 +5094,7 @@ mark();load()})();</script>"#;
             _ => "Spot machines, one per job, in your AWS account.".to_string(),
         };
         let rows = format!("{}{further_cf}{}{further_aws}{}{further}{}", provider_row("cloudflare", containers, &cloudflare), provider_row_html("aws", &aws_what, &aws),
-            provider_row("modal", "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.", &modal), more_clouds(&RUNNERS_SOON));
+            provider_row("modal", &match self.modal.as_ref().filter(|_| several_modal) { Some(m) => format!("Sandboxes, one per job, in the Modal workspace {}. The first add builds a small image.", m.workspace), None => "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.".to_string() }, &modal), more_clouds(&RUNNERS_SOON));
         format!(r#"<div class="bar"><h1 class="page-title">Add a provider</h1><a class="chip" href="/?p=runners">Back to runners</a></div><p class="note" style="margin-bottom:22px">Where runners come from: each provider starts a fresh one for every job. Add one or more.</p><div class="picks page">{rows}</div>"#)
     }
 

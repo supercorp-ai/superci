@@ -130,11 +130,24 @@ fn a_modal_control_plane_is_deployed_in_the_workspace_named_not_only_the_one_in_
         let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "mdplane00002").output().unwrap();
         (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
     };
-    // A dry run names the workspace: the one named, else the one in hand.
+    // A dry run names the workspace named; with two signed in to and none named, which is asked, never guessed (a
+    // dry run too, and the dashboard's form alike).
     let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two", "--dry-run"]);
     assert!(ok && said.contains("deploy a control plane to Modal, in workspace acme-two"), "{said}");
-    let (ok, said) = run(&["planes", "create", "modal", "--dry-run"]);
-    assert!(ok && said.contains("deploy a control plane to Modal, in workspace acmeorg"), "{said}");
+    for args in [&["planes", "create", "modal", "--dry-run"][..], &["planes", "create", "modal"], &["runners", "create", "modal"], &["runners", "create", "modal", "--dry-run"]] {
+        let (ok, said) = run(args);
+        assert!(!ok && said.contains("Say which Modal workspace: --account=WORKSPACE. Yours: acme-two, acmeorg."), "{args:?}: {said}");
+    }
+    let (mut child, link) = common::dashboard(&home);
+    for path in ["/plane/modal", "/runners/modal"] {
+        let (status, _, said) = common::post(&link, path, &[]);
+        assert!(status == 409 && words(&said).contains("Which Modal workspace?") && words(&said).contains("acme-two, acmeorg"), "{path}: {status} {}", words(&said));
+    }
+    // The page's own Set up names the workspace its row says.
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); part(&link, "/?p=planes&fragment=1").1 }).find(|p| p.contains(r#"action="/plane/modal""#)).unwrap_or_default();
+    assert!(page.contains(r#"<input type="hidden" name="account" value="acmeorg">"#), "{page}");
+    let _ = child.kill();
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxCreate") || u.ends_with("/AppGetOrCreate"))), "nothing deployed");
     // A workspace not signed in to: said, nothing deployed.
     let (ok, said) = run(&["planes", "create", "modal", "--account=globex"]);
     assert!(!ok && said.contains("Sign in with Modal to the workspace globex first: `superci login modal --add`."), "{said}");
@@ -240,6 +253,25 @@ fn a_control_plane_in_a_second_aws_account_is_created_updated_and_deleted_with_t
     let (ok, said) = run(&["planes", "delete", "awsplane0002", "--confirm"]);
     assert!(ok, "deleted: {said}");
     common::all_signed_by(&served, "awsplane0002", "aws:", "aws:ASIATWO");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two AWS accounts signed in to and none named for a new control plane: which one is asked, by the command (a dry
+/// run too) and by the dashboard alike, and nothing is made in either.
+#[test]
+fn a_new_aws_control_plane_with_two_accounts_signed_in_asks_which() {
+    let served = serve(own_aws);
+    let home = signed_in_two_aws(&served);
+    for args in [&["planes", "create", "aws", "--region=us-east-1"][..], &["planes", "create", "aws", "--region=us-east-1", "--dry-run"]] {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("Say which AWS account: --account=ID. Yours: 111111111111, 222222222222."), "{args:?}: {said}");
+    }
+    let (mut child, link) = common::dashboard(&home);
+    let (status, _, said) = common::post(&link, "/plane/aws", &[("region", "us-east-1")]);
+    assert!(status == 409 && words(&said).contains("Which AWS account?") && words(&said).contains("--account=ID --region=us-east-1"), "{status} {}", words(&said));
+    let _ = child.kill();
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|b| b.contains("CreateRole")) || (a["method"] == "POST" && a["url"].as_str().is_some_and(|u| u.ends_with("/2015-03-31/functions")))), "nothing made");
     let _ = std::fs::remove_dir_all(&home);
 }
 

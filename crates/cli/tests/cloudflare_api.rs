@@ -188,7 +188,14 @@ fn cloudflare_then_modal(workspace: &str) {
     let (ok, said) = run("", &["runners", "create", "cloudflare", "--plane=cfplane00002"]);
     assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
     step("04-cf-modal-agent");
-    let (ok, said) = run("", &["runners", "create", "modal", "--plane=cfplane00002"]);
+    // (With a second workspace signed in to, the one it goes into is named: never guessed.)
+    let mut args = vec!["runners", "create", "modal", "--plane=cfplane00002"];
+    if workspace != "acmeorg" {
+        let (ok, said) = run("", &args);
+        assert!(!ok && said.contains("Say which Modal workspace: --account=WORKSPACE.") && said.contains("acmeorg") && said.contains(workspace), "{said}");
+        args.push("--account=acmeorg");
+    }
+    let (ok, said) = run("", &args);
     assert!(ok && said.contains("Deploying the Modal launcher") && said.contains("modal runs jobs now."), "{said}");
     let agents = served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
     assert!(agents.contains("\"cloud\":\"modal\"") && agents.contains("acmeorg--superci-runners-cfplane00002"), "{agents}");

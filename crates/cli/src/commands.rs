@@ -1150,6 +1150,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if !CLOUDS.contains(&cloud) { return usage("Say where: `superci planes create aws --region=us-east-1`, `superci planes create cloudflare` or `superci planes create modal`.") }
             let region = match (cloud, args.get("region")) { ("aws", None) => return usage("Say where: --region=us-east-1 (any AWS region the dashboard's Control plane page lists)."), (_, r) => r.unwrap_or_default().to_string() };
             let mut d = ready()?;
+            // (Several accounts or workspaces signed in to: which one is said, never guessed.)
+            let accounts: Vec<String> = d.aws_accounts_signed_in().into_iter().map(|(a, _)| a).collect();
+            if cloud == "aws" && args.get("account").is_none() && accounts.len() > 1 { return usage(format!("Say which AWS account: --account=ID. Yours: {}.", accounts.join(", "))) }
+            let workspaces = d.modal_workspaces();
+            if cloud == "modal" && args.get("account").is_none() && workspaces.len() > 1 { return usage(format!("Say which Modal workspace: --account=WORKSPACE. Yours: {}.", workspaces.join(", "))) }
             let (fields, place) = match cloud {
                 "aws" => (std::iter::once(field("region", region.clone())).chain(args.get("account").map(|a| field("account", a))).collect(), format!("AWS, in {region}")),
                 "cloudflare" => {
@@ -1236,7 +1241,24 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let plane = in_use(&d)?;
             // As the Add runners page does: a control plane starts machines in its own cloud itself; elsewhere it is
             // connected (AWS: a role it may assume; Cloudflare, Modal: a small launcher there).
+            // (Several accounts or workspaces signed in to, and none named for a runner outside the control plane's own
+            // cloud: which one is said, never guessed. The CI's own AWS runners, while it has none, go into the account
+            // named; after them, an account named is a further one.)
+            let accounts: Vec<String> = d.aws_accounts_signed_in().into_iter().map(|(a, _)| a).collect();
+            let workspaces = d.modal_workspaces();
+            // (Read only where it decides: a control plane that does not say stops the command, nothing guessed.)
+            let aws_first = if cloud == "aws" && args.has("account") && !matches!(plane, Plane::Aws { .. }) { !view(&mut d)?.aws } else { false };
+            match (cloud, &plane, args.get("account")) {
+                ("aws", Plane::Aws { .. }, _) | ("modal", Plane::Modal { .. }, _) | (_, _, Some(_)) => {}
+                ("aws", _, None) if accounts.len() > 1 => return usage(format!("Say which AWS account: --account=ID. Yours: {}.", accounts.join(", "))),
+                ("modal", _, None) if workspaces.len() > 1 => return usage(format!("Say which Modal workspace: --account=WORKSPACE. Yours: {}.", workspaces.join(", "))),
+                _ => {}
+            }
             let (path, fields) = match (cloud, &plane) {
+                ("aws", _) if aws_first && args.has("account") => match args.get("region") {
+                    Some(r) => ("/aws/connect", vec![field("account", args.get("account").unwrap_or_default()), field("region", r)]),
+                    None => return usage("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."),
+                },
                 // (A further account signed in to: by its id, with a region and perhaps its word.)
                 ("aws", _) if args.has("account") => match args.get("region") {
                     Some(r) => ("/runners/aws", [Some(field("account", args.get("account").unwrap_or_default())), Some(field("region", r)), args.get("name").map(|n| field("name", n))].into_iter().flatten().collect()),
