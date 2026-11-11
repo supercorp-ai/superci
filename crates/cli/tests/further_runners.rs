@@ -174,8 +174,11 @@ fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_
     // a real update).
     replay("02-deploy-modal");
     served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", "mdplane00002")]);
+    // (The listing after the deploy again: the deploy's recording, replayed for the update, lists apps as before it.)
+    served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    let (_, listed) = run(&["planes", "list"]);
     let (ok, said) = run(&["planes", "update", "mdplane00002"]);
-    assert!(ok, "{said}");
+    assert!(ok, "{said}\n(`planes list` just before:)\n{listed}");
     // Deleted by its id: its Dicts and apps, with acme-two's sign-in.
     replay("11-delete-md");
     let (ok, said) = run(&["planes", "delete", "mdplane00002", "--confirm"]);
