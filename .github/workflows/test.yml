@@ -219,7 +219,7 @@ jobs:
         run: cargo build -p superci-layers
       - name: Docker ${{ matrix.docker }} with containerd ${{ matrix.containerd }}
         run: |
-          docker build -q --build-arg DOCKER='${{ matrix.docker }}' --build-arg CONTAINERD='${{ matrix.containerd }}' -t e2e crates/layers/e2e
+          docker build --progress=plain --build-arg DOCKER='${{ matrix.docker }}' --build-arg CONTAINERD='${{ matrix.containerd }}' -t e2e crates/layers/e2e
           docker volume create e2e-lib
           docker run --rm --privileged -e IMAGES=mirror.gcr.io/library -v "$PWD/target/debug/superci-layers:/superci-layers:ro" -v e2e-lib:/var/lib e2e
       # One job failed: the rest of the run is cancelled, so a failure is known at once.
