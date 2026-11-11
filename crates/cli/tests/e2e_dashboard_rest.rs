@@ -543,16 +543,22 @@ fn a_control_plane_from_before_keeps_a_change_in_its_cloud_and_refuses_what_chan
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A move that brings a launcher in Cloudflare while no Cloudflare account is known to put it in, and one that brings
-/// a launcher in Modal to a new control plane that does not give its keys: each said.
+/// A move that brings a launcher in Cloudflare while the sign-in reaches no account it can tell it is in (said before
+/// anything moves), and one that brings a launcher in Modal to a new control plane that does not give its keys: each
+/// said.
 #[test]
 fn a_move_bringing_a_launcher_says_where_it_cannot_go() {
     let launchers = |cloud: &'static str| move |served: &Served, home: &std::path::Path| {
         served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), &serde_json::json!([{ "cloud": cloud, "url": format!("https://superci-runners-testplane0001.{cloud}.example") }]).to_string());
         kept_as(home, |k| { k["cloudflare"] = cloudflare_signed_in(); k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }); });
     };
-    let page = moving_with(None, launchers("cloudflare")).moved();
-    assert!(page.contains("no Cloudflare account"), "{page}");
+    let m = moving_with(None, launchers("cloudflare"));
+    let (status, _, said) = common::post(&m.link, "/plane/move?c=testplane0001", &[("plane", "testplane0002")]);
+    let said = common::words(&said);
+    assert!(status == 409 && said.contains("Its Cloudflare runners' account is not one this sign-in reaches") && said.contains("Nothing has changed"), "{status} {said}");
+    let touched = |id: &str| m.served.aws.settings(id).iter().any(|(k, _)| k == "MOVE_TOKEN");
+    assert!(!touched(superci_testkit::PLANE) && !touched("testplane0002"), "nothing moved");
+    drop(m);
     let keyless: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |_, target, status, body| if target.starts_with("/.well-known/jwks.json") { (500, b"{}".to_vec()) } else { (status, body) };
     let page = moving_with(Some(keyless), launchers("modal")).moved();
     assert!(page.contains("500"), "{page}");
