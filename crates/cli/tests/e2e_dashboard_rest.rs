@@ -543,16 +543,22 @@ fn a_control_plane_from_before_keeps_a_change_in_its_cloud_and_refuses_what_chan
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A move that brings a launcher in Cloudflare while no Cloudflare account is known to put it in, and one that brings
-/// a launcher in Modal to a new control plane that does not give its keys: each said.
+/// A move that brings a launcher in Cloudflare while the sign-in reaches no account it can tell it is in (said before
+/// anything moves), and one that brings a launcher in Modal to a new control plane that does not give its keys: each
+/// said.
 #[test]
 fn a_move_bringing_a_launcher_says_where_it_cannot_go() {
     let launchers = |cloud: &'static str| move |served: &Served, home: &std::path::Path| {
         served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), &serde_json::json!([{ "cloud": cloud, "url": format!("https://superci-runners-testplane0001.{cloud}.example") }]).to_string());
         kept_as(home, |k| { k["cloudflare"] = cloudflare_signed_in(); k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }); });
     };
-    let page = moving_with(None, launchers("cloudflare")).moved();
-    assert!(page.contains("no Cloudflare account"), "{page}");
+    let m = moving_with(None, launchers("cloudflare"));
+    let (status, _, said) = common::post(&m.link, "/plane/move?c=testplane0001", &[("plane", "testplane0002")]);
+    let said = common::words(&said);
+    assert!(status == 409 && said.contains("Its Cloudflare runners' account is not one this sign-in reaches") && said.contains("Nothing has changed"), "{status} {said}");
+    let touched = |id: &str| m.served.aws.settings(id).iter().any(|(k, _)| k == "MOVE_TOKEN");
+    assert!(!touched(superci_testkit::PLANE) && !touched("testplane0002"), "nothing moved");
+    drop(m);
     let keyless: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |_, target, status, body| if target.starts_with("/.well-known/jwks.json") { (500, b"{}".to_vec()) } else { (status, body) };
     let page = moving_with(Some(keyless), launchers("modal")).moved();
     assert!(page.contains("500"), "{page}");
@@ -805,6 +811,43 @@ fn cloudflare_runners_go_into_the_account_named_and_an_update_says_a_launcher_cl
 
 /// AWS's runners for a control plane in Cloudflare: the role made, the control plane handed what it assumes it with,
 /// and its answer awaited (connected; not yet able to use it, said; or settings Cloudflare would not keep, said).
+/// A control plane in Cloudflare with two AWS accounts signed in to: which one its AWS runners go into is asked,
+/// nothing made; named, they are connected there with that account's sign-in. (The command's own asking:
+/// `cloudflare_api::cloudflare_then_modal`.)
+#[test]
+fn aws_runners_for_a_control_plane_in_cloudflare_go_into_the_account_named_and_with_two_are_asked_for() {
+    let served = serve(|_| {});
+    let plane = superci_testkit::front(&served.url, |method, target, status, body| if method == "POST" && target.starts_with("/aws/callback") { (200, br#"{"connected":true}"#.to_vec()) } else { (status, body) });
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = common::signed_in(&served);
+    as_cloudflare(&home, &served);
+    kept_as(&home, |k| {
+        k["plane"]["Cloudflare"]["url"] = plane.clone().into();
+        k["cloudflare"] = cloudflare_signed_in();
+        let mut other = k["aws"].clone();
+        other["account_id"] = "222222222222".into();
+        other["creds"]["access_key_id"] = "ASIATWO".into();
+        k["aws_more"] = serde_json::json!([other]);
+    });
+    served.aws.second_account("aws:ASIATWO", "222222222222");
+    // (Its role and network, as AWS answered them for a control plane in Cloudflare.)
+    for region in ["us-east-1", "us-east-2", "us-west-2"] { served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &plane), ("us-east-1", region)]) }
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1")]);
+    assert!(status == 409 && said.contains("Which AWS account?") && said.contains("111111111111, 222222222222") && said.contains("--account=ID --region=us-east-1"), "{status} {said}");
+    // (What connecting makes: its role and what it may do; looking for control planes reads IAM too, and is no change.)
+    let iam = || served.aws.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains("iam.amazonaws.com") && (w.contains("Action=CreateRole") || w.contains("Action=PutRolePolicy")))).count();
+    assert_eq!(iam(), 0, "nothing made in AWS");
+    // Named: its own AWS runners there (the first, so not a further account), with its sign-in.
+    let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1"), ("account", "222222222222")]);
+    assert!(status == 303, "{status} {said}");
+    assert!(iam() > 0);
+    // (Each change made there with its own sign-in: none with the first account's.)
+    let made: Vec<String> = served.aws.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains("iam.amazonaws.com") && (w.contains("Action=CreateRole") || w.contains("Action=PutRolePolicy") || w.contains("Action=UpdateAssumeRolePolicy")))).map(|c| c["who"].as_str().unwrap_or_default().to_string()).collect();
+    assert!(made.iter().all(|w| w == "aws:ASIATWO"), "{made:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn aws_runners_for_a_control_plane_in_cloudflare_connect_or_say_what_stopped_them() {
     for (callback, refused) in [(Some(r#"{"connected":true}"#), None), (Some(r#"{"connected":false,"error":"AccessDenied: not yet"}"#), None), (None, Some("AWS_CONNECT")), (None, Some("AWS_REGIONS"))] {

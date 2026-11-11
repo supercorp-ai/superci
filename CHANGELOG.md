@@ -2,6 +2,22 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.20.4
+- A control plane in any AWS account or Modal workspace SuperCI is signed in to is changed with that one's sign-in, whichever is in hand: created there (`superci planes create modal --account=WORKSPACE`), moved to and from, updated, deleted, its settings and keys written. A command naming one other than the CI's own (`planes update ID`, `planes delete ID`, a move) used the first sign-in of its cloud, or refused, saying SuperCI was signed in elsewhere. Found and first fixed for Modal by Taras Kornichuk (github.com/artile), who tried it on real workspaces.
+- Deleting a Modal control plane deletes the Dict of each kind of its records too (`…-k-…`), not only its state and settings.
+- `superci planes update ID` with an id not known here says so. It updated the control plane in use in its place.
+- The expired keys of an AWS control plane in a further account are tidied in that account. They were looked for in the account in hand, and stayed.
+- Control planes are looked for in every Modal workspace signed in to, as in every AWS account: one in a further workspace was not found by a later command, or on another computer.
+- A sign-in its cloud ended in one AWS account or Modal workspace, beside others still signed in to, is said by that account or workspace (`superci planes list`, the dashboard, and each change that needs it) until it is signed in to again: `superci login aws --add`, `superci login modal --add`. It was forgotten without a word, its control planes and runners no longer shown. The others go on: a control plane in a further account or workspace is updated and deleted with its own sign-in when the first one's has ended, which said to sign in with AWS first.
+- Updating or deleting a control plane in another account from the dashboard leaves the account in hand as it was. The pages and later changes went on with the other account's sign-in.
+- A move between control planes is not stopped by an AWS sign-in that ended when neither of them is in AWS.
+- A command that changes a setting acts on the control plane named with `--plane=ID` (or `SUPERCI_PLANE`) when it is not the one in use: `superci keys create NAME --plane=ID`, its limits, its order. It was refused as not among the control planes here.
+- A move brings each kind of runner in its own account: AWS runners with the sign-in to the account they are in (it asked to sign in with AWS when another account was in hand), a Modal launcher in its own workspace (with that workspace not signed in to, it was deployed in the one in hand, where its jobs then ran and were billed), and a Cloudflare launcher in the account it is in (it went to the first account the Cloudflare sign-in reaches). One whose account is not signed in to is asked for before anything moves.
+- The control plane's permissions read the AWS role in every account signed in to, with that account's sign-in: a role in an account not in hand was shown as one to sign in for, and never read.
+- The control plane's page offers Update for a control plane whose account or workspace is signed in to beside one that ended.
+- With several AWS accounts or Modal workspaces signed in to, a new control plane or runners outside the control plane's own cloud are made only in the one named: `superci planes create aws --account=ID`, `superci planes create modal --account=WORKSPACE`, `superci runners create aws --account=ID --region=R` (the CI's own AWS runners, while it has none), `superci runners create modal --account=WORKSPACE`. Without one, the command and the dashboard ask which, and nothing is made. They went into the one in hand. The dashboard's own buttons name the one their row says.
+- A command naming a control plane with `--plane=ID` acts on it for that command alone. It became the one in use from then on where no control plane serves a code host, and deleting it was then refused as the one in use.
+
 ## 0.20.3 — 2026-11-09
 - The control plane's page says how many spot CPUs its account may run at once across every region its spot machines start in (300 in N. Virginia and 300 in Ohio: 600, 150 jobs of the default size), and each region's own. Opened before the Runners page, it knew only its home region's and said that alone.
 

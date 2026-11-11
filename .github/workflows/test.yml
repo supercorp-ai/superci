@@ -140,6 +140,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: tests
+      # (Public resolvers for the runner and Docker's containers and builds: GitHub's Ubuntu runners could not resolve
+      # Ubuntu's archive through their own, 2026-11-11. Kept beside what the runner sets.)
+      - name: Public resolvers
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' | sudo tee /etc/systemd/resolved.conf.d/public.conf >/dev/null
+          sudo systemctl restart systemd-resolved
+          sudo mkdir -p /etc/docker && { sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'; } | jq '. + {"dns": ["1.1.1.1", "8.8.8.8"]}' | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json && sudo systemctl restart docker
       # (The layer store's tests make EROFS files as the converter does, and serve them as root.)
       - name: mkfs.erofs
         run: sudo apt-get install -y -qq erofs-utils >/dev/null
@@ -168,6 +176,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: tests
+      # (Public resolvers for the runner and Docker's containers and builds: GitHub's Ubuntu runners could not resolve
+      # Ubuntu's archive through their own, 2026-11-11. Kept beside what the runner sets.)
+      - name: Public resolvers
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' | sudo tee /etc/systemd/resolved.conf.d/public.conf >/dev/null
+          sudo systemctl restart systemd-resolved
+          sudo mkdir -p /etc/docker && { sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'; } | jq '. + {"dns": ["1.1.1.1", "8.8.8.8"]}' | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json && sudo systemctl restart docker
       - name: Slice ${{ matrix.part }} of every sweep's faults
         run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --no-fail-fast -E 'binary(~sweep_) | test(~holds_with_each_call_and_store_operation_failing) | (package(superci-core) & binary(=plane) & test(every_test_here))'
 
@@ -217,9 +233,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: superci-layers
         run: cargo build -p superci-layers
+      # (Public resolvers for the runner and Docker's containers and builds: GitHub's Ubuntu runners could not resolve
+      # Ubuntu's archive through their own, 2026-11-11. Kept beside what the runner sets.)
+      - name: Public resolvers
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' | sudo tee /etc/systemd/resolved.conf.d/public.conf >/dev/null
+          sudo systemctl restart systemd-resolved
+          sudo mkdir -p /etc/docker && { sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'; } | jq '. + {"dns": ["1.1.1.1", "8.8.8.8"]}' | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json && sudo systemctl restart docker
       - name: Docker ${{ matrix.docker }} with containerd ${{ matrix.containerd }}
         run: |
-          docker build -q --build-arg DOCKER='${{ matrix.docker }}' --build-arg CONTAINERD='${{ matrix.containerd }}' -t e2e crates/layers/e2e
+          docker build --progress=plain --build-arg DOCKER='${{ matrix.docker }}' --build-arg CONTAINERD='${{ matrix.containerd }}' -t e2e crates/layers/e2e
           docker volume create e2e-lib
           docker run --rm --privileged -e IMAGES=mirror.gcr.io/library -v "$PWD/target/debug/superci-layers:/superci-layers:ro" -v e2e-lib:/var/lib e2e
       # One job failed: the rest of the run is cancelled, so a failure is known at once.

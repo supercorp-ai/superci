@@ -1,4 +1,6 @@
-Modal did not answer (Modal AuthTokenGet: the test kit's Modal has no answer for it).
+Modal did not answer (acme-two: Modal AuthTokenGet: the test kit's Modal has no answer for it).
+What is there is not shown; it is asked again on the next page.
+Modal did not answer (acmeorg: Modal AuthTokenGet: the test kit's Modal has no answer for it).
 What is there is not shown; it is asked again on the next page.
 Control plane GitHub and GitLab send their jobs to the control plane in use.
 To move it, set one up in another cloud and Move here: everything comes along.

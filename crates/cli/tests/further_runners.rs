@@ -17,6 +17,8 @@ fn two_workspaces() -> (superci_testkit::Served, std::path::PathBuf) {
     kept["modal"] = session("acmeorg");
     kept["modal_more"] = serde_json::json!([session("acme-two")]);
     std::fs::write(&file, kept.to_string()).unwrap();
+    // (Each workspace its own, as two real ones are: acme-two's sign-in reaches acme-two's Dicts and apps alone.)
+    served.aws.apart("modal:ak-acme-two", "acme-two");
     let mut w = served.aws.workers.lock().unwrap();
     for workspace in ["acmeorg", "acme-two"] { w.insert(format!("{workspace}--superci-runners-{PLANE}.modal.run"), served.url.clone()); }
     drop(w);
@@ -122,30 +124,316 @@ fn a_modal_control_plane_is_deployed_in_the_workspace_named_not_only_the_one_in_
     let (served, home) = two_workspaces();
     // (The new control plane, served here at the address Modal gives it in acme-two.)
     let aws = served.aws.clone();
-    let md = superci_testkit::serve_as("mdplane00002", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); });
+    let md = superci_testkit::serve_as("mdplane00002", move |c| { c.read_settings(&aws.modal_plane_settings_in("acme-two")); c.own_cloud = "modal".into(); });
     served.aws.workers.lock().unwrap().insert("acme-two--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
     let run = |args: &[&str]| {
         let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "mdplane00002").output().unwrap();
         (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
     };
-    // A dry run names the workspace: the one named, else the one in hand.
+    // A dry run names the workspace named; with two signed in to and none named, which is asked, never guessed (a
+    // dry run too, and the dashboard's form alike).
     let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two", "--dry-run"]);
     assert!(ok && said.contains("deploy a control plane to Modal, in workspace acme-two"), "{said}");
-    let (ok, said) = run(&["planes", "create", "modal", "--dry-run"]);
-    assert!(ok && said.contains("deploy a control plane to Modal, in workspace acmeorg"), "{said}");
+    for args in [&["planes", "create", "modal", "--dry-run"][..], &["planes", "create", "modal"], &["runners", "create", "modal"], &["runners", "create", "modal", "--dry-run"]] {
+        let (ok, said) = run(args);
+        assert!(!ok && said.contains("Say which Modal workspace: --account=WORKSPACE. Yours: acme-two, acmeorg."), "{args:?}: {said}");
+    }
+    let (mut child, link) = common::dashboard(&home);
+    for path in ["/plane/modal", "/runners/modal"] {
+        let (status, _, said) = common::post(&link, path, &[]);
+        assert!(status == 409 && words(&said).contains("Which Modal workspace?") && words(&said).contains("acme-two, acmeorg"), "{path}: {status} {}", words(&said));
+    }
+    // The page's own Set up names the workspace its row says.
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); part(&link, "/?p=planes&fragment=1").1 }).find(|p| p.contains(r#"action="/plane/modal""#)).unwrap_or_default();
+    assert!(page.contains(r#"<input type="hidden" name="account" value="acmeorg">"#), "{page}");
+    let _ = child.kill();
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxCreate") || u.ends_with("/AppGetOrCreate"))), "nothing deployed");
     // A workspace not signed in to: said, nothing deployed.
     let (ok, said) = run(&["planes", "create", "modal", "--account=globex"]);
     assert!(!ok && said.contains("Sign in with Modal to the workspace globex first: `superci login modal --add`."), "{said}");
-    // Deployed in acme-two, with its sign-in: its address is that workspace's.
-    served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/move/02-deploy-modal.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    // Deployed in acme-two, with its sign-in: its address is that workspace's (Modal answering acme-two's sign-in so).
+    served.aws.replaying_for("modal:ak-acme-two", &std::fs::read_to_string(format!("{}/fixtures/move/02-deploy-modal.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
     let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
     assert!(ok && said.contains("The control plane is running: https://acme-two--superci-plane-mdplane00002.modal.run"), "{said}");
+    // (Modal listing acme-two's apps as it listed them after a real deploy: the new control plane's among them; and
+    // acmeorg's, not.)
+    served.aws.replaying_for("modal:ak-acme-two", include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
     let (ok, said) = run(&["planes", "list"]);
-    assert!(ok && said.contains("Modal · acme-two"), "{said}");
+    assert!(ok && said.contains("Modal · acme-two") && !said.contains("Modal · acmeorg"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
 /// Further runners already on the control plane: `words`, each in a workspace named after the word.
+/// A control plane in a second Modal workspace, changed from beside the CI's own (which stays in use): each command
+/// that names it (update, delete) acts with that workspace's sign-in, and a move to it and back writes each with its
+/// own (Taras Kornichuk's #26 and #27). The whole class: a cloud's first sign-in taken for a control plane elsewhere.
+#[test]
+fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_workspaces_sign_in() {
+    let (served, home) = two_workspaces();
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00002", move |c| { c.read_settings(&aws.modal_plane_settings_in("acme-two")); c.own_cloud = "modal".into(); });
+    served.aws.workers.lock().unwrap().insert("acme-two--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "mdplane00002").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // (What Modal answered, answered to acme-two's sign-in alone: acmeorg's has none of it, as a real one would not.)
+    let replay = |name: &str| served.aws.replaying_for("modal:ak-acme-two", &std::fs::read_to_string(format!("{}/fixtures/move/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap().replace("acmeorg--", "acme-two--"), &[]);
+    let listed = || served.aws.replaying_for("modal:ak-acme-two", include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    replay("02-deploy-modal");
+    let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
+    assert!(ok && said.contains("acme-two--superci-plane-mdplane00002.modal.run"), "{said}");
+    // (Modal listing the workspace's apps as it listed them after a real deploy: the new control plane's among them.)
+    listed();
+    // A control plane not known here is refused by its id, never the one in use updated in its place.
+    let (ok, said) = run(&["planes", "update", "nosuchplane1"]);
+    assert!(!ok && said.contains("That control plane is not known here"), "{said}");
+    // Updated by its id, the CI's own still in use (its AWS runners' role in the CI's AWS account too, as AWS answered
+    // a real update).
+    replay("02-deploy-modal");
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", "mdplane00002")]);
+    // (The listing after the deploy again: the deploy's recording, replayed for the update, lists apps as before it.)
+    listed();
+    let (_, listed) = run(&["planes", "list"]);
+    let (ok, said) = run(&["planes", "update", "mdplane00002"]);
+    assert!(ok, "{said}\n(`planes list` just before:)\n{listed}");
+    // Its keys, written where it reads them (acme-two's settings Dict), with that sign-in: made, listed by it, ended.
+    let (ok, said) = run(&["keys", "create", "ci", "--plane=mdplane00002"]);
+    assert!(ok && said.contains("A read key"), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=mdplane00002"]);
+    assert!(ok && said.lines().any(|l| l.starts_with("ci ")), "{said}");
+    let (ok, said) = run(&["keys", "delete", "ci", "--plane=mdplane00002"]);
+    assert!(ok && said.contains("The key ci no longer reads."), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=mdplane00002"]);
+    assert!(ok && !said.lines().any(|l| l.starts_with("ci ")), "{said}");
+    // Deleted by its id: its Dicts and apps, with acme-two's sign-in.
+    replay("11-delete-md");
+    let (ok, said) = run(&["planes", "delete", "mdplane00002", "--confirm"]);
+    assert!(ok && said.contains("Deleted Modal · acme-two"), "{said}");
+    common::all_signed_by(&served, "superci-plane-mdplane00002", "modal:", "modal:ak-acme-two");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane in a second AWS account, made and changed from beside the CI's own (which stays in use, in the
+/// first): each command naming it acts with that account's sign-in, never the one in hand's.
+#[test]
+fn a_control_plane_in_a_second_aws_account_is_created_updated_and_deleted_with_that_accounts_sign_in() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    // (Served here, reading its settings where AWS keeps them for it: the parameters the CLI wrote, its key among them.)
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("awsplane0002", move |c| {
+        c.read_settings(&aws.settings_in("222222222222", "awsplane0002"));
+        (c.aws_own, c.aws_own_creds) = (Some(("222222222222".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAPLANE2".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    // (What AWS answered, answered to the second account's sign-in alone, as another account's would not have it.)
+    let replay = |name: &str| served.aws.replaying_for("aws:ASIATWO", &std::fs::read_to_string(format!("{}/fixtures/aws/planes/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        .replace("testplane0002", "awsplane0002").replace("111111111111", "222222222222"), &[("http://new-plane.test", &other.url)]);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "awsplane0002").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    replay("deploy");
+    let (ok, said) = run(&["planes", "create", "aws", "--account=222222222222", "--region=us-east-1"]);
+    assert!(ok, "created: {said}");
+    replay("update");
+    let (ok, said) = run(&["planes", "update", "awsplane0002"]);
+    assert!(ok, "updated: {said}");
+    // Its keys, written where it reads them (its account's parameters), with that sign-in: made, listed by it, ended.
+    let (ok, said) = run(&["keys", "create", "ci", "--plane=awsplane0002"]);
+    assert!(ok && said.contains("A read key"), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=awsplane0002"]);
+    assert!(ok && said.lines().any(|l| l.starts_with("ci ")), "{said}");
+    let (ok, said) = run(&["keys", "delete", "ci", "--plane=awsplane0002"]);
+    assert!(ok && said.contains("The key ci no longer reads."), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=awsplane0002"]);
+    assert!(ok && !said.lines().any(|l| l.starts_with("ci ")), "{said}");
+    replay("delete");
+    let (ok, said) = run(&["planes", "delete", "awsplane0002", "--confirm"]);
+    assert!(ok, "deleted: {said}");
+    common::all_signed_by(&served, "awsplane0002", "aws:", "aws:ASIATWO");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two AWS accounts signed in to and none named for a new control plane: which one is asked, by the command (a dry
+/// run too) and by the dashboard alike, and nothing is made in either.
+#[test]
+fn a_new_aws_control_plane_with_two_accounts_signed_in_asks_which() {
+    let served = serve(own_aws);
+    let home = signed_in_two_aws(&served);
+    for args in [&["planes", "create", "aws", "--region=us-east-1"][..], &["planes", "create", "aws", "--region=us-east-1", "--dry-run"]] {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("Say which AWS account: --account=ID. Yours: 111111111111, 222222222222."), "{args:?}: {said}");
+    }
+    let (mut child, link) = common::dashboard(&home);
+    let (status, _, said) = common::post(&link, "/plane/aws", &[("region", "us-east-1")]);
+    assert!(status == 409 && words(&said).contains("Which AWS account?") && words(&said).contains("--account=ID --region=us-east-1"), "{status} {}", words(&said));
+    let _ = child.kill();
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|b| b.contains("CreateRole")) || (a["method"] == "POST" && a["url"].as_str().is_some_and(|u| u.ends_with("/2015-03-31/functions")))), "nothing made");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The AWS sign-in kept for `account` due now, and AWS refusing to renew it, as it refuses one it has ended.
+fn aws_sign_in_ended(served: &superci_testkit::Served, home: &std::path::Path, account: &str) {
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let refresh = format!("refresh-ended-{account}");
+    let due = |s: &mut serde_json::Value| {
+        if s["account_id"] != account { return false }
+        s["creds"]["expires_at_ms"] = 0.into();
+        s["refresh_token"] = refresh.clone().into();
+        s["who"] = format!("arn:aws:iam::{account}:user/acme").into();
+        s["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+        true
+    };
+    let mut found = due(&mut kept["aws"]);
+    if let Some(more) = kept["aws_more"].as_array_mut() { for s in more { found |= due(s) } }
+    assert!(found, "signed in to {account}: {kept}");
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(&aws_renews(&refresh, None), &[]);
+}
+
+/// How many times AWS was asked to renew a sign-in.
+fn renewals(served: &superci_testkit::Served) -> usize { served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with(".signin.aws.amazon.com/v1/token"))).count() }
+
+/// A further AWS account's sign-in that AWS ended (it ends one after twelve hours at most): said by its account, at
+/// each look until it is signed in to again, never quietly forgotten with its control planes and runners; a change
+/// there says which sign-in to make, and changes nothing; the first account's control plane changes as before.
+#[test]
+fn a_further_aws_accounts_ended_sign_in_is_said_by_its_account_and_the_first_goes_on() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    with_further_aws(&served, &[("aws-acme", "222222222222")]);
+    let home = signed_in_two_aws(&served);
+    aws_sign_in_ended(&served, &home, "222222222222");
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let ended = "SuperCI's AWS sign-in to account 222222222222 has ended";
+    let (ok, said) = run(&["planes", "list"]);
+    assert!(ok && said.contains(PLANE) && said.contains(ended) && said.contains("superci login aws --add"), "{said}");
+    // Kept as ended: said again, AWS not asked to renew it again.
+    let asked = renewals(&served);
+    let (ok, said) = run(&["planes", "list"]);
+    assert!(ok && said.contains(ended), "{said}");
+    assert_eq!(renewals(&served), asked, "an ended sign-in is not renewed again");
+    // Its runners' account changed: refused by its account's sign-in, nothing changed.
+    let before = stored_or_none(&served);
+    let (ok, said) = run(&["runners", "update", "aws-acme", "--regions=eu-north-1"]);
+    assert!(!ok && said.contains(ended), "{said}");
+    assert_eq!(stored_or_none(&served), before);
+    // The first account's control plane, as before, with the first's sign-in.
+    let (ok, said) = run(&["accounts", "update", "aws", "--monthly-usd=50"]);
+    assert!(ok, "{said}");
+    assert!(!served.aws.callers.lock().unwrap().iter().any(|c| c["who"] == "aws:ASIATWO"), "nothing asked with the ended sign-in");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The first AWS account's sign-in ended while a further one's goes on: a control plane in the further account is
+/// updated and deleted with its own sign-in (the one in hand being gone takes nothing else with it), the ended one is
+/// said by its account, and a change to the control plane in the ended account says which sign-in to make.
+#[test]
+fn the_first_aws_accounts_ended_sign_in_leaves_a_control_plane_in_the_second_changeable() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("awsplane0002", move |c| {
+        c.read_settings(&aws.settings_in("222222222222", "awsplane0002"));
+        (c.aws_own, c.aws_own_creds) = (Some(("222222222222".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAPLANE2".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let replay = |name: &str| served.aws.replaying_for("aws:ASIATWO", &std::fs::read_to_string(format!("{}/fixtures/aws/planes/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        .replace("testplane0002", "awsplane0002").replace("111111111111", "222222222222"), &[("http://new-plane.test", &other.url)]);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "awsplane0002").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    replay("deploy");
+    let (ok, said) = run(&["planes", "create", "aws", "--account=222222222222", "--region=us-east-1"]);
+    assert!(ok, "created: {said}");
+    aws_sign_in_ended(&served, &home, "111111111111");
+    replay("update");
+    let (ok, said) = run(&["planes", "update", "awsplane0002"]);
+    assert!(ok, "updated with the second account's sign-in: {said}");
+    let (ok, said) = run(&["planes", "list"]);
+    assert!(ok && said.contains("awsplane0002") && said.contains("SuperCI's AWS sign-in to account 111111111111 has ended"), "{said}");
+    // The one in use, in the ended account: its update says which sign-in to make, and nothing is deployed.
+    let (ok, said) = run(&["planes", "update"]);
+    assert!(!ok && said.contains("SuperCI's AWS sign-in to account 111111111111 has ended"), "{said}");
+    replay("delete");
+    let (ok, said) = run(&["planes", "delete", "awsplane0002", "--confirm"]);
+    assert!(ok, "deleted: {said}");
+    common::all_signed_by(&served, "awsplane0002", "aws:", "aws:ASIATWO");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further Modal workspace's sign-in that Modal no longer takes: said by its name, at each look until it is signed
+/// in to again (Modal not asked with it again); a change there says which sign-in to make; the first's go on.
+#[test]
+fn a_further_modal_workspaces_ended_sign_in_is_said_by_its_name_and_the_first_goes_on() {
+    let (served, home) = two_workspaces();
+    served.aws.modal_refuse("ak-acme-two");
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let ended = "Modal no longer accepts SuperCI's sign-in to the workspace acme-two";
+    let (ok, said) = run(&["planes", "list"]);
+    // (Not as a workspace that did not answer: it answered, refusing the sign-in.)
+    assert!(ok && said.contains(PLANE) && said.contains(ended) && said.contains("superci login modal --add") && !said.contains("(acme-two:"), "{said}");
+    let asked = || served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == "modal:ak-acme-two").count();
+    let before = asked();
+    let (ok, said) = run(&["planes", "list"]);
+    assert!(ok && said.contains(ended), "{said}");
+    assert_eq!(asked(), before, "Modal is not asked again with a sign-in it no longer takes");
+    // A runner in it: refused by its name.
+    deploy_answers(&served);
+    let (ok, said) = run(&["runners", "create", "modal", "--account=acme-two"]);
+    assert!(!ok && said.contains(ended), "{said}");
+    let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
+    assert!(!ok && said.contains(ended), "{said}");
+    // The first workspace's, as before.
+    let (ok, said) = run(&["accounts", "update", "modal", "--monthly-usd=50"]);
+    assert!(ok && said.contains("The Modal account spent"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The first Modal workspace's sign-in ended while a further one's goes on: a control plane in the further workspace
+/// is updated and deleted with its own sign-in, and the ended one is said by its name.
+#[test]
+fn the_first_modal_workspaces_ended_sign_in_leaves_a_control_plane_in_the_second_changeable() {
+    let (served, home) = two_workspaces();
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00002", move |c| { c.read_settings(&aws.modal_plane_settings_in("acme-two")); c.own_cloud = "modal".into(); });
+    served.aws.workers.lock().unwrap().insert("acme-two--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "mdplane00002").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let replay = |name: &str| served.aws.replaying_for("modal:ak-acme-two", &std::fs::read_to_string(format!("{}/fixtures/move/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap().replace("acmeorg--", "acme-two--"), &[]);
+    let listed = || served.aws.replaying_for("modal:ak-acme-two", include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    replay("02-deploy-modal");
+    let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
+    assert!(ok, "created: {said}");
+    // Modal stops taking acmeorg's sign-in.
+    served.aws.modal_refuse("ak-acmeorg");
+    replay("02-deploy-modal");
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", "mdplane00002")]);
+    listed();
+    let (ok, said) = run(&["planes", "update", "mdplane00002"]);
+    assert!(ok, "updated with acme-two's sign-in: {said}");
+    let (ok, said) = run(&["planes", "list"]);
+    assert!(ok && said.contains("mdplane00002") && said.contains("Modal no longer accepts SuperCI's sign-in to the workspace acmeorg"), "{said}");
+    replay("11-delete-md");
+    let (ok, said) = run(&["planes", "delete", "mdplane00002", "--confirm"]);
+    assert!(ok && said.contains("Deleted Modal · acme-two"), "{said}");
+    common::all_signed_by(&served, "superci-plane-mdplane00002", "modal:", "modal:ak-acme-two");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 fn with_further(served: &superci_testkit::Served, plane: &str, words: &[&str]) {
     let launcher = |word: &str, workspace: &str| serde_json::json!({ "cloud": word, "url": format!("https://{workspace}--superci-runners-{plane}.modal.run") });
     let mut launchers = vec![launcher("modal", "acmeorg")];
@@ -374,8 +662,11 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let mut other = kept["aws"].clone();
     other["account_id"] = "222222222222".into();
+    // (Its own keys, as each account's are: a call made with the first's would show; and reach its own alone.)
+    other["creds"]["access_key_id"] = "ASIATWO".into();
     kept["aws_more"] = serde_json::json!([other]);
     std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.second_account("aws:ASIATWO", "222222222222");
     let run = |args: &[&str]| {
         let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
         (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
@@ -391,6 +682,8 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     for region in ["eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1"] { served.aws.replaying(&connect.join("\n").replace("ec2.us-east-1", &format!("ec2.{region}")), &[]) }
     let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
     assert!(ok && said.contains("aws-acme runs jobs now."), "{said}");
+    // Its networks made with its own sign-in, never the first account's.
+    common::all_signed_by(&served, "ec2.eu-west-1", "aws:", "aws:ASIATWO");
     let record = stored(&served);
     assert_eq!(record["accounts"], serde_json::json!([{ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }]), "{record}");
     assert_eq!(record["runners"], serde_json::json!([{ "name": "aws-acme", "account": "aws-acme" }, { "name": "aws-acme-on-demand", "account": "aws-acme", "on_demand": true }]), "{record}");
@@ -442,8 +735,12 @@ fn signed_in_two_aws(served: &superci_testkit::Served) -> std::path::PathBuf {
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let mut other = kept["aws"].clone();
     other["account_id"] = "222222222222".into();
+    // (Its own keys, as each account's are: a call made with the first's shows in `common::all_signed_by`; and what
+    // they reach is that account's alone, as in AWS.)
+    other["creds"]["access_key_id"] = "ASIATWO".into();
     kept["aws_more"] = serde_json::json!([other]);
     std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.second_account("aws:ASIATWO", "222222222222");
     home
 }
 
@@ -1304,7 +1601,7 @@ fn every_page_says_further_runners_of_each_cloud_as_it_said_before() {
         let at = format!("{}/fixtures/further/pages/{page}.txt", env!("CARGO_MANIFEST_DIR"));
         if std::env::var_os("SUPERCI_WRITE_FIXTURES").is_some() { std::fs::create_dir_all(std::path::Path::new(&at).parent().unwrap()).unwrap(); std::fs::write(&at, &said).unwrap() }
         let want = std::fs::read_to_string(&at).unwrap_or_default();
-        for (n, (w, g)) in want.lines().zip(said.lines()).enumerate() { assert_eq!(w, g, "{page}, line {}", n + 1) }
+        for (n, (w, g)) in want.lines().zip(said.lines()).enumerate() { assert_eq!(w, g, "{page}, line {} (the page as said now, for fixtures/further/pages/{page}.txt:)\n{said}", n + 1) }
         assert_eq!(want.lines().count(), said.lines().count(), "{page}");
     }
     let _ = child.kill();

@@ -601,3 +601,67 @@ fn gitlab_answers_only_for_what_it_has() {
     let jobs = |rid: u64| { let r = lab.answer(&Request::new("GET", &format!("https://gitlab.com/api/v4/runners/{rid}/jobs")).with_header("private-token", &token)).unwrap(); serde_json::from_slice::<Value>(&r.body).unwrap().as_array().unwrap().len() };
     assert_eq!((jobs(7), jobs(8)), (1, 0));
 }
+
+/// Two accounts kept apart are two accounts: what one sign-in writes in SSM or a Modal settings Dict, or a recording
+/// made for it, the other never reads, as a wrong account's sign-in would find nothing of the right one's in a real
+/// cloud. (What SuperCI's tests of several accounts stand on: a call made with the wrong sign-in fails there.)
+#[test]
+fn each_account_kept_apart_keeps_its_own() {
+    let aws = Aws::serve();
+    aws.apart("aws:ASIATWO", "222222222222");
+    let signed = |key: &str| format!("AWS4-HMAC-SHA256 Credential={key}/20261111/us-east-1/ssm/aws4_request, SignedHeaders=host, Signature=0");
+    let ask = |key: &str, target: &str, a: Value| {
+        let auth = signed(key);
+        let (s, v) = http(&aws.url, "POST", "/ssm.us-east-1.amazonaws.com/", &[("authorization", auth.as_str()), ("x-amz-target", target), ("content-type", "application/x-amz-json-1.1")], a.to_string().as_bytes());
+        (s, serde_json::from_str::<Value>(&v).unwrap_or_default())
+    };
+    assert_eq!(ask("ASIATWO", "AmazonSSM.PutParameter", json!({ "Name": "/superci/two/KEY", "Value": "2" })).0, 200);
+    assert_eq!(ask("ASIAONE", "AmazonSSM.PutParameter", json!({ "Name": "/superci/one/KEY", "Value": "1" })).0, 200);
+    // (The same name in each: two parameters, one in each account.)
+    assert_eq!(ask("ASIATWO", "AmazonSSM.PutParameter", json!({ "Name": "/superci/one/KEY", "Value": "1b" })).0, 200);
+    assert_eq!(ask("ASIATWO", "AmazonSSM.DeleteParameter", json!({ "Name": "/superci/one/KEY" })).0, 200);
+    assert_eq!(ask("ASIATWO", "AmazonSSM.GetParameter", json!({ "Name": "/superci/one/KEY" })).1["__type"], "ParameterNotFound");
+    assert_eq!(ask("ASIAONE", "AmazonSSM.GetParameter", json!({ "Name": "/superci/two/KEY" })).1["__type"], "ParameterNotFound");
+    let got = ask("ASIATWO", "AmazonSSM.GetParameter", json!({ "Name": "/superci/two/KEY", "WithDecryption": true })).1;
+    assert_eq!((got["Parameter"]["Value"].as_str(), got["Parameter"]["ARN"].as_str().is_some_and(|a| a.contains(":222222222222:"))), (Some("2"), true), "{got}");
+    let one = ask("ASIAONE", "AmazonSSM.GetParameter", json!({ "Name": "/superci/one/KEY", "WithDecryption": true })).1;
+    assert_eq!((one["Parameter"]["Value"].as_str(), one["Parameter"]["ARN"].as_str().is_some_and(|a| a.contains(&format!(":{ACCOUNT}:")))), (Some("1"), true), "{one}");
+    let listed = |key: &str| ask(key, "AmazonSSM.GetParametersByPath", json!({ "Path": "/superci/", "Recursive": true })).1["Parameters"].as_array().unwrap().iter().map(|p| p["Name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!((listed("ASIATWO"), listed("ASIAONE")), (vec!["/superci/two/KEY".to_string()], vec!["/superci/one/KEY".to_string()]));
+    assert_eq!(aws.settings_in("222222222222", "two"), [("KEY".to_string(), "2".to_string())]);
+    assert!(aws.settings("two").is_empty() && aws.settings_in("222222222222", "one").is_empty() && aws.settings_in("333333333333", "two").is_empty());
+    // A recording made for one sign-in answers it alone; another is answered as one with no recording is.
+    // (At an address no other recording has.)
+    aws.replaying_for("aws:ASIATWO", &json!({ "method": "POST", "url": "https://apart.us-east-1.amazonaws.com/", "target": "", "asked": "Action=Ask", "status": 200, "answer": "<two/>" }).to_string(), &[]);
+    let roles = |key: &str| http(&aws.url, "POST", "/apart.us-east-1.amazonaws.com/", &[("authorization", signed(key).as_str())], b"Action=Ask").1;
+    assert_eq!(roles("ASIATWO"), "<two/>");
+    assert!(roles("ASIAONE").contains("SuperCITestkitUnknown"));
+    // The first account's recordings are its own: a second account answers as one with no control plane in it.
+    let list = |key: &str| http(&aws.url, "POST", "/iam.amazonaws.com/", &[("authorization", signed(key).as_str())], b"Action=ListRoles&Version=2010-05-08").1;
+    assert!(list("ASIAONE").contains(&format!("superci-plane-{PLANE}")), "{}", list("ASIAONE"));
+    assert!(list("ASIATWO").contains("SuperCITestkitUnknown"));
+    aws.second_account("aws:ASIATWO", "222222222222");
+    assert!(list("ASIATWO").contains("<ListRolesResponse") && !list("ASIATWO").contains("superci-plane-") && !list("ASIATWO").contains(ACCOUNT), "{}", list("ASIATWO"));
+    // Modal: a workspace kept apart keeps its Dicts' entries; a sign-in Modal no longer takes is refused at every call.
+    aws.apart("modal:ak-two", "acme-two");
+    aws.replaying(&recording("DictUpdate", json!(json!({ "answers": [] }).to_string())), &[]);
+    let pickled = |t: &str| [vec![0x80, 4, 0x95], vec![0; 8], vec![0x8c, t.len() as u8], t.as_bytes().to_vec()].concat();
+    let entry = |k: &str, v: &str| field(2, &[field(1, &pickled(k)), field(2, &pickled(v))].concat());
+    let token = |t: &str| { let mut h = http::HeaderMap::new(); h.insert("x-modal-token-id", t.parse().unwrap()); h };
+    aws.modal_answer("DictUpdate", &token("ak-two"), &entry("ROUTING", "two"));
+    aws.modal_answer("DictUpdate", &token("ak-one"), &entry("ROUTING", "one"));
+    assert_eq!(aws.modal_settings.lock().unwrap().get("ROUTING").map(String::as_str), Some("one"));
+    assert_eq!(aws.modal_plane_settings_in("acme-two"), [("ROUTING".to_string(), "two".to_string())]);
+    assert!(aws.modal_plane_settings_in("acme-three").is_empty());
+    aws.modal_refuse("ak-two");
+    assert_eq!(aws.modal_answer("DictUpdate", &token("ak-two"), &entry("ROUTING", "again")).1, Some((16, "Token not found".to_string())));
+    assert_eq!(aws.modal_answer("DictUpdate", &token("ak-one"), &entry("ROUTING", "again")).1, None);
+    assert_eq!(aws.modal_plane_settings_in("acme-two"), [("ROUTING".to_string(), "two".to_string())]);
+    // Cloudflare: an account kept apart keeps its Workers' secrets; another account's Worker of the same name is
+    // another Worker.
+    aws.apart_cloudflare("2222");
+    aws.replaying(&json!({ "method": "PUT", "url": "x", "target": "", "asked": "", "status": 200, "answer": "{}" }).to_string(), &[]);
+    let put = |account: &str, v: &str| http(&aws.url, "PUT", &format!("/api.cloudflare.com/client/v4/accounts/{account}/workers/scripts/superci/secrets"), &[("authorization", "Bearer t")], json!({ "name": "ROUTING", "text": v, "type": "secret_text" }).to_string().as_bytes()).0;
+    assert_eq!((put("1111", "one"), put("2222", "two")), (200, 200));
+    assert_eq!((aws.worker_settings("superci"), aws.worker_settings_in("2222", "superci")), (vec![("ROUTING".to_string(), "one".to_string())], vec![("ROUTING".to_string(), "two".to_string())]));
+}

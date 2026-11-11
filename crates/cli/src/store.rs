@@ -47,6 +47,12 @@ pub struct Kept {
     pub cloudflare_ended: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub modal_ended: bool,
+    /// The AWS accounts and the Modal workspaces whose sign-in their cloud ended beside others still signed in to (by
+    /// account, by workspace): each said by its name until it is signed in to again, never quietly forgotten.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aws_ended_in: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modal_ended_in: Vec<String>,
 }
 
 /// What a workspace is called and looks like: what a list of workspaces says of each without asking its control
@@ -73,7 +79,7 @@ impl Kept {
     pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() || !self.modal_more.is_empty() }
     /// Worth keeping: a sign-in, or what is left of one that ended (the control plane, and the key it is read with:
     /// what the dashboard keeps always has one).
-    pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended) && self.plane.is_some()) }
+    pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended || !self.aws_ended_in.is_empty() || !self.modal_ended_in.is_empty()) && self.plane.is_some()) }
 }
 
 #[derive(Clone)]
