@@ -1759,13 +1759,13 @@ fn without_its_own_network_a_machine_still_tries_each_zone_and_a_full_region_is_
 }
 
 /// The fake clouds, with GitHub saying how run 3 stands (`done`) and taking requests to run a job again.
-struct Runs { clouds: FakeClouds, done: std::cell::Cell<bool>, may_rerun: bool }
+struct Runs { clouds: FakeClouds, done: std::cell::Cell<bool>, may_rerun: bool, passed: std::cell::Cell<bool> }
 #[async_trait(?Send)]
 impl Http for Runs {
     async fn send(&self, r: Request) -> io::Result<Response> {
         let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         if r.url == "https://api.github.com/repos/acme/app/actions/runs/3" {
-            return Ok(Response::new(200, "application/json", serde_json::json!({ "status": if self.done.get() { "completed" } else { "in_progress" } }).to_string()));
+            return Ok(Response::new(200, "application/json", serde_json::json!({ "status": if self.done.get() { "completed" } else { "in_progress" }, "conclusion": if !self.done.get() { serde_json::Value::Null } else if self.passed.get() { "success".into() } else { "failure".into() } }).to_string()));
         }
         if r.url.ends_with("/rerun") || r.url.ends_with("/rerun-failed-jobs") {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), String::new()));
@@ -1777,7 +1777,7 @@ impl Http for Runs {
 
 #[test]
 fn a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_demand() {
-    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(false), may_rerun: true }, Wakes::default(), Cache::default());
+    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(false), may_rerun: true, passed: Default::default() }, Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
@@ -1838,7 +1838,7 @@ fn a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_d
 #[test]
 fn a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted() {
     use superci_core::plane::{modal_function_usd_per_hour, modal_usd_per_hour};
-    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(false), may_rerun: true }, Wakes::default(), Cache::default(), OwnContainers::default());
+    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(false), may_rerun: true, passed: Default::default() }, Wakes::default(), Cache::default(), OwnContainers::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.containers, config.own_cloud) = (true, "modal".into());
@@ -1904,7 +1904,7 @@ fn a_preempted_modal_function_is_run_again_once_further_down_the_order_and_count
 /// A job Modal preempted goes past them too, unless nothing else can take it: then a Function it is.
 #[test]
 fn functions_are_a_row_a_label_and_a_preemption_go_past() {
-    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true }, Wakes::default(), Cache::default(), OwnContainers::default());
+    let (store, clouds, wakes, cache, own) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true, passed: Default::default() }, Wakes::default(), Cache::default(), OwnContainers::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.containers, config.own_cloud) = (true, "modal".into());
@@ -1960,9 +1960,32 @@ fn a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it() {
     assert!(e.contains("the modal-acme-two launcher is from before Functions, and would start a sandbox: update it (`superci runners create modal --account=acme-two`)"), "{e}");
 }
 
+/// A run that passed without the job a lost machine was running (the job may fail: `continue-on-error`) is not
+/// run again: a new attempt would only cost a machine.
+#[test]
+fn a_lost_job_of_a_run_that_passed_without_it_is_not_run_again() {
+    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true, passed: std::cell::Cell::new(true) }, Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    run(webhook("queued", None));
+    let token = job(&store, 7)["notice"].as_str().unwrap().to_string();
+    let runner = format!("superci-{PLANE_ID}-7");
+    run(webhook("in_progress", Some(&runner)));
+    run(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={token}")));
+    run(webhook("completed", Some(&runner)));
+    block_on(plane.alarm()).unwrap();
+    assert!(!clouds.clouds.calls.borrow().iter().any(|c| c.1.ends_with("/rerun") || c.1.ends_with("/rerun-failed-jobs")));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["rerun"]["state"].as_str()), (Some("failed"), Some("not run again: its run passed without it")), "{j}");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("rerun:")));
+}
+
 #[test]
 fn an_app_that_may_not_run_jobs_again_says_so() {
-    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: false }, Wakes::default(), Cache::default());
+    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: false, passed: Default::default() }, Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
@@ -2122,7 +2145,7 @@ fn a_job_that_passed_as_the_notice_came_is_not_run_again_and_a_notice_follows_th
 
 #[test]
 fn several_jobs_of_one_run_taken_back_are_run_again_with_one_request() {
-    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true }, Wakes::default(), Cache::default());
+    let (store, clouds, wakes, cache) = (Mem::default(), Runs { clouds: FakeClouds::default(), done: std::cell::Cell::new(true), may_rerun: true, passed: Default::default() }, Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
@@ -7720,6 +7743,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,
         a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted,
+        a_lost_job_of_a_run_that_passed_without_it_is_not_run_again,
         functions_are_a_row_a_label_and_a_preemption_go_past,
         a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it
     ];
