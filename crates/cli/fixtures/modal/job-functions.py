@@ -97,9 +97,25 @@ if kind == "jobs":
     runner.wait.side_effect = [KeyboardInterrupt(), 130]
     assert ns["run_job"]("L", None, notice) == {"exit": 130, "preempted": True}
     assert ns["urllib"].request.urlopen.call_count == 2 and signals == [("kill", 4242, signal.SIGINT)], signals
+    # A second interrupt as it stops, and one while it waits for the telling to end: it is stopping already, and still
+    # returns, the runner interrupted once.
+    modal.current_function_call_id.return_value = "fc-3c"
+    signals.clear(); told.clear()
+    ns["urllib"].request.urlopen.reset_mock()
+    ns["urllib"].request.urlopen.side_effect = OSError("down")
+    teller = mock.Mock(); teller.join.side_effect = KeyboardInterrupt()
+    threading_was = ns["threading"]
+    ns["threading"] = mock.Mock(Thread=mock.Mock(return_value=teller))
+    runner.wait.side_effect = [KeyboardInterrupt(), KeyboardInterrupt(), 130]
+    assert ns["run_job"]("L", None, notice) == {"exit": 130, "preempted": True}
+    assert signals == [("kill", 4242, signal.SIGINT)] and teller.start.called and teller.join.called, signals
+    ns["threading"] = threading_was
     # A SIGTERM is the same; a runner that has not ended 25 s later is ended with its whole session.
     def waits(timeout=None):
-        if timeout is None: return -9
+        # (Its end waited for after SIGKILL, through an interrupt that comes meanwhile.)
+        if timeout is None:
+            if not waits.interrupted: waits.interrupted = True; raise KeyboardInterrupt()
+            return -9
         clock[0] += timeout
         if clock[0] == 1: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
         raise Expired()
@@ -108,6 +124,7 @@ if kind == "jobs":
         signals.clear(); told.clear(); clock[0] = 0
         ns["listeners"] = lambda: listening
         modal.current_function_call_id.return_value = f"fc-{4 + len(listening)}"
+        waits.interrupted = False
         runner.wait.side_effect = waits
         assert ns["run_job"]("M", None, None) == {"exit": -9, "preempted": True}
         assert signals == [first, ("killpg", 99, signal.SIGKILL)] and 25 < clock[0] <= 27 and told == [], (signals, clock)
