@@ -811,9 +811,9 @@ fn cloudflare_runners_go_into_the_account_named_and_an_update_says_a_launcher_cl
 
 /// AWS's runners for a control plane in Cloudflare: the role made, the control plane handed what it assumes it with,
 /// and its answer awaited (connected; not yet able to use it, said; or settings Cloudflare would not keep, said).
-/// A control plane in Cloudflare with two AWS accounts signed in to: which one its AWS runners go into is asked, by the
-/// command (a dry run too) and the dashboard alike, nothing made; named, they are connected there with that account's
-/// sign-in.
+/// A control plane in Cloudflare with two AWS accounts signed in to: which one its AWS runners go into is asked,
+/// nothing made; named, they are connected there with that account's sign-in. (The command's own asking:
+/// `cloudflare_api::cloudflare_then_modal`.)
 #[test]
 fn aws_runners_for_a_control_plane_in_cloudflare_go_into_the_account_named_and_with_two_are_asked_for() {
     let served = serve(|_| {});
@@ -832,25 +832,15 @@ fn aws_runners_for_a_control_plane_in_cloudflare_go_into_the_account_named_and_w
     served.aws.second_account("aws:ASIATWO", "222222222222");
     // (Its role and network, as AWS answered them for a control plane in Cloudflare.)
     for region in ["us-east-1", "us-east-2", "us-west-2"] { served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &plane), ("us-east-1", region)]) }
-    let run = |args: &[&str]| {
-        let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
-        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
-    };
-    let (_, listed) = run(&["planes", "list"]);
-    for args in [&["runners", "create", "aws", "--region=us-east-1"][..], &["runners", "create", "aws", "--region=us-east-1", "--dry-run"]] {
-        let (ok, said) = run(args);
-        assert!(!ok && said.contains("Say which AWS account: --account=ID. Yours: 111111111111, 222222222222."), "{args:?}: {said}\n(`planes list`:)\n{listed}");
-    }
-    let (child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1")]);
-    assert!(status == 409 && said.contains("Which AWS account?"), "{status} {said}");
-    drop(child);
+    assert!(status == 409 && said.contains("Which AWS account?") && said.contains("111111111111, 222222222222") && said.contains("--account=ID --region=us-east-1"), "{status} {said}");
     // (What connecting makes: its role and what it may do; looking for control planes reads IAM too, and is no change.)
     let iam = || served.aws.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains("iam.amazonaws.com") && (w.contains("Action=CreateRole") || w.contains("Action=PutRolePolicy")))).count();
     assert_eq!(iam(), 0, "nothing made in AWS");
     // Named: its own AWS runners there (the first, so not a further account), with its sign-in.
-    let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=us-east-1"]);
-    assert!(ok && said.contains("aws runs jobs now."), "{said}");
+    let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1"), ("account", "222222222222")]);
+    assert!(status == 303, "{status} {said}");
     assert!(iam() > 0);
     // (Each change made there with its own sign-in: none with the first account's.)
     let made: Vec<String> = served.aws.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains("iam.amazonaws.com") && (w.contains("Action=CreateRole") || w.contains("Action=PutRolePolicy") || w.contains("Action=UpdateAssumeRolePolicy")))).map(|c| c["who"].as_str().unwrap_or_default().to_string()).collect();

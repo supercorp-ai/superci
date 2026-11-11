@@ -183,6 +183,23 @@ fn cloudflare_then_modal(workspace: &str) {
     let account = format!("--account={workspace}");
     let (ok, said) = run("mdplane00002", &["planes", "create", "modal", &account]);
     assert!(ok && said.contains(&format!("The control plane is running: https://{workspace}--superci-plane-mdplane00002.modal.run")), "{said}");
+    // With a second AWS account signed in to beside the first, which one its AWS runners would go into is asked (a
+    // dry run too), never guessed; named, the dry run goes on. (The second sign-in then taken out again.)
+    let file = home.join("workspaces/default/sign-ins.json");
+    let before: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut two = before.clone();
+    let mut other = two["aws"].clone();
+    (other["account_id"], other["creds"]["access_key_id"]) = ("222222222222".into(), "ASIATWO".into());
+    two["aws_more"] = serde_json::json!([other]);
+    std::fs::write(&file, two.to_string()).unwrap();
+    served.aws.second_account("aws:ASIATWO", "222222222222");
+    for args in [&["runners", "create", "aws", "--plane=cfplane00002", "--region=us-east-1"][..], &["runners", "create", "aws", "--plane=cfplane00002", "--region=us-east-1", "--dry-run"]] {
+        let (ok, said) = run("", args);
+        assert!(!ok && said.contains("Say which AWS account: --account=ID. Yours: 111111111111, 222222222222."), "{args:?}: {said}");
+    }
+    let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1", "--dry-run"]);
+    assert!(ok && said.contains("let aws run jobs"), "{said}");
+    std::fs::write(&file, before.to_string()).unwrap();
     // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
     step("03-cf-containers");
     let (ok, said) = run("", &["runners", "create", "cloudflare", "--plane=cfplane00002"]);

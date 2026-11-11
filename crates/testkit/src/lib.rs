@@ -976,7 +976,7 @@ impl Aws {
     /// signed in to beside the first looks like before anything of SuperCI's is made there.
     pub fn second_account(&self, who: &str, account: &str) {
         self.apart(who, account);
-        let own = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").replace(ACCOUNT, account).replace("<RoleName>superci-plane-", "<RoleName>another-role-");
+        let own = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").replace(ACCOUNT, account).replace("superci-plane-", "another-role-");
         self.replaying_for(who, &own, &[]);
     }
 
