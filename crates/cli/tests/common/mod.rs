@@ -273,3 +273,13 @@ pub fn pb(fields: &[Pb]) -> Vec<u8> {
     }
     out
 }
+
+/// Every call the stand-in was asked about `about` (a control plane's id, a region's address) made with `who`'s sign-in
+/// (`modal:TOKEN_ID`, `aws:ACCESS_KEY_ID`): what is done for a control plane or runners in one account or workspace is
+/// done with that one's sign-in, never the one in hand's. At least one such call, so the check holds something.
+pub fn all_signed_by(served: &superci_testkit::Served, about: &str, cloud: &str, who: &str) {
+    let calls: Vec<(String, String)> = served.aws.callers_about(about).into_iter().filter(|(w, _)| w.starts_with(cloud)).collect();
+    assert!(!calls.is_empty(), "no {cloud} call about {about}");
+    let wrong: Vec<&(String, String)> = calls.iter().filter(|(w, _)| w != who).collect();
+    assert!(wrong.is_empty(), "made with another sign-in than {who}: {wrong:#?}");
+}

@@ -146,16 +146,6 @@ fn a_modal_control_plane_is_deployed_in_the_workspace_named_not_only_the_one_in_
 }
 
 /// Further runners already on the control plane: `words`, each in a workspace named after the word.
-/// Every call the stand-in was asked about `about` (a control plane's id, a region's address) made with `who`'s sign-in
-/// (`modal:TOKEN_ID`, `aws:ACCESS_KEY_ID`): what is done for a control plane or runners in one account or workspace is
-/// done with that one's sign-in, never the one in hand's. At least one such call, so the check holds something.
-fn all_signed_by(served: &superci_testkit::Served, about: &str, cloud: &str, who: &str) {
-    let calls: Vec<(String, String)> = served.aws.callers_about(about).into_iter().filter(|(w, _)| w.starts_with(cloud)).collect();
-    assert!(!calls.is_empty(), "no {cloud} call about {about}");
-    let wrong: Vec<&(String, String)> = calls.iter().filter(|(w, _)| w != who).collect();
-    assert!(wrong.is_empty(), "made with another sign-in than {who}: {wrong:#?}");
-}
-
 /// A control plane in a second Modal workspace, changed from beside the CI's own (which stays in use): each command
 /// that names it (update, delete) acts with that workspace's sign-in, and a move to it and back writes each with its
 /// own (Taras Kornichuk's #26 and #27). The whole class: a cloud's first sign-in taken for a control plane elsewhere.
@@ -181,7 +171,34 @@ fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_
     replay("11-delete-md");
     let (ok, said) = run(&["planes", "delete", "mdplane00002", "--confirm"]);
     assert!(ok && said.contains("Deleted Modal · acme-two"), "{said}");
-    all_signed_by(&served, "mdplane00002", "modal:", "modal:ak-acme-two");
+    common::all_signed_by(&served, "superci-plane-mdplane00002", "modal:", "modal:ak-acme-two");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane in a second AWS account, made and changed from beside the CI's own (which stays in use, in the
+/// first): each command naming it acts with that account's sign-in, never the one in hand's.
+#[test]
+fn a_control_plane_in_a_second_aws_account_is_created_updated_and_deleted_with_that_accounts_sign_in() {
+    let served = serve(own_aws);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in_two_aws(&served);
+    let other = superci_testkit::serve_as("awsplane0002", |c| (c.aws_own, c.aws_own_creds) = (Some(("222222222222".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAPLANE2".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })));
+    let replay = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/aws/planes/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        .replace("testplane0002", "awsplane0002").replace("111111111111", "222222222222"), &[("http://new-plane.test", &other.url)]);
+    let run = |args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "awsplane0002").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    replay("deploy");
+    let (ok, said) = run(&["planes", "create", "aws", "--account=222222222222", "--region=us-east-1"]);
+    assert!(ok, "created: {said}");
+    replay("update");
+    let (ok, said) = run(&["planes", "update", "awsplane0002"]);
+    assert!(ok, "updated: {said}");
+    replay("delete");
+    let (ok, said) = run(&["planes", "delete", "awsplane0002", "--confirm"]);
+    assert!(ok, "deleted: {said}");
+    common::all_signed_by(&served, "awsplane0002", "aws:", "aws:ASIATWO");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -433,7 +450,7 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     let (ok, said) = run(&["runners", "create", "aws", "--account=222222222222", "--region=eu-west-1", "--name=aws-acme"]);
     assert!(ok && said.contains("aws-acme runs jobs now."), "{said}");
     // Its networks made with its own sign-in, never the first account's.
-    all_signed_by(&served, "ec2.eu-west-1", "aws:", "aws:ASIATWO");
+    common::all_signed_by(&served, "ec2.eu-west-1", "aws:", "aws:ASIATWO");
     let record = stored(&served);
     assert_eq!(record["accounts"], serde_json::json!([{ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }]), "{record}");
     assert_eq!(record["runners"], serde_json::json!([{ "name": "aws-acme", "account": "aws-acme" }, { "name": "aws-acme-on-demand", "account": "aws-acme", "on_demand": true }]), "{record}");
@@ -485,6 +502,8 @@ fn signed_in_two_aws(served: &superci_testkit::Served) -> std::path::PathBuf {
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let mut other = kept["aws"].clone();
     other["account_id"] = "222222222222".into();
+    // (Its own keys, as each account's are: a call made with the first's shows in `common::all_signed_by`.)
+    other["creds"]["access_key_id"] = "ASIATWO".into();
     kept["aws_more"] = serde_json::json!([other]);
     std::fs::write(&file, kept.to_string()).unwrap();
     home
