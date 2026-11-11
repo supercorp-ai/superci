@@ -93,6 +93,15 @@ def listeners():
     return found
 
 
+def ended(runner):
+    """The exit code of a runner ended with SIGKILL, waited for whatever interrupts come meanwhile."""
+    while True:
+        try:
+            return runner.wait()
+        except KeyboardInterrupt:
+            pass
+
+
 def run_job(jit, fail=None, notice=None):
     """GitHub's runner for one job, until it ends; or, started again on the same input (Modal preempted it), the
     control plane told so and no runner. Stopped by Modal while it runs (SIGINT or SIGTERM): the control plane told
@@ -148,12 +157,19 @@ def run_job(jit, fail=None, notice=None):
                         os.killpg(runner.pid, signal.SIGKILL)
                     except OSError:
                         pass
-                    code = runner.wait()
+                    code = ended(runner)
                     break
             except KeyboardInterrupt:
-                stopping()
+                # (A second one while it stops: it is stopping already, and still ends as said.)
+                try:
+                    stopping()
+                except KeyboardInterrupt:
+                    pass
         if "teller" in stop:
-            stop["teller"].join(max(0.0, STOP_S + 3 - (time.monotonic() - stop["at"])))
+            try:
+                stop["teller"].join(max(0.0, STOP_S + 3 - (time.monotonic() - stop["at"])))
+            except KeyboardInterrupt:
+                pass
     finally:
         for s, handler in before.items():
             signal.signal(s, handler)
