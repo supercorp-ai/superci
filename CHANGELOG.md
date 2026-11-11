@@ -8,6 +8,9 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - `superci planes update ID` with an id not known here says so. It updated the control plane in use in its place.
 - The expired keys of an AWS control plane in a further account are tidied in that account. They were looked for in the account in hand, and stayed.
 - Control planes are looked for in every Modal workspace signed in to, as in every AWS account: one in a further workspace was not found by a later command, or on another computer.
+- A sign-in its cloud ended in one AWS account or Modal workspace, beside others still signed in to, is said by that account or workspace (`superci planes list`, the dashboard, and each change that needs it) until it is signed in to again: `superci login aws --add`, `superci login modal --add`. It was forgotten without a word, its control planes and runners no longer shown. The others go on: a control plane in a further account or workspace is updated and deleted with its own sign-in when the first one's has ended, which said to sign in with AWS first.
+- Updating or deleting a control plane in another account from the dashboard leaves the account in hand as it was. The pages and later changes went on with the other account's sign-in.
+- A move between control planes is not stopped by an AWS sign-in that ended when neither of them is in AWS.
 
 ## 0.20.3 — 2026-11-09
 - The control plane's page says how many spot CPUs its account may run at once across every region its spot machines start in (300 in N. Virginia and 300 in Ohio: 600, 150 jobs of the default size), and each region's own. Opened before the Runners page, it knew only its home region's and said that alone.

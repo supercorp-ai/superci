@@ -414,7 +414,8 @@ impl GitHub {
         if let (Some(h), Some(aws)) = (url.host_str().filter(|h| h.ends_with(".amazonaws.com")), self.aws.lock().unwrap().clone()) {
             let _ = h;
             let target = r.header("x-amz-target").unwrap_or_default().to_string();
-            let (status, headers, answer) = aws.handle_full(&r.method, &r.url, &target, &String::from_utf8_lossy(&r.body));
+            let who = crate::who(r.header("authorization").unwrap_or_default());
+            let (status, headers, answer) = crate::as_caller(who, || aws.handle_full(&r.method, &r.url, &target, &String::from_utf8_lossy(&r.body)));
             let mut res = Response::new(status, if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" }, answer);
             for (k, v) in headers { res = res.with_header(&k, &v) }
             return Some(res)

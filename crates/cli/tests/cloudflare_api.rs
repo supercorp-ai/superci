@@ -106,7 +106,9 @@ fn a_control_plane_in_a_second_cloudflare_account_is_made_and_deleted_there() {
     let served = serve(|_| {});
     served.connect_github();
     let aws = served.aws.clone();
-    let cf = serve_as("cfplane00002", move |c| c.read_settings(&aws.worker_settings("superci")));
+    // (Reading its Worker's secrets in the second account, kept apart from the first's Worker of the same name.)
+    served.aws.apart_cloudflare(second);
+    let cf = serve_as("cfplane00002", move |c| c.read_settings(&aws.worker_settings_in(second, "superci")));
     served.aws.workers.lock().unwrap().insert("superci.globex.workers.dev".into(), cf.url.clone());
     let home = common::signed_in(&served);
     with_cloudflare(&home);
@@ -125,6 +127,8 @@ fn a_control_plane_in_a_second_cloudflare_account_is_made_and_deleted_there() {
     assert!(ok, "{said}");
     let calls: Vec<String> = served.aws.callers.lock().unwrap().iter().filter_map(|c| c["what"].as_str().filter(|w| w.contains("/workers/scripts/superci")).map(str::to_string)).collect();
     assert!(!calls.is_empty() && calls.iter().all(|w| w.contains(second) && !w.contains(first)), "{calls:#?}");
+    // (Nothing of it written into the first account's Worker of the same name.)
+    assert!(served.aws.worker_settings("superci").is_empty(), "{:?}", served.aws.worker_settings("superci"));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -142,8 +146,12 @@ fn cloudflare_then_modal(workspace: &str) {
     });
     cf.aws.params.lock().unwrap().remove("/superci/cfplane00002/CONTAINERS");
     let aws = served.aws.clone();
+    // (Its settings Dict where its workspace keeps it: a workspace beside the first is one of its own.)
+    let ws = workspace.to_string();
+    let md_settings = move |aws: &superci_testkit::Aws| if ws == "acmeorg" { aws.modal_plane_settings() } else { aws.modal_plane_settings_in(&ws) };
+    let read = md_settings.clone();
     let md = serve_as("mdplane00002", move |c| {
-        let settings = aws.modal_plane_settings();
+        let settings = read(&aws);
         c.read_settings(&settings);
         c.own_cloud = "modal".into();
         c.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
@@ -158,7 +166,10 @@ fn cloudflare_then_modal(workspace: &str) {
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
-    if workspace != "acmeorg" { kept["modal_more"] = serde_json::json!([{ "token_id": format!("ak-{workspace}"), "token_secret": format!("as-{workspace}"), "workspace": workspace }]) }
+    if workspace != "acmeorg" {
+        kept["modal_more"] = serde_json::json!([{ "token_id": format!("ak-{workspace}"), "token_secret": format!("as-{workspace}"), "workspace": workspace }]);
+        served.aws.apart(&format!("modal:ak-{workspace}"), workspace);
+    }
     std::fs::write(&file, kept.to_string()).unwrap();
     let step = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/move/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
     let run = |id: &str, args: &[&str]| {
@@ -193,8 +204,8 @@ fn cloudflare_then_modal(workspace: &str) {
     step("07-move");
     let (ok, said) = run("", &["planes", "move", "mdplane00002", "--plane=cfplane00002"]);
     assert!(ok && said.contains("Bringing your runner providers") && said.contains("Moved."), "{said}");
-    assert!(served.aws.modal_plane_settings().iter().any(|(k, v)| k == "LAUNCHERS" && v.contains("\"cloud\":\"cloudflare\"")), "{:?}", served.aws.modal_plane_settings());
-    assert!(served.aws.modal_plane_settings().iter().any(|(k, v)| k == "CONTAINERS" && v == "on"));
+    assert!(md_settings(&served.aws).iter().any(|(k, v)| k == "LAUNCHERS" && v.contains("\"cloud\":\"cloudflare\"")), "{:?}", md_settings(&served.aws));
+    assert!(md_settings(&served.aws).iter().any(|(k, v)| k == "CONTAINERS" && v == "on"));
     assert_eq!(cf.store.under("moved_to").len(), 1);
     step("08-after-move");
     let (ok, said) = run("", &["runners", "list", "--plane=mdplane00002"]);

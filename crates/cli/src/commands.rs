@@ -1164,7 +1164,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 }
                 // (In the workspace named, one signed in to; else the one in hand.)
                 _ => match (args.get("account"), d.modal_workspace(args.get("account"))) {
-                    (Some(a), None) => return Err(format!("Sign in with Modal to the workspace {a} first: `superci login modal --add`.").into()),
+                    (Some(a), None) => return Err(d.modal_needed(a).into()),
                     (a, Some(w)) => (a.map(|a| field("account", a)).into_iter().collect(), format!("Modal, in workspace {w}")),
                     (None, None) => (vec![], "Modal".to_string()),
                 },

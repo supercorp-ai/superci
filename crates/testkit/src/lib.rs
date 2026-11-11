@@ -65,6 +65,17 @@ thread_local! {
     /// On a served control plane's own thread: the settings views (`Aws::settings`, …) are its cloud's copy there,
     /// what a control plane builds its configuration from; elsewhere (a test's) they are what it reads, its record's.
     static AS_PLANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whose sign-in the call being answered on this thread was made with (see `who`): which account's own it reaches
+    /// (`Aws::apart`), and which recordings answer it (`Aws::replaying_for`).
+    static CALLER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// `f` answered as a call made with `who`'s sign-in (see `CALLER`).
+pub(crate) fn as_caller<R>(who: String, f: impl FnOnce() -> R) -> R {
+    let was = CALLER.with(|c| c.replace(who));
+    let r = f();
+    CALLER.with(|c| *c.borrow_mut() = was);
+    r
 }
 
 /// Each control plane served, by its address: its store (where what was written through it is kept).
@@ -503,6 +514,18 @@ pub struct Aws {
     pub faults: Faults,
     /// Its server ends (see `Ends`).
     pub stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Sign-ins that reach an account of their own, as each AWS account, Modal workspace is its own: `aws:ASIATWO` →
+    /// `222222222222`, `modal:ak-acme-two` → `acme-two` (see `apart`). Every other sign-in reaches the first account.
+    pub apart: Arc<Mutex<BTreeMap<String, String>>>,
+    /// SSM's parameters of each account kept apart, by account (the first's are `params`).
+    pub params_apart: Arc<Mutex<BTreeMap<String, Arc<Mutex<BTreeMap<String, (String, u64, u64)>>>>>>,
+    /// What each workspace kept apart gave Modal's settings Dicts, by workspace (the first's is `modal_settings`).
+    pub modal_settings_apart: Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>,
+    /// Cloudflare accounts kept apart (by id): their Workers' secrets are kept as `ACCOUNT:script` in `worker_secrets`.
+    pub cloudflare_apart: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Modal sign-ins Modal no longer takes, by token id: each call made with one is refused as Modal refuses it
+    /// (`fixtures/modal/sign-in/ended.jsonl`: Unauthenticated, "Token not found").
+    pub modal_refused: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 /// A Modal sign-in's approval as Modal hands it out (see `Aws::modal_approve`).
@@ -589,7 +612,14 @@ pub(crate) fn action(target: &str, asked: &str) -> String {
 
 /// Whose sign-in a call was made with, from its `authorization` header: AWS's access key id (Signature Version 4's
 /// `Credential=KEY/…`), else a bearer token; empty for none.
-fn who(authorization: &str) -> String {
+/// A parameter written into an account's parameters as SSM's `PutParameter` writes one (its version one more).
+fn put_into(params: &Mutex<BTreeMap<String, (String, u64, u64)>>, name: &str, value: &str) {
+    let mut p = params.lock().unwrap();
+    let version = p.get(name).map(|(_, v, _)| v + 1).unwrap_or(1);
+    p.insert(name.to_string(), (value.to_string(), version, system_ms()));
+}
+
+pub(crate) fn who(authorization: &str) -> String {
     if let Some(rest) = authorization.split("Credential=").nth(1) { return format!("aws:{}", rest.split('/').next().unwrap_or_default()) }
     authorization.strip_prefix("Bearer ").map(|t| format!("bearer:{t}")).unwrap_or_default()
 }
@@ -612,6 +642,12 @@ impl Aws {
         let token = headers.get("x-modal-token-id").and_then(|v| v.to_str().ok()).unwrap_or_default();
         let readable: String = String::from_utf8_lossy(message).chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
         self.callers.lock().unwrap().push(json!({ "who": format!("modal:{token}"), "what": format!("{method} {readable}") }));
+        CALLER.with(|c| *c.borrow_mut() = format!("modal:{token}"));
+        // (A sign-in Modal no longer takes: every call refused, as Modal refused a real one's.)
+        if !token.is_empty() && self.modal_refused.lock().unwrap().contains(token) {
+            self.asked.lock().unwrap().push(json!({ "method": "POST", "url": url, "target": "", "asked": asked, "status": 500, "answer": json!({ "error": format!("Modal {method}: Token not found") }).to_string() }));
+            return (vec![], Some((16, "Token not found".to_string())))
+        }
         // (A sweep's fault: Modal's own status for an internal error.)
         if self.faults.call(format!("POST {url}")).is_some() { return (vec![], Some((13, "internal error".to_string()))) }
         // (What Modal refuses whatever a recording has: a client it cannot tell the version of; and a client that says
@@ -622,7 +658,12 @@ impl Aws {
             return (vec![], Some((code, message)))
         }
         // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
-        if method == "DictUpdate" { self.modal_settings.lock().unwrap().extend(modal_entries(message)) }
+        if method == "DictUpdate" {
+            match self.account_here() {
+                Some(workspace) => self.modal_settings_apart.lock().unwrap().entry(workspace).or_default().extend(modal_entries(message)),
+                None => self.modal_settings.lock().unwrap().extend(modal_entries(message)),
+            }
+        }
         // (What a sandbox is given on its input, taken as Modal takes it: nothing answered but that it was, a recording
         // having it or not.)
         let written = (method == "SandboxStdinWrite").then(|| (200, vec![], json!({ "answers": [""] }).to_string()));
@@ -759,6 +800,7 @@ impl Aws {
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
             a.callers.lock().unwrap().push(json!({ "who": who(&header("authorization")), "what": format!("{method} {target} {} {}", header("x-amz-target"), String::from_utf8_lossy(&body).chars().take(600).collect::<String>()) }));
+            CALLER.with(|c| *c.borrow_mut() = who(&header("authorization")));
             // (Counted here, but what goes on to GitHub's stand-in, which counts it.)
             let s3_recorded = host.contains(".s3.") && a.recorded.lock().unwrap().iter().any(|r| r["url"] == format!("https:/{target}").as_str() && r["method"] == method.as_str());
             let to_github = ((!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || host.contains(".s3."))
@@ -780,6 +822,10 @@ impl Aws {
                 // (A Worker's secrets kept as written: what a control plane served here reads as its settings.)
                 let path = url.split('?').next().unwrap_or_default().to_string();
                 if let Some((script, rest)) = path.split_once("/workers/scripts/").map(|(_, r)| r.split_once('/').unwrap_or((r, ""))) {
+                    // (An account kept apart keeps its own: `ACCOUNT:script`.)
+                    let account = path.split("/accounts/").nth(1).and_then(|r| r.split('/').next()).unwrap_or_default();
+                    let script = if a.cloudflare_apart.lock().unwrap().contains(account) { format!("{account}:{script}") } else { script.to_string() };
+                    let script = script.as_str();
                     let mut kept = a.worker_secrets.lock().unwrap();
                     match (method.as_str(), rest) {
                         ("PUT", "secrets") => if let Ok(v) = serde_json::from_str::<Value>(&asked) { if let (Some(n), Some(t)) = (v["name"].as_str(), v["text"].as_str()) { kept.entry(script.to_string()).or_default().insert(n.to_string(), t.to_string()); } },
@@ -849,12 +895,18 @@ impl Aws {
 
     /// What a real account answered in a situation (`fixtures/aws/planes/update.jsonl`, …), answered first from now
     /// on, with what stood for something there replaced by what it is here (a control plane's id, its address).
-    pub fn replaying(&self, recording: &str, replace: &[(&str, &str)]) {
+    pub fn replaying(&self, recording: &str, replace: &[(&str, &str)]) { self.replaying_as(None, recording, replace) }
+
+    /// The same, answered only to calls made with `who`'s sign-in (`aws:ASIATWO`, `modal:ak-acme-two`): what that
+    /// account answered; any other is answered as before, as another account would.
+    pub fn replaying_for(&self, who: &str, recording: &str, replace: &[(&str, &str)]) { self.replaying_as(Some(who), recording, replace) }
+
+    fn replaying_as(&self, who: Option<&str>, recording: &str, replace: &[(&str, &str)]) {
         let mut all = self.recorded.lock().unwrap();
         // (Each answer marked with its recording's place: the newest recording's answers come first.)
         let newest = all.iter().filter_map(|r| r["recording"].as_u64()).max().unwrap_or(0) + 1;
         let mut r: Vec<Value> = recording.lines().filter_map(|l| serde_json::from_str::<Value>(&replace.iter().fold(l.to_string(), |l, (from, to)| l.replace(from, to))).ok())
-            .map(|mut v| { v["recording"] = newest.into(); v }).collect();
+            .map(|mut v| { v["recording"] = newest.into(); if let Some(w) = who { v["for"] = w.into() } v }).collect();
         r.extend(all.drain(..));
         *all = r;
         self.replayed.lock().unwrap().clear();
@@ -911,10 +963,47 @@ impl Aws {
     }
 
     /// A parameter written as SSM's `PutParameter` writes one.
-    pub fn put_param(&self, name: &str, value: &str) {
-        let mut p = self.params.lock().unwrap();
-        let version = p.get(name).map(|(_, v, _)| v + 1).unwrap_or(1);
-        p.insert(name.to_string(), (value.to_string(), version, system_ms()));
+    pub fn put_param(&self, name: &str, value: &str) { put_into(&self.params, name, value) }
+
+    /// Calls made with `who`'s sign-in (`aws:ASIATWO`, `modal:ak-acme-two`) reach `account`, an account of their own:
+    /// what they write and read in SSM or a Modal settings Dict is that account's, never the first's (nor the first's
+    /// theirs), as two real accounts' are.
+    pub fn apart(&self, who: &str, account: &str) { self.apart.lock().unwrap().insert(who.to_string(), account.to_string()); }
+
+    /// A Cloudflare account kept apart: its Workers' secrets are its own (another account's Worker of the same name
+    /// is another Worker).
+    pub fn apart_cloudflare(&self, account: &str) { self.cloudflare_apart.lock().unwrap().insert(account.to_string()); }
+
+    /// Modal no longer takes this sign-in (its token id): each call made with it is refused as Modal refuses one.
+    pub fn modal_refuse(&self, token_id: &str) { self.modal_refused.lock().unwrap().insert(token_id.to_string()); }
+
+    /// The account kept apart that the call being answered reaches (none: the first).
+    fn account_here(&self) -> Option<String> { CALLER.with(|c| self.apart.lock().unwrap().get(c.borrow().as_str()).cloned()) }
+
+    /// SSM's parameters of the account the call being answered reaches.
+    fn params_here(&self) -> Arc<Mutex<BTreeMap<String, (String, u64, u64)>>> {
+        match self.account_here() { Some(a) => self.params_apart.lock().unwrap().entry(a).or_default().clone(), None => self.params.clone() }
+    }
+
+    /// A control plane's settings in an account kept apart, by name, as it reads them there (`/superci/<id>/<NAME>`):
+    /// what was written with that account's sign-in, and nothing of the first's.
+    pub fn settings_in(&self, account: &str, plane: &str) -> Vec<(String, String)> {
+        let prefix = format!("/superci/{plane}/");
+        let params = self.params_apart.lock().unwrap().get(account).cloned().unwrap_or_default();
+        let kept = params.lock().unwrap().iter().filter_map(|(k, (v, _, _))| Some((k.strip_prefix(&prefix)?.to_string(), v.clone()))).filter(|(k, _)| !k.contains('/')).collect();
+        kept
+    }
+
+    /// What a workspace kept apart gave Modal's settings Dicts, as a Modal control plane there reads them.
+    pub fn modal_plane_settings_in(&self, workspace: &str) -> Vec<(String, String)> {
+        let kept = self.modal_settings_apart.lock().unwrap().get(workspace).cloned().unwrap_or_default();
+        self.overlaid(self.served_at(|h| h.starts_with(&format!("{workspace}--")) && h.ends_with(".modal.run")), kept.into_iter().filter(|(_, v)| !v.is_empty()).collect())
+    }
+
+    /// A Worker's secrets in a Cloudflare account kept apart, as a control plane there reads them.
+    pub fn worker_settings_in(&self, account: &str, script: &str) -> Vec<(String, String)> {
+        let kept = self.worker_secrets.lock().unwrap().get(&format!("{account}:{script}")).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+        self.overlaid(None, kept)
     }
 
     /// A control plane's settings, by name, as it reads them (`/superci/<id>/<NAME>`).
@@ -975,7 +1064,9 @@ impl Aws {
     /// The recorded answer to the same request, else to the same action at the same address.
     fn replay(&self, method: &str, url: &str, target: &str, asked: &str) -> Option<(u16, Vec<(String, String)>, String)> {
         let recorded = self.recorded.lock().unwrap();
-        let at = |r: &&Value| r["url"] == url && r["target"] == target && r["method"] == method;
+        // (A recording made for one sign-in answers that sign-in only: see `replaying_for`.)
+        let caller = CALLER.with(|c| c.borrow().clone());
+        let at = |r: &&Value| r["url"] == url && r["target"] == target && r["method"] == method && (r["for"].is_null() || r["for"] == caller.as_str());
         // The same call (exactly, else the same action at the same address), the next of its answers in their order.
         let same: Vec<&Value> = recorded.iter().filter(|r| at(r) && r["asked"] == asked).collect();
         let same: Vec<&Value> = if same.is_empty() { recorded.iter().filter(|r| at(r) && action(r["target"].as_str().unwrap_or_default(), r["asked"].as_str().unwrap_or_default()) == action(target, asked)).collect() } else { same };
@@ -1006,11 +1097,14 @@ impl Aws {
 
     fn answer(&self, url: &str, target: &str, asked: &str) -> (u16, Value) {
         let a: Value = serde_json::from_str(asked).unwrap_or_default();
+        // (The parameters of the account the caller's sign-in reaches.)
+        let params = self.params_here();
+        let account = self.account_here().unwrap_or_else(|| ACCOUNT.to_string());
         let region = url.split('.').nth(1).unwrap_or(REGION).to_string();
         let not_found = || (400, json!({ "__type": "ParameterNotFound" }));
         // (SSM's time: seconds, with milliseconds.)
         let at = |ms: u64| Value::from(ms as f64 / 1000.0);
-        let one = |name: &str, (value, version, ms): &(String, u64, u64), decrypt: bool| json!({ "ARN": format!("arn:aws:ssm:{region}:{ACCOUNT}:parameter{name}"), "DataType": "text", "LastModifiedDate": at(*ms),
+        let one = |name: &str, (value, version, ms): &(String, u64, u64), decrypt: bool| json!({ "ARN": format!("arn:aws:ssm:{region}:{account}:parameter{name}"), "DataType": "text", "LastModifiedDate": at(*ms),
             "Name": name, "Type": "SecureString", "Value": if decrypt { value.clone() } else { "EXAMPLECIPHERTEXT".to_string() }, "Version": version });
         let name = a["Name"].as_str().unwrap_or_default().to_string();
         // AWS's sign-in refusing its last step, as it answered a real one whose account was changed on its page
@@ -1027,30 +1121,30 @@ impl Aws {
         if let Some(op) = target.strip_prefix("DynamoDB_20120810.") { if let Some(answered) = self.dynamo(op, &a) { return answered } }
         match target {
             "AmazonSSM.PutParameter" => {
-                if self.params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }
-                self.put_param(&name, a["Value"].as_str().unwrap_or_default());
-                (200, json!({ "Tier": "Standard", "Version": self.params.lock().unwrap()[&name].1 }))
+                if params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }
+                put_into(&params, &name, a["Value"].as_str().unwrap_or_default());
+                (200, json!({ "Tier": "Standard", "Version": params.lock().unwrap()[&name].1 }))
             }
-            "AmazonSSM.GetParameter" => match self.params.lock().unwrap().get(&name) {
+            "AmazonSSM.GetParameter" => match params.lock().unwrap().get(&name) {
                 Some(p) => (200, json!({ "Parameter": one(&name, p, a["WithDecryption"] == true) })),
                 None => not_found(),
             },
             "AmazonSSM.GetParameters" => {
-                let p = self.params.lock().unwrap();
+                let p = params.lock().unwrap();
                 let (mut found, mut not) = (vec![], vec![]);
                 a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).for_each(|n| match p.get(n) { Some(v) => found.push(one(n, v, a["WithDecryption"] == true)), None => not.push(n) });
                 (200, json!({ "Parameters": found, "InvalidParameters": not }))
             }
-            "AmazonSSM.DeleteParameter" => match self.params.lock().unwrap().remove(&name) { Some(_) => (200, json!({})), None => not_found() },
+            "AmazonSSM.DeleteParameter" => match params.lock().unwrap().remove(&name) { Some(_) => (200, json!({})), None => not_found() },
             "AmazonSSM.DeleteParameters" => {
-                let mut p = self.params.lock().unwrap();
+                let mut p = params.lock().unwrap();
                 let (mut gone, mut not) = (vec![], vec![]);
                 a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).for_each(|n| if p.remove(n).is_some() { gone.push(n) } else { not.push(n) });
                 (200, json!({ "DeletedParameters": gone, "InvalidParameters": not }))
             }
             "AmazonSSM.GetParametersByPath" => {
                 let path = a["Path"].as_str().unwrap_or_default();
-                let p = self.params.lock().unwrap();
+                let p = params.lock().unwrap();
                 let under: Vec<Value> = p.iter().filter(|(k, _)| k.strip_prefix(path).is_some_and(|rest| a["Recursive"] == true || !rest.contains('/'))).map(|(k, v)| one(k, v, a["WithDecryption"] == true)).collect();
                 let from: usize = a["NextToken"].as_str().and_then(|t| t.strip_prefix("next-")).and_then(|n| n.parse().ok()).unwrap_or(0);
                 let max = a["MaxResults"].as_u64().unwrap_or(10) as usize;
