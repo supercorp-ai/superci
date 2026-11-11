@@ -32,6 +32,8 @@ modal.App.return_value.function = function
 kind, source = sys.argv[1], sys.stdin.read()
 ns = {"__name__": "superci_" + kind}
 exec(compile(source, kind, "exec"), ns)
+# (The module's own look for runner listeners, before a test stands in for it.)
+scan = ns.get("listeners")
 
 # One Function per image, by its address and Secret: the same name in all three.
 name = ns["function_name"]
@@ -128,6 +130,52 @@ if kind == "jobs":
         runner.wait.side_effect = waits
         assert ns["run_job"]("M", None, None) == {"exit": -9, "preempted": True}
         assert signals == [first, ("killpg", 99, signal.SIGKILL)] and 25 < clock[0] <= 27 and told == [], (signals, clock)
+    # The same with real processes and a real signal, what the stand-ins above cannot show: a runner whose run.sh, as
+    # GitHub's, passes no interrupt on to its listener; this Function's process sent SIGINT, as Modal stops one. The
+    # control plane is told, the listener hears an interrupt from the Function within seconds, and the Function returns.
+    # (With `subprocess.run`, before, the interrupt ended run.sh alone: the listener ran on, its job with it.)
+    import os as real_os, subprocess as real_subprocess, tempfile, threading as real_threading, time as real_time
+    d = tempfile.mkdtemp()
+    heard, listener, run_sh = (real_os.path.join(d, n) for n in ("heard", "listener.py", "run.sh"))
+    with open(listener, "w") as f:
+        f.write("import signal, sys, time\ndef stop(*_):\n    open(sys.argv[1], 'w').write('SIGINT'); sys.exit(0)\nsignal.signal(signal.SIGINT, stop)\ntime.sleep(60)\n")
+    with open(run_sh, "w") as f:
+        f.write(f"#!/bin/bash\n{sys.executable} -I {listener} {heard} Runner.Listener\n")
+    real_os.chmod(run_sh, 0o755)
+    class RealProcesses:
+        TimeoutExpired = real_subprocess.TimeoutExpired
+        @staticmethod
+        def Popen(command, cwd=None, **options): return real_subprocess.Popen(command, cwd=d, **options)
+    told_at = []
+    ns["urllib"] = mock.Mock(); ns["urllib"].request.urlopen.side_effect = lambda r, timeout: told_at.append(real_time.time()) or mock.Mock()
+    ns["subprocess"], ns["time"], ns["threading"], ns["os"] = RealProcesses, real_time, real_threading, real_os
+    ns["runner_command"] = lambda jit, fail: [run_sh]
+    # (Only this test's listener: the computer running the test may run GitHub's own runner, never to be interrupted.)
+    def ours():
+        found = []
+        for pid in scan():
+            try:
+                if d.encode() in open(f"/proc/{pid}/cmdline", "rb").read(): found.append(pid)
+            except OSError: pass
+        return found
+    ns["listeners"] = ours
+    def modal_stops():
+        end = real_time.monotonic() + 10
+        while not ours() and real_time.monotonic() < end: real_time.sleep(0.05)
+        real_time.sleep(0.2)
+        real_os.kill(real_os.getpid(), signal.SIGINT)
+    # (Where processes are found as in Modal's Linux containers, in /proc: CI's Linux runners.)
+    if real_os.path.isdir("/proc"):
+        real_threading.Thread(target=modal_stops, daemon=True).start()
+        modal.current_function_call_id.return_value = "fc-real"
+        started = real_time.monotonic()
+        result = ns["run_job"]("J", None, notice)
+        took = real_time.monotonic() - started
+        assert result.get("preempted") is True and took < 15, (result, took)
+        assert real_os.path.exists(heard) and open(heard).read() == "SIGINT", "the listener heard no interrupt"
+        assert told_at and told_at[0] <= real_os.path.getmtime(heard) + 1, "told first"
+        assert not ours(), "no listener left running"
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
     print("ok", kind)
     sys.exit(0)
 
