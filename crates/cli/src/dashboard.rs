@@ -1789,6 +1789,8 @@ impl Dashboard {
     fn kept(&self) -> Kept {
         let mut planes: Vec<String> = self.keyed.iter().cloned().collect();
         planes.sort();
+        // (One named for this command alone, `--plane=ID`, is not kept as the one in use: the one kept stays.)
+        let used = view::named().and(self.kept_plane.as_ref()).and_then(|k| self.planes.iter().position(|p| p.plane_id() == k.plane_id())).unwrap_or(self.selected);
         Kept {
             cloudflare: if self.cf_given { None } else { self.cf.clone() },
             aws: self.aws_accounts().into_iter().next(),
@@ -1796,8 +1798,8 @@ impl Dashboard {
             modal: if self.modal_given { None } else { self.modal.clone() },
             modal_more: self.modal_others.clone(),
             key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
-            plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
-            planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != self.selected && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
+            plane: self.planes.get(used).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
+            planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != used && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
             aws_ended: self.aws_ended && self.aws.is_none() && self.aws_others.is_empty(),
             cloudflare_ended: self.cf_still_ended(),
             modal_ended: self.modal_still_ended(),

@@ -12,6 +12,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - Updating or deleting a control plane in another account from the dashboard leaves the account in hand as it was. The pages and later changes went on with the other account's sign-in.
 - A move between control planes is not stopped by an AWS sign-in that ended when neither of them is in AWS.
 - A command that changes a setting acts on the control plane named with `--plane=ID` (or `SUPERCI_PLANE`) when it is not the one in use: `superci keys create NAME --plane=ID`, its limits, its order. It was refused as not among the control planes here.
+- A command naming a control plane with `--plane=ID` acts on it for that command alone. It became the one in use from then on where no control plane serves a code host, and deleting it was then refused as the one in use.
 
 ## 0.20.3 — 2026-11-09
 - The control plane's page says how many spot CPUs its account may run at once across every region its spot machines start in (300 in N. Virginia and 300 in Ohio: 600, 150 jobs of the default size), and each region's own. Opened before the Runners page, it knew only its home region's and said that alone.
