@@ -424,7 +424,13 @@ fn pickle_str(s: &str) -> Result<Vec<u8>> {
 /// Modal's own client in a sandbox. Safe to repeat.
 pub fn delete_plane(session: &Session, plane_id: &str) -> Result<()> {
     let app = plane_app(plane_id);
-    modal_run(session, &format!("modal app stop --yes {app} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; modal app stop --yes superci-runners-{plane_id} || true; {}", stop_jobs(plane_id)), "", None).map(|_| ())
+    modal_run(session, &format!("modal app stop --yes {app} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; {}; modal app stop --yes superci-runners-{plane_id} || true; {}", kinds_deleted(&app), stop_jobs(plane_id)), "", None).map(|_| ())
+}
+
+/// What deletes a control plane's Dict of each kind of record (`APP-k-KIND`: see modal_plane.py's `kind_of`), found by
+/// Modal's own listing, as many as there are (seen left behind by Taras Kornichuk, #27).
+fn kinds_deleted(app: &str) -> String {
+    format!("for d in $(python3 -c 'import modal; print(\"\\n\".join(d.name for d in modal.Dict.objects.list() if d.name.startswith(\"{app}-k-\")))'); do modal dict delete --yes \"$d\" || true; done")
 }
 
 /// Deletes the launcher made for a control plane elsewhere (and its jobs' Functions, if any).

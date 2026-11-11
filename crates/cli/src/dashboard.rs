@@ -247,10 +247,10 @@ fn owners_said(owners: &str) -> String {
 
 struct Writer { cf: Option<cloudflare::Cloudflare>, aws: Option<superci_core::aws::Credentials>, modal: Option<modal::Session>, modals: Vec<modal::Session>, aws_all: Vec<(String, superci_core::aws::Credentials)>, own: Own }
 
-/// Whose the sign-ins kept are: the AWS account, the Cloudflare accounts the login reaches (none: not asked yet), the
-/// Modal workspace.
+/// Whose the sign-ins kept are: every AWS account signed in to, the Cloudflare accounts the login reaches (none: not
+/// asked yet), every Modal workspace signed in to.
 #[derive(Clone, Default)]
-struct Own { aws: Option<String>, cf: Vec<String>, modal: Option<String> }
+struct Own { aws: Vec<String>, cf: Vec<String>, modal: Vec<String> }
 
 impl Own {
     /// A control plane is changed only with the sign-in of the account it lives in: with another account's the cloud
@@ -258,8 +258,8 @@ impl Own {
     fn check(&self, plane: &Plane) -> Result<()> {
         let other = |cloud: &str, its: &str, ours: &str| Err(format!("This control plane is in {cloud} {its}, and SuperCI is signed in to {ours}. Sign in to {its} to change it. Nothing has changed."));
         match plane {
-            Plane::Aws { account_id, .. } => match &self.aws { Some(a) if a != account_id => other("AWS account", account_id, a), _ => Ok(()) },
-            Plane::Modal { workspace, .. } => match &self.modal { Some(w) if w != workspace => other("the Modal workspace", workspace, w), _ => Ok(()) },
+            Plane::Aws { account_id, .. } if !self.aws.is_empty() && !self.aws.contains(account_id) => other("AWS account", account_id, &self.aws.join(", ")),
+            Plane::Modal { workspace, .. } if !self.modal.is_empty() && !self.modal.contains(workspace) => other("the Modal workspace", workspace, &self.modal.join(", ")),
             Plane::Cloudflare { account_id, account_name, .. } if !self.cf.is_empty() && !self.cf.contains(account_id) => {
                 Err(format!("This control plane is in the Cloudflare account {account_name}, which the Cloudflare sign-in kept does not reach. Sign in to it to change it. Nothing has changed."))
             }
@@ -270,42 +270,47 @@ impl Own {
 
 impl Writer {
     fn put(&self, plane: &Plane, name: &str, value: &str) -> Result<()> {
-        // A Modal control plane in a further workspace signed in to (a move between workspaces): with that sign-in.
-        if let Some((session, plane_id)) = self.further_modal(plane) { return modal::put_setting(session, plane_id, name, value) }
         self.own.check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.put_secret(account_id, script, name, value),
-            Plane::Aws { region, plane_id, .. } => aws_plane::put_secret(self.aws.as_ref().ok_or("Sign in with AWS first.")?, region, plane_id, name, value),
-            Plane::Modal { plane_id, .. } => modal::put_setting(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id, name, value),
+            Plane::Aws { account_id, region, plane_id, .. } => aws_plane::put_secret(self.aws_of(account_id)?, region, plane_id, name, value),
+            Plane::Modal { workspace, plane_id, .. } => modal::put_setting(self.modal_of(workspace)?, plane_id, name, value),
             Plane::Seen { .. } => Err("Sign in where this control plane runs first.".into()),
         }
     }
 
-    /// A Modal control plane in a workspace other than the one in hand that SuperCI is signed in to too (`superci login
-    /// modal --add`), with that workspace's sign-in: a move from one workspace to another writes to both.
-    fn further_modal<'a>(&'a self, plane: &'a Plane) -> Option<(&'a modal::Session, &'a str)> {
-        let Plane::Modal { workspace, plane_id, .. } = plane else { return None };
-        if self.modal.as_ref().is_some_and(|m| &m.workspace == workspace) { return None }
-        self.modals.iter().find(|m| &m.workspace == workspace).map(|m| (m, plane_id.as_str()))
+    /// The sign-in to the AWS account a control plane is in, whichever is in hand: a move between accounts writes to
+    /// both, each with its own.
+    fn aws_of(&self, account: &str) -> Result<&superci_core::aws::Credentials> {
+        if self.aws.is_none() && self.aws_all.is_empty() { return Err("Sign in with AWS first.".into()) }
+        self.aws_all.iter().find(|(a, _)| a == account).map(|(_, c)| c).or(self.aws.as_ref().filter(|_| self.aws_all.is_empty()))
+            .ok_or_else(|| format!("Sign in with AWS to account {account} first: `superci login aws --add`."))
+    }
+
+    /// The sign-in to the Modal workspace a control plane is in, whichever is in hand (`superci login modal --add`): a
+    /// move from one workspace to another writes to both (Taras Kornichuk's #27).
+    fn modal_of(&self, workspace: &str) -> Result<&modal::Session> {
+        if self.modal.is_none() && self.modals.is_empty() { return Err("Sign in with Modal first.".into()) }
+        self.modals.iter().chain(&self.modal).find(|m| m.workspace == workspace)
+            .ok_or_else(|| format!("Sign in with Modal to the workspace {workspace} first: `superci login modal --add`."))
     }
 
     /// The names of a control plane's settings, where its cloud lists them (Modal's Dict is not listed: none).
     fn names(&self, plane: &Plane) -> Vec<String> {
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().and_then(|c| c.secret_names(account_id, script).ok()).unwrap_or_default(),
-            Plane::Aws { region, plane_id, .. } => self.aws.as_ref().and_then(|c| aws_plane::secret_names(c, region, plane_id).ok()).unwrap_or_default(),
+            Plane::Aws { account_id, region, plane_id, .. } => self.aws_of(account_id).ok().and_then(|c| aws_plane::secret_names(c, region, plane_id).ok()).unwrap_or_default(),
             _ => vec![],
         }
     }
 
     /// Removes a setting (Modal's is emptied: its settings are entries of one Dict).
     fn drop(&self, plane: &Plane, name: &str) -> Result<()> {
-        if let Some((session, plane_id)) = self.further_modal(plane) { return modal::put_setting(session, plane_id, name, "") }
         self.own.check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.delete_secret(account_id, script, name),
-            Plane::Aws { region, plane_id, .. } => aws_plane::delete_secret(self.aws.as_ref().ok_or("Sign in with AWS first.")?, region, plane_id, name),
-            Plane::Modal { plane_id, .. } => modal::put_setting(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id, name, ""),
+            Plane::Aws { account_id, region, plane_id, .. } => aws_plane::delete_secret(self.aws_of(account_id)?, region, plane_id, name),
+            Plane::Modal { workspace, plane_id, .. } => modal::put_setting(self.modal_of(workspace)?, plane_id, name, ""),
             Plane::Seen { .. } => Err("Sign in where this control plane runs first.".into()),
         }
     }
@@ -2081,7 +2086,7 @@ impl Dashboard {
         match plane {
             Plane::Aws { account_id, .. } => self.aws.iter().chain(self.aws_others.iter()).any(|a| &a.account_id == account_id),
             Plane::Cloudflare { .. } => self.cf.is_some(),
-            Plane::Modal { .. } => self.modal.is_some(),
+            Plane::Modal { workspace, .. } => self.modal_for(workspace).is_some(),
             Plane::Seen { .. } => false,
         }
     }
@@ -2324,7 +2329,7 @@ impl Dashboard {
 
     /// Whose the sign-ins kept are (see `Own`).
     fn own(&self) -> Own {
-        Own { aws: self.aws.as_ref().map(|a| a.account_id.clone()), cf: self.cf_accounts.iter().map(|(id, _)| id.clone()).collect(), modal: self.modal.as_ref().map(|m| m.workspace.clone()) }
+        Own { aws: self.aws_accounts().into_iter().map(|a| a.account_id).collect(), cf: self.cf_accounts.iter().map(|(id, _)| id.clone()).collect(), modal: self.modal_accounts().into_iter().map(|m| m.workspace).collect() }
     }
 
     /// Writes the control plane's settings that are not secrets (where jobs run, its launchers): what changed from
@@ -2376,8 +2381,8 @@ impl Dashboard {
         self.own().check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.put_secret(account_id, script, name, value),
-            Plane::Aws { region, plane_id, .. } => aws_plane::put_secret(&self.aws_creds()?, region, plane_id, name, value),
-            Plane::Modal { plane_id, .. } => modal::put_setting(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id, name, value),
+            Plane::Aws { account_id, region, plane_id, .. } => aws_plane::put_secret(&self.aws_creds_of(account_id)?, region, plane_id, name, value),
+            Plane::Modal { workspace, plane_id, .. } => modal::put_setting(self.modal_session_of(workspace)?, plane_id, name, value),
             Plane::Seen { .. } => Err("This control plane is known only from AWS: sign in where it runs to change it.".into()),
         }
     }
@@ -2387,8 +2392,8 @@ impl Dashboard {
         self.own().check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_secret(account_id, script, name),
-            Plane::Aws { region, plane_id, .. } => aws_plane::delete_secret(&self.aws_creds()?, region, plane_id, name),
-            Plane::Modal { plane_id, .. } => modal::put_setting(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id, name, ""),
+            Plane::Aws { account_id, region, plane_id, .. } => aws_plane::delete_secret(&self.aws_creds_of(account_id)?, region, plane_id, name),
+            Plane::Modal { workspace, plane_id, .. } => modal::put_setting(self.modal_session_of(workspace)?, plane_id, name, ""),
             Plane::Seen { .. } => Err("This control plane is known only from AWS: sign in where it runs to change it.".into()),
         }
     }
@@ -2410,6 +2415,20 @@ impl Dashboard {
         // (Another account's that AWS no longer renews: left out, as the one in hand is.)
         self.aws_others.retain_mut(|s| !s.due() || !s.credentials().is_err_and(|e| e.starts_with(aws::ENDED)));
         self.keep();
+    }
+
+    /// The credentials of an AWS account signed in to, whichever is in hand: what is done for a control plane is done
+    /// with its own account's (a move between accounts, a delete or update of one not selected).
+    fn aws_creds_of(&mut self, account: &str) -> Result<superci_core::aws::Credentials> {
+        if self.aws.is_none() || self.aws.as_ref().is_some_and(|a| a.account_id == account) { return self.aws_creds() }
+        let session = self.aws_others.iter_mut().find(|a| a.account_id == account).ok_or_else(|| format!("Sign in with AWS to account {account} first: `superci login aws --add`."))?;
+        session.credentials().map_err(|e| if e.starts_with(aws::ENDED) { format!("{}. Sign in with AWS to account {account} again.", aws::ENDED) } else { e })
+    }
+
+    /// The sign-in to a Modal workspace signed in to, whichever is in hand.
+    fn modal_session_of(&self, workspace: &str) -> Result<&modal::Session> {
+        if self.modal.is_none() && self.modal_others.is_empty() { return Err("Sign in with Modal first.".into()) }
+        self.modal_for(workspace).ok_or_else(|| format!("Sign in with Modal to the workspace {workspace} first: `superci login modal --add`."))
     }
 
     fn aws_creds(&mut self) -> Result<superci_core::aws::Credentials> {
@@ -3460,9 +3479,11 @@ impl Dashboard {
                 // In the background, its steps shown where its Update button was (the sidebar, the Control plane page).
                 let cf = if matches!(plane, Plane::Cloudflare { .. }) || launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"].as_str().is_some_and(|w| view::records_in(&status).provider_of(w) == "cloudflare"))) { self.cloudflare().ok() } else { None };
                 // What deploys it, with its cloud's sign-in (a Modal control plane's is there: checked above).
-                let (steps, deploying): (&'static [&'static str], Deploying) = match (plane.clone(), self.modal.clone()) {
+                // (Each with its own account's or workspace's sign-in, whichever is in hand.)
+                let modal_session = match &plane { Plane::Modal { workspace, .. } => self.modal_for(workspace).cloned(), _ => None };
+                let (steps, deploying): (&'static [&'static str], Deploying) = match (plane.clone(), modal_session) {
                     (Plane::Cloudflare { account_id, script, label, .. }, _) => (&UPDATE_CLOUDFLARE, Deploying::Cloudflare { account_id, script, label }),
-                    (Plane::Aws { account_id, region, plane_id, label, .. }, _) => (&UPDATE_AWS, Deploying::Aws { creds: self.aws_creds()?, account_id, region, plane_id, label }),
+                    (Plane::Aws { account_id, region, plane_id, label, .. }, _) => (&UPDATE_AWS, Deploying::Aws { creds: self.aws_creds_of(&account_id)?, account_id, region, plane_id, label }),
                     // (Its old container stopped as the new one starts, where no job runs in its own app: see
                     // `modal::deploy_plane`.)
                     (Plane::Modal { plane_id, label, .. }, Some(session)) => (&UPDATE_MODAL, Deploying::Modal { session, plane_id, label, recreate: true }),
@@ -5393,21 +5414,20 @@ mark();load()})();</script>"#;
     /// Deletes a control plane from its cloud, and the launchers and AWS role made for it in other clouds (those
     /// this session is signed in to). Returns what could not be removed, in words.
     fn delete_plane(&mut self, plane: &Plane, status: &serde_json::Value) -> Result<Vec<String>> {
-        // (A Modal control plane in any workspace signed in to is deleted with that workspace's sign-in: one moved
-        // away from, in the workspace SuperCI was signed in to first, or one set up beside it.)
-        let modal_session = match plane { Plane::Modal { workspace, .. } => self.modal_for(workspace).cloned(), _ => None };
-        if modal_session.is_none() { self.own().check(plane)?; }
+        // (A control plane in any account or workspace signed in to is deleted with that one's sign-in: one moved away
+        // from, or one set up beside the one in hand; Taras Kornichuk's #27 for Modal.)
+        self.own().check(plane)?;
         let mut left = vec![];
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_plane(account_id, script, plane.plane_id())?,
             Plane::Aws { region, plane_id, account_id, .. } => {
-                let creds = self.aws_creds()?;
+                let creds = self.aws_creds_of(account_id)?;
                 // (Its budget in AWS itself first, if one was made: its rule comes off the role before the role goes.)
                 if !status["routing"]["aws_budget"].is_null() { if let Err(e) = crate::aws_budget::with(&creds, account_id, plane_id, |b| b.remove()) { left.push(format!("Its budget in AWS ({e}).")) } }
                 aws_plane::delete(&creds, region, plane_id)?;
                 if let Err(e) = aws::delete_networks(&creds, plane_id, &REGIONS) { left.push(format!("Its machines' network in AWS ({e}).")) }
             }
-            Plane::Modal { plane_id, .. } => modal::delete_plane(modal_session.as_ref().or(self.modal.as_ref()).ok_or("Sign in with Modal first.")?, plane_id)?,
+            Plane::Modal { workspace, plane_id, .. } => modal::delete_plane(self.modal_session_of(workspace)?, plane_id)?,
             Plane::Seen { .. } => return Err("Sign in where this control plane runs to delete it.".into()),
         }
         let records = view::records_in(&status);
@@ -9389,7 +9409,7 @@ mod tests {
         assert!(seen(theirs.clone(), false, None, false, false).goes_with(&ours, false).unwrap_err().contains("did not answer and was left as it is (`superci planes delete bbbbbbbbbbbb --confirm` deletes it)"));
 
         // A change is written only with the sign-in of the control plane's own account or workspace.
-        let own = Own { aws: Some("111111111111".into()), cf: vec!["cf-a".into()], modal: Some("acme".into()) };
+        let own = Own { aws: vec!["111111111111".into()], cf: vec!["cf-a".into()], modal: vec!["acme".into()] };
         assert!(own.check(&ours).is_ok());
         assert_eq!(own.check(&theirs).unwrap_err(), "This control plane is in AWS account 222222222222, and SuperCI is signed in to 111111111111. Sign in to 222222222222 to change it. Nothing has changed.");
         let cf = |account: &str| Plane::Cloudflare { account_id: account.into(), account_name: "Other Inc.".into(), script: "superci".into(), url: "https://superci.other.workers.dev".into(), plane_id: "dddddddddddd".into(), label: "superci".into() };
@@ -9404,10 +9424,16 @@ mod tests {
         // A move between Modal workspaces writes to both: a further workspace signed in to is written with its own
         // sign-in; one not signed in to is still refused.
         let session = |w: &str| modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: w.into() };
-        let writer = Writer { cf: None, aws: None, modal: Some(session("acme")), modals: vec![session("acme"), session("other")], aws_all: vec![], own: own.clone() };
-        assert_eq!(writer.further_modal(&modal("other")).map(|(s, id)| (s.workspace.as_str(), id)), Some(("other", "eeeeeeeeeeee")));
-        assert!(writer.further_modal(&modal("acme")).is_none() && writer.further_modal(&ours).is_none());
-        assert!(writer.further_modal(&modal("globex")).is_none() && writer.put(&modal("globex"), "ROUTING", "{}").unwrap_err().contains("the Modal workspace globex, and SuperCI is signed in to acme"));
+        let both = Own { aws: vec!["111111111111".into(), "222222222222".into()], modal: vec!["acme".into(), "other".into()], ..own.clone() };
+        let creds = |key: &str| superci_core::aws::Credentials { access_key_id: key.into(), secret_access_key: "s".into(), session_token: None, expires_at_ms: u64::MAX };
+        let writer = Writer { cf: None, aws: Some(creds("AKIAONE")), modal: Some(session("acme")), modals: vec![session("acme"), session("other")],
+            aws_all: vec![("111111111111".into(), creds("AKIAONE")), ("222222222222".into(), creds("AKIATWO"))], own: both };
+        assert_eq!(writer.modal_of("other").map(|s| s.workspace.as_str()), Ok("other"));
+        assert_eq!(writer.modal_of("acme").map(|s| s.workspace.as_str()), Ok("acme"));
+        assert!(writer.put(&modal("globex"), "ROUTING", "{}").unwrap_err().contains("the Modal workspace globex, and SuperCI is signed in to acme, other"));
+        // The same between AWS accounts: each control plane with its own account's credentials, never the one in hand's.
+        assert_eq!(writer.aws_of("222222222222").map(|c| c.access_key_id.as_str()), Ok("AKIATWO"));
+        assert!(writer.aws_of("333333333333").unwrap_err().contains("Sign in with AWS to account 333333333333 first"));
     }
 
     #[test]

@@ -472,6 +472,11 @@ pub struct Aws {
     /// DynamoDB's items, by table, partition and sort key (`p`, `k`: an AWS control plane's table), as its item calls
     /// keep them.
     pub items: Arc<Mutex<BTreeMap<(String, String, String), Value>>>,
+    /// Every call made to AWS, Cloudflare or Modal, with whose sign-in made it (`who`: `aws:ACCESS_KEY_ID`,
+    /// `bearer:TOKEN`, `modal:TOKEN_ID`) and what it was (`what`: its method, address, AWS target and the start of its
+    /// body; Modal's method and the readable part of its message): so a test can hold every call about a thing to
+    /// that thing's own account's sign-in (see `callers_about`).
+    pub callers: Arc<Mutex<Vec<Value>>>,
     /// Lambda functions called without waiting (`Event`): each function's name and what it was given.
     pub invoked: Arc<Mutex<Vec<(String, Value)>>>,
     /// A control plane not updated yet: while set, it says this version and answers as one from before 0.19.13 did
@@ -582,7 +587,21 @@ pub(crate) fn action(target: &str, asked: &str) -> String {
     asked.split('&').find_map(|kv| kv.strip_prefix("Action=")).unwrap_or_default().to_string()
 }
 
+/// Whose sign-in a call was made with, from its `authorization` header: AWS's access key id (Signature Version 4's
+/// `Credential=KEY/…`), else a bearer token; empty for none.
+fn who(authorization: &str) -> String {
+    if let Some(rest) = authorization.split("Credential=").nth(1) { return format!("aws:{}", rest.split('/').next().unwrap_or_default()) }
+    authorization.strip_prefix("Bearer ").map(|t| format!("bearer:{t}")).unwrap_or_default()
+}
+
 impl Aws {
+    /// The calls whose `what` mentions `about` (a control plane's id, a workspace's name), each with whose sign-in made
+    /// it: what a test holds to that thing's own account's.
+    pub fn callers_about(&self, about: &str) -> Vec<(String, String)> {
+        self.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains(about)))
+            .map(|c| (c["who"].as_str().unwrap_or_default().to_string(), c["what"].as_str().unwrap_or_default().chars().take(160).collect())).collect()
+    }
+
     /// Modal's answer to one call (`method`, its request's message), as a recording has it: each answer's message, or
     /// Modal's refusal as a gRPC status (its code and message).
     fn modal_answer(&self, method: &str, headers: &http::HeaderMap, message: &[u8]) -> (Vec<Vec<u8>>, Option<(u32, String)>) {
@@ -590,6 +609,9 @@ impl Aws {
         let b64 = base64::engine::general_purpose::STANDARD;
         let url = format!("https://api.modal.com/modal.client.ModalClient/{method}");
         let asked = b64.encode(message);
+        let token = headers.get("x-modal-token-id").and_then(|v| v.to_str().ok()).unwrap_or_default();
+        let readable: String = String::from_utf8_lossy(message).chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+        self.callers.lock().unwrap().push(json!({ "who": format!("modal:{token}"), "what": format!("{method} {readable}") }));
         // (A sweep's fault: Modal's own status for an internal error.)
         if self.faults.call(format!("POST {url}")).is_some() { return (vec![], Some((13, "internal error".to_string()))) }
         // (What Modal refuses whatever a recording has: a client it cannot tell the version of; and a client that says
@@ -736,6 +758,7 @@ impl Aws {
             let Ok((method, target, headers, body)) = read(&stream) else { return };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
+            a.callers.lock().unwrap().push(json!({ "who": who(&header("authorization")), "what": format!("{method} {target} {} {}", header("x-amz-target"), String::from_utf8_lossy(&body).chars().take(600).collect::<String>()) }));
             // (Counted here, but what goes on to GitHub's stand-in, which counts it.)
             let s3_recorded = host.contains(".s3.") && a.recorded.lock().unwrap().iter().any(|r| r["url"] == format!("https:/{target}").as_str() && r["method"] == method.as_str());
             let to_github = ((!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || host.contains(".s3."))
