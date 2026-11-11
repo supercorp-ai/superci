@@ -3478,15 +3478,17 @@ impl Dashboard {
                 let which = field("plane");
                 // Updating another one does not make it the one that later pages and commands act on.
                 let was = self.selected;
-                // (One named that is not known here is refused: never the one in use in its place.)
-                match self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) {
-                    Some(i) => self.select(i),
-                    None if !which.is_empty() => return Err("That control plane is not known here: its id is in `superci planes list`.".into()),
-                    None => {}
-                }
-                let plane = self.plane();
-                self.selected = was;
-                let plane = plane?;
+                // (One found in a signed-in cloud but not kept here is updated too, as one is deleted; one named that is
+                // not known at all is refused: never the one in use in its place.)
+                let found = self.found.iter().find(|p| p.plane_id() == which).cloned();
+                let plane = match self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) {
+                    Some(i) => { self.select(i); let plane = self.plane(); self.selected = was; plane? }
+                    None => match found {
+                        Some(plane) => plane,
+                        None if !which.is_empty() => return Err("That control plane is not known here: its id is in `superci planes list`.".into()),
+                        None => self.plane()?,
+                    },
+                };
                 // Its cloud's sign-in ended (AWS ends one after 12 hours): said, with what to do.
                 if !self.signed_in_at(&plane) && !matches!(plane, Plane::Seen { .. }) {
                     let name = provider_name(plane.cloud());

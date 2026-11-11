@@ -1380,7 +1380,7 @@ fn every_page_says_further_runners_of_each_cloud_as_it_said_before() {
         let at = format!("{}/fixtures/further/pages/{page}.txt", env!("CARGO_MANIFEST_DIR"));
         if std::env::var_os("SUPERCI_WRITE_FIXTURES").is_some() { std::fs::create_dir_all(std::path::Path::new(&at).parent().unwrap()).unwrap(); std::fs::write(&at, &said).unwrap() }
         let want = std::fs::read_to_string(&at).unwrap_or_default();
-        for (n, (w, g)) in want.lines().zip(said.lines()).enumerate() { assert_eq!(w, g, "{page}, line {}", n + 1) }
+        for (n, (w, g)) in want.lines().zip(said.lines()).enumerate() { assert_eq!(w, g, "{page}, line {} (the page as said now, for fixtures/further/pages/{page}.txt:)\n{said}", n + 1) }
         assert_eq!(want.lines().count(), said.lines().count(), "{page}");
     }
     let _ = child.kill();
