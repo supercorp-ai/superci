@@ -2735,8 +2735,10 @@ impl<'a> ControlPlane<'a> {
             match github::run_status(self.http, &api, &token, &r.repo, r.run_id).await {
                 // (A newer run of its workflow on its branch, still going: run again, this one would come after it,
                 // and a workflow that cancels runs in progress would cancel that newer one.)
-                Ok((s, Some(newer))) if s == "completed" => return Some(format!("not run again: its branch has a newer run of its workflow ({newer}), which running this one again would cancel where the workflow cancels runs in progress")),
-                Ok((s, None)) if s == "completed" => {}
+                // (It passed without the job: the job may fail, `continue-on-error`. A new attempt only costs a machine.)
+                Ok((s, Some(c), _)) if s == "completed" && c == "success" => return Some("not run again: its run passed without it".into()),
+                Ok((s, _, Some(newer))) if s == "completed" => return Some(format!("not run again: its branch has a newer run of its workflow ({newer}), which running this one again would cancel where the workflow cancels runs in progress")),
+                Ok((s, _, None)) if s == "completed" => {}
                 Err(e) if e.contains(" 404 ") => return Some("not run again: its run is gone".into()),
                 _ => return None,
             }

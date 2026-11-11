@@ -290,11 +290,13 @@ pub async fn redeliver(http: &dyn Http, app: &App, delivery_id: u64, now_ms: u64
     as_app(http, app, "POST", &format!("/app/hook/deliveries/{delivery_id}/attempts"), now_ms, None).await.map(|_| ())
 }
 
-/// A workflow run's status at GitHub ("queued", "in_progress", "completed"), and a newer run of its workflow on its
-/// branch, for another commit (a newer push), that is still going (queued or in progress), if one is.
-pub async fn run_status(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<(String, Option<u64>)> {
+/// A workflow run's status at GitHub ("queued", "in_progress", "completed"), its conclusion once completed
+/// ("success", "failure", …), and a newer run of its workflow on its branch, for another commit (a newer push), that
+/// is still going (queued or in progress), if one is.
+pub async fn run_status(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<(String, Option<String>, Option<u64>)> {
     let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{run_id}"), token, None).await?;
     let status = v["status"].as_str().map(str::to_string).ok_or("no run status")?;
+    let conclusion = v["conclusion"].as_str().map(str::to_string);
     let branch = v["head_branch"].as_str().unwrap_or_default();
     let newer = if branch.is_empty() { None } else {
         let query = format!("branch={}&event={}&per_page=50", url::form_urlencoded::byte_serialize(branch.as_bytes()).collect::<String>(), v["event"].as_str().unwrap_or_default());
@@ -303,7 +305,7 @@ pub async fn run_status(http: &dyn Http, api: &str, token: &str, repo: &str, run
             .find(|r| r["workflow_id"] == v["workflow_id"] && r["head_branch"] == v["head_branch"] && r["head_sha"] != v["head_sha"] && r["id"].as_u64().is_some_and(|id| id > run_id) && r["status"] != "completed")
             .and_then(|r| r["id"].as_u64())
     };
-    Ok((status, newer))
+    Ok((status, conclusion, newer))
 }
 
 /// Runs one job of a finished run again (and the jobs that depend on it), as a new attempt. Needs Actions: write;
