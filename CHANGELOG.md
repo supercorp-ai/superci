@@ -12,6 +12,9 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - Updating or deleting a control plane in another account from the dashboard leaves the account in hand as it was. The pages and later changes went on with the other account's sign-in.
 - A move between control planes is not stopped by an AWS sign-in that ended when neither of them is in AWS.
 - A command that changes a setting acts on the control plane named with `--plane=ID` (or `SUPERCI_PLANE`) when it is not the one in use: `superci keys create NAME --plane=ID`, its limits, its order. It was refused as not among the control planes here.
+- A move brings each kind of runner in its own account: AWS runners with the sign-in to the account they are in (it asked to sign in with AWS when another account was in hand), a Modal launcher in its own workspace (with that workspace not signed in to, it was deployed in the one in hand, where its jobs then ran and were billed), and a Cloudflare launcher in the account it is in (it went to the first account the Cloudflare sign-in reaches). One whose account is not signed in to is asked for before anything moves.
+- The control plane's permissions read the AWS role in every account signed in to, with that account's sign-in: a role in an account not in hand was shown as one to sign in for, and never read.
+- The control plane's page offers Update for a control plane whose account or workspace is signed in to beside one that ended.
 - A command naming a control plane with `--plane=ID` acts on it for that command alone. It became the one in use from then on where no control plane serves a code host, and deleting it was then refused as the one in use.
 
 ## 0.20.3 — 2026-11-09
