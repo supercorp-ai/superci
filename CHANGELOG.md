@@ -5,6 +5,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 ## 0.20.4
 - A control plane in any AWS account or Modal workspace SuperCI is signed in to is changed with that one's sign-in, whichever is in hand: created there (`superci planes create modal --account=WORKSPACE`), moved to and from, updated, deleted, its settings and keys written. A command naming one other than the CI's own (`planes update ID`, `planes delete ID`, a move) used the first sign-in of its cloud, or refused, saying SuperCI was signed in elsewhere. Found and first fixed for Modal by Taras Kornichuk (github.com/artile), who tried it on real workspaces.
 - Deleting a Modal control plane deletes the Dict of each kind of its records too (`…-k-…`), not only its state and settings.
+- Control planes are looked for in every Modal workspace signed in to, as in every AWS account: one in a further workspace was not found by a later command, or on another computer.
 
 ## 0.20.3 — 2026-11-09
 - The control plane's page says how many spot CPUs its account may run at once across every region its spot machines start in (300 in N. Virginia and 300 in Ohio: 600, 150 jobs of the default size), and each region's own. Opened before the Runners page, it knew only its home region's and said that alone.

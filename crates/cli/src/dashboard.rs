@@ -2492,32 +2492,43 @@ impl Dashboard {
             }
             self.aws_others.retain(|s| !ended.contains(&s.account_id));
         }
-        let modal = if self.looked_modal { None } else { self.modal.clone() };
+        // (Every Modal workspace signed in to, as every AWS account: a control plane in a further one is found too.)
+        let modals: Vec<modal::Session> = if self.looked_modal { vec![] } else { self.modal_accounts() };
         // (Cloudflare is looked in again only after a sign-in changed, which forgets the accounts it reached: asked anew.)
-        let (cf_found, aws_found, modal_found) = std::thread::scope(|s| {
+        let (cf_found, aws_found, modal_found_all) = std::thread::scope(|s| {
             let c = cf.as_ref().map(|cf| s.spawn(move || -> Result<(Vec<(String, String)>, Vec<Plane>)> {
                 let accounts = timed("Cloudflare: accounts", || cf.accounts())?;
                 let planes = timed("Cloudflare: find control planes", || cf.find_planes(&accounts))?;
                 Ok((accounts, planes))
             }));
             let a: Vec<_> = aws.iter().map(|(creds, _)| s.spawn(move || timed("AWS: find control planes", || aws::connected_planes(creds)))).collect();
-            let m = modal.as_ref().map(|session| s.spawn(move || -> Result<Vec<Plane>> {
+            // (Each found with whether its address answered: see the merge below.)
+            let m: Vec<_> = modals.iter().map(|session| s.spawn(move || -> Result<Vec<(Plane, bool)>> {
                 let found = timed("Modal: find control planes", || modal::find_planes(session))?;
                 Ok(std::thread::scope(|s| {
                     let hs: Vec<_> = found.into_iter().map(|(plane_id, url)| s.spawn(move || {
-                        let label = cloudflare::health(&url).and_then(|h| h["label"].as_str().map(str::to_string)).unwrap_or_else(|| "superci".into());
-                        Plane::Modal { workspace: session.workspace.clone(), url, plane_id, label }
+                        let health = cloudflare::health(&url);
+                        let label = health.as_ref().and_then(|h| h["label"].as_str().map(str::to_string)).unwrap_or_else(|| "superci".into());
+                        (Plane::Modal { workspace: session.workspace.clone(), url, plane_id, label }, health.is_some())
                     })).collect();
                     hs.into_iter().filter_map(|h| h.join().ok()).collect()
                 }))
-            }));
-            (c.map(|h| searched(h, "Cloudflare")), a.into_iter().map(|h| searched(h, "AWS")).collect::<Vec<_>>(), m.map(|h| searched(h, "Modal")))
+            })).collect();
+            (c.map(|h| searched(h, "Cloudflare")), a.into_iter().map(|h| searched(h, "AWS")).collect::<Vec<_>>(), m.into_iter().map(|h| searched(h, "Modal")).collect::<Vec<_>>())
         });
         // Where the kept control plane was looked for, and what was found there.
         let (mut looked, mut there): (Vec<String>, Vec<String>) = (vec![], vec![]);
         // Cloudflare took the token no more (ended there, where renewing it still worked a moment ago): the same.
         let cf_found = match cf_found { Some(Err(e)) if cloudflare::over(&e) && !self.cf_given => { self.cf_over(); None } found => found };
-        let modal_found = match modal_found { Some(Err(e)) if e.contains(modal::ENDED) && !self.modal_given => { self.modal_over(); None } found => found };
+        // (The workspace in hand's sign-in that Modal took no more is ended, as before; another's is said unanswered.)
+        let in_hand = self.modal.as_ref().map(|m| m.workspace.clone());
+        let mut modal_found: Vec<(String, Result<Vec<(Plane, bool)>>)> = vec![];
+        for (session, found) in modals.iter().zip(modal_found_all) {
+            match found {
+                Err(e) if e.contains(modal::ENDED) && !self.modal_given && in_hand.as_deref() == Some(session.workspace.as_str()) => self.modal_over(),
+                found => modal_found.push((session.workspace.clone(), found)),
+            }
+        }
         match cf_found {
             Some(Err(e)) => unanswered.push(format!("Cloudflare: {e}")),
             Some(Ok((accounts, planes))) => {
@@ -2557,18 +2568,26 @@ impl Dashboard {
         }
         // (Every account looked in, or looked in again next time.)
         if asked_aws && !unanswered.iter().any(|u| u.starts_with("AWS: ")) { self.looked_aws = true }
-        match modal_found {
-            Some(Err(e)) => unanswered.push(format!("Modal: {e}")),
-            Some(Ok(found)) => {
-                looked.extend(modal.as_ref().map(|m| format!("modal:{}", m.workspace)));
-                self.found.retain(|p| !matches!(p, Plane::Modal { .. }));
-                for found in found {
-                    there.push(found.plane_id().to_string());
-                    match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.found.push(found) }
+        if !modal_found.is_empty() {
+            let mut all: Vec<(Plane, bool)> = vec![];
+            for (workspace, found) in modal_found {
+                match found {
+                    Err(e) => unanswered.push(format!("Modal: {}{e}", if modals.len() > 1 { format!("{workspace}: ") } else { String::new() })),
+                    Ok(found) => { looked.push(format!("modal:{workspace}")); all.extend(found) }
                 }
-                self.looked_modal = true;
             }
-            None => {}
+            // One control plane is in one workspace; a listing that gives the same id in two (as a stand-in may) keeps
+            // the one whose address answered.
+            all.sort_by_key(|(_, answered)| !answered);
+            let mut seen_ids: Vec<String> = vec![];
+            self.found.retain(|p| !matches!(p, Plane::Modal { .. }));
+            for (found, _) in all {
+                if seen_ids.iter().any(|id| id == found.plane_id()) { continue }
+                seen_ids.push(found.plane_id().to_string());
+                there.push(found.plane_id().to_string());
+                match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.found.push(found) }
+            }
+            if !unanswered.iter().any(|u| u.starts_with("Modal")) { self.looked_modal = true }
         }
         // A control plane kept from the last run: looked for where it lives and not there any more, it is gone.
         let home = |p: &Plane| match p {

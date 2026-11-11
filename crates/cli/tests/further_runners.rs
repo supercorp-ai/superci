@@ -182,7 +182,12 @@ fn a_control_plane_in_a_second_aws_account_is_created_updated_and_deleted_with_t
     let served = serve(own_aws);
     served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
     let home = signed_in_two_aws(&served);
-    let other = superci_testkit::serve_as("awsplane0002", |c| (c.aws_own, c.aws_own_creds) = (Some(("222222222222".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAPLANE2".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })));
+    // (Served here, reading its settings where AWS keeps them for it: the parameters the CLI wrote, its key among them.)
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("awsplane0002", move |c| {
+        c.read_settings(&aws.settings("awsplane0002"));
+        (c.aws_own, c.aws_own_creds) = (Some(("222222222222".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAPLANE2".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
     let replay = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/aws/planes/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap()
         .replace("testplane0002", "awsplane0002").replace("111111111111", "222222222222"), &[("http://new-plane.test", &other.url)]);
     let run = |args: &[&str]| {
