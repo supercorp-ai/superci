@@ -10602,7 +10602,7 @@ mod rest_tests {
         assert_eq!(d.own().check(&p("222222222222")).unwrap_err(), format!("{} Nothing has changed.", aws_ended_in("222222222222")));
         assert!(d.own().check(&p("111111111111")).is_ok() && d.own().check(&p("333333333333")).unwrap_err().contains("SuperCI is signed in to 111111111111"));
         assert_eq!(d.aws_creds_of("222222222222").unwrap_err(), aws_ended_in("222222222222"));
-        assert_eq!(d.modal_session_of("globex").unwrap_err(), modal_ended_in("globex"));
+        assert_eq!(d.modal_session_of("globex").err(), Some(modal_ended_in("globex")));
         assert_eq!(d.modal_needed("initech"), "Sign in with Modal to the workspace initech first: `superci login modal --add`.");
         // Kept, and said by the next process.
         d.keep();
