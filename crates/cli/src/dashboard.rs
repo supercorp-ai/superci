@@ -2581,11 +2581,17 @@ impl Dashboard {
             all.sort_by_key(|(_, answered)| !answered);
             let mut seen_ids: Vec<String> = vec![];
             self.found.retain(|p| !matches!(p, Plane::Modal { .. }));
-            for (found, _) in all {
+            for (found, answered) in all {
                 if seen_ids.iter().any(|id| id == found.plane_id()) { continue }
                 seen_ids.push(found.plane_id().to_string());
                 there.push(found.plane_id().to_string());
-                match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.found.push(found) }
+                // (Nor does one that did not answer take the place of one known in another workspace.)
+                let elsewhere = |x: &Plane| matches!((x, &found), (Plane::Modal { workspace: a, .. }, Plane::Modal { workspace: b, .. }) if a != b);
+                match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) {
+                    Some(i) if !answered && elsewhere(&self.planes[i]) => {}
+                    Some(i) => self.planes[i] = found,
+                    None => self.found.push(found),
+                }
             }
             if !unanswered.iter().any(|u| u.starts_with("Modal")) { self.looked_modal = true }
         }
@@ -2762,7 +2768,8 @@ impl Dashboard {
                 Plane::Cloudflare { account_id, script, .. } => if let Ok(cf) = self.cloudflare() {
                     tidy.push(Box::new(move || for old in expired(cf.secret_names(&account_id, &script).unwrap_or_default()) { let _ = cf.delete_secret(&account_id, &script, &old); }));
                 },
-                Plane::Aws { region, plane_id, .. } => if let Ok(creds) = self.aws_creds() {
+                // (With its own account's sign-in, whichever is in hand.)
+                Plane::Aws { account_id, region, plane_id, .. } => if let Ok(creds) = self.aws_creds_of(&account_id) {
                     tidy.push(Box::new(move || for old in expired(aws_plane::secret_names(&creds, &region, &plane_id).unwrap_or_default()) { let _ = aws_plane::delete_secret(&creds, &region, &plane_id, &old); }));
                 },
                 // Modal keeps expired keys; the control plane ignores them. (One only seen has no key: not among these.)

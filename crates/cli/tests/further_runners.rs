@@ -163,8 +163,11 @@ fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_
     replay("02-deploy-modal");
     let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
     assert!(ok && said.contains("acme-two--superci-plane-mdplane00002.modal.run"), "{said}");
-    // Updated by its id, the CI's own still in use.
+    // Updated by its id, the CI's own still in use (its AWS runners' role in the CI's AWS account too, as AWS answered
+    // a real update).
     replay("02-deploy-modal");
+    let iam: Vec<&str> = include_str!("../fixtures/aws/planes/update.jsonl").lines().filter(|l| l.contains("iam.amazonaws.com")).collect();
+    served.aws.replaying(&iam.join("\n"), &[("testplane0002", "mdplane00002")]);
     let (ok, said) = run(&["planes", "update", "mdplane00002"]);
     assert!(ok, "{said}");
     // Deleted by its id: its Dicts and apps, with acme-two's sign-in.
