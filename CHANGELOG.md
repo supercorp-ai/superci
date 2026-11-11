@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.20.4
+## 0.20.4 — 2026-11-11
 - A preempted Modal Function stops its job in seconds. Modal stops one with SIGINT, which never reached GitHub's runner: the job stayed in progress until GitHub gave up on the lost runner, about twelve minutes, every step red, and the control plane heard of it only when Modal started the same input again. Now the control plane is told at once and the runner interrupted, as on a spot machine AWS takes back: the job's steps hear the interrupt and the job fails within seconds, then runs again once its run has finished. Found, measured on a real workspace and fixed by Taras Kornichuk (github.com/artile). Update your control plane for it.
 - A job whose machine was lost is not run again when its run passed without it (a job that may fail, `continue-on-error`): a new attempt would only cost a machine. By Taras Kornichuk.
 - A control plane in any AWS account or Modal workspace SuperCI is signed in to is changed with that one's sign-in, whichever is in hand: created there (`superci planes create modal --account=WORKSPACE`), moved to and from, updated, deleted, its settings and keys written. A command naming one other than the CI's own (`planes update ID`, `planes delete ID`, a move) used the first sign-in of its cloud, or refused, saying SuperCI was signed in elsewhere. Found and first fixed for Modal by Taras Kornichuk (github.com/artile), who tried it on real workspaces.
