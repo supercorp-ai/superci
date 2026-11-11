@@ -140,6 +140,8 @@ fn a_modal_control_plane_is_deployed_in_the_workspace_named_not_only_the_one_in_
     served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/move/02-deploy-modal.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
     let (ok, said) = run(&["planes", "create", "modal", "--account=acme-two"]);
     assert!(ok && said.contains("The control plane is running: https://acme-two--superci-plane-mdplane00002.modal.run"), "{said}");
+    // (Modal listing the workspace's apps as it listed them after a real deploy: the new control plane's among them.)
+    served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
     let (ok, said) = run(&["planes", "list"]);
     assert!(ok && said.contains("Modal · acme-two"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
@@ -166,8 +168,7 @@ fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_
     // Updated by its id, the CI's own still in use (its AWS runners' role in the CI's AWS account too, as AWS answered
     // a real update).
     replay("02-deploy-modal");
-    let iam: Vec<&str> = include_str!("../fixtures/aws/planes/update.jsonl").lines().filter(|l| l.contains("iam.amazonaws.com")).collect();
-    served.aws.replaying(&iam.join("\n"), &[("testplane0002", "mdplane00002")]);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", "mdplane00002")]);
     let (ok, said) = run(&["planes", "update", "mdplane00002"]);
     assert!(ok, "{said}");
     // Deleted by its id: its Dicts and apps, with acme-two's sign-in.
