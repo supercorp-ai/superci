@@ -10565,6 +10565,63 @@ mod rest_tests {
     }
 
     #[test]
+    fn updating_a_control_plane_of_another_account_leaves_the_one_in_hand() {
+        // (Neither answers: the update stops there, after taking the control plane it is for.)
+        let mut d = Dashboard::new();
+        let aws = |id: &str, account: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: NOWHERE.into(), plane_id: id.into(), label: "superci".into() };
+        let modal = |id: &str, workspace: &str| Plane::Modal { workspace: workspace.into(), url: NOWHERE.into(), plane_id: id.into(), label: "superci".into() };
+        d.planes = vec![aws("p0", "111111111111"), aws("p1", "222222222222"), modal("p2", "acme"), modal("p3", "globex")];
+        (d.aws, d.aws_others) = (Some(aws::Session::for_test("111111111111")), vec![aws::Session::for_test("222222222222")]);
+        (d.modal, d.modal_others) = (Some(modal_session("acme")), vec![modal_session("globex")]);
+        for id in ["p1", "p3"] {
+            let r = send(&mut d, "/plane/update", &[("plane", id)]).unwrap();
+            assert_eq!(r.status, 503, "{id}: {}", words_of(&r));
+            assert_eq!((d.selected, d.aws.as_ref().map(|a| a.account_id.as_str()), d.modal.as_ref().map(|m| m.workspace.as_str())), (0, Some("111111111111"), Some("acme")), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_sign_in_ended_beside_others_is_kept_and_said_by_its_account_until_signed_in_again() {
+        let dir = std::env::temp_dir().join(format!("superci-ended-in-{}", random_token(6)));
+        let store = Store::at(&dir);
+        let mut d = Dashboard::new();
+        d.store = Some(store.clone());
+        // (Its credentials good for long: nothing is renewed, and AWS is not reached.)
+        (d.aws, d.modal, d.modal_others) = (Some(aws::Session::for_test_until("111111111111", u64::MAX)), Some(modal_session("acme")), vec![]);
+        d.planes = vec![aws_plane("p0", NOWHERE)];
+        d.aws_account_ended("222222222222");
+        d.modal_workspace_ended("globex");
+        d.aws_account_ended("222222222222");
+        assert_eq!((d.aws_ended_in.clone(), d.modal_ended_in.clone()), (vec!["222222222222".to_string()], vec!["globex".to_string()]));
+        let notes = d.ended_notes();
+        assert!(notes.contains(&aws_ended_in("222222222222")) && notes.contains(&modal_ended_in("globex")), "{notes:?}");
+        let page = d.others_ended_notice();
+        assert!(page.contains("Your AWS sign-in to account 222222222222 has ended") && page.contains("Modal no longer accepts your sign-in to the workspace globex"), "{page}");
+        // A change there says it by its name; the first's own are changed as before.
+        let p = |account: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: NOWHERE.into(), plane_id: "x".into(), label: "superci".into() };
+        assert_eq!(d.own().check(&p("222222222222")).unwrap_err(), format!("{} Nothing has changed.", aws_ended_in("222222222222")));
+        assert!(d.own().check(&p("111111111111")).is_ok() && d.own().check(&p("333333333333")).unwrap_err().contains("SuperCI is signed in to 111111111111"));
+        assert_eq!(d.aws_creds_of("222222222222").unwrap_err(), aws_ended_in("222222222222"));
+        assert_eq!(d.modal_session_of("globex").unwrap_err(), modal_ended_in("globex"));
+        assert_eq!(d.modal_needed("initech"), "Sign in with Modal to the workspace initech first: `superci login modal --add`.");
+        // Kept, and said by the next process.
+        d.keep();
+        let again = Dashboard::signed_in(Some(store.clone()));
+        assert_eq!((again.aws_ended_in.clone(), again.modal_ended_in.clone()), (vec!["222222222222".to_string()], vec!["globex".to_string()]));
+        // Signed in to again: not ended any more.
+        let mut again = again;
+        again.add_account(aws::Session::for_test_until("222222222222", u64::MAX));
+        again.came_modal(modal_session("globex"));
+        assert!(again.aws_ended_in.is_empty() && again.modal_ended_in.is_empty() && again.ended_notes().is_empty());
+        // With no other sign-in of its cloud left, it is said as before, as one.
+        let mut alone = Dashboard::new();
+        alone.modal_workspace_ended("acme");
+        alone.modal_ended = true;
+        assert_eq!(alone.ended_notes(), ["Modal no longer accepts the sign-in: what is in Modal was not looked at. `superci login modal` signs in again."]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_move_needs_the_one_in_use_and_a_new_one_that_takes_github() {
         // The switch of a move that did not finish, to a new one that cannot take GitHub yet: said, nothing changed.
         let to = serving(|_, path, _| match path { "/health" => (200, serde_json::json!({ "version": DASHBOARD_VERSION, "standby": true }).to_string()), _ => (500, "{}".into()) });

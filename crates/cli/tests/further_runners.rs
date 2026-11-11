@@ -184,6 +184,15 @@ fn a_control_plane_in_a_second_modal_workspace_is_updated_and_deleted_with_that_
     let (_, listed) = run(&["planes", "list"]);
     let (ok, said) = run(&["planes", "update", "mdplane00002"]);
     assert!(ok, "{said}\n(`planes list` just before:)\n{listed}");
+    // Its keys, written where it reads them (acme-two's settings Dict), with that sign-in: made, listed by it, ended.
+    let (ok, said) = run(&["keys", "create", "ci", "--plane=mdplane00002"]);
+    assert!(ok && said.contains("A read key"), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=mdplane00002"]);
+    assert!(ok && said.lines().any(|l| l.starts_with("ci ")), "{said}");
+    let (ok, said) = run(&["keys", "delete", "ci", "--plane=mdplane00002"]);
+    assert!(ok && said.contains("The key ci no longer reads."), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=mdplane00002"]);
+    assert!(ok && !said.lines().any(|l| l.starts_with("ci ")), "{said}");
     // Deleted by its id: its Dicts and apps, with acme-two's sign-in.
     replay("11-delete-md");
     let (ok, said) = run(&["planes", "delete", "mdplane00002", "--confirm"]);
@@ -218,6 +227,15 @@ fn a_control_plane_in_a_second_aws_account_is_created_updated_and_deleted_with_t
     replay("update");
     let (ok, said) = run(&["planes", "update", "awsplane0002"]);
     assert!(ok, "updated: {said}");
+    // Its keys, written where it reads them (its account's parameters), with that sign-in: made, listed by it, ended.
+    let (ok, said) = run(&["keys", "create", "ci", "--plane=awsplane0002"]);
+    assert!(ok && said.contains("A read key"), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=awsplane0002"]);
+    assert!(ok && said.lines().any(|l| l.starts_with("ci ")), "{said}");
+    let (ok, said) = run(&["keys", "delete", "ci", "--plane=awsplane0002"]);
+    assert!(ok && said.contains("The key ci no longer reads."), "{said}");
+    let (ok, said) = run(&["keys", "list", "--plane=awsplane0002"]);
+    assert!(ok && !said.lines().any(|l| l.starts_with("ci ")), "{said}");
     replay("delete");
     let (ok, said) = run(&["planes", "delete", "awsplane0002", "--confirm"]);
     assert!(ok, "deleted: {said}");
