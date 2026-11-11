@@ -829,16 +829,17 @@ fn aws_runners_for_a_control_plane_in_cloudflare_go_into_the_account_named_and_w
         other["creds"]["access_key_id"] = "ASIATWO".into();
         k["aws_more"] = serde_json::json!([other]);
     });
-    served.aws.apart("aws:ASIATWO", "222222222222");
+    served.aws.second_account("aws:ASIATWO", "222222222222");
     // (Its role and network, as AWS answered them for a control plane in Cloudflare.)
     for region in ["us-east-1", "us-east-2", "us-west-2"] { served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &plane), ("us-east-1", region)]) }
     let run = |args: &[&str]| {
         let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
         (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
     };
+    let (_, listed) = run(&["planes", "list"]);
     for args in [&["runners", "create", "aws", "--region=us-east-1"][..], &["runners", "create", "aws", "--region=us-east-1", "--dry-run"]] {
         let (ok, said) = run(args);
-        assert!(!ok && said.contains("Say which AWS account: --account=ID. Yours: 111111111111, 222222222222."), "{args:?}: {said}");
+        assert!(!ok && said.contains("Say which AWS account: --account=ID. Yours: 111111111111, 222222222222."), "{args:?}: {said}\n(`planes list`:)\n{listed}");
     }
     let (child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1")]);

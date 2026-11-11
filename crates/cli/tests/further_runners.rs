@@ -666,7 +666,7 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     other["creds"]["access_key_id"] = "ASIATWO".into();
     kept["aws_more"] = serde_json::json!([other]);
     std::fs::write(&file, kept.to_string()).unwrap();
-    served.aws.apart("aws:ASIATWO", "222222222222");
+    served.aws.second_account("aws:ASIATWO", "222222222222");
     let run = |args: &[&str]| {
         let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
         (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
@@ -740,7 +740,7 @@ fn signed_in_two_aws(served: &superci_testkit::Served) -> std::path::PathBuf {
     other["creds"]["access_key_id"] = "ASIATWO".into();
     kept["aws_more"] = serde_json::json!([other]);
     std::fs::write(&file, kept.to_string()).unwrap();
-    served.aws.apart("aws:ASIATWO", "222222222222");
+    served.aws.second_account("aws:ASIATWO", "222222222222");
     home
 }
 

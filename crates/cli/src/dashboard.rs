@@ -5063,6 +5063,8 @@ mark();load()})();</script>"#;
         // (with several signed in to, the one this row names, as it says).
         let own_modal = matches!(v.plane, Plane::Modal { .. });
         let several_modal = self.modal_accounts().len() > 1;
+        // (Its launcher's workspace once added, else the one its Add goes into.)
+        let modal_where = modal_runs_in(v).or_else(|| self.modal.as_ref().map(|m| m.workspace.clone())).filter(|_| several_modal);
         let in_workspace = |m: &modal::Session| if several_modal { format!(r#"<input type="hidden" name="account" value="{}">"#, esc(&m.workspace)) } else { String::new() };
         let modal = if launcher("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if let Some(m) = self.modal.as_ref() { row_form("/runners/modal", &in_workspace(m), "Add") }
             else if self.modal_pending.is_some() { format!(r#"{}<form method="post" action="/modal/signin"><input type="hidden" name="next"><button class="button secondary sm">Open again</button></form>"#, pill("open", "Waiting for Modal")) }
@@ -5094,7 +5096,7 @@ mark();load()})();</script>"#;
             _ => "Spot machines, one per job, in your AWS account.".to_string(),
         };
         let rows = format!("{}{further_cf}{}{further_aws}{}{further}{}", provider_row("cloudflare", containers, &cloudflare), provider_row_html("aws", &aws_what, &aws),
-            provider_row("modal", &match self.modal.as_ref().filter(|_| several_modal) { Some(m) => format!("Sandboxes, one per job, in the Modal workspace {}. The first add builds a small image.", m.workspace), None => "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.".to_string() }, &modal), more_clouds(&RUNNERS_SOON));
+            provider_row("modal", &match modal_where { Some(w) => format!("Sandboxes, one per job, in the Modal workspace {w}. The first add builds a small image."), None => "Sandboxes, one per job, in your Modal workspace. The first add builds a small image.".to_string() }, &modal), more_clouds(&RUNNERS_SOON));
         format!(r#"<div class="bar"><h1 class="page-title">Add a provider</h1><a class="chip" href="/?p=runners">Back to runners</a></div><p class="note" style="margin-bottom:22px">Where runners come from: each provider starts a fresh one for every job. Add one or more.</p><div class="picks page">{rows}</div>"#)
     }
 

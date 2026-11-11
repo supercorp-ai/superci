@@ -789,7 +789,8 @@ impl Aws {
 
     pub fn serve() -> Aws {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let recorded = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        // (The first account's answers: see `replay`.)
+        let recorded = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|mut v| { v["first"] = true.into(); v }).collect();
         let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(Mutex::new(recorded)), ..Default::default() };
         let a = aws.clone();
         std::thread::spawn(move || listener.incoming().flatten().take_while(|_| !a.stop.load(std::sync::atomic::Ordering::SeqCst)).for_each(|stream| {
@@ -970,6 +971,15 @@ impl Aws {
     /// theirs), as two real accounts' are.
     pub fn apart(&self, who: &str, account: &str) { self.apart.lock().unwrap().insert(who.to_string(), account.to_string()); }
 
+    /// A second AWS account, kept apart (see `apart`), answering as the first one's recordings do (what a real account
+    /// answered, `dashboard.jsonl`) under its own id, with no SuperCI control plane in it: what a real second account
+    /// signed in to beside the first looks like before anything of SuperCI's is made there.
+    pub fn second_account(&self, who: &str, account: &str) {
+        self.apart(who, account);
+        let own = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").replace(ACCOUNT, account).replace("<RoleName>superci-plane-", "<RoleName>another-role-");
+        self.replaying_for(who, &own, &[]);
+    }
+
     /// A Cloudflare account kept apart: its Workers' secrets are its own (another account's Worker of the same name
     /// is another Worker).
     pub fn apart_cloudflare(&self, account: &str) { self.cloudflare_apart.lock().unwrap().insert(account.to_string()); }
@@ -1066,7 +1076,9 @@ impl Aws {
         let recorded = self.recorded.lock().unwrap();
         // (A recording made for one sign-in answers that sign-in only: see `replaying_for`.)
         let caller = CALLER.with(|c| c.borrow().clone());
-        let at = |r: &&Value| r["url"] == url && r["target"] == target && r["method"] == method && (r["for"].is_null() || r["for"] == caller.as_str());
+        // (What the first account answered, `dashboard.jsonl`, is that account's: an account kept apart gets none of it.)
+        let apart = self.apart.lock().unwrap().contains_key(&caller);
+        let at = |r: &&Value| r["url"] == url && r["target"] == target && r["method"] == method && (r["for"].is_null() || r["for"] == caller.as_str()) && !(apart && r["first"] == true);
         // The same call (exactly, else the same action at the same address), the next of its answers in their order.
         let same: Vec<&Value> = recorded.iter().filter(|r| at(r) && r["asked"] == asked).collect();
         let same: Vec<&Value> = if same.is_empty() { recorded.iter().filter(|r| at(r) && action(r["target"].as_str().unwrap_or_default(), r["asked"].as_str().unwrap_or_default()) == action(target, asked)).collect() } else { same };

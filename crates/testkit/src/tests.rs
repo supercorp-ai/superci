@@ -636,6 +636,12 @@ fn each_account_kept_apart_keeps_its_own() {
     let roles = |key: &str| http(&aws.url, "POST", "/apart.us-east-1.amazonaws.com/", &[("authorization", signed(key).as_str())], b"Action=Ask").1;
     assert_eq!(roles("ASIATWO"), "<two/>");
     assert!(roles("ASIAONE").contains("SuperCITestkitUnknown"));
+    // The first account's recordings are its own: a second account answers as one with no control plane in it.
+    let list = |key: &str| http(&aws.url, "POST", "/iam.amazonaws.com/", &[("authorization", signed(key).as_str())], b"Action=ListRoles&Version=2010-05-08").1;
+    assert!(list("ASIAONE").contains(&format!("superci-plane-{PLANE}")), "{}", list("ASIAONE"));
+    assert!(list("ASIATWO").contains("SuperCITestkitUnknown"));
+    aws.second_account("aws:ASIATWO", "222222222222");
+    assert!(list("ASIATWO").contains("<ListRolesResponse") && !list("ASIATWO").contains("superci-plane-") && !list("ASIATWO").contains(ACCOUNT), "{}", list("ASIATWO"));
     // Modal: a workspace kept apart keeps its Dicts' entries; a sign-in Modal no longer takes is refused at every call.
     aws.apart("modal:ak-two", "acme-two");
     aws.replaying(&recording("DictUpdate", json!(json!({ "answers": [] }).to_string())), &[]);
