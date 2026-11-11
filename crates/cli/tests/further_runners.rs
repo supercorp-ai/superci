@@ -350,7 +350,8 @@ fn a_further_modal_workspaces_ended_sign_in_is_said_by_its_name_and_the_first_go
     };
     let ended = "Modal no longer accepts SuperCI's sign-in to the workspace acme-two";
     let (ok, said) = run(&["planes", "list"]);
-    assert!(ok && said.contains(PLANE) && said.contains(ended) && said.contains("superci login modal --add") && !said.contains("did not answer"), "{said}");
+    // (Not as a workspace that did not answer: it answered, refusing the sign-in.)
+    assert!(ok && said.contains(PLANE) && said.contains(ended) && said.contains("superci login modal --add") && !said.contains("(acme-two:"), "{said}");
     let asked = || served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == "modal:ak-acme-two").count();
     let before = asked();
     let (ok, said) = run(&["planes", "list"]);

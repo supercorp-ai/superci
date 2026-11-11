@@ -1461,8 +1461,10 @@ impl Dashboard {
     /// its cloud is signed in to, nothing more is looked for (finding control planes asks a cloud in every region);
     /// else as `ready`.
     pub fn ready_for_settings(&mut self) -> Result<()> {
+        // (Another one named, `--plane=ID`: looked for as `ready` does, never refused for not being the one known.)
+        let other_named = view::named().is_some_and(|n| !self.planes.get(self.selected).is_some_and(|p| view::is(p, &n)));
         match self.planes.get(self.selected).map(|p| p.cloud()) {
-            Some(cloud) if self.preloaded.is_some() && self.signed_in_with(cloud) => Ok(()),
+            Some(cloud) if !other_named && self.preloaded.is_some() && self.signed_in_with(cloud) => Ok(()),
             _ => self.ready(),
         }
     }
@@ -3456,7 +3458,9 @@ impl Dashboard {
                 }
                 let plan = self.carry_plan(&from_view, &to_view);
                 if let Some(Carry::NeedsSignIn(p)) = plan.iter().find(|c| matches!(c, Carry::NeedsSignIn(_))) { return Ok(message(409, &format!("Sign in with {} first", provider_name(p)), "Its runners come along with the move.")) }
-                // (Each sign-in that still gives credentials: one that ended stops only what needs it, said there.)
+                // (Each sign-in that still gives credentials: one that ended stops what needs it, an AWS control plane's
+                // move here before anything moves, and nothing else.)
+                for p in [&from, &to] { if let Plane::Aws { account_id, .. } = p { self.aws_creds_of(account_id)?; } }
                 let writer = Writer { cf: if self.cf.is_some() { Some(self.cf_client()?) } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), modals: self.modal_accounts(), aws_all: self.aws_all(), own: self.own() };
                 let aws_account = self.aws.as_ref().map(|a| a.account_id.clone());
                 let cf_account = match &from { Plane::Cloudflare { account_id, .. } => Some(account_id.clone()), _ => self.cf_accounts.first().map(|a| a.0.clone()) };

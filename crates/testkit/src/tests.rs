@@ -631,8 +631,9 @@ fn each_account_kept_apart_keeps_its_own() {
     assert_eq!(aws.settings_in("222222222222", "two"), [("KEY".to_string(), "2".to_string())]);
     assert!(aws.settings("two").is_empty() && aws.settings_in("222222222222", "one").is_empty() && aws.settings_in("333333333333", "two").is_empty());
     // A recording made for one sign-in answers it alone; another is answered as one with no recording is.
-    aws.replaying_for("aws:ASIATWO", &json!({ "method": "POST", "url": "https://iam.amazonaws.com/", "target": "", "asked": "Action=ListRoles", "status": 200, "answer": "<two/>" }).to_string(), &[]);
-    let roles = |key: &str| http(&aws.url, "POST", "/iam.amazonaws.com/", &[("authorization", signed(key).as_str())], b"Action=ListRoles").1;
+    // (At an address no other recording has.)
+    aws.replaying_for("aws:ASIATWO", &json!({ "method": "POST", "url": "https://apart.us-east-1.amazonaws.com/", "target": "", "asked": "Action=Ask", "status": 200, "answer": "<two/>" }).to_string(), &[]);
+    let roles = |key: &str| http(&aws.url, "POST", "/apart.us-east-1.amazonaws.com/", &[("authorization", signed(key).as_str())], b"Action=Ask").1;
     assert_eq!(roles("ASIATWO"), "<two/>");
     assert!(roles("ASIAONE").contains("SuperCITestkitUnknown"));
     // Modal: a workspace kept apart keeps its Dicts' entries; a sign-in Modal no longer takes is refused at every call.
