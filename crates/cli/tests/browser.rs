@@ -20157,7 +20157,7 @@ fn the_runners_pages_add_for_modal_goes_into_the_workspace_its_row_names() {
     b.wait(field);
     assert_eq!(b.eval(&format!("{field}.value")), "acme-two");
     // (What a deploy asks of Modal; finding control planes only reads.)
-    let changes = |who: &str| served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == who && c["what"].as_str().is_some_and(|w| ["/AppGetOrCreate", "/ImageGetOrCreate", "/SandboxCreate"].iter().any(|m| w.contains(m)))).count();
+    let changes = |who: &str| served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == who && c["what"].as_str().is_some_and(|w| ["AppGetOrCreate ", "ImageGetOrCreate ", "SandboxCreate "].iter().any(|m| w.starts_with(m)))).count();
     let (two, org) = (changes("modal:ak-acme-two"), changes("modal:ak-acmeorg"));
     b.eval(r#"document.querySelector('form[action="/runners/modal"] button').click()"#);
     // Its launcher, in acme-two, kept as the control plane's.

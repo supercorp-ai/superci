@@ -1624,7 +1624,7 @@ fn a_modal_control_plane_kept_in_one_workspace_is_not_taken_for_another_workspac
     let o = common::command(&home).args(["planes", "list"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "{said}");
-    assert!(served.aws.callers.lock().unwrap().iter().any(|c| c["who"] == "modal:ak-acme-two" && c["what"].as_str().is_some_and(|w| w.contains("/AppList"))), "acme-two listed");
+    assert!(served.aws.callers.lock().unwrap().iter().any(|c| c["who"] == "modal:ak-acme-two" && c["what"].as_str().is_some_and(|w| w.starts_with("AppList "))), "acme-two listed");
     let line = said.lines().find(|l| l.contains("mdplane00002")).unwrap_or_default();
     assert!(line.contains("acmeorg") && !line.contains("acme-two"), "{said}");
     let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
