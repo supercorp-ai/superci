@@ -186,6 +186,14 @@ mod tests {
         assert!(Browser::open_among(&["/no/such/chrome"], 800, 600).is_none());
     }
 
+    /// A Chrome that is there and gives no tab (here one that ends at once): started again once, then no test passed.
+    #[test]
+    fn a_chrome_that_gives_no_tab_is_started_again_then_fails() {
+        let started = std::panic::catch_unwind(|| Browser::open_among(&["/bin/true"], 800, 600));
+        let said = started.err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        assert!(said.contains("Target.createTarget") && said.contains("; started again: "), "{said}");
+    }
+
     #[test]
     fn a_command_not_sent_or_not_answered_or_refused_is_said() {
         let (tx, from) = channel();
