@@ -80,7 +80,7 @@ jobs:
         with:
           tool: cargo-zigbuild
       - name: worker-build
-        run: cargo install --locked worker-build
+        run: cargo install --locked worker-build@0.8.7
       - name: Build everything and pack the npm packages
         run: ./scripts/npm-pack.sh
       - name: Whether this commit's tests passed already (the Test workflow)

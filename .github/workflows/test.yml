@@ -66,7 +66,7 @@ jobs:
           tool: cargo-zigbuild,cargo-nextest
       - name: worker-build
         if: steps.programs.outputs.cache-hit != 'true'
-        run: cargo install --locked worker-build
+        run: cargo install --locked worker-build@0.8.7
       - name: Build
         if: steps.programs.outputs.cache-hit != 'true'
         run: ./build.sh
