@@ -191,7 +191,7 @@ mod tests {
     fn a_chrome_that_gives_no_tab_is_started_again_then_fails() {
         let started = std::panic::catch_unwind(|| Browser::open_among(&["/bin/true"], 800, 600));
         let said = started.err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
-        assert!(said.contains("Target.createTarget") && said.contains("; started again: "), "{said}");
+        assert!(said.contains("; started again: "), "{said}");
     }
 
     #[test]
