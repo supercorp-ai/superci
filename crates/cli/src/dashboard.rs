@@ -3488,14 +3488,19 @@ impl Dashboard {
                     return Ok(message(409, "That control plane serves a code host of its own", "A move would replace its GitHub App and its settings. Move to one that serves nothing yet; to bring an organization there, add it on its Repositories page. Nothing has changed."))
                 }
                 let plan = self.carry_plan(&from_view, &to_view);
-                if let Some(Carry::NeedsSignIn(p)) = plan.iter().find(|c| matches!(c, Carry::NeedsSignIn(_))) { return Ok(message(409, &format!("Sign in with {} first", provider_name(p)), "Its runners come along with the move.")) }
+                // (The account its AWS runners are in, by its id; whichever is in hand.)
+                let aws_account = from_view.status.as_ref().and_then(|s| s["aws"]["account_id"].as_str()).filter(|a| !a.is_empty()).map(str::to_string);
+                if let Some(Carry::NeedsSignIn(p)) = plan.iter().find(|c| matches!(c, Carry::NeedsSignIn(_))) {
+                    // (AWS runners in an account whose sign-in AWS ended: said by that account.)
+                    if let (&"aws", Some(a)) = (p, &aws_account) { if self.aws_ended_in.contains(a) { return Ok(self.aws_needed(a, "")) } }
+                    return Ok(message(409, &format!("Sign in with {} first", provider_name(p)), "Its runners come along with the move."))
+                }
                 // (Each sign-in that still gives credentials: one that ended stops what needs it, an AWS control plane's
                 // move here before anything moves, and nothing else.)
                 if let Plane::Aws { account_id, .. } = &from { self.aws_creds_of(account_id)?; }
                 if let Plane::Aws { account_id, .. } = &to { self.aws_creds_of(account_id)?; }
-                // (The account its AWS runners are in, with that account's sign-in, when they come along to a Cloudflare
-                // control plane: whichever is in hand; one that ended stops the move here too.)
-                let aws_account = from_view.status.as_ref().and_then(|s| s["aws"]["account_id"].as_str()).filter(|a| !a.is_empty()).map(str::to_string);
+                // (Its AWS runners' account's sign-in, when they come along to a Cloudflare control plane: one AWS does
+                // not renew now stops the move here, before anything moves.)
                 let aws_runners = match (plan.contains(&Carry::Comes("aws")), &to, aws_account) {
                     (true, Plane::Cloudflare { .. }, Some(account)) => { let creds = self.aws_creds_of(&account)?; Some((account, creds)) }
                     _ => None,

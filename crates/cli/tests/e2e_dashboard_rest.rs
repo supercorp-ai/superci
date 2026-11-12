@@ -572,12 +572,15 @@ fn a_move_bringing_a_launcher_says_where_it_cannot_go() {
     });
     let asked = |path: &str| m.served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.contains(path))).count();
     until("its accounts listed", || { common::part(&m.link, "/?p=planes&fragment=1&c=testplane0001"); asked("/client/v4/accounts?") > 0 });
-    common::part(&m.link, "/?p=planes&fragment=1&c=testplane0001");
-    let before = asked("/workers/subdomain");
-    let (status, _, said) = common::post(&m.link, "/plane/move?c=testplane0001", &[("plane", "testplane0002")]);
-    let said = common::words(&said);
-    assert!(status == 409 && said.contains("Its Cloudflare runners' account is not one this sign-in reaches"), "{status} {said}");
-    assert_eq!(asked("/workers/subdomain") - before, 2, "each account's workers.dev asked");
+    // (The accounts are taken in a moment after Cloudflare lists them: asked again until they are.)
+    let mut last = (0, String::new());
+    until("each account's workers.dev asked", || {
+        let before = asked("/workers/subdomain");
+        let (status, _, said) = common::post(&m.link, "/plane/move?c=testplane0001", &[("plane", "testplane0002")]);
+        last = (status, common::words(&said));
+        asked("/workers/subdomain") - before == 2
+    });
+    assert!(last.0 == 409 && last.1.contains("Its Cloudflare runners' account is not one this sign-in reaches"), "{last:?}");
     assert!(!m.served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "MOVE_TOKEN"), "nothing moved");
 }
 
@@ -1148,39 +1151,48 @@ fn deleting_a_control_plane_takes_its_cloudflare_launcher_out_after_a_sign_in_ma
     }
 }
 
-/// A move bringing AWS runners to a Cloudflare control plane, their account's sign-in ended (AWS stopped renewing it):
-/// stopped before anything moves, saying which sign-in to make.
+/// A move bringing AWS runners to a Cloudflare control plane, their account's sign-in not giving credentials: stopped
+/// before anything moves, saying why. AWS ended it: said by that account. AWS not answering as it renews it: what AWS
+/// answered. Not signed in to that account at all: sign in with AWS first.
 #[test]
-fn a_move_whose_aws_runners_account_sign_in_ended_stops_before_anything_moves() {
-    let served = serve(|_| {});
-    served.connect_github();
-    served.aws.put(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE), "off");
-    // Its AWS runners in a further account, 222222222222, signed in to; that sign-in's renewal refused.
-    served.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "222222222222", "region": "us-east-1", "role_arn": format!("arn:aws:iam::222222222222:role/superci-plane-{}", superci_testkit::PLANE), "connected": true, "error": null }).to_string());
-    let cf = superci_testkit::serve_as("cfplane00003", |_| {});
-    cf.store.0.lock().unwrap().insert("standby".into(), "1".into());
-    let home = common::signed_in(&served);
-    let url = cf.url.clone();
-    kept_as(&home, |k| {
-        k["cloudflare"] = cloudflare_signed_in();
-        let mut other = k["aws"].clone();
-        other["account_id"] = "222222222222".into();
-        other["creds"]["access_key_id"] = "ASIATWO".into();
-        other["creds"]["expires_at_ms"] = 0.into();
-        other["refresh_token"] = "superci-refresh-ended".into();
-        other["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
-        k["aws_more"] = serde_json::json!([other]);
-        k["planes_more"] = serde_json::json!([{ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": url, "plane_id": "cfplane00003", "label": "superci" } }]);
-        k["key"]["planes"] = serde_json::json!([superci_testkit::PLANE, "cfplane00003"]);
-    });
-    served.aws.second_account("aws:ASIATWO", "222222222222");
-    served.aws.fail("signin.aws.amazon.com/v1/token", 400, r#"{"error":"INVALID_REQUEST","message":"The provided authorization grant is invalid, expired, revoked, or malformed"}"#, None);
-    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "1")]);
-    let (status, said) = sent(&link, &format!("/plane/move?c={}", superci_testkit::PLANE), &[("plane", "cfplane00003")]);
-    assert!(status >= 400 && said.contains("SuperCI's AWS sign-in to account 222222222222 has ended"), "{status} {said}");
-    assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "MOVE_TOKEN"), "nothing moved");
-    assert!(!served.aws.worker_secrets.lock().unwrap().values().any(|m| m.contains_key("MOVE_TOKEN")), "nothing moved");
-    let _ = std::fs::remove_dir_all(&home);
+fn a_move_whose_aws_runners_account_gives_no_credentials_stops_before_anything_moves() {
+    for (renewal, why) in [(Some(400), "SuperCI's AWS sign-in to account 222222222222 has ended"), (Some(500), "AWS sign-in: 500"), (None, "Sign in with AWS first")] {
+        let served = serve(|_| {});
+        served.connect_github();
+        served.aws.put(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE), "off");
+        // Its AWS runners in a further account, 222222222222.
+        served.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "222222222222", "region": "us-east-1", "role_arn": format!("arn:aws:iam::222222222222:role/superci-plane-{}", superci_testkit::PLANE), "connected": true, "error": null }).to_string());
+        let cf = superci_testkit::serve_as("cfplane00003", |_| {});
+        cf.store.0.lock().unwrap().insert("standby".into(), "1".into());
+        let home = common::signed_in(&served);
+        let url = cf.url.clone();
+        kept_as(&home, |k| {
+            k["cloudflare"] = cloudflare_signed_in();
+            if renewal.is_some() {
+                let mut other = k["aws"].clone();
+                other["account_id"] = "222222222222".into();
+                other["creds"]["access_key_id"] = "ASIATWO".into();
+                other["creds"]["expires_at_ms"] = 0.into();
+                other["refresh_token"] = "superci-refresh-222".into();
+                other["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+                k["aws_more"] = serde_json::json!([other]);
+            }
+            k["planes_more"] = serde_json::json!([{ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": url, "plane_id": "cfplane00003", "label": "superci" } }]);
+            k["key"]["planes"] = serde_json::json!([superci_testkit::PLANE, "cfplane00003"]);
+        });
+        served.aws.second_account("aws:ASIATWO", "222222222222");
+        match renewal {
+            Some(400) => served.aws.fail("signin.aws.amazon.com/v1/token", 400, r#"{"error":"INVALID_REQUEST","message":"The provided authorization grant is invalid, expired, revoked, or malformed"}"#, None),
+            Some(_) => served.aws.fail("signin.aws.amazon.com/v1/token", 500, r#"{"error":"server_error","message":"We encountered an internal error."}"#, None),
+            None => {}
+        }
+        let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "1")]);
+        let (status, said) = sent(&link, &format!("/plane/move?c={}", superci_testkit::PLANE), &[("plane", "cfplane00003")]);
+        assert!(status >= 400 && said.contains(why), "{renewal:?}: {status} {said}");
+        assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "MOVE_TOKEN"), "{renewal:?}: nothing moved");
+        assert!(!served.aws.worker_secrets.lock().unwrap().values().any(|m| m.contains_key("MOVE_TOKEN")), "{renewal:?}: nothing moved");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 /// A move while the Cloudflare sign-in is due and Cloudflare does not renew it: stopped before anything moves, saying

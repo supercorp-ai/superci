@@ -20101,8 +20101,8 @@ fn the_runners_pages_add_for_aws_goes_into_the_account_its_row_names() {
     let home = signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
     let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    // (Cloudflare not signed in to: its runners need no sign-in there.)
     k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": plane, "plane_id": PLANE, "label": "superci" } });
-    k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
     let first = k["aws"].clone();
     let mut other = first.clone();
     other["account_id"] = "222222222222".into();
@@ -20113,7 +20113,7 @@ fn the_runners_pages_add_for_aws_goes_into_the_account_its_row_names() {
     // (Its role and network, as AWS answered them for a control plane in Cloudflare.)
     for region in ["us-east-1", "us-east-2", "us-west-2"] { served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &plane), ("us-east-1", region)]) }
     let (mut child, link) = dashboard(&home);
-    b.goto(&format!("{link}&p=runners"));
+    b.goto(&format!("{link}&p=add-runners"));
     b.wait("document.querySelector('form.aws-add input[name=account]')");
     assert_eq!(b.eval("document.querySelector('form.aws-add input[name=account]').value"), "222222222222");
     // (What connecting makes; looking for control planes reads IAM too, and is no change.)
@@ -20139,15 +20139,18 @@ fn the_runners_pages_add_for_modal_goes_into_the_workspace_its_row_names() {
     let session = |w: &str| serde_json::json!({ "token_id": format!("ak-{w}"), "token_secret": format!("as-{w}"), "workspace": w });
     (k["modal"], k["modal_more"]) = (session("acme-two"), serde_json::json!([session("acmeorg")]));
     std::fs::write(&file, k.to_string()).unwrap();
-    // (Each its own: acme-two's sign-in reaches acme-two's apps alone.)
+    // (Each its own: acme-two's sign-in reaches acme-two's apps alone. Each workspace's token, as Modal answered one.)
     served.aws.apart("modal:ak-acme-two", "acme-two");
+    let token = include_str!("../fixtures/move/02-deploy-modal.jsonl").lines().find(|l| l.contains("/AuthTokenGet\"")).unwrap();
+    served.aws.replaying(token, &[]);
+    served.aws.replaying_for("modal:ak-acme-two", token, &[]);
     let (mut child, link) = dashboard(&home);
-    b.goto(&format!("{link}&p=runners"));
+    b.goto(&format!("{link}&p=add-runners"));
     let field = r#"document.querySelector('form[action="/runners/modal"] input[name=account]')"#;
     b.wait(field);
     assert_eq!(b.eval(&format!("{field}.value")), "acme-two");
-    // (Finding control planes lists each workspace's apps: no change.)
-    let changes = |who: &str| served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == who && c["what"].as_str().is_some_and(|w| w.contains("modal.client.ModalClient/") && !w.contains("/AppList"))).count();
+    // (What a deploy asks of Modal; finding control planes only reads.)
+    let changes = |who: &str| served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == who && c["what"].as_str().is_some_and(|w| ["/AppGetOrCreate", "/ImageGetOrCreate", "/SandboxCreate"].iter().any(|m| w.contains(m)))).count();
     let (two, org) = (changes("modal:ak-acme-two"), changes("modal:ak-acmeorg"));
     b.eval(r#"document.querySelector('form[action="/runners/modal"] button').click()"#);
     until("deployed in acme-two", || changes("modal:ak-acme-two") > two);
