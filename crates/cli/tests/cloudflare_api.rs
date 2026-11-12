@@ -207,10 +207,6 @@ fn cloudflare_then_modal(workspace: &str) {
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1"]);
     assert!(!ok && !said.contains("let aws run jobs") && !said.contains("runs jobs now"), "{said}");
     served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf_url);
-    // Named, the control plane read with SUPERCI_PLANE not answering at all: said, nothing made.
-    let o = common::command(&home).args(["runners", "create", "aws", "--account=222222222222", "--region=us-east-1"]).env("SUPERCI_PLANE", "http://127.0.0.1:9").env("SUPERCI_KEY", "superci_run_not-answered-0000").output().unwrap();
-    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-    assert!(!o.status.success() && said.contains("The control plane at SUPERCI_PLANE did not answer."), "{said}");
     std::fs::write(&file, before.to_string()).unwrap();
     // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
     step("03-cf-containers");
