@@ -728,8 +728,18 @@ mod tests {
     fn strings_pickle_as_modal_writes_them() {
         assert_eq!(super::pickle_str("config:GITHUB_APP").unwrap(), b"\x80\x04\x95\x15\x00\x00\x00\x00\x00\x00\x00\x8c\x11config:GITHUB_APP\x94.".to_vec());
         for s in ["", "é ünïcode", &"x".repeat(300), &"{\"pem\":\"-----BEGIN\"}".repeat(200)] {
-            let Ok(out) = std::process::Command::new("python3").args(["-c", "import pickle,sys; sys.stdout.buffer.write(pickle.dumps(sys.argv[1], protocol=4))", s]).output() else { return };
+            let Some(out) = python_or_skip(std::process::Command::new("python3").args(["-c", "import pickle,sys; sys.stdout.buffer.write(pickle.dumps(sys.argv[1], protocol=4))", s]).stdout(std::process::Stdio::piped()).spawn()) else { return };
+            let out = out.wait_with_output().unwrap();
             assert_eq!(super::pickle_str(s).unwrap(), out.stdout, "{}", s.len());
+        }
+    }
+
+    /// Python started for a check of the Python SuperCI deploys; none here: skipped on a computer, never in CI, where a
+    /// check that quietly did not run would pass.
+    fn python_or_skip(started: std::io::Result<std::process::Child>) -> Option<std::process::Child> {
+        match started {
+            Ok(python) => Some(python),
+            Err(e) => { assert!(std::env::var_os("CI").is_none(), "python3 is needed in CI to check the Python SuperCI deploys: {e}"); eprintln!("no python3 here: skipped ({e})"); None }
         }
     }
 
@@ -740,7 +750,7 @@ mod tests {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/plane-store.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-        let Ok(mut python) = python else { return };
+        let Some(mut python) = python_or_skip(python) else { return };
         python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
         let out = python.wait_with_output().unwrap();
         assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane store"), "{}", String::from_utf8_lossy(&out.stderr));
@@ -780,7 +790,7 @@ mod tests {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/plane-ends.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-        let Ok(mut python) = python else { return };
+        let Some(mut python) = python_or_skip(python) else { return };
         python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
         let out = python.wait_with_output().unwrap();
         assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok plane ends"), "{}", String::from_utf8_lossy(&out.stderr));
@@ -797,7 +807,7 @@ mod tests {
         let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode("{}"));
         for (kind, source) in [("launcher", launcher.as_str()), ("plane", include_str!("modal_plane.py"))] {
             let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/job-images.py"), kind]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-            let Ok(mut python) = python else { return };
+            let Some(mut python) = python_or_skip(python) else { return };
             python.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
             let out = python.wait_with_output().unwrap();
             assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&format!("ok {kind}")), "{kind}: {}", String::from_utf8_lossy(&out.stderr));
@@ -818,7 +828,7 @@ mod tests {
         let jobs = include_str!("modal_jobs.py").replace("__NAME__", &super::functions_app("abc")).replace("__IMAGE_BUILDER__", IMAGE_BUILDER).replace("__IMAGES__", &b64.encode(r#"[["ghcr.io/acme/ci:1", "ghcr-read"]]"#));
         for (kind, source) in [("launcher", launcher.as_str()), ("plane", plane.as_str()), ("jobs", jobs.as_str())] {
             let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/job-functions.py"), kind]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-            let Ok(mut python) = python else { return };
+            let Some(mut python) = python_or_skip(python) else { return };
             python.stdin.take().unwrap().write_all(source.as_bytes()).unwrap();
             let out = python.wait_with_output().unwrap();
             assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&format!("ok {kind}")), "{kind}: {}", String::from_utf8_lossy(&out.stderr));

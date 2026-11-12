@@ -2,6 +2,11 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.20.5
+- A dashboard left running keeps your sign-ins when another program is midway through writing them. It read the half-written file as every sign-in ended, and removed it.
+- Deleting a control plane takes its Cloudflare launcher out just after you signed in to Cloudflare again in a terminal. It was left in Cloudflare, and nothing said so. When Cloudflare does not list your accounts, the launcher is named among what was left.
+- A move bringing AWS runners to a Cloudflare control plane checks their account's sign-in before anything moves: one AWS ended stops it at once, said by its account. It stopped partway through.
+
 ## 0.20.4 — 2026-11-11
 - A preempted Modal Function stops its job in seconds. Modal stops one with SIGINT, which never reached GitHub's runner: the job stayed in progress until GitHub gave up on the lost runner, about twelve minutes, every step red, and the control plane heard of it only when Modal started the same input again. Now the control plane is told at once and the runner interrupted, as on a spot machine AWS takes back: the job's steps hear the interrupt and the job fails within seconds, then runs again once its run has finished. Found, measured on a real workspace and fixed by Taras Kornichuk (github.com/artile). Update your control plane for it.
 - A job whose machine was lost is not run again when its run passed without it (a job that may fail, `continue-on-error`): a new attempt would only cost a machine. By Taras Kornichuk.

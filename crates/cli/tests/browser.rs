@@ -20088,3 +20088,71 @@ fn a_dialog_saved_after_a_teammate_changed_one_of_its_fields_keeps_theirs_or_say
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Two AWS accounts signed in to, the runners page of a control plane in Cloudflare: AWS's Add carries the account its
+/// row names (the one in hand, 222222222222 here, not the first signed in to), and pressing it makes the runners there,
+/// with that account's sign-in alone; nothing asks which.
+#[test]
+fn the_runners_pages_add_for_aws_goes_into_the_account_its_row_names() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let plane = superci_testkit::front(&served.url, |method, target, status, body| if method == "POST" && target.starts_with("/aws/callback") { (200, br#"{"connected":true}"#.to_vec()) } else { (status, body) });
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": plane, "plane_id": PLANE, "label": "superci" } });
+    k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    let first = k["aws"].clone();
+    let mut other = first.clone();
+    other["account_id"] = "222222222222".into();
+    other["creds"]["access_key_id"] = "ASIATWO".into();
+    (k["aws"], k["aws_more"]) = (other, serde_json::json!([first]));
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.second_account("aws:ASIATWO", "222222222222");
+    // (Its role and network, as AWS answered them for a control plane in Cloudflare.)
+    for region in ["us-east-1", "us-east-2", "us-west-2"] { served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &plane), ("us-east-1", region)]) }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait("document.querySelector('form.aws-add input[name=account]')");
+    assert_eq!(b.eval("document.querySelector('form.aws-add input[name=account]').value"), "222222222222");
+    // (What connecting makes; looking for control planes reads IAM too, and is no change.)
+    let made = || served.aws.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains("iam.amazonaws.com") && (w.contains("Action=CreateRole") || w.contains("Action=PutRolePolicy")))).map(|c| c["who"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+    assert!(made().is_empty());
+    b.eval("document.querySelector('form.aws-add button.primary').click()");
+    until("its role made", || !made().is_empty());
+    b.wait(&format!("!{}", page_shows("Which AWS account?")));
+    assert!(made().iter().all(|w| w == "aws:ASIATWO"), "{:?}", made());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two Modal workspaces signed in to: the runners page's Add for Modal carries the workspace its row names (the one in
+/// hand, acme-two here), and pressing it deploys there, with that workspace's sign-in alone; nothing asks which.
+#[test]
+fn the_runners_pages_add_for_modal_goes_into_the_workspace_its_row_names() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let session = |w: &str| serde_json::json!({ "token_id": format!("ak-{w}"), "token_secret": format!("as-{w}"), "workspace": w });
+    (k["modal"], k["modal_more"]) = (session("acme-two"), serde_json::json!([session("acmeorg")]));
+    std::fs::write(&file, k.to_string()).unwrap();
+    // (Each its own: acme-two's sign-in reaches acme-two's apps alone.)
+    served.aws.apart("modal:ak-acme-two", "acme-two");
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    let field = r#"document.querySelector('form[action="/runners/modal"] input[name=account]')"#;
+    b.wait(field);
+    assert_eq!(b.eval(&format!("{field}.value")), "acme-two");
+    // (Finding control planes lists each workspace's apps: no change.)
+    let changes = |who: &str| served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == who && c["what"].as_str().is_some_and(|w| w.contains("modal.client.ModalClient/") && !w.contains("/AppList"))).count();
+    let (two, org) = (changes("modal:ak-acme-two"), changes("modal:ak-acmeorg"));
+    b.eval(r#"document.querySelector('form[action="/runners/modal"] button').click()"#);
+    until("deployed in acme-two", || changes("modal:ak-acme-two") > two);
+    b.wait(&format!("!{}", page_shows("Which Modal workspace?")));
+    assert_eq!(changes("modal:ak-acmeorg"), org, "nothing done in acmeorg");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

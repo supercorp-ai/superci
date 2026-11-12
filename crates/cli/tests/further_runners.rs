@@ -1607,3 +1607,26 @@ fn every_page_says_further_runners_of_each_cloud_as_it_said_before() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A Modal control plane kept here in one workspace, and another workspace's listing giving the same id at an address
+/// that does not answer (as a stand-in may): the one kept stays as it is, never moved to the other workspace.
+#[test]
+fn a_modal_control_plane_kept_in_one_workspace_is_not_taken_for_another_workspaces_that_does_not_answer() {
+    let (served, home) = two_workspaces();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Modal": { "workspace": "acmeorg", "url": "https://acmeorg--superci-plane-mdplane00002.modal.run", "plane_id": "mdplane00002", "label": "" } }]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // (acme-two's apps, mdplane00002's among them; nothing answers at its address there.)
+    served.aws.replaying_for("modal:ak-acme-two", include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    let o = common::command(&home).args(["planes", "list"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{said}");
+    assert!(served.aws.callers.lock().unwrap().iter().any(|c| c["who"] == "modal:ak-acme-two" && c["what"].as_str().is_some_and(|w| w.contains("/AppList"))), "acme-two listed");
+    let line = said.lines().find(|l| l.contains("mdplane00002")).unwrap_or_default();
+    assert!(line.contains("acmeorg") && !line.contains("acme-two"), "{said}");
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(kept["planes_more"].as_array().into_iter().flatten().any(|p| p["Modal"]["plane_id"] == "mdplane00002" && p["Modal"]["workspace"] == "acmeorg"), "{kept}");
+    assert!(!kept.to_string().contains("acme-two--superci-plane-mdplane00002"), "{kept}");
+    let _ = std::fs::remove_dir_all(&home);
+}

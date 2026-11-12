@@ -1973,6 +1973,61 @@ mod tests {
         assert!(runner_user_data_for(&gh, 70, "linux", Some("https://x/'; reboot; '")).is_err() && runner_user_data_for(&gh, 70, "windows", Some("http://x/y")).is_err());
     }
 
+    /// A spot machine's watch, run as written with real processes (Linux, as the machines): AWS's notice (a rehearsal
+    /// file, as on a machine) is said to the control plane first, whose answer is run; the runner is given until twenty
+    /// seconds before the machine goes; then GitHub's runner's listener is interrupted itself (its run.sh does not
+    /// pass an interrupt on), and it hears SIGINT. (Its process named apart here: the runner running this test has a
+    /// Runner.Listener of its own, never to be interrupted.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spot_machines_watch_tells_the_control_plane_then_interrupts_the_runners_listener() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("superci-spot-{}", crate::crypto::random_id(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let told = dir.join("told");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let link = format!("http://127.0.0.1:{}/interrupted?runner=r-1&t=tok", listener.local_addr().unwrap().port());
+        // The control plane: answers the notice with what the machine runs (here: a note of when it was told).
+        let answer = format!("date +%s%N > {}\n", told.display());
+        let plane = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut asked = [0u8; 4096];
+            let n = c.read(&mut asked).unwrap();
+            let _ = c.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}", answer.len()).as_bytes());
+            String::from_utf8_lossy(&asked[..n]).to_string()
+        });
+        let script = runner_user_data_for(&crate::io::Work::GitHub { jit: "abc".into() }, 70, "linux", Some(&link)).unwrap();
+        let (from, to) = (script.find("( while sleep 5; do").unwrap(), script.find("done ) &\n").unwrap() + "done ) &\n".len());
+        let name = format!("Runner.Listener-{}", crate::crypto::random_id(8));
+        let notice = dir.join("superci-interrupted");
+        let watch = script[from..to].replace("/tmp/superci-interrupted", &notice.display().to_string()).replace("Runner.Listener", &name);
+        assert!(watch.contains(&format!("pkill -INT -f {name}")) && !watch.contains("pkill -INT -f Runner.Listener "), "{watch}");
+        // GitHub's runner's listener: ends on an interrupt, as it does, after noting it.
+        let heard = dir.join("heard");
+        let mut runner = std::process::Command::new("bash").args(["-c", &format!("trap 'date +%s%N > {}; exit 0' INT; while :; do sleep 0.1; done", heard.display()), &name]).spawn().unwrap();
+        // AWS's notice, the machine to go in 23 seconds: the job has 3 of them.
+        std::fs::write(&notice, "23").unwrap();
+        // (Run from a file, as the machine runs its start-up script: its command line does not hold the listener's name.)
+        let file = dir.join("watch.sh");
+        std::fs::write(&file, format!("{watch}wait\n")).unwrap();
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new("bash").arg(&file).output().unwrap();
+        let took = started.elapsed().as_secs_f64();
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success() && said.contains("AWS is taking this spot machine back; its job has ") && said.contains(" seconds to end by itself"), "{said} {}", String::from_utf8_lossy(&out.stderr));
+        let asked = plane.join().unwrap();
+        assert!(asked.starts_with("POST /interrupted?runner=r-1&t=tok "), "{asked}");
+        let ended = runner.wait().unwrap();
+        assert!(ended.success(), "the listener ended on its interrupt: {ended:?}");
+        let at = |f: &std::path::Path| std::fs::read_to_string(f).unwrap_or_default().trim().parse::<u128>().unwrap_or(0);
+        assert!(at(&told) > 0 && at(&heard) > 0, "told and interrupted");
+        assert!(at(&told) < at(&heard), "the control plane told first");
+        // (Interrupted when the job's time was up, not before: five seconds' wait for the notice, then its three, counted
+        // in whole seconds.)
+        assert!(at(&heard) - at(&told) >= 1_500_000_000 && took < 30.0, "{} {took}", at(&heard) - at(&told));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_given_network_names_real_ids() {
         assert!(aws_id("subnet-0abc1234", "subnet-") && aws_id("sg-0123456789abcdef0", "sg-"));

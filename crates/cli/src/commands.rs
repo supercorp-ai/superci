@@ -1255,7 +1255,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 _ => {}
             }
             let (path, fields) = match (cloud, &plane) {
-                ("aws", _) if aws_first && args.has("account") => match args.get("region") {
+                ("aws", _) if aws_first => match args.get("region") {
                     Some(r) => ("/aws/connect", vec![field("account", args.get("account").unwrap_or_default()), field("region", r)]),
                     None => return usage("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."),
                 },

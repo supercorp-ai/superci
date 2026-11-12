@@ -254,13 +254,16 @@ impl Store {
     }
 
     /// What is kept (nothing, when there is no file or it cannot be read as this version writes it).
-    pub fn read(&self) -> Kept {
-        let mut kept: Kept = std::fs::read(self.path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        // A key a SuperCI from before 0.19.13 wrote (it names them DASHBOARD_KEY_…): the same key under the name control
-        // planes read now, handed to each again under it. (Taken for one that has expired, it would be replaced, and
-        // the two versions would replace each other's keys at each command.)
-        if let Some(k) = kept.key.as_mut().filter(|k| k.name.starts_with("DASHBOARD_KEY_")) { k.name = k.name.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1); k.planes.clear() }
-        kept
+    pub fn read(&self) -> Kept { fixed(std::fs::read(self.path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()) }
+
+    /// What is kept, only when the file reads whole: none when it is there but cannot be read as JSON this version
+    /// writes (another program midway through writing it, say), so nothing is taken from it as if all were signed out.
+    /// No file: nothing kept (signed out everywhere).
+    pub fn read_whole(&self) -> Option<Kept> {
+        match std::fs::read(self.path()) {
+            Ok(b) => serde_json::from_slice(&b).ok().map(fixed),
+            Err(e) => (e.kind() == std::io::ErrorKind::NotFound).then(Kept::default),
+        }
     }
 
     /// Writes what is kept: to a file beside it first, then moved over, so a stop midway leaves the last one whole.
@@ -281,6 +284,15 @@ impl Store {
             Err(e) => Err(format!("could not remove {}: {e}", self.path().display())),
         }
     }
+}
+
+/// What was read, as this version keeps it.
+fn fixed(mut kept: Kept) -> Kept {
+    // A key a SuperCI from before 0.19.13 wrote (it names them DASHBOARD_KEY_…): the same key under the name control
+    // planes read now, handed to each again under it. (Taken for one that has expired, it would be replaced, and
+    // the two versions would replace each other's keys at each command.)
+    if let Some(k) = kept.key.as_mut().filter(|k| k.name.starts_with("DASHBOARD_KEY_")) { k.name = k.name.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1); k.planes.clear() }
+    kept
 }
 
 /// What is kept here as JSON for people to read: strings, numbers, flags and lists, which serde_json always writes.
@@ -340,7 +352,25 @@ mod tests {
         // A file this version cannot read is nothing kept, not an error.
         std::fs::write(store.path(), b"{ not json").unwrap();
         assert!(!store.read().signed_in() && !store.read().worth_keeping());
+        // Read whole: none for it (another program may be midway), nothing kept for no file, all of it for a whole one,
+        // and none for one that cannot be read at all (a folder in its place).
+        assert!(store.read_whole().is_none());
+        store.write(&kept).unwrap();
+        assert!(store.read_whole().is_some_and(|k| k.key == kept.key && k.signed_in()));
         assert!(store.remove().unwrap());
+        assert!(store.read_whole().is_some_and(|k| !k.signed_in() && !k.worth_keeping()));
+        std::fs::create_dir(store.path()).unwrap();
+        assert!(store.read_whole().is_none());
+        std::fs::remove_dir(store.path()).unwrap();
+        store.write(&Kept { key: Some(Key { name: "DASHBOARD_KEY_1794848867_4HXLAV".into(), value: "k".into(), planes: vec!["p1".into()] }), ..Default::default() }).unwrap();
+        assert!(store.read_whole().unwrap().key.unwrap().name == "DEVICE_KEY_1794848867_4HXLAV");
+        assert!(store.remove().unwrap());
+        // One account's or workspace's sign-in ended alone, with a control plane: kept (the pages say it by its name).
+        let plane = kept.plane.clone();
+        for ended in [Kept { aws_ended_in: vec!["111111111111".into()], plane: plane.clone(), ..Default::default() }, Kept { modal_ended_in: vec!["acme".into()], plane: plane.clone(), ..Default::default() }] {
+            assert!(!ended.signed_in() && ended.worth_keeping());
+            assert!(!Kept { plane: None, ..ended }.worth_keeping());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

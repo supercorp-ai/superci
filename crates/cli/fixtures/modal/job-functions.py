@@ -176,6 +176,8 @@ if kind == "jobs":
         assert told_at and told_at[0] <= real_os.path.getmtime(heard) + 1, "told first"
         assert not ours(), "no listener left running"
         assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    elif sys.platform.startswith("linux"):
+        raise AssertionError("no /proc on Linux: the check with real processes did not run")
     print("ok", kind)
     sys.exit(0)
 
