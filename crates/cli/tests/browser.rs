@@ -20101,7 +20101,6 @@ fn the_runners_pages_add_for_aws_goes_into_the_account_its_row_names() {
     let home = signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
     let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    // (Cloudflare not signed in to: its runners need no sign-in there.)
     k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": plane, "plane_id": PLANE, "label": "superci" } });
     let first = k["aws"].clone();
     let mut other = first.clone();
@@ -20119,10 +20118,15 @@ fn the_runners_pages_add_for_aws_goes_into_the_account_its_row_names() {
     // (What connecting makes; looking for control planes reads IAM too, and is no change.)
     let made = || served.aws.callers.lock().unwrap().iter().filter(|c| c["what"].as_str().is_some_and(|w| w.contains("iam.amazonaws.com") && (w.contains("Action=CreateRole") || w.contains("Action=PutRolePolicy")))).map(|c| c["who"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
     assert!(made().is_empty());
+    // (Signed in to Cloudflare, where the control plane is told of its role, only now: its control plane is no Worker the
+    // stand-in's Cloudflare lists, and a page finding control planes there would take it for one that is gone.)
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, k.to_string()).unwrap();
     b.eval("document.querySelector('form.aws-add button.primary').click()");
-    until("its role made", || !made().is_empty());
-    b.wait(&format!("!{}", page_shows("Which AWS account?")));
-    assert!(made().iter().all(|w| w == "aws:ASIATWO"), "{:?}", made());
+    until("the control plane told of its role", || served.aws.worker_secrets.lock().unwrap().get("superci").is_some_and(|m| m.contains_key("AWS_CONNECT")));
+    assert!(!made().is_empty() && made().iter().all(|w| w == "aws:ASIATWO"), "{:?}", made());
+    assert!(!b.eval("document.body.innerText").as_str().unwrap_or_default().contains("Which AWS account?"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -20141,9 +20145,12 @@ fn the_runners_pages_add_for_modal_goes_into_the_workspace_its_row_names() {
     std::fs::write(&file, k.to_string()).unwrap();
     // (Each its own: acme-two's sign-in reaches acme-two's apps alone. Each workspace's token, as Modal answered one.)
     served.aws.apart("modal:ak-acme-two", "acme-two");
-    let token = include_str!("../fixtures/move/02-deploy-modal.jsonl").lines().find(|l| l.contains("/AuthTokenGet\"")).unwrap();
-    served.aws.replaying(token, &[]);
-    served.aws.replaying_for("modal:ak-acme-two", token, &[]);
+    // (Its launcher deployed as Modal answered a real deploy; no app of a control plane listed.)
+    let deployed: Vec<&str> = include_str!("../fixtures/modal/further/01-add.jsonl").lines().filter(|l| !l.contains("/AppList\"")).collect();
+    served.aws.replaying(include_str!("../fixtures/runners/04-modal-agent.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
+    served.aws.replaying(&deployed.join("\n"), &[("mdplane00002", PLANE)]);
+    // (Its address, once deployed, served here.)
+    served.aws.workers.lock().unwrap().insert(format!("acme-two--superci-runners-{PLANE}.modal.run"), served.url.clone());
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=add-runners"));
     let field = r#"document.querySelector('form[action="/runners/modal"] input[name=account]')"#;
@@ -20153,8 +20160,11 @@ fn the_runners_pages_add_for_modal_goes_into_the_workspace_its_row_names() {
     let changes = |who: &str| served.aws.callers.lock().unwrap().iter().filter(|c| c["who"] == who && c["what"].as_str().is_some_and(|w| ["/AppGetOrCreate", "/ImageGetOrCreate", "/SandboxCreate"].iter().any(|m| w.contains(m)))).count();
     let (two, org) = (changes("modal:ak-acme-two"), changes("modal:ak-acmeorg"));
     b.eval(r#"document.querySelector('form[action="/runners/modal"] button').click()"#);
-    until("deployed in acme-two", || changes("modal:ak-acme-two") > two);
-    b.wait(&format!("!{}", page_shows("Which Modal workspace?")));
+    // Its launcher, in acme-two, kept as the control plane's.
+    let kept = || format!("{:?} {:?}", served.aws.settings(PLANE), served.store.0.lock().unwrap().get("settings"));
+    until("its launcher kept", || kept().contains(&format!("https://acme-two--superci-runners-{PLANE}")));
+    assert!(changes("modal:ak-acme-two") > two && !kept().contains("https://acmeorg--"), "{}", kept());
+    assert!(!b.eval("document.body.innerText").as_str().unwrap_or_default().contains("Which Modal workspace?"));
     assert_eq!(changes("modal:ak-acmeorg"), org, "nothing done in acmeorg");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);

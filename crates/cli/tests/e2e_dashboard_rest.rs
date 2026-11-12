@@ -569,6 +569,8 @@ fn a_move_bringing_a_launcher_says_where_it_cannot_go() {
         kept_as(home, |k| k["cloudflare"] = cloudflare_signed_in());
         served.aws.fail("/client/v4/accounts?", 200, &cf_ok(r#"[{"id":"1111111111111111111111111111111a","name":"Initech"},{"id":"2222222222222222222222222222222b","name":"Globex"}]"#), None);
         served.aws.fail("/workers/subdomain", 200, &cf_ok(r#"{"subdomain":"globex"}"#), None);
+        // (No control plane among their Workers.)
+        served.aws.fail("/workers/scripts", 200, &cf_ok("[]"), None);
     });
     let asked = |path: &str| m.served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.contains(path))).count();
     until("its accounts listed", || { common::part(&m.link, "/?p=planes&fragment=1&c=testplane0001"); asked("/client/v4/accounts?") > 0 });

@@ -1618,7 +1618,8 @@ fn a_modal_control_plane_kept_in_one_workspace_is_not_taken_for_another_workspac
     kept["planes_more"] = serde_json::json!([{ "Modal": { "workspace": "acmeorg", "url": "https://acmeorg--superci-plane-mdplane00002.modal.run", "plane_id": "mdplane00002", "label": "" } }]);
     std::fs::write(&file, kept.to_string()).unwrap();
     // (acme-two's apps, mdplane00002's among them; nothing answers at its address there.)
-    served.aws.replaying_for("modal:ak-acme-two", include_str!("../fixtures/move/02-deploy-modal.jsonl").lines().find(|l| l.contains("/AuthTokenGet\"")).unwrap(), &[]);
+    let listing: Vec<&str> = include_str!("../fixtures/move/03-cf-containers.jsonl").lines().filter(|l| l.contains("modal.client.ModalClient/")).collect();
+    served.aws.replaying_for("modal:ak-acme-two", &listing.join("\n"), &[]);
     served.aws.replaying_for("modal:ak-acme-two", include_str!("../fixtures/move/03-cf-containers.jsonl").lines().find(|l| l.contains("/AppList\"")).unwrap(), &[]);
     let o = common::command(&home).args(["planes", "list"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
