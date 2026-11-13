@@ -213,12 +213,12 @@ pub fn connect_runners(creds: &Credentials, account_id: &str, plane_url: &str, p
     let exists = |r: Result<String>| match r { Err(e) if e.starts_with("EntityAlreadyExists") => Ok(()), Err(e) => Err(e), Ok(_) => Ok(()) };
     let provider_arn = format!("arn:aws:iam::{account_id}:oidc-provider/{host}");
     exists(iam("CreateOpenIDConnectProvider", serde_json::json!({ "Url": plane_url, "ClientIDList": { "member": [audience] },
-        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })))?;
+        "Tags": aws::plane_tags_iam(plane_id) })))?;
     let role = format!("superci-plane-{plane_id}");
     let trust = aws::trust_policy(&provider_arn, &host, plane_id, audience).to_string();
     match iam("CreateRole", serde_json::json!({ "RoleName": role, "AssumeRolePolicyDocument": trust, "MaxSessionDuration": 3600,
         "Description": format!("Assumed by the SuperCI control plane {plane_url} (OpenID Connect) to run GitHub Actions jobs."),
-        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })) {
+        "Tags": aws::plane_tags_iam(plane_id) })) {
         Err(e) if e.starts_with("EntityAlreadyExists") => { iam("UpdateAssumeRolePolicy", serde_json::json!({ "RoleName": role, "PolicyDocument": trust }))?; }
         r => { r?; }
     }

@@ -72,7 +72,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // another cloud's control plane gets).
     let trust = json!({ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }] });
     ok_if(a.iam("CreateRole", json!({ "RoleName": name, "AssumeRolePolicyDocument": trust.to_string(), "Description": format!("Runs a SuperCI control plane (Lambda, {region})."),
-        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })), &["EntityAlreadyExists"])?;
+        "Tags": aws::plane_tags_iam(plane_id) })), &["EntityAlreadyExists"])?;
     let own = json!({ "Version": "2012-10-17", "Statement": [
         { "Sid": "State", "Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"], "Resource": table_arn },
         { "Sid": "Secrets", "Effect": "Allow", "Action": "ssm:GetParametersByPath", "Resource": [params_arn, format!("{params_arn}/*")] },
@@ -96,7 +96,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     ok_if(ddb("CreateTable", json!({ "TableName": name, "BillingMode": "PAY_PER_REQUEST",
         "AttributeDefinitions": [{ "AttributeName": "p", "AttributeType": "S" }, { "AttributeName": "k", "AttributeType": "S" }],
         "KeySchema": [{ "AttributeName": "p", "KeyType": "HASH" }, { "AttributeName": "k", "KeyType": "RANGE" }],
-        "Tags": [{ "Key": "superci-plane", "Value": plane_id }] })), &["ResourceInUseException"])?;
+        "Tags": aws::plane_tags_list(plane_id) })), &["ResourceInUseException"])?;
     // Records with an end (`x`, seconds) are removed by DynamoDB itself. Only for tidying, so a refusal stops nothing.
     // (Half a minute at most: then on, as if it were.)
     let mut asked = 0;
@@ -124,7 +124,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     } else {
         create_function(&a, json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap",
             "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
-            "Tags": { "superci-plane": plane_id } }))?;
+            "Tags": aws::plane_tags_map(plane_id) }))?;
     }
     wait_ready(&a, &name)?;
     deploy_converter(&a, account_id, region, plane_id, &zip)?;
@@ -142,7 +142,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // The sweep, every minute (the shortest AWS schedules): jobs waiting for room, machines left idle.
     step(4);
     let events = |op: &str, body: Value| a.target("events", &format!("events.{region}.amazonaws.com"), &format!("AWSEvents.{op}"), "1.1", body);
-    let rule_arn = events("PutRule", json!({ "Name": name, "ScheduleExpression": "rate(1 minute)", "State": "ENABLED", "Description": "SuperCI control plane sweep" }))?["RuleArn"].as_str().unwrap_or_default().to_string();
+    let rule_arn = events("PutRule", json!({ "Name": name, "ScheduleExpression": "rate(1 minute)", "State": "ENABLED", "Description": "SuperCI control plane sweep", "Tags": aws::plane_tags_list(plane_id) }))?["RuleArn"].as_str().unwrap_or_default().to_string();
     events("PutTargets", json!({ "Rule": name, "Targets": [{ "Id": "plane", "Arn": format!("arn:aws:lambda:{region}:{account_id}:function:{name}"), "Input": json!({ "superci": "sweep" }).to_string() }] }))?;
     ok_if(a.lambda("POST", &format!("/2015-03-31/functions/{name}/policy"), Some(json!({ "StatementId": "sweep", "Action": "lambda:InvokeFunction", "Principal": "events.amazonaws.com", "SourceArn": rule_arn }))), &["ResourceConflictException"])?;
 
@@ -158,7 +158,7 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
     let name = converter_name(plane_id);
     let trust = json!({ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }] });
     ok_if(a.iam("CreateRole", json!({ "RoleName": name, "AssumeRolePolicyDocument": trust.to_string(), "Description": format!("Converts Docker layers for the SuperCI control plane {plane_id} (Lambda, {region})."),
-        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })), &["EntityAlreadyExists"])?;
+        "Tags": aws::plane_tags_iam(plane_id) })), &["EntityAlreadyExists"])?;
     let own = json!({ "Version": "2012-10-17", "Statement": [
         { "Sid": "LayerStore", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"], "Resource": format!("arn:aws:s3:::superci-plane-{plane_id}-*/layers/*") },
         { "Sid": "Logs", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": format!("arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{name}:*") },
@@ -171,7 +171,7 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(config))?;
     } else {
         let mut create = json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap", "Role": format!("arn:aws:iam::{account_id}:role/{name}"),
-            "Code": { "ZipFile": zip }, "Description": "SuperCI layer store converter", "Tags": { "superci-plane": plane_id } });
+            "Code": { "ZipFile": zip }, "Description": "SuperCI layer store converter", "Tags": aws::plane_tags_map(plane_id) });
         create.as_object_mut().unwrap().extend(config.as_object().unwrap().clone());
         create_function(a, create)?;
     }

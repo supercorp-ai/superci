@@ -8273,6 +8273,13 @@ fn extra_tags_reach_every_tag_specification_and_the_fleet() {
     superci_core::aws::extra_tags("CreateLaunchTemplate", &mut template, "l3:tool=superci");
     assert_eq!(template["TagSpecification"][0]["Tag"][1]["Key"], "l3:tool");
     assert_eq!(template["LaunchTemplateData"]["TagSpecification"][0]["Tag"][0]["Value"], "superci");
+    let kinds: Vec<&str> = template["LaunchTemplateData"]["TagSpecification"].as_array().unwrap().iter().map(|s| s["ResourceType"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["instance", "volume", "network-interface"]);
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][2]["Tag"][0]["Key"], "l3:tool");
+    let mut run = serde_json::json!({ "TagSpecification": [{ "ResourceType": "instance", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }] });
+    superci_core::aws::extra_tags("RunInstances", &mut run, "l3:tool=superci");
+    assert_eq!(run["TagSpecification"][1]["ResourceType"], "volume");
+    assert_eq!(run["TagSpecification"][1]["Tag"], run["TagSpecification"][0]["Tag"]);
     let mut none = serde_json::json!({ "Type": "instant" });
     superci_core::aws::extra_tags("CreateFleet", &mut none, "");
     assert!(none.get("TagSpecification").is_none());

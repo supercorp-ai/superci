@@ -226,8 +226,11 @@ pub const EXTRA_TAGS: &str = match option_env!("SUPERCI_EXTRA_TAGS") { Some(t) =
 /// Adds `extra` ("k=v,...") to each of a call's tag specifications, and gives an instant fleet one of its own (AWS
 /// checks a fleet request's own tags, not its template's).
 pub fn extra_tags(action: &str, params: &mut serde_json::Value, extra: &str) {
-    let pairs: Vec<(&str, &str)> = extra.split(',').filter_map(|p| p.split_once('=')).filter(|(k, _)| !k.is_empty()).collect();
+    let pairs = tag_pairs(extra);
     if pairs.is_empty() { return }
+    // A machine's disks and network interfaces bill on their own (EBS, public IPv4): they get its tags too.
+    mirror_instance_tags(params.get_mut("TagSpecification"));
+    mirror_instance_tags(params.get_mut("LaunchTemplateData").and_then(|d| d.get_mut("TagSpecification")));
     if action == "CreateFleet" && params.get("TagSpecification").is_none() {
         params["TagSpecification"] = serde_json::json!([{ "ResourceType": "fleet", "Tag": [] }]);
     }
@@ -236,6 +239,36 @@ pub fn extra_tags(action: &str, params: &mut serde_json::Value, extra: &str) {
     };
     if let Some(specs) = params.get_mut("TagSpecification").and_then(|s| s.as_array_mut()) { specs.iter_mut().for_each(add) }
     if let Some(specs) = params.get_mut("LaunchTemplateData").and_then(|d| d.get_mut("TagSpecification")).and_then(|s| s.as_array_mut()) { specs.iter_mut().for_each(add) }
+}
+
+/// `"k=v,k2=v2"` as pairs (empty keys left out).
+pub fn tag_pairs(extra: &str) -> Vec<(&str, &str)> {
+    extra.split(',').filter_map(|p| p.split_once('=')).filter(|(k, _)| !k.is_empty()).collect()
+}
+
+/// Adds `volume` and `network-interface` specifications with the `instance` one's tags, where there are none of those.
+fn mirror_instance_tags(specs: Option<&mut serde_json::Value>) {
+    let Some(specs) = specs.and_then(|s| s.as_array_mut()) else { return };
+    let Some(tags) = specs.iter().find(|s| s["ResourceType"] == "instance").map(|s| s["Tag"].clone()) else { return };
+    for kind in ["volume", "network-interface"] {
+        if !specs.iter().any(|s| s["ResourceType"] == kind) { specs.push(serde_json::json!({ "ResourceType": kind, "Tag": tags.clone() })) }
+    }
+}
+
+/// The tags of what a control plane makes outside EC2 (roles, table, functions, schedule, buckets): its own, and the
+/// build's extra ones. As `[(k, v)]`.
+pub fn plane_tags(plane_id: &str) -> Vec<(String, String)> {
+    std::iter::once(("superci-plane".to_string(), plane_id.to_string())).chain(tag_pairs(EXTRA_TAGS).into_iter().map(|(k, v)| (k.to_string(), v.to_string()))).collect()
+}
+/// [`plane_tags`] as IAM's query list (`{"member": [{Key, Value}]}`).
+pub fn plane_tags_iam(plane_id: &str) -> serde_json::Value { serde_json::json!({ "member": plane_tags_list(plane_id) }) }
+/// [`plane_tags`] as `[{Key, Value}]` (DynamoDB, EventBridge).
+pub fn plane_tags_list(plane_id: &str) -> serde_json::Value {
+    plane_tags(plane_id).into_iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect()
+}
+/// [`plane_tags`] as `{k: v}` (Lambda).
+pub fn plane_tags_map(plane_id: &str) -> serde_json::Value {
+    plane_tags(plane_id).into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect::<serde_json::Map<_, _>>().into()
 }
 
 /// One signed IAM call (a global service, signed for us-east-1).
@@ -957,8 +990,17 @@ pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, pla
     let rule = format!(r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>superci-cache</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{}</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule><Rule><ID>superci-layers-staging</ID><Filter><Prefix>{}</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#, crate::cache::BUCKET_DAYS, crate::layers::STAGING);
     let sum = b64(&crate::crypto::sha256(rule.as_bytes()));
     said(s3(http, "PUT", &format!("{url}?lifecycle"), region, creds, rule.into_bytes(), &[("x-amz-sdk-checksum-algorithm", "SHA256"), ("x-amz-checksum-sha256", &sum)], now_ms).await?)?;
+    // Its tags, so its cost has an owner (only in a build with extra tags: a stock one asks nothing more).
+    if !tag_pairs(EXTRA_TAGS).is_empty() {
+        let set: String = plane_tags(plane_id).iter().map(|(k, v)| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(k), xml_escape(v))).collect();
+        let tagging = format!(r#"<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>{set}</TagSet></Tagging>"#);
+        let sum = b64(&crate::crypto::sha256(tagging.as_bytes()));
+        said(s3(http, "PUT", &format!("{url}?tagging"), region, creds, tagging.into_bytes(), &[("x-amz-sdk-checksum-algorithm", "SHA256"), ("x-amz-checksum-sha256", &sum)], now_ms).await?)?;
+    }
     Ok(())
 }
+
+fn xml_escape(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
 
 /// Puts an object in the cache bucket of a region unless it is there as it is (`superci-cache` for a version; its
 /// SHA-256 is kept with it).
