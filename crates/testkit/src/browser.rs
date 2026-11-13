@@ -28,15 +28,20 @@ impl Browser {
     pub fn open(width: u32, height: u32) -> Option<Browser> { Browser::open_among(&CHROMES, width, height) }
 
     /// The same, with the first of these that is there; `None` where none is. (One that is there and does not start
-    /// is no test passed: it panics.)
+    /// is no test passed: it panics. One whose first tab does not come, as when many start at once on a busy runner, is
+    /// started again once first.)
     fn open_among(chromes: &[&str], width: u32, height: u32) -> Option<Browser> {
         let chrome = chromes.iter().find(|p| std::path::Path::new(p).exists())?;
+        Some(Browser::start(chrome, width, height).or_else(|first| Browser::start(chrome, width, height).map_err(|again| format!("{first}; started again: {again}"))).unwrap())
+    }
+
+    fn start(chrome: &str, width: u32, height: u32) -> Result<Browser, String> {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let profile = TempDir(std::env::temp_dir().join(format!("superci-chrome-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst))));
         let ((their_in, our_out), (our_in, their_out)) = (pipe(), pipe());
         // (Ours are not handed on to Chrome; its two become its 3 and 4.)
         unsafe { libc::fcntl(our_out, libc::F_SETFD, libc::FD_CLOEXEC); libc::fcntl(our_in, libc::F_SETFD, libc::FD_CLOEXEC); }
-        let mut cmd = std::process::Command::new(*chrome);
+        let mut cmd = std::process::Command::new(chrome);
         cmd.args(["--headless=new", "--remote-debugging-pipe", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--hide-scrollbars", "--mute-audio",
             &format!("--window-size={width},{height}"), &format!("--user-data-dir={}", profile.0.display()), "about:blank"])
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -47,11 +52,11 @@ impl Browser {
         let (tx, from) = channel();
         std::thread::spawn(move || messages(from_chrome, tx));
         let mut b = Browser { child, to, from, id: 0, session: String::new(), _profile: profile };
-        let target = b.call("Target.createTarget", json!({ "url": "about:blank" })).unwrap()["targetId"].clone();
-        b.session = b.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true })).unwrap()["sessionId"].as_str().unwrap().to_string();
-        b.call("Page.enable", json!({})).unwrap();
-        b.call("Runtime.enable", json!({})).unwrap();
-        Some(b)
+        let target = b.call("Target.createTarget", json!({ "url": "about:blank" }))?["targetId"].clone();
+        b.session = b.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true }))?["sessionId"].as_str().unwrap_or_default().to_string();
+        b.call("Page.enable", json!({}))?;
+        b.call("Runtime.enable", json!({}))?;
+        Ok(b)
     }
 
     /// One command, to the tab (once attached), and its result.
@@ -179,6 +184,14 @@ mod tests {
     fn where_no_chrome_is_it_opens_none() {
         assert!(Browser::open_among(&[], 800, 600).is_none());
         assert!(Browser::open_among(&["/no/such/chrome"], 800, 600).is_none());
+    }
+
+    /// A Chrome that is there and gives no tab (here one that ends at once): started again once, then no test passed.
+    #[test]
+    fn a_chrome_that_gives_no_tab_is_started_again_then_fails() {
+        let started = std::panic::catch_unwind(|| Browser::open_among(&["/bin/true"], 800, 600));
+        let said = started.err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+        assert!(said.contains("; started again: "), "{said}");
     }
 
     #[test]

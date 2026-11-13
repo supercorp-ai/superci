@@ -657,6 +657,10 @@ fn each_account_kept_apart_keeps_its_own() {
     assert_eq!(aws.modal_answer("DictUpdate", &token("ak-two"), &entry("ROUTING", "again")).1, Some((16, "Token not found".to_string())));
     assert_eq!(aws.modal_answer("DictUpdate", &token("ak-one"), &entry("ROUTING", "again")).1, None);
     assert_eq!(aws.modal_plane_settings_in("acme-two"), [("ROUTING".to_string(), "two".to_string())]);
+    // (A Worker's address, or another host that only begins with the workspace's name, is no app of the workspace.)
+    for host in ["superci.acme.workers.dev", "acme-two--superci.example.dev"] { aws.workers.lock().unwrap().insert(host.into(), "http://127.0.0.1:9".into()); }
+    assert_eq!(aws.modal_plane_settings_in("acme-two"), [("ROUTING".to_string(), "two".to_string())]);
+    aws.workers.lock().unwrap().clear();
     // Cloudflare: an account kept apart keeps its Workers' secrets; another account's Worker of the same name is
     // another Worker.
     aws.apart_cloudflare("2222");

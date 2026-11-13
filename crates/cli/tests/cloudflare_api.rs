@@ -199,6 +199,14 @@ fn cloudflare_then_modal(workspace: &str) {
     }
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1", "--dry-run"]);
     assert!(ok && said.contains("let aws run jobs"), "{said}");
+    // Named, with nowhere for its machines to start: said, nothing made.
+    let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222"]);
+    assert!(!ok && said.contains("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."), "{said}");
+    // Named, the control plane not answering when asked whether it has AWS runners yet: stopped there, nothing made.
+    let cf_url = served.aws.workers.lock().unwrap().remove("superci.acme.workers.dev").unwrap();
+    let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1"]);
+    assert!(!ok && !said.contains("let aws run jobs") && !said.contains("runs jobs now"), "{said}");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf_url);
     std::fs::write(&file, before.to_string()).unwrap();
     // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
     step("03-cf-containers");

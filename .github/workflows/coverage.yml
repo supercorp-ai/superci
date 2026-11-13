@@ -69,7 +69,7 @@ jobs:
           tool: cargo-zigbuild
       - name: worker-build
         if: steps.programs.outputs.cache-hit != 'true'
-        run: cargo install --locked worker-build
+        run: cargo install --locked worker-build@0.8.7
       - name: Build
         if: steps.programs.outputs.cache-hit != 'true'
         run: ./build.sh
@@ -197,7 +197,7 @@ jobs:
       # worker-build, and run by the wrangler on PATH, which supercov reads it through.)
       - uses: taiki-e/install-action@v2
         with:
-          tool: worker-build
+          tool: worker-build@0.8.7
       - name: wrangler
         run: npm install -g wrangler@4.149.0
       - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
