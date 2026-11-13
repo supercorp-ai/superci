@@ -214,8 +214,28 @@ pub async fn json_call(http: &dyn Http, method: &str, url: &str, region: &str, s
 }
 
 /// One signed EC2 Query API call.
-pub async fn ec2(http: &dyn Http, region: &str, creds: &Credentials, action: &str, params: serde_json::Value, now_ms: u64) -> Result<String> {
+pub async fn ec2(http: &dyn Http, region: &str, creds: &Credentials, action: &str, mut params: serde_json::Value, now_ms: u64) -> Result<String> {
+    extra_tags(action, &mut params, EXTRA_TAGS);
     query(http, &format!("https://ec2.{region}.amazonaws.com/"), region, "ec2", "2016-11-15", creds, action, params, now_ms).await
+}
+
+/// Tags put on everything made, set when built: `SUPERCI_EXTRA_TAGS="k=v,k2=v2"` (for an organization whose policy
+/// asks every launch to carry a tag, as `aws:RequestTag/...`). Empty: none.
+pub const EXTRA_TAGS: &str = match option_env!("SUPERCI_EXTRA_TAGS") { Some(t) => t, None => "" };
+
+/// Adds `extra` ("k=v,...") to each of a call's tag specifications, and gives an instant fleet one of its own (AWS
+/// checks a fleet request's own tags, not its template's).
+pub fn extra_tags(action: &str, params: &mut serde_json::Value, extra: &str) {
+    let pairs: Vec<(&str, &str)> = extra.split(',').filter_map(|p| p.split_once('=')).filter(|(k, _)| !k.is_empty()).collect();
+    if pairs.is_empty() { return }
+    if action == "CreateFleet" && params.get("TagSpecification").is_none() {
+        params["TagSpecification"] = serde_json::json!([{ "ResourceType": "fleet", "Tag": [] }]);
+    }
+    let add = |spec: &mut serde_json::Value| if let Some(tags) = spec.get_mut("Tag").and_then(|t| t.as_array_mut()) {
+        for (k, v) in &pairs { if !tags.iter().any(|t| t["Key"] == *k) { tags.push(serde_json::json!({ "Key": k, "Value": v })) } }
+    };
+    if let Some(specs) = params.get_mut("TagSpecification").and_then(|s| s.as_array_mut()) { specs.iter_mut().for_each(add) }
+    if let Some(specs) = params.get_mut("LaunchTemplateData").and_then(|d| d.get_mut("TagSpecification")).and_then(|s| s.as_array_mut()) { specs.iter_mut().for_each(add) }
 }
 
 /// One signed IAM call (a global service, signed for us-east-1).
