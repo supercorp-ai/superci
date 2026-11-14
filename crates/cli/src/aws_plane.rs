@@ -72,7 +72,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // another cloud's control plane gets).
     let trust = json!({ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }] });
     ok_if(a.iam("CreateRole", json!({ "RoleName": name, "AssumeRolePolicyDocument": trust.to_string(), "Description": format!("Runs a SuperCI control plane (Lambda, {region})."),
-        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })), &["EntityAlreadyExists"])?;
+        "Tags": aws::plane_tags_iam(plane_id) })), &["EntityAlreadyExists"])?;
     let own = json!({ "Version": "2012-10-17", "Statement": [
         { "Sid": "State", "Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"], "Resource": table_arn },
         { "Sid": "Secrets", "Effect": "Allow", "Action": "ssm:GetParametersByPath", "Resource": [params_arn, format!("{params_arn}/*")] },
@@ -93,10 +93,12 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // State.
     step(1);
     let ddb = |op: &str, body: Value| a.target("dynamodb", &format!("dynamodb.{region}.amazonaws.com"), &format!("DynamoDB_20120810.{op}"), "1.0", body);
-    ok_if(ddb("CreateTable", json!({ "TableName": name, "BillingMode": "PAY_PER_REQUEST",
+    let table = ddb("CreateTable", json!({ "TableName": name, "BillingMode": "PAY_PER_REQUEST",
         "AttributeDefinitions": [{ "AttributeName": "p", "AttributeType": "S" }, { "AttributeName": "k", "AttributeType": "S" }],
         "KeySchema": [{ "AttributeName": "p", "KeyType": "HASH" }, { "AttributeName": "k", "KeyType": "RANGE" }],
-        "Tags": [{ "Key": "superci-plane", "Value": plane_id }] })), &["ResourceInUseException"])?;
+        "Tags": aws::plane_tags_list(plane_id) }));
+    let table_exists = matches!(&table, Err(e) if e.starts_with("ResourceInUseException"));
+    ok_if(table, &["ResourceInUseException"])?;
     // Records with an end (`x`, seconds) are removed by DynamoDB itself. Only for tidying, so a refusal stops nothing.
     // (Half a minute at most: then on, as if it were.)
     let mut asked = 0;
@@ -104,6 +106,9 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         crate::aws::pause(1000);
         asked += 1;
         if asked == 30 { break }
+    }
+    if table_exists && !aws::tag_pairs(aws::EXTRA_TAGS).is_empty() {
+        tag_table(&a, &table_arn, aws::EXTRA_TAGS)?;
     }
     let ttl = ddb("DescribeTimeToLive", json!({ "TableName": name })).ok();
     if !ttl.as_ref().is_some_and(|t| ["ENABLED", "ENABLING"].contains(&t["TimeToLiveDescription"]["TimeToLiveStatus"].as_str().unwrap_or(""))) {
@@ -121,10 +126,11 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         // Its size as set now (one set up before had a smaller one: slower to start and to answer).
         wait_ready(&a, &name)?;
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(json!({ "MemorySize": MEMORY_MB, "Timeout": 60 })))?;
+        tag_function(&a, account_id, region, &name, aws::EXTRA_TAGS)?;
     } else {
         create_function(&a, json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap",
             "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
-            "Tags": { "superci-plane": plane_id } }))?;
+            "Tags": aws::plane_tags_map(plane_id) }))?;
     }
     wait_ready(&a, &name)?;
     deploy_converter(&a, account_id, region, plane_id, &zip)?;
@@ -142,7 +148,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // The sweep, every minute (the shortest AWS schedules): jobs waiting for room, machines left idle.
     step(4);
     let events = |op: &str, body: Value| a.target("events", &format!("events.{region}.amazonaws.com"), &format!("AWSEvents.{op}"), "1.1", body);
-    let rule_arn = events("PutRule", json!({ "Name": name, "ScheduleExpression": "rate(1 minute)", "State": "ENABLED", "Description": "SuperCI control plane sweep" }))?["RuleArn"].as_str().unwrap_or_default().to_string();
+    let rule_arn = events("PutRule", json!({ "Name": name, "ScheduleExpression": "rate(1 minute)", "State": "ENABLED", "Description": "SuperCI control plane sweep", "Tags": aws::plane_tags_list(plane_id) }))?["RuleArn"].as_str().unwrap_or_default().to_string();
     events("PutTargets", json!({ "Rule": name, "Targets": [{ "Id": "plane", "Arn": format!("arn:aws:lambda:{region}:{account_id}:function:{name}"), "Input": json!({ "superci": "sweep" }).to_string() }] }))?;
     ok_if(a.lambda("POST", &format!("/2015-03-31/functions/{name}/policy"), Some(json!({ "StatementId": "sweep", "Action": "lambda:InvokeFunction", "Principal": "events.amazonaws.com", "SourceArn": rule_arn }))), &["ResourceConflictException"])?;
 
@@ -158,7 +164,7 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
     let name = converter_name(plane_id);
     let trust = json!({ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }] });
     ok_if(a.iam("CreateRole", json!({ "RoleName": name, "AssumeRolePolicyDocument": trust.to_string(), "Description": format!("Converts Docker layers for the SuperCI control plane {plane_id} (Lambda, {region})."),
-        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })), &["EntityAlreadyExists"])?;
+        "Tags": aws::plane_tags_iam(plane_id) })), &["EntityAlreadyExists"])?;
     let own = json!({ "Version": "2012-10-17", "Statement": [
         { "Sid": "LayerStore", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"], "Resource": format!("arn:aws:s3:::superci-plane-{plane_id}-*/layers/*") },
         { "Sid": "Logs", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": format!("arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{name}:*") },
@@ -169,14 +175,29 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/code"), Some(json!({ "ZipFile": zip, "Architectures": ["arm64"] })))?;
         wait_ready(a, &name)?;
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(config))?;
+        tag_function(a, account_id, region, &name, aws::EXTRA_TAGS)?;
     } else {
         let mut create = json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap", "Role": format!("arn:aws:iam::{account_id}:role/{name}"),
-            "Code": { "ZipFile": zip }, "Description": "SuperCI layer store converter", "Tags": { "superci-plane": plane_id } });
+            "Code": { "ZipFile": zip }, "Description": "SuperCI layer store converter", "Tags": aws::plane_tags_map(plane_id) });
         create.as_object_mut().unwrap().extend(config.as_object().unwrap().clone());
         create_function(a, create)?;
     }
     wait_ready(a, &name)?;
     a.lambda("PUT", &format!("/2019-09-25/functions/{name}/event-invoke-config"), Some(json!({ "MaximumRetryAttempts": 0 }))).map(|_| ())
+}
+
+fn tag_table(a: &Api, arn: &str, extra: &str) -> Result<()> {
+    let tags: Vec<Value> = aws::tag_pairs(extra).into_iter().map(|(k, v)| json!({ "Key": k, "Value": v })).collect();
+    if tags.is_empty() { return Ok(()) }
+    a.target("dynamodb", &format!("dynamodb.{}.amazonaws.com", a.region), "DynamoDB_20120810.TagResource", "1.0", json!({ "ResourceArn": arn, "Tags": tags })).map(|_| ())
+}
+
+fn tag_function(a: &Api, account_id: &str, region: &str, name: &str, extra: &str) -> Result<()> {
+    let tags: serde_json::Map<String, Value> = aws::tag_pairs(extra).into_iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect();
+    if tags.is_empty() { return Ok(()) }
+    let arn = format!("arn:aws:lambda:{region}:{account_id}:function:{name}");
+    let encoded: String = url::form_urlencoded::byte_serialize(arn.as_bytes()).collect();
+    a.lambda("POST", &format!("/2017-03-31/tags/{encoded}"), Some(json!({ "Tags": tags }))).map(|_| ())
 }
 
 /// A function made, asked again while its new role is not yet one Lambda may use (a few seconds, a minute at most).
@@ -336,6 +357,58 @@ mod tests {
     fn deploy(at: &str) -> Result<Deployed> { with(at, || deploy_with(&creds(), "111111111111", "us-east-1", "p1", "superci", false, &|_| {})) }
 
     fn given(what: &str, a: Vec<u8>) -> Vec<(String, Vec<u8>)> { vec![(what.to_string(), a)] }
+
+    #[test]
+    fn tagging_existing_resources_only_sends_configured_keys() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let at = clouds::serve_aws(move |what, body| {
+            recorded.lock().unwrap().push((what.to_string(), serde_json::from_slice::<Value>(body).unwrap()));
+            answer(200, "{}")
+        });
+        with(&at, || {
+            let creds = creds();
+            let a = api(&creds, "us-east-1");
+            tag_table(&a, "arn:table", "").unwrap();
+            tag_function(&a, "111111111111", "us-east-1", "superci-plane-p1", "").unwrap();
+            assert!(calls.lock().unwrap().is_empty());
+            tag_table(&a, "arn:table", "owner=team").unwrap();
+            tag_function(&a, "111111111111", "us-east-1", "superci-plane-p1", "owner=team").unwrap();
+        });
+        let got = calls.lock().unwrap();
+        assert_eq!(got[0].1["Tags"], json!([{ "Key": "owner", "Value": "team" }]));
+        assert_eq!(got[1].1["Tags"], json!({ "owner": "team" }));
+    }
+
+    #[test]
+    fn existing_resources_receive_extra_tags() {
+        if aws::EXTRA_TAGS != "owner=team" { return }
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let at = clouds::serve_aws(move |what, body| {
+            recorded.lock().unwrap().push((what.to_string(), String::from_utf8_lossy(body).to_string()));
+            match what {
+                "DynamoDB_20120810.CreateTable" => aws_error("ResourceInUseException"),
+                "DynamoDB_20120810.DescribeTable" => answer(200, r#"{"Table":{"TableStatus":"ACTIVE"}}"#),
+                "DynamoDB_20120810.DescribeTimeToLive" => answer(200, r#"{"TimeToLiveDescription":{"TimeToLiveStatus":"ENABLED"}}"#),
+                "AWSEvents.PutRule" => answer(200, r#"{"RuleArn":"arn:rule"}"#),
+                w if w.ends_with("/configuration") && w.starts_with("GET ") => answer(200, r#"{"State":"Active","LastUpdateStatus":"Successful"}"#),
+                w if w.ends_with("/url") => answer(200, r#"{"FunctionUrl":"https://plane.test/"}"#),
+                _ => answer(200, "{}"),
+            }
+        });
+        deploy(&at).unwrap();
+        let calls = calls.lock().unwrap();
+        let table = calls.iter().find(|(w, _)| w == "DynamoDB_20120810.TagResource").unwrap();
+        let body: Value = serde_json::from_str(&table.1).unwrap();
+        assert_eq!(body["ResourceArn"], "arn:aws:dynamodb:us-east-1:111111111111:table/superci-plane-p1");
+        assert!(body["Tags"].as_array().unwrap().iter().any(|t| t["Key"] == "owner" && t["Value"] == "team"));
+        let functions: Vec<_> = calls.iter().filter(|(w, _)| w.starts_with("POST ") && w.contains("/2017-03-31/tags/")).collect();
+        assert_eq!(functions.len(), 2);
+        for (_, body) in functions { assert_eq!(serde_json::from_str::<Value>(body).unwrap()["Tags"]["owner"], "team") }
+    }
 
     /// A control plane updated: its function and its converter's each given their code, waited for and sized; each
     /// step refused is an error.

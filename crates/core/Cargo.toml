@@ -21,6 +21,7 @@ getrandom.workspace = true
 yaml-rust2.workspace = true
 async-trait.workspace = true
 url.workspace = true
+quick-xml = { version = "0.38", features = ["serialize"] }
 
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["executor"] }
