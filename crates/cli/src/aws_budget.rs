@@ -133,7 +133,7 @@ impl Budgets<'_> {
             "Condition": { "StringEquals": { "aws:SourceAccount": self.account }, "ArnLike": { "aws:SourceArn": format!("arn:aws:budgets::{}:budget/{}", self.account, self.name()) } } }] });
         exists(self.iam("CreateRole", json!({ "RoleName": aws::budget_role_name(self.plane_id), "AssumeRolePolicyDocument": trust.to_string(),
             "Description": "AWS Budgets puts the no-new-machines rule on a SuperCI control plane's role with it, at the budget's limit.",
-            "Tags": { "member": [{ "Key": "superci-plane", "Value": self.plane_id }] } })))?;
+            "Tags": aws::plane_tags_iam(self.plane_id) })))?;
         let may = json!({ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": ["iam:AttachRolePolicy", "iam:DetachRolePolicy"],
             "Resource": format!("arn:aws:iam::{}:role/{}", self.account, self.plane_role()), "Condition": { "ArnEquals": { "iam:PolicyARN": self.policy_arn() } } }] });
         self.iam("PutRolePolicy", json!({ "RoleName": aws::budget_role_name(self.plane_id), "PolicyName": "put-the-rule", "PolicyDocument": may.to_string() }))?;

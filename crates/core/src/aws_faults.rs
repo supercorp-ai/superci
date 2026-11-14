@@ -242,6 +242,62 @@ fn prices() -> Answer {
 }
 
 #[test]
+fn image_copy_tags_its_backing_snapshots() {
+    let answer: Answer = Box::new(|action, request| {
+        assert_eq!(action, "CopyImage");
+        let params: std::collections::HashMap<_, _> = url::form_urlencoded::parse(&request.body).into_owned().collect();
+        for (i, resource) in [(1, "image"), (2, "snapshot")] {
+            assert_eq!(params.get(&format!("TagSpecification.{i}.ResourceType")).map(String::as_str), Some(resource));
+            assert_eq!(params.get(&format!("TagSpecification.{i}.Tag.1.Key")).map(String::as_str), Some(IMAGE_TAG.0));
+            assert_eq!(params.get(&format!("TagSpecification.{i}.Tag.1.Value")).map(String::as_str), Some(IMAGE_TAG.1));
+        }
+        (200, "<imageId>ami-copy</imageId>".into())
+    });
+    once(answer, |aws| futures::executor::block_on(copy_image(aws, "eu-north-1", &creds(), "us-east-1", "ami-1", "n", 0)));
+    let mut params = serde_json::json!({ "TagSpecification": [
+        { "ResourceType": "image", "Tag": [{ "Key": IMAGE_TAG.0, "Value": IMAGE_TAG.1 }] },
+        { "ResourceType": "snapshot", "Tag": [{ "Key": IMAGE_TAG.0, "Value": IMAGE_TAG.1 }] }
+    ] });
+    extra_tags("CopyImage", &mut params, "owner=team");
+    for spec in params["TagSpecification"].as_array().unwrap() {
+        assert!(spec["Tag"].as_array().unwrap().iter().any(|t| t["Key"] == "owner" && t["Value"] == "team"));
+    }
+}
+
+#[test]
+fn bucket_tagging_keeps_existing_tags_and_propagates_read_errors() {
+    let answer: Answer = Box::new(|what, request| {
+        if what.starts_with("GET ") && what.ends_with("?tagging") {
+            return (200, "<Tagging><TagSet><Tag><Key>other</Key><Value>a&amp;b</Value></Tag><Tag><Key>owner</Key><Value>old</Value></Tag></TagSet></Tagging>".into());
+        }
+        if what.starts_with("PUT ") && what.ends_with("?tagging") {
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(body.contains("<Key>other</Key><Value>a&amp;b</Value>"));
+            assert!(body.contains("<Key>owner</Key><Value>new</Value>"));
+            assert!(body.contains("<Key>superci-plane</Key><Value>p1</Value>"));
+            assert!(!body.contains("<Value>old</Value>"));
+        }
+        (200, String::new())
+    });
+    once(answer, |http| futures::executor::block_on(make_bucket_with_tags(http, "us-east-1", &creds(), "p1", 0, "owner=new")));
+    let denied: Answer = Box::new(|what, _| if what.starts_with("GET ") { (403, "<Error><Code>AccessDenied</Code></Error>".into()) } else { (200, String::new()) });
+    let aws = Aws { answer: denied, fail: None, n: Cell::new(0), calls: RefCell::default() };
+    assert!(futures::executor::block_on(make_bucket_with_tags(&aws, "us-east-1", &creds(), "p1", 0, "owner=new")).is_err());
+    assert!(!aws.calls.borrow().iter().any(|c| c.starts_with("PUT ") && c.ends_with("?tagging")));
+    assert!(bucket_tags("<Tagging><broken/></Tagging>").is_err());
+    assert!(bucket_tags("<Tagging><TagSet><Tag><Key>owner</Key></Tag></TagSet></Tagging>").is_err());
+    assert_eq!(bucket_tags("<Tagging><TagSet><Tag><Key>owner</Key><Value/></Tag></TagSet></Tagging>").unwrap(), [("owner".into(), "".into())]);
+    let empty: Answer = Box::new(|what, request| {
+        if what.starts_with("GET ") { return (404, "<Error><Code>NoSuchTagSet</Code></Error>".into()) }
+        if what.starts_with("PUT ") && what.ends_with("?tagging") {
+            assert!(String::from_utf8_lossy(&request.body).contains("<Key>owner</Key><Value>new</Value>"));
+        }
+        (200, String::new())
+    });
+    once(empty, |http| futures::executor::block_on(make_bucket_with_tags(http, "us-east-1", &creds(), "p1", 0, "owner=new")));
+}
+
+#[test]
 fn prices_images_and_quotas_read_hold_with_each_call_failing() {
     let on = |f: &dyn Fn(&dyn Http) -> Result<f64>| swept(prices, f);
     assert_eq!(on(&|aws| futures::executor::block_on(spot_price(aws, "us-east-1", Some("us-east-1a"), &creds(), "m7a.large", "linux", 0))), 0.03);
@@ -501,4 +557,26 @@ fn a_machine_not_to_be_had_is_said_as_that_in_every_way_aws_says_it() {
     let other = "<fleetId>f</fleetId><errorSet><item><errorCode>InvalidFleetConfiguration</errorCode><errorMessage>Something else</errorMessage></item></errorSet>";
     assert_eq!(fleet_said(other, &pools, &mut told).err().as_deref(), Some("InvalidFleetConfiguration: Something else"));
     assert_eq!(fleet_said("<nothing/>", &pools, &mut told).err().as_deref(), Some("CreateFleet without a fleet"));
+}
+
+#[test]
+fn extra_tags_reach_every_tag_specification_and_the_fleet() {
+    let mut fleet = serde_json::json!({ "Type": "instant" });
+    extra_tags("CreateFleet", &mut fleet, "l3:tool=superci");
+    assert_eq!(fleet["TagSpecification"][0]["Tag"][0], serde_json::json!({ "Key": "l3:tool", "Value": "superci" }));
+    let mut template = serde_json::json!({ "TagSpecification": [{ "ResourceType": "launch-template", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }],
+        "LaunchTemplateData": { "TagSpecification": [{ "ResourceType": "instance", "Tag": [] }] } });
+    extra_tags("CreateLaunchTemplate", &mut template, "l3:tool=superci");
+    assert_eq!(template["TagSpecification"][0]["Tag"][1]["Key"], "l3:tool");
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][0]["Tag"][0]["Value"], "superci");
+    let kinds: Vec<&str> = template["LaunchTemplateData"]["TagSpecification"].as_array().unwrap().iter().map(|s| s["ResourceType"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["instance", "volume", "network-interface"]);
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][2]["Tag"][0]["Key"], "l3:tool");
+    let mut run = serde_json::json!({ "TagSpecification": [{ "ResourceType": "instance", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }] });
+    extra_tags("RunInstances", &mut run, "l3:tool=superci");
+    assert_eq!(run["TagSpecification"][1]["ResourceType"], "volume");
+    assert_eq!(run["TagSpecification"][1]["Tag"], run["TagSpecification"][0]["Tag"]);
+    let mut none = serde_json::json!({ "Type": "instant" });
+    extra_tags("CreateFleet", &mut none, "");
+    assert!(none.get("TagSpecification").is_none());
 }
