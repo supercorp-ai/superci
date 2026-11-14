@@ -7750,6 +7750,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
         "a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done", "a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner", "every_test_here_holds_with_each_call_and_store_operation_failing",
+        // Pure tag transformations have no cloud or store calls to fault.
+        "extra_tags_reach_every_tag_specification_and_the_fleet",
         // (And one that measures, over a thousand jobs: a fault would only make it slower.)
         "a_busy_request_costs_the_same_however_many_jobs_are_kept_and_fits_what_waits_for_it"];
     let all: Vec<&str> = include_str!("plane.rs").split("#[test]\nfn ").skip(1).filter_map(|t| t.split('(').next()).collect();
@@ -8261,4 +8263,31 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     let sent: Vec<Change> = serde_json::from_str(r#"[{"op":"set","path":["a"],"value":1,"from":null},{"op":"set","path":["a"],"value":1}]"#).unwrap();
     assert_eq!(sent, vec![Change::Set { path: path(&["a"]), value: 1.into(), from: Some(serde_json::Value::Null) }, Change::Set { path: path(&["a"]), value: 1.into(), from: None }]);
     assert_eq!(serde_json::to_string(&sent[1]).unwrap(), r#"{"op":"set","path":["a"],"value":1}"#);
+}
+
+#[test]
+fn extra_tags_reach_every_tag_specification_and_the_fleet() {
+    let mut fleet = serde_json::json!({ "Type": "instant" });
+    superci_core::aws::extra_tags("CreateFleet", &mut fleet, "l3:tool=superci");
+    assert_eq!(fleet["TagSpecification"][0]["Tag"][0], serde_json::json!({ "Key": "l3:tool", "Value": "superci" }));
+    let mut template = serde_json::json!({ "TagSpecification": [{ "ResourceType": "launch-template", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }],
+        "LaunchTemplateData": { "TagSpecification": [{ "ResourceType": "instance", "Tag": [] }] } });
+    superci_core::aws::extra_tags("CreateLaunchTemplate", &mut template, "l3:tool=superci");
+    assert_eq!(template["TagSpecification"][0]["Tag"][1]["Key"], "l3:tool");
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][0]["Tag"][0]["Value"], "superci");
+    let kinds: Vec<&str> = template["LaunchTemplateData"]["TagSpecification"].as_array().unwrap().iter().map(|s| s["ResourceType"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["instance", "volume", "network-interface"]);
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][2]["Tag"][0]["Key"], "l3:tool");
+    let mut run = serde_json::json!({ "TagSpecification": [{ "ResourceType": "instance", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }] });
+    superci_core::aws::extra_tags("RunInstances", &mut run, "l3:tool=superci");
+    assert_eq!(run["TagSpecification"][1]["ResourceType"], "volume");
+    assert_eq!(run["TagSpecification"][1]["Tag"], run["TagSpecification"][0]["Tag"]);
+    let mut none = serde_json::json!({ "Type": "instant" });
+    superci_core::aws::extra_tags("CreateFleet", &mut none, "");
+    assert!(none.get("TagSpecification").is_none());
+    let mut stock = serde_json::json!({ "TagSpecification": [{ "ResourceType": "instance", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }] });
+    superci_core::aws::extra_tags("RunInstances", &mut stock, "");
+    assert_eq!(stock["TagSpecification"][1]["Tag"], stock["TagSpecification"][0]["Tag"]);
+    assert_eq!(stock["TagSpecification"][2]["ResourceType"], "network-interface");
+    assert_eq!(superci_core::aws::tag_pairs("superci-plane=wrong,team=ci,team=other,superci-network=wrong"), vec![("team", "ci")]);
 }

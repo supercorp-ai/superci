@@ -31,6 +31,20 @@ env:
     target/x86_64-pc-windows-gnu/release/superci-cache.exe
 
 jobs:
+  aws-cost-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fetch --locked
+      - name: Network and tagging regression tests (offline)
+        run: |
+          cargo test --locked --offline -p superci-core --lib a_network_is_made_once_whole_and_found_after
+          cargo test --locked --offline -p superci-core --lib bucket_tag_reconciliation
+          cargo test --locked --offline -p superci-core --lib copied_images_tag
+          cargo test --locked --offline -p superci-core --test plane extra_tags_reach_every_tag_specification_and_the_fleet
+
   # Everything built once: the programs the binary carries (kept between runs while their sources stay) and the tests,
   # compiled into one archive the test jobs run from without compiling again.
   build:

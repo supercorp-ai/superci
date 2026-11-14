@@ -66,6 +66,18 @@ target/release/superci
 
 `build.sh` needs Rust, [worker-build](https://crates.io/crates/worker-build), zig with [cargo-zigbuild](https://crates.io/crates/cargo-zigbuild), and `zip`.
 
+To include an organization's AWS resource tags, set `SUPERCI_EXTRA_TAGS` for the entire build, for example:
+
+```sh
+SUPERCI_EXTRA_TAGS='team=ci,project=runners' ./build.sh
+```
+
+The setting is compiled into both the dashboard and the control planes it packages; setting it only when running the
+binary does not change tags. Build all components with `build.sh` so the control plane and CLI use the same values.
+The keys `superci-plane` and `superci-network` are reserved for ownership; repeated keys use their first value.
+Updating an existing AWS plane reconciles the configured keys on its DynamoDB table and Lambda functions, and preserves
+other keys. The sign-in used for the update needs permission to tag those resources and to read and write bucket tags.
+
 The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release; then it publishes the crates (`scripts/crates-publish.sh`), writes the Homebrew formula into the tap (`scripts/brew-formula.sh`), and tries `install.sh`, all three from npm's files or the same source. Every push and pull request is built and tested by `.github/workflows/test.yml`.
 
 ## Contributors
