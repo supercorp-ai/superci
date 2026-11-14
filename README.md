@@ -88,3 +88,7 @@ The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS,
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Local pre-push checks
+
+The repository's pre-push gate runs the AWS cost and tagging regression tests and the CLI unit tests against the checked-out commit. Install it with `git config box.repoHooksPath .githooks` on Box, or `git config core.hooksPath .githooks` elsewhere. Before pushing, run `cargo fetch --locked` and `./build.sh` to build the programs embedded in the CLI; see the prerequisites at the top of `build.sh`. The gate requires tracked changes to be committed and only accepts the checked-out commit. CI runs the broader workspace and integration tests.

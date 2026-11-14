@@ -1,0 +1,22 @@
+#!/bin/sh
+# Run the cost and tagging regressions and CLI unit tests against the commit being pushed.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+head=$(git rev-parse HEAD)
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_sha" in *[!0]*)
+    if [ "$local_sha" != "$head" ]; then
+      echo "pre-push: check out the commit being pushed before running the gate" >&2
+      exit 1
+    fi ;;
+  esac
+done
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "pre-push: commit or stash tracked changes before running the gate" >&2
+  exit 1
+fi
+cargo test --locked --offline -p superci-core --lib a_network_is_made_once_whole_and_found_after
+cargo test --locked --offline -p superci-core --lib bucket_tag_reconciliation
+cargo test --locked --offline -p superci-core --lib copied_images_tag
+cargo test --locked --offline -p superci-core --test plane extra_tags_reach_every_tag_specification_and_the_fleet
+cargo test --locked --offline -p superci --bin superci
