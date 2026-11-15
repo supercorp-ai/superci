@@ -839,6 +839,36 @@ pub async fn find_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     Ok(Some(Network { vpc, security_group, subnets, ..Default::default() }))
 }
 
+/// CreateTags updates only the specified keys and leaves every other resource tag intact.
+async fn tag_owned_ec2_resources(http: &dyn Http, region: &str, creds: &Credentials, ids: &[&str], extra: &str, now_ms: u64) -> Result<()> {
+    let tags: Vec<_> = tag_pairs(extra).into_iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect();
+    if tags.is_empty() || ids.is_empty() { return Ok(()) }
+    ec2(http, region, creds, "CreateTags", serde_json::json!({ "ResourceId": ids, "Tag": tags }), now_ms).await
+        .map(|_| ()).map_err(|e| format!("tagging owned EC2 resources: {e}"))
+}
+
+/// Reconcile extra tags only on S3 gateway endpoints bearing this network's ownership tag.
+/// Describe and tag failures are returned so a denied permission cannot look like success.
+async fn tag_owned_s3_endpoints(http: &dyn Http, region: &str, creds: &Credentials, vpc: &str, whose: Whose<'_>, extra: &str, now_ms: u64) -> Result<()> {
+    if tag_pairs(extra).is_empty() { return Ok(()) }
+    let (key, value) = whose.filter();
+    let service = format!("com.amazonaws.{region}.s3");
+    let mut next: Option<String> = None;
+    loop {
+        let mut params = serde_json::json!({ "Filter": filters(&[("vpc-id", vpc), ("service-name", &service), ("vpc-endpoint-type", "Gateway"), (&key, &value)]) });
+        if let Some(token) = &next { params["NextToken"] = serde_json::json!(token) }
+        let response = ec2(http, region, creds, "DescribeVpcEndpoints", params, now_ms).await
+            .map_err(|e| format!("finding owned S3 gateway endpoints to tag: {e}"))?;
+        let ids: Vec<&str> = pairs(&response, "vpcEndpointId", "vpcEndpointId").into_iter().map(|(id, _)| id).collect();
+        tag_owned_ec2_resources(http, region, creds, &ids, extra, now_ms).await
+            .map_err(|e| format!("tagging owned S3 gateway endpoints: {e}"))?;
+        let following = xml_tag(&response, "nextToken").filter(|t| !t.is_empty()).map(str::to_string);
+        if following.is_none() { return Ok(()) }
+        if following == next { return Err("finding owned S3 gateway endpoints: repeated pagination token".into()) }
+        next = following;
+    }
+}
+
 /// Makes (or completes) the network a control plane's machines use in a region; safe to repeat: its own from before
 /// when it has one, else the network SuperCI's control planes in the account share there (made by the first). With
 /// the account's own sign-in (the control plane's role cannot make networks).
@@ -846,6 +876,7 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     let call = |action: &'static str, params: serde_json::Value| ec2(http, region, creds, action, params, now_ms);
     let ok_if = |r: Result<String>, codes: &[&str]| match r { Err(e) if codes.iter().any(|c| e.starts_with(c)) => Ok(String::new()), r => r };
     let found = network_vpc(http, region, creds, plane_id, now_ms).await?;
+    let reused = found.is_some();
     let whose = found.as_ref().map(|(_, w)| *w).unwrap_or(Whose::Shared);
     let (tk, tv) = whose.filter();
     let mine = filters(&[(&tk, &tv)]);
@@ -861,6 +892,8 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
             }
         }
     };
+    // The VPC was selected by its SuperCI ownership tag; do not tag arbitrary attached resources.
+    if reused { tag_owned_ec2_resources(http, region, creds, &[&vpc], EXTRA_TAGS, now_ms).await?; }
     // A way out to the internet (GitHub, packages): an internet gateway and a route table that uses it.
     let gateways = call("DescribeInternetGateways", serde_json::json!({ "Filter": mine })).await?;
     let gateway = match xml_tag(&gateways, "internetGatewayId") {
@@ -898,6 +931,7 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     if endpoints.as_ref().is_ok_and(|e| !e.contains("<vpcEndpointId>")) {
         let _ = call("CreateVpcEndpoint", serde_json::json!({ "VpcId": vpc, "ServiceName": s3, "VpcEndpointType": "Gateway", "RouteTableId": [route_table], "TagSpecification": whose.tagged("vpc-endpoint") })).await;
     }
+    tag_owned_s3_endpoints(http, region, creds, &vpc, whose, EXTRA_TAGS, now_ms).await?;
     // Nothing comes in (no inbound rules, not even from its own machines); everything may go out (AWS's default).
     let groups = call("DescribeSecurityGroups", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("group-name", NETWORK_GROUP)]) })).await?;
     let security_group = match xml_tag(&groups, "groupId") {
@@ -1894,6 +1928,57 @@ mod tests {
                 other => panic!("unexpected {other}"),
             };
             Ok(crate::io::Response::new(200, "text/xml", body))
+        }
+    }
+
+    #[test]
+    fn owned_gateway_tag_reconciliation_is_scoped_and_reports_denials() {
+        use std::cell::RefCell;
+        struct Endpoint { calls: RefCell<Vec<Vec<(String, String)>>>, fail: Option<&'static str>, empty: bool }
+        #[async_trait::async_trait(?Send)]
+        impl Http for Endpoint {
+            async fn send(&self, r: Request) -> Result<crate::io::Response> {
+                let args: Vec<(String, String)> = url::form_urlencoded::parse(&r.body).into_owned().collect();
+                let action = args.iter().find(|(k, _)| k == "Action").map(|(_, v)| v.as_str()).unwrap_or("");
+                let body = if self.fail == Some(action) {
+                    "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>denied</Message></Error></Errors></Response>"
+                } else if action == "DescribeVpcEndpoints" && !self.empty {
+                    "<item><vpcEndpointId>vpce-owned</vpcEndpointId></item>"
+                } else { "<return>true</return>" };
+                let status = if self.fail == Some(action) { 403 } else { 200 };
+                self.calls.borrow_mut().push(args);
+                Ok(crate::io::Response::new(status, "text/xml", body))
+            }
+        }
+        let creds = Credentials { access_key_id: "A".into(), secret_access_key: "s".into(), session_token: None, expires_at_ms: u64::MAX };
+        let run = |api: &Endpoint, extra| futures::executor::block_on(tag_owned_s3_endpoints(api, "us-east-1", &creds, "vpc-1", Whose::Shared, extra, 0));
+        let api = Endpoint { calls: RefCell::new(vec![]), fail: None, empty: false };
+        run(&api, "").unwrap();
+        assert!(api.calls.borrow().is_empty());
+        run(&api, "l3:tool=superci").unwrap();
+        let calls = api.calls.borrow();
+        let get = |n: usize, key: &str| calls[n].iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()).unwrap_or("");
+        assert_eq!((get(0, "Filter.1.Name"), get(0, "Filter.1.Value.1")), ("vpc-id", "vpc-1"));
+        assert_eq!((get(0, "Filter.2.Name"), get(0, "Filter.2.Value.1")), ("service-name", "com.amazonaws.us-east-1.s3"));
+        assert_eq!((get(0, "Filter.3.Name"), get(0, "Filter.3.Value.1")), ("vpc-endpoint-type", "Gateway"));
+        assert_eq!((get(0, "Filter.4.Name"), get(0, "Filter.4.Value.1")), ("tag:superci-network", "shared"));
+        assert_eq!((get(1, "Action"), get(1, "ResourceId.1"), get(1, "Tag.1.Key"), get(1, "Tag.1.Value")), ("CreateTags", "vpce-owned", "l3:tool", "superci"));
+        assert_eq!(calls[1].iter().filter(|(k, _)| k.starts_with("Tag.") && k.ends_with(".Key")).count(), 1);
+        drop(calls);
+        let vpc = Endpoint { calls: RefCell::new(vec![]), fail: None, empty: false };
+        futures::executor::block_on(tag_owned_ec2_resources(&vpc, "us-east-1", &creds, &["vpc-owned"], "l3:tool=superci", 0)).unwrap();
+        let vpc_calls = vpc.calls.borrow();
+        assert!(vpc_calls[0].contains(&("ResourceId.1".into(), "vpc-owned".into())));
+        assert!(vpc_calls[0].contains(&("Tag.1.Key".into(), "l3:tool".into())));
+        drop(vpc_calls);
+        let denied_vpc = Endpoint { calls: RefCell::new(vec![]), fail: Some("CreateTags"), empty: false };
+        assert!(futures::executor::block_on(tag_owned_ec2_resources(&denied_vpc, "us-east-1", &creds, &["vpc-owned"], "l3:tool=superci", 0)).unwrap_err().contains("UnauthorizedOperation"));
+        let empty = Endpoint { calls: RefCell::new(vec![]), fail: None, empty: true };
+        run(&empty, "l3:tool=superci").unwrap();
+        assert_eq!(empty.calls.borrow().len(), 1);
+        for action in ["DescribeVpcEndpoints", "CreateTags"] {
+            let denied = Endpoint { calls: RefCell::new(vec![]), fail: Some(action), empty: false };
+            assert!(run(&denied, "l3:tool=superci").unwrap_err().contains("UnauthorizedOperation"));
         }
     }
 

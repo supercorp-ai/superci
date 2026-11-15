@@ -76,7 +76,11 @@ The setting is compiled into both the dashboard and the control planes it packag
 binary does not change tags. Build all components with `build.sh` so the control plane and CLI use the same values.
 The keys `superci-plane` and `superci-network` are reserved for ownership; repeated keys use their first value.
 Updating an existing AWS plane reconciles the configured keys on its DynamoDB table and Lambda functions, and preserves
-other keys. The sign-in used for the update needs permission to tag those resources and to read and write bucket tags.
+other keys. When setting up a network, it also reconciles these keys on the selected SuperCI-owned VPC and S3 gateway
+endpoints that carry the matching ownership tag; unowned endpoints are never tagged. The sign-in needs
+`ec2:DescribeVpcEndpoints` and `ec2:CreateTags` for the selected VPC and owned endpoints, as well as permission to tag the table and
+functions and read and write bucket tags. A denied reconciliation is reported as an error. Other existing network
+resources, IAM roles and EventBridge rules are not reconciled by this path; inventory them separately.
 
 The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release; then it publishes the crates (`scripts/crates-publish.sh`), writes the Homebrew formula into the tap (`scripts/brew-formula.sh`), and tries `install.sh`, all three from npm's files or the same source. Every push and pull request is built and tested by `.github/workflows/test.yml`.
 

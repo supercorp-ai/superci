@@ -40,6 +40,7 @@ jobs:
       - run: cargo fetch --locked
       - name: Network and tagging regression tests (offline)
         run: |
+          cargo test --locked --offline -p superci-core --lib owned_gateway_tag_reconciliation_is_scoped_and_reports_denials
           cargo test --locked --offline -p superci-core --lib a_network_is_made_once_whole_and_found_after
           cargo test --locked --offline -p superci-core --lib bucket_tag_reconciliation
           cargo test --locked --offline -p superci-core --lib copied_images_tag
