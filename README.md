@@ -66,6 +66,8 @@ target/release/superci
 
 `build.sh` needs Rust, [worker-build](https://crates.io/crates/worker-build), zig with [cargo-zigbuild](https://crates.io/crates/cargo-zigbuild), and `zip`.
 
+To run these checks before each push, configure the repository hook with `git config core.hooksPath .githooks`. On a Box with its own hook wrapper, use `git config box.repoHooksPath .githooks` instead, so the wrapper runs the same checks. CI also runs the additional platform, fault-sweep, and container tests in `.github/workflows/test.yml`.
+
 To include organization ownership tags in AWS requests, build with `SUPERCI_EXTRA_TAGS='owner=team,cost-center=ci' ./build.sh`. These tags are compiled in. When an existing AWS control plane is updated, its Lambda functions and DynamoDB table receive the configured tags; existing S3 bucket tags with other keys are preserved. The caller needs permission to tag these resources, read and write bucket tags, and create EC2 tags on image copies and their snapshots. Tagging failures are reported by the operation.
 
 The npm packages are packed with `./scripts/npm-pack.sh` (the program for macOS, Linux and Windows, and a launcher). A release is the workflow **Publish to npm** (`.github/workflows/publish.yml`), run by hand with the version: it builds, tests, tries the packages on macOS and Windows, publishes through npm's trusted publishing, and tags the release; then it publishes the crates (`scripts/crates-publish.sh`), writes the Homebrew formula into the tap (`scripts/brew-formula.sh`), and tries `install.sh`, all three from npm's files or the same source. Every push and pull request is built and tested by `.github/workflows/test.yml`.
