@@ -2,5 +2,8 @@
 # Run the source validation documented in README.md before delivery.
 set -eu
 cd "$(git rev-parse --show-toplevel)"
+# Git exports repository-specific variables to hooks. Tests invoke Git in their own fixtures; let those commands
+# discover their own repositories rather than inheriting the one being pushed.
+unset $(git rev-parse --local-env-vars)
 ./build.sh
 cargo test --workspace
