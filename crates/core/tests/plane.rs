@@ -8262,3 +8262,25 @@ fn an_edit_is_the_changes_of_its_fields_and_they_apply_over_others() {
     assert_eq!(sent, vec![Change::Set { path: path(&["a"]), value: 1.into(), from: Some(serde_json::Value::Null) }, Change::Set { path: path(&["a"]), value: 1.into(), from: None }]);
     assert_eq!(serde_json::to_string(&sent[1]).unwrap(), r#"{"op":"set","path":["a"],"value":1}"#);
 }
+
+#[test]
+fn extra_tags_reach_every_tag_specification_and_the_fleet() {
+    let mut fleet = serde_json::json!({ "Type": "instant" });
+    superci_core::aws::extra_tags("CreateFleet", &mut fleet, "l3:tool=superci");
+    assert_eq!(fleet["TagSpecification"][0]["Tag"][0], serde_json::json!({ "Key": "l3:tool", "Value": "superci" }));
+    let mut template = serde_json::json!({ "TagSpecification": [{ "ResourceType": "launch-template", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }],
+        "LaunchTemplateData": { "TagSpecification": [{ "ResourceType": "instance", "Tag": [] }] } });
+    superci_core::aws::extra_tags("CreateLaunchTemplate", &mut template, "l3:tool=superci");
+    assert_eq!(template["TagSpecification"][0]["Tag"][1]["Key"], "l3:tool");
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][0]["Tag"][0]["Value"], "superci");
+    let kinds: Vec<&str> = template["LaunchTemplateData"]["TagSpecification"].as_array().unwrap().iter().map(|s| s["ResourceType"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["instance", "volume", "network-interface"]);
+    assert_eq!(template["LaunchTemplateData"]["TagSpecification"][2]["Tag"][0]["Key"], "l3:tool");
+    let mut run = serde_json::json!({ "TagSpecification": [{ "ResourceType": "instance", "Tag": [{ "Key": "superci-plane", "Value": "p" }] }] });
+    superci_core::aws::extra_tags("RunInstances", &mut run, "l3:tool=superci");
+    assert_eq!(run["TagSpecification"][1]["ResourceType"], "volume");
+    assert_eq!(run["TagSpecification"][1]["Tag"], run["TagSpecification"][0]["Tag"]);
+    let mut none = serde_json::json!({ "Type": "instant" });
+    superci_core::aws::extra_tags("CreateFleet", &mut none, "");
+    assert!(none.get("TagSpecification").is_none());
+}

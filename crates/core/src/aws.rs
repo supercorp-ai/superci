@@ -214,8 +214,61 @@ pub async fn json_call(http: &dyn Http, method: &str, url: &str, region: &str, s
 }
 
 /// One signed EC2 Query API call.
-pub async fn ec2(http: &dyn Http, region: &str, creds: &Credentials, action: &str, params: serde_json::Value, now_ms: u64) -> Result<String> {
+pub async fn ec2(http: &dyn Http, region: &str, creds: &Credentials, action: &str, mut params: serde_json::Value, now_ms: u64) -> Result<String> {
+    extra_tags(action, &mut params, EXTRA_TAGS);
     query(http, &format!("https://ec2.{region}.amazonaws.com/"), region, "ec2", "2016-11-15", creds, action, params, now_ms).await
+}
+
+/// Tags put on everything made, set when built: `SUPERCI_EXTRA_TAGS="k=v,k2=v2"` (for an organization whose policy
+/// asks every launch to carry a tag, as `aws:RequestTag/...`). Empty: none.
+pub const EXTRA_TAGS: &str = match option_env!("SUPERCI_EXTRA_TAGS") { Some(t) => t, None => "" };
+
+/// Adds `extra` ("k=v,...") to each of a call's tag specifications, and gives an instant fleet one of its own (AWS
+/// checks a fleet request's own tags, not its template's).
+pub fn extra_tags(action: &str, params: &mut serde_json::Value, extra: &str) {
+    let pairs = tag_pairs(extra);
+    if pairs.is_empty() { return }
+    // A machine's disks and network interfaces bill on their own (EBS, public IPv4): they get its tags too.
+    mirror_instance_tags(params.get_mut("TagSpecification"));
+    mirror_instance_tags(params.get_mut("LaunchTemplateData").and_then(|d| d.get_mut("TagSpecification")));
+    if action == "CreateFleet" && params.get("TagSpecification").is_none() {
+        params["TagSpecification"] = serde_json::json!([{ "ResourceType": "fleet", "Tag": [] }]);
+    }
+    let add = |spec: &mut serde_json::Value| if let Some(tags) = spec.get_mut("Tag").and_then(|t| t.as_array_mut()) {
+        for (k, v) in &pairs { if !tags.iter().any(|t| t["Key"] == *k) { tags.push(serde_json::json!({ "Key": k, "Value": v })) } }
+    };
+    if let Some(specs) = params.get_mut("TagSpecification").and_then(|s| s.as_array_mut()) { specs.iter_mut().for_each(add) }
+    if let Some(specs) = params.get_mut("LaunchTemplateData").and_then(|d| d.get_mut("TagSpecification")).and_then(|s| s.as_array_mut()) { specs.iter_mut().for_each(add) }
+}
+
+/// `"k=v,k2=v2"` as pairs (empty keys left out).
+pub fn tag_pairs(extra: &str) -> Vec<(&str, &str)> {
+    extra.split(',').filter_map(|p| p.split_once('=')).filter(|(k, _)| !k.is_empty()).collect()
+}
+
+/// Adds `volume` and `network-interface` specifications with the `instance` one's tags, where there are none of those.
+fn mirror_instance_tags(specs: Option<&mut serde_json::Value>) {
+    let Some(specs) = specs.and_then(|s| s.as_array_mut()) else { return };
+    let Some(tags) = specs.iter().find(|s| s["ResourceType"] == "instance").map(|s| s["Tag"].clone()) else { return };
+    for kind in ["volume", "network-interface"] {
+        if !specs.iter().any(|s| s["ResourceType"] == kind) { specs.push(serde_json::json!({ "ResourceType": kind, "Tag": tags.clone() })) }
+    }
+}
+
+/// The tags of what a control plane makes outside EC2 (roles, table, functions, schedule, buckets): its own, and the
+/// build's extra ones. As `[(k, v)]`.
+pub fn plane_tags(plane_id: &str) -> Vec<(String, String)> {
+    std::iter::once(("superci-plane".to_string(), plane_id.to_string())).chain(tag_pairs(EXTRA_TAGS).into_iter().map(|(k, v)| (k.to_string(), v.to_string()))).collect()
+}
+/// [`plane_tags`] as IAM's query list (`{"member": [{Key, Value}]}`).
+pub fn plane_tags_iam(plane_id: &str) -> serde_json::Value { serde_json::json!({ "member": plane_tags_list(plane_id) }) }
+/// [`plane_tags`] as `[{Key, Value}]` (DynamoDB, EventBridge).
+pub fn plane_tags_list(plane_id: &str) -> serde_json::Value {
+    plane_tags(plane_id).into_iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect()
+}
+/// [`plane_tags`] as `{k: v}` (Lambda).
+pub fn plane_tags_map(plane_id: &str) -> serde_json::Value {
+    plane_tags(plane_id).into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect::<serde_json::Map<_, _>>().into()
 }
 
 /// One signed IAM call (a global service, signed for us-east-1).
@@ -937,7 +990,41 @@ pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, pla
     let rule = format!(r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>superci-cache</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{}</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule><Rule><ID>superci-layers-staging</ID><Filter><Prefix>{}</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#, crate::cache::BUCKET_DAYS, crate::layers::STAGING);
     let sum = b64(&crate::crypto::sha256(rule.as_bytes()));
     said(s3(http, "PUT", &format!("{url}?lifecycle"), region, creds, rule.into_bytes(), &[("x-amz-sdk-checksum-algorithm", "SHA256"), ("x-amz-checksum-sha256", &sum)], now_ms).await?)?;
+    // Its tags, so its cost has an owner (only in a build with extra tags: a stock one asks nothing more).
+    if !tag_pairs(EXTRA_TAGS).is_empty() {
+        // PutBucketTagging replaces the entire set, so first keep every key not owned by this build.
+        let current = s3(http, "GET", &format!("{url}?tagging"), region, creds, vec![], &[], now_ms).await?;
+        let previous = match current.status {
+            200 => current.body_text(),
+            404 if current.body_text().contains("NoSuchTagSet") => "<TagSet/>".into(),
+            status => return Err(aws_error(&current.body_text(), status)),
+        };
+        let set = merge_bucket_tags(&previous, &plane_tags(plane_id))?;
+        let tagging = format!(r#"<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>{set}</TagSet></Tagging>"#);
+        let sum = b64(&crate::crypto::sha256(tagging.as_bytes()));
+        said(s3(http, "PUT", &format!("{url}?tagging"), region, creds, tagging.into_bytes(), &[("x-amz-sdk-checksum-algorithm", "SHA256"), ("x-amz-checksum-sha256", &sum)], now_ms).await?)?;
+    }
     Ok(())
+}
+
+fn xml_escape(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
+
+/// Retain the AWS-returned XML for other keys without decoding and re-encoding their values. Reject an unexpected
+/// shape instead of replacing a bucket's tags with a partial set.
+fn merge_bucket_tags(current: &str, wanted: &[(String, String)]) -> Result<String> {
+    let mut kept = String::new();
+    if !current.contains("<TagSet/>") && !current.contains("<TagSet />") {
+        let mut rest = current.split_once("<TagSet>").and_then(|(_, s)| s.split_once("</TagSet>").map(|(set, _)| set)).ok_or("unexpected S3 bucket tag set")?.trim();
+        while !rest.is_empty() {
+            let tag = rest.strip_prefix("<Tag>").and_then(|s| s.split_once("</Tag>")).ok_or("unexpected S3 bucket tag")?;
+            let key = xml_tag(tag.0, "Key").ok_or("S3 bucket tag without a key")?;
+            if xml_tag(tag.0, "Value").is_none() { return Err("S3 bucket tag without a value".into()) }
+            if !wanted.iter().any(|(k, _)| xml_escape(k) == key) { kept.push_str(&format!("<Tag>{}</Tag>", tag.0)); }
+            rest = tag.1.trim();
+        }
+    }
+    for (k, v) in wanted { kept.push_str(&format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(k), xml_escape(v))); }
+    Ok(kept)
 }
 
 /// Puts an object in the cache bucket of a region unless it is there as it is (`superci-cache` for a version; its
@@ -1206,7 +1293,10 @@ pub const IMAGE_TAG: (&str, &str) = ("superci", "runner-image");
 pub async fn copy_image(http: &dyn Http, region: &str, creds: &Credentials, from_region: &str, from_image: &str, name: &str, now_ms: u64) -> Result<String> {
     let xml = ec2(http, region, creds, "CopyImage", serde_json::json!({ "SourceRegion": from_region, "SourceImageId": from_image, "Name": name,
         "Description": format!("The image SuperCI's jobs run on, copied from {from_region} ({from_image})"),
-        "TagSpecification": [{ "ResourceType": "image", "Tag": [{ "Key": IMAGE_TAG.0, "Value": IMAGE_TAG.1 }] }] }), now_ms).await?;
+        "TagSpecification": [
+            { "ResourceType": "image", "Tag": [{ "Key": IMAGE_TAG.0, "Value": IMAGE_TAG.1 }] },
+            { "ResourceType": "snapshot", "Tag": [{ "Key": IMAGE_TAG.0, "Value": IMAGE_TAG.1 }] },
+        ] }), now_ms).await?;
     xml_tag(&xml, "imageId").map(str::to_string).ok_or_else(|| "CopyImage without an imageId".into())
 }
 
@@ -1669,6 +1759,37 @@ mod faults;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copied_images_tag_their_backing_snapshots() {
+        struct Capture(std::cell::RefCell<String>);
+        #[async_trait::async_trait(?Send)]
+        impl super::Http for Capture {
+            async fn send(&self, request: super::Request) -> super::Result<crate::io::Response> {
+                *self.0.borrow_mut() = String::from_utf8(request.body).unwrap();
+                Ok(crate::io::Response::new(200, "text/xml", "<imageId>ami-copy</imageId>"))
+            }
+        }
+        let capture = Capture(std::cell::RefCell::new(String::new()));
+        let creds = super::Credentials { access_key_id: "id".into(), secret_access_key: "secret".into(), session_token: None, expires_at_ms: 0 };
+        futures::executor::block_on(super::copy_image(&capture, "us-east-2", &creds, "us-east-1", "ami-source", "runner", 0)).unwrap();
+        let body = capture.0.borrow();
+        let fields: std::collections::HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
+        assert_eq!(fields.get("TagSpecification.1.ResourceType").map(String::as_str), Some("image"));
+        assert_eq!(fields.get("TagSpecification.2.ResourceType").map(String::as_str), Some("snapshot"));
+        assert_eq!(fields.get("TagSpecification.2.Tag.1.Key").map(String::as_str), Some("superci"));
+    }
+    #[test]
+    fn bucket_tag_reconciliation_preserves_other_keys_and_rejects_unknown_shapes() {
+        let wanted = vec![("l3:tool".to_string(), "superci".to_string()), ("superci-plane".to_string(), "p1".to_string())];
+        let existing = "<Tagging><TagSet><Tag><Key>owner</Key><Value>A &amp; B</Value></Tag><Tag><Key>l3:tool</Key><Value>old</Value></Tag></TagSet></Tagging>";
+        let merged = super::merge_bucket_tags(existing, &wanted).unwrap();
+        assert!(merged.contains("<Tag><Key>owner</Key><Value>A &amp; B</Value></Tag>"));
+        assert!(merged.contains("<Tag><Key>l3:tool</Key><Value>superci</Value></Tag>"));
+        assert!(!merged.contains("<Value>old</Value>"));
+        assert_eq!(super::merge_bucket_tags("<TagSet/>", &wanted).unwrap(), "<Tag><Key>l3:tool</Key><Value>superci</Value></Tag><Tag><Key>superci-plane</Key><Value>p1</Value></Tag>");
+        assert!(super::merge_bucket_tags("<TagSet><Unexpected/></TagSet>", &wanted).is_err());
+        assert!(super::merge_bucket_tags("<TagSet><Tag><Key>owner</Key></Tag></TagSet>", &wanted).is_err());
+    }
     use super::*;
 
     #[test]
