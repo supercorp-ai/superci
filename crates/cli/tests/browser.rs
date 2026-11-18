@@ -19834,6 +19834,24 @@ fn finding_control_planes_with_awss_sign_in_over_or_the_only_cloud_not_answering
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane that does not take this computer's key (it expired): Overview, which does not wait for the key,
+/// says why and what to do once the wait is over, rather than "Reading your control plane…" for ever.
+#[test]
+fn overview_says_its_control_plane_refuses_the_key_rather_than_reading_for_ever() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1")]);
+    b.goto(&link);
+    b.wait(&format!("{} && {}", shows("does not take this computer's key"), shows("superci login")));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
+    assert!(!page.contains("Reading your control plane"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A workspace whose control plane does not take this computer's key: its Settings still has what is this
 /// computer's own (its id, removing it when there are others), under the card that says why, and it is removed.
 #[test]
