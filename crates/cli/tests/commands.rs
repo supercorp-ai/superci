@@ -241,6 +241,9 @@ fn the_control_plane_is_updated_as_aws_answered_a_real_account() {
     // Its new function went up; its role, table, address and schedule were checked.
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
     assert!(asked.iter().any(|a| a.starts_with("PUT https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0001/code")), "{asked:?}");
+    // Its time raised from the 60 s it had to 180 (#41).
+    let configured = served.aws.asked.lock().unwrap().iter().find(|a| a["method"] == "PUT" && a["url"] == "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0001/configuration").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(configured["asked"].as_str().unwrap()).unwrap(), serde_json::json!({ "MemorySize": 1024, "Timeout": 180 }));
     // The layer store's converter beside it, made (new in this version), not tried again when it fails.
     assert!(asked.iter().any(|a| a == "PUT https://lambda.us-east-1.amazonaws.com/2019-09-25/functions/superci-plane-testplane0001-convert/event-invoke-config"), "{asked:?}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
