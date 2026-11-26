@@ -45,6 +45,17 @@ jobs:
             if [ "$answer" = "201" ] || [ "$answer" = "200" ]; then echo "$package: trusted"; else echo "$package: $answer $(jq -c 'del(.token)' "$RUNNER_TEMP/answer.json" 2>/dev/null)"; failed=1; fi
           done
           [ "$failed" = 0 ] || { echo "npm does not trust this workflow for every package: set each one's Trusted publisher on npmjs.com (supercorp-ai/superci, publish.yml, Allow npm publish)." >&2; exit 1; }
+      - name: The pinned Linux images are still RunsOn's
+        # A release boots the builds it pins (IMAGE_BUILDS in crates/core/src/aws.rs). RunsOn keeps only its last three
+        # Linux builds: a pin among them moves only after scripts/image-check.sh passed on the new ones; one already
+        # gone is a release that would ask its users to update, and update them to nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned=$(sed -n 's/^pub const IMAGE_RELEASE: &str = "\(.*\)";/\1/p' crates/core/src/aws.rs)
+          kept=$(gh release list -R runs-on/runner-images-for-aws --limit 30 --json tagName --jq '[.[].tagName | select(startswith("linux-"))][:3][]')
+          echo "Pinned: linux-$pinned. RunsOn keeps: $(echo $kept)"
+          echo "$kept" | grep -qx "linux-$pinned" || { echo "RunsOn no longer has the pinned Linux build (linux-$pinned). Move the pins (IMAGE_BUILDS, IMAGE_RELEASE) after scripts/image-check.sh passed on its newest builds." >&2; exit 1; }
 
   build:
     # A Mac builds them all: its own two, and Linux's and Windows' through zig.

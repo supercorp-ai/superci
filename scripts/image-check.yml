@@ -1,0 +1,99 @@
+# The check a release runs before it moves the image pins (`IMAGE_BUILDS` in crates/core/src/aws.rs): one job on each
+# kind of image, through a control plane updated with the release's build. It tries what a new build broke before:
+# signals inside containers (RunsOn's Ubuntu 26.04 build of 2 November 2026 denied every one), Docker builds and
+# service containers, the cache, and /tmp in RAM on 26.04 as on GitHub. Run it with scripts/image-check.sh.
+name: Image check
+on: workflow_dispatch
+
+jobs:
+  ubuntu24-x64:
+    runs-on: superci/image=ubuntu24/arch=x64/cpu=2
+    services: &services
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: check }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 2s --health-retries 30
+    steps: &linux
+      - name: The machine
+        run: |
+          uname -a
+          grep PRETTY_NAME /etc/os-release
+          nproc; free -g; df -h / /tmp
+      - name: Containers may signal each other
+        run: |
+          set -eu
+          # The setting SuperCI makes at boot, when the kernel has it.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined ]; then
+            test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined)" = 0
+          fi
+          docker run --rm ubuntu:24.04 bash -c 'sleep 60 & kill -TERM $!; wait $! || true; echo signalled'
+          docker run -d --name pg -e POSTGRES_PASSWORD=check postgres:17
+          for i in $(seq 60); do docker exec pg pg_isready -U postgres && break; sleep 1; done
+          docker exec pg pg_isready -U postgres
+          start=$(date +%s); docker stop -t 20 pg; took=$(( $(date +%s) - start ))
+          echo "postgres stopped in ${took}s"
+          test "$took" -lt 10
+          test "$(docker inspect -f '{{.State.ExitCode}}' pg)" = 0
+      - name: The service container answers
+        run: pg_isready -h 127.0.0.1 -p 5432 -U postgres
+      - name: A Docker build
+        run: |
+          set -eu
+          dir=$(mktemp -d)
+          printf 'FROM ubuntu:24.04\nRUN echo built > /built\nCMD ["cat", "/built"]\n' > "$dir/Dockerfile"
+          docker build -q -t image-check "$dir"
+          test "$(docker run --rm image-check)" = built
+      - name: /tmp is in RAM on Ubuntu 26.04
+        run: |
+          findmnt -n -o FSTYPE /tmp || true
+          if grep -q 'VERSION_ID="26' /etc/os-release; then test "$(findmnt -n -o FSTYPE /tmp)" = tmpfs; fi
+      - name: Tools as on GitHub
+        run: node --version && python3 --version && git --version && docker compose version
+      - name: Cache saved
+        run: mkdir -p cached && echo "${{ github.run_id }}" > cached/stamp
+      - uses: actions/cache/save@v4
+        with: { path: cached, key: "image-check-${{ github.job }}-${{ github.run_id }}" }
+      - run: rm -rf cached
+      - uses: actions/cache/restore@v4
+        with: { path: cached, key: "image-check-${{ github.job }}-${{ github.run_id }}", fail-on-cache-miss: true }
+      - run: test "$(cat cached/stamp)" = "${{ github.run_id }}"
+
+  ubuntu24-arm64:
+    runs-on: superci/image=ubuntu24/arch=arm64/cpu=2
+    services: *services
+    steps: *linux
+
+  ubuntu26-x64:
+    runs-on: superci/image=ubuntu26/arch=x64/cpu=2
+    services: *services
+    steps: *linux
+
+  ubuntu26-arm64:
+    runs-on: superci/image=ubuntu26/arch=arm64/cpu=2
+    services: *services
+    steps: *linux
+
+  windows:
+    runs-on: superci/os=windows/cpu=2
+    steps:
+      - run: |
+          [System.Environment]::OSVersion
+          node --version
+          git --version
+          python --version
+        shell: pwsh
+      - run: echo "${{ github.run_id }}" > stamp.txt
+        shell: bash
+      - uses: actions/cache/save@v4
+        with: { path: stamp.txt, key: "image-check-windows-${{ github.run_id }}" }
+
+  gpu-ubuntu24:
+    runs-on: superci/gpu=t4/image=ubuntu24
+    steps: &gpu
+      - run: nvidia-smi
+      - run: docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L
+
+  gpu-ubuntu26:
+    runs-on: superci/gpu=t4/image=ubuntu26
+    steps: *gpu

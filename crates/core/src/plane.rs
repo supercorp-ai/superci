@@ -2654,12 +2654,7 @@ impl<'a> ControlPlane<'a> {
     /// The current machine image in a region for a machine (Linux x64 or arm64, Linux with NVIDIA's drivers for GPUs,
     /// Windows), with its disk's size (looked up at most every six hours).
     async fn image(&self, region: &str, spec: &Spec, creds: &Credentials, now: u64) -> Result<(String, u32)> {
-        // The Ubuntu asked for, else as GitHub's `ubuntu-latest` is now (24.04, 26.04 from 2026-11-19).
-        let ubuntu = spec.ubuntu(now);
-        let base = self.config.image_name.replace("ubuntu24", ubuntu);
-        let pattern = if spec.os() == "windows" { base.replace(&format!("-{ubuntu}-full-"), "-windows25-full-") }
-            else if spec.gpu.is_some() { base.replace(&format!("-{ubuntu}-full-"), &format!("-{ubuntu}-gpu-")) }
-            else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base };
+        let pattern = image_pattern(&self.config.image_name, spec, now);
         let key = format!("{region}/{pattern}");
         if let Some((image, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| *until > now) { return Ok(image.clone()) }
         // The build this version pins; once its maker has deleted it, the oldest newer one, noted for the status.
@@ -6138,6 +6133,17 @@ fn tree_place(kept: &str, tree: &str, part: u32) -> (String, String) {
     match kept.split_once('|') { Some((region, object)) => (region.to_string(), object.to_string()), None => (kept.to_string(), tree_object(tree, part)) }
 }
 
+/// The name pattern of the image a machine boots, from the control plane's own (`runs-on-v2.2-ubuntu24-full-x64-*`):
+/// the Ubuntu asked for, else as GitHub's `ubuntu-latest` is now (24.04, 26.04 from 2026-11-19); Linux x64 or arm64,
+/// Linux with NVIDIA's drivers for GPUs, or Windows.
+pub fn image_pattern(base: &str, spec: &Spec, now: u64) -> String {
+    let ubuntu = spec.ubuntu(now);
+    let base = base.replace("ubuntu24", ubuntu);
+    if spec.os() == "windows" { base.replace(&format!("-{ubuntu}-full-"), "-windows25-full-") }
+    else if spec.gpu.is_some() { base.replace(&format!("-{ubuntu}-full-"), &format!("-{ubuntu}-gpu-")) }
+    else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base }
+}
+
 #[cfg(test)]
 mod price_tests {
     use super::*;
@@ -6185,6 +6191,40 @@ mod price_tests {
         assert_eq!(MODAL_GPU_USD_PER_SECOND.map(|(g, _)| g), crate::spec::GPUS);
         for (gpu, per_second) in MODAL_GPU_USD_PER_SECOND { assert_eq!(modal_gpu_usd_per_hour(Some(gpu)), per_second * 3600.0, "{gpu}") }
         assert_eq!((modal_gpu_usd_per_hour(Some("a10g")), modal_gpu_usd_per_hour(None), modal_gpu_usd_per_hour(Some("v100"))), (0.000306 * 3600.0, 0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    /// The check a release runs before it moves the pins (scripts/image-check.yml) has a job on each kind pinned, and
+    /// none on a kind not pinned: a kind added to the pins is checked, and the check does not drift from what jobs boot.
+    #[test]
+    fn the_image_check_boots_each_pinned_kind_of_image_once() {
+        let workflow = crate::workflow::parse(include_str!("../../../scripts/image-check.yml")).unwrap();
+        let jobs = workflow.get("jobs").unwrap().pairs();
+        let mut kinds: Vec<String> = jobs.iter().map(|(name, job)| {
+            let name = name.text().unwrap();
+            let label = job.get("runs-on").and_then(|l| l.text()).unwrap_or_else(|| panic!("{name} has a label"));
+            let spec = Spec::parse(label, "superci").unwrap().unwrap_or_else(|e| panic!("{name}: {e}"));
+            aws::image_flavor(&image_pattern(&Config::new("p".into()).image_name, &spec, 0)).to_string()
+        }).collect();
+        kinds.sort();
+        let mut pinned: Vec<String> = aws::IMAGE_BUILDS.iter().map(|(k, _)| k.to_string()).collect();
+        pinned.sort();
+        assert_eq!(kinds, pinned);
+    }
+
+    #[test]
+    fn a_machine_boots_the_ubuntu_it_asks_for_else_ubuntu_latest_with_its_arch_gpu_or_windows() {
+        let base = "runs-on-v2.2-ubuntu24-full-x64-*";
+        let at = |label: &str, now: u64| image_pattern(base, &Spec::parse(label, "superci").unwrap().unwrap(), now);
+        let after = crate::spec::UBUNTU_26_FROM_MS;
+        assert_eq!((at("superci", after - 1), at("superci", after)), ("runs-on-v2.2-ubuntu24-full-x64-*".into(), "runs-on-v2.2-ubuntu26-full-x64-*".into()));
+        assert_eq!(at("superci/arch=arm64/image=ubuntu24", after), "runs-on-v2.2-ubuntu24-full-arm64-*");
+        assert_eq!(at("superci/gpu=t4", after), "runs-on-v2.2-ubuntu26-gpu-x64-*");
+        assert_eq!(at("superci/os=windows", after), "runs-on-v2.2-windows25-full-x64-*");
     }
 }
 
