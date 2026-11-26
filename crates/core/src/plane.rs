@@ -218,6 +218,9 @@ impl Config {
     pub fn gitlabs(&self) -> impl Iterator<Item = &GitLab> { self.gitlab.iter().chain(self.more_gitlabs.iter()) }
 }
 
+/// What a sweep read once (see `Cache::sweeping`).
+struct Sweeping { jobs: Vec<(String, Job)>, spend: Option<(HashMap<String, f64>, HashMap<String, f64>)> }
+
 /// What a runtime keeps between requests while it is alive (credentials, tokens, the image id).
 #[derive(Default)]
 pub struct Cache {
@@ -229,6 +232,10 @@ pub struct Cache {
     settings: RefCell<Option<(u64, Option<Stored>)>>,
     /// Whether the jobs' indexes are complete (once they are, they stay so).
     indexed: std::cell::Cell<bool>,
+    /// While a sweep runs: the live jobs as it read them, with each job it has written since, and the spend as it read
+    /// it. Each waiting job it tries again is placed against these, not against every job and day read again: with
+    /// hundreds waiting that was hundreds of thousands of reads, and a sweep that ran past its time (see `sweep`).
+    sweeping: RefCell<Option<Sweeping>>,
     /// Runners' links known to be a job's (`rjob:<token>`), until when; and a count for posts of lines in one
     /// millisecond (see `ControlPlane::lines_in`).
     runner_links: RefCell<HashMap<String, u64>>,
@@ -3089,6 +3096,7 @@ impl<'a> ControlPlane<'a> {
     }
 
     async fn live_jobs(&self) -> Result<Vec<(String, Job)>> {
+        if let Some(s) = self.cache.sweeping.borrow().as_ref() { return Ok(s.jobs.clone()) }
         let now = self.clock.now_ms();
         if !self.indexed().await {
             return Ok(self.store.list("job:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).filter(|(_, j)| needs_care(j, now)).collect())
@@ -3179,9 +3187,13 @@ impl<'a> ControlPlane<'a> {
 
     /// What machines cost this month and today, by place (see `place_of`).
     async fn spend(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
+        if let Some(spend) = self.cache.sweeping.borrow().as_ref().and_then(|s| s.spend.clone()) { return Ok(spend) }
         let now = self.clock.now_ms();
         let (_, spend) = self.hours((now - month_start_ms(now)) / 86_400_000).await?;
-        Ok(month_and_day(now, spend))
+        let spend = month_and_day(now, spend);
+        // (A sweep reads it once: what its jobs add meanwhile is counted from the next.)
+        if let Some(s) = self.cache.sweeping.borrow_mut().as_mut() { s.spend = Some(spend.clone()) }
+        Ok(spend)
     }
 
     /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
@@ -3345,6 +3357,10 @@ impl<'a> ControlPlane<'a> {
             let add = self.counting(&mut write);
             if self.store.swap_until(key, was.as_deref(), crate::io::json(&write), Self::job_end(&write, self.clock.now_ms())).await? {
                 job.rev.set(write.rev.get());
+                // (A sweep places its next jobs knowing this one as it is now.)
+                if let Some(s) = self.cache.sweeping.borrow_mut().as_mut() {
+                    match s.jobs.iter_mut().find(|(k, _)| k == key) { Some((_, j)) => *j = write.clone(), None => s.jobs.push((key.to_string(), write.clone())) }
+                }
                 self.indexes(key, &write, was.is_none(), add).await?;
                 return Ok(())
             }
@@ -5288,6 +5304,14 @@ impl<'a> ControlPlane<'a> {
     }
 
     async fn alarm_settled(&self) -> Result<()> {
+        let done = self.sweep().await;
+        *self.cache.sweeping.borrow_mut() = None;
+        done
+    }
+
+    /// The sweep: each job still cared for, looked at once (see `alarm`). What it reads of the live jobs and the spend
+    /// it reads once (see `Cache::sweeping`); what another request writes meanwhile, the next sweep sees.
+    async fn sweep(&self) -> Result<()> {
         let now = self.clock.now_ms();
         // The store's own upkeep: what an earlier layout left is moved, a little each minute; what has passed its end
         // goes, once an hour (where the store does not remove it by itself).
@@ -5303,6 +5327,7 @@ impl<'a> ControlPlane<'a> {
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         if self.indexed().await { let _ = self.recount_runs(150).await; }
         let kept = self.live_jobs().await?;
+        *self.cache.sweeping.borrow_mut() = Some(Sweeping { jobs: kept.clone(), spend: None });
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);

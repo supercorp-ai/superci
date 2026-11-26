@@ -1378,6 +1378,33 @@ fn jobs_at_once_are_twenty_unless_set_and_a_number_set_above_twenty_is_taken() {
     assert_eq!((superci_core::plane::jobs_at_once("cloudflare"), superci_core::plane::jobs_at_once("aws"), superci_core::plane::jobs_at_once("modal")), (20, 20, 20));
 }
 
+/// A sweep with many jobs waiting for room reads the live jobs and the spend once, not again for each job it tries
+/// (with hundreds waiting, that ran a sweep past its time: #41); and each job it starts counts at once against the
+/// next, so no more start than there is room for.
+#[test]
+fn a_sweep_reads_the_jobs_once_however_many_wait_and_starts_only_what_there_is_room_for() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: Some(5), monthly_usd: None }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    for id in 1..=45 { block_on(plane.handle(job_event("queued", id, "acme/app", None))); }
+    let state = |id: u64| job(&store, id)["state"].as_str().unwrap_or_default().to_string();
+    assert_eq!(((1..=45).filter(|id| state(*id) == "launched").count(), (1..=45).filter(|id| state(*id) == "waiting").count()), (5, 40));
+    // Two finish; the sweep starts two of the forty, and no more.
+    for id in 1..=2 { block_on(plane.handle(job_event("completed", id, "acme/app", Some(&format!("superci-{PLANE_ID}-{id}"))))); }
+    let ops = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counted = ops.clone();
+    store.meddling(move |_, _, _| counted.set(counted.get() + 1));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(((1..=45).filter(|id| state(*id) == "launched").count(), (1..=45).filter(|id| state(*id) == "waiting").count()), (5, 38));
+    // Each job waiting costs the operations of its own record (read, placed, written); the live jobs and the month's
+    // days are read once. Read again for each, as before, it was some 80 more each (45 jobs and the days so far).
+    eprintln!("{} store operations for a sweep of 40 jobs waiting", ops.get());
+    assert!(ops.get() < 40 * 30, "{} store operations for 40 jobs waiting", ops.get());
+}
+
 #[test]
 fn limits_make_jobs_wait_or_move_down_the_order() {
     let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
