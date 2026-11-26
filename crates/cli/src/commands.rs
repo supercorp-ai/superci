@@ -1839,11 +1839,11 @@ fn runners_of(d: &mut Dashboard) -> Result<Done> {
     let view = view(d)?;
     let st = view.status.clone().unwrap_or_default();
     let pools = view.order();
-    let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "monthly_usd": p.monthly_usd,
+    let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "jobs_at_once": p.max_jobs.unwrap_or_else(|| superci_core::plane::jobs_at_once(view.records().provider_of(&p.cloud))), "monthly_usd": p.monthly_usd,
         "regions": if view.records().provider_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
         "running": st["active"][&p.cloud].as_u64().unwrap_or(0), "spent_usd": st["spend"][&p.cloud].as_f64().unwrap_or(0.0) })).collect();
     let line = |p: &Value| [p["regions"].as_array().map(|r| format!("in {}", r.iter().filter_map(|r| r.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default(),
-        p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]
+        p["jobs_at_once"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]
         .into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join("  ");
     let mut said: Vec<String> = order.iter().filter(|p| p["taken_out"] != true).enumerate().map(|(i, p)| format!("{}. {:<14} {}", i + 1, p["cloud"].as_str().unwrap_or_default(), line(p)).trim_end().to_string()).collect();
     let out: Vec<&str> = order.iter().filter(|p| p["taken_out"] == true).filter_map(|p| p["cloud"].as_str()).collect();

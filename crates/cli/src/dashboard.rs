@@ -6710,7 +6710,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         let state = if no_spot.is_some() { pill("open", "not allowed") } else { pill("good", "ready") };
         let spent = v.spend(&p.cloud);
         let mut limits = vec![];
-        if let Some(n) = p.max_jobs { limits.push(format!("{n} at once")) }
+        limits.push(format!("{} at once", p.max_jobs.unwrap_or_else(|| superci_core::plane::jobs_at_once(v.records().provider_of(&p.cloud)))));
         if let Some(cap) = p.monthly_usd { limits.push(format!("{} of {}", usd(spent), usd(cap))) }
         // Modal's Functions: their preemptions this month (all of Modal's together).
         let preempted = v.status.as_ref().and_then(|s| s["preempted"]["month"].as_u64()).unwrap_or(0);
@@ -6729,6 +6729,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
             esc(&p.cloud), logo(&logo_key, 32), esc(&name), esc(&what), esc(&name)));
         // Its settings, alike for every row: jobs at once, a monthly budget, and where it starts machines.
+        let default_jobs = superci_core::plane::jobs_at_once(v.records().provider_of(&p.cloud));
         let value = |n: Option<String>| n.map(|n| format!(r#" value="{n}""#)).unwrap_or_default();
         let budget = format!(r#"<label class="field"><span>Monthly budget</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{}></span><small>{} this month. At the budget, jobs go to the next provider.</small></label>"#,
             value(p.monthly_usd.map(|n| format!("{n:.0}"))), usd(spent));
@@ -6742,8 +6743,8 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
             } else { String::new() };
         // (Taking it out keeps its settings; nothing is deleted anywhere.)
         let take_out = r#"<button type="button" class="button secondary sm" style="margin-right:auto" onclick="var f=this.form;f.elements.action.value='take_out';f.requestSubmit()">Take out of the order</button>"#;
-        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body" onsubmit="superciRegions(this)"><input type="hidden" name="action" value="pool"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div><label class="field"><span>Jobs at once</span><input type="number" name="max" min="1" max="999" placeholder="No limit"{}><small>When this many run, the next job goes to the next provider (or waits).</small></label>{budget}{place}<div class="dlg-foot">{take_out}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
-            esc(&p.cloud), esc(&current), logo(&logo_key, 36), esc(&name), esc(&what), value(p.max_jobs.map(|n| n.to_string()))));
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body" onsubmit="superciRegions(this)"><input type="hidden" name="action" value="pool"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div><label class="field"><span>Jobs at once</span><input type="number" name="max" min="1" max="999" placeholder="{}"{}><small>When this many run, the next job goes to the next provider (or waits). Left empty: {}.</small></label>{budget}{place}<div class="dlg-foot">{take_out}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+            esc(&p.cloud), esc(&current), logo(&logo_key, 36), esc(&name), esc(&what), default_jobs, value(p.max_jobs.map(|n| n.to_string())), default_jobs));
     });
     let waiting: Vec<&serde_json::Value> = jobs.iter().filter(|j| j["state"] == "waiting").collect();
     let waiting = match waiting.as_slice() {
@@ -11280,6 +11281,10 @@ mod rest_tests {
         let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": { "order": [{ "cloud": "aws", "monthly_usd": 50.0, "max_jobs": 4 }] } })) };
         let card = pools_card(&v, &HashMap::new(), None, &HashMap::new(), None);
         assert!(card.contains(r#"name="usd" min="1" step="1" placeholder="No limit" value="50""#) && card.contains("4 at once"), "{card}");
+        // A provider with no number set says the 20 it runs at once, on its row and in its settings: never "No limit".
+        let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": { "order": [{ "cloud": "aws" }] } })) };
+        let card = pools_card(&v, &HashMap::new(), None, &HashMap::new(), None);
+        assert!(card.contains(r#"name="max" min="1" max="999" placeholder="20">"#) && card.contains("Left empty: 20.") && card.contains("20 at once"), "{card}");
         let cache = plain(&cache_card(&v, Some(&serde_json::json!({ "now_ms": 1, "repos": [{ "id": "gh123", "entries": 1, "bytes": 10, "used_ms": 1 }] }))));
         assert!(cache.contains("Repository 123"), "{cache}");
     }

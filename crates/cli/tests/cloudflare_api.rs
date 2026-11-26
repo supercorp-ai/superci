@@ -53,7 +53,8 @@ fn a_cloudflare_control_plane_is_deployed_given_its_containers_shown_and_deleted
     assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
     assert_eq!(served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == "CONTAINERS").map(|(_, v)| v).as_deref(), Some("on"));
     let (ok, said) = run(&["runners", "list", "--plane=cfplane00001"]);
-    assert!(ok && said.contains("1. cloudflare"), "{said}");
+    // With no number set, the 20 it runs at once is said, never left out as if there were no limit.
+    assert!(ok && said.contains("1. cloudflare") && said.contains("up to 20 jobs at once"), "{said}");
     // Secrets on Cloudflare: the Worker hands its control plane those a run is given with each request, so a
     // control plane there keeps 12, about 4.8 KB each; past either, refused before anything is written.
     {

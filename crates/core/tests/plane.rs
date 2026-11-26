@@ -1329,6 +1329,25 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     assert_eq!(launches(&clouds).len(), 3);
 }
 
+/// With no number set, a provider runs 20 jobs at once (what the dashboard and the CLI show for it); a number set
+/// above that is taken as it is: the 21st job starts.
+#[test]
+fn jobs_at_once_are_twenty_unless_set_and_a_number_set_above_twenty_is_taken() {
+    for (max_jobs, last) in [(None, "waiting"), (Some(25), "launched")] {
+        let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        config.containers = true;
+        config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs, monthly_usd: None }];
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        for id in 1..=21 { block_on(plane.handle(job_event("queued", id, "acme/app", None))); }
+        assert!((1..=20).all(|id| job(&store, id)["state"] == "launched"), "{max_jobs:?}");
+        assert_eq!(job(&store, 21)["state"], last, "{max_jobs:?}");
+        if max_jobs.is_none() { assert_eq!(job(&store, 21)["error"], "waiting: Cloudflare runs 20 at once") }
+    }
+    assert_eq!((superci_core::plane::jobs_at_once("cloudflare"), superci_core::plane::jobs_at_once("aws"), superci_core::plane::jobs_at_once("modal")), (20, 20, 20));
+}
+
 #[test]
 fn limits_make_jobs_wait_or_move_down_the_order() {
     let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());

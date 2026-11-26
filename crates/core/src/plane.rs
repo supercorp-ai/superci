@@ -1003,6 +1003,10 @@ pub const MAX_CPU: u32 = 32;
 /// Jobs at once in a cloud unless the dashboard sets another.
 pub const JOBS_AT_ONCE: u32 = 20;
 
+/// How many jobs a provider's runners run at once when the order sets no number for them: what the dashboard and the
+/// CLI show for one left empty, so it is never taken for no limit.
+pub fn jobs_at_once(provider: &str) -> u32 { if provider == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE } }
+
 fn matches_repo(pattern: &str, repo: &str) -> bool {
     pattern == "*" || pattern.eq_ignore_ascii_case(repo)
         || pattern.strip_suffix("/*").is_some_and(|owner| repo.split('/').next().is_some_and(|o| o.eq_ignore_ascii_case(owner)))
@@ -2883,7 +2887,7 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
-            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if self.config.records.provider_of(cloud) == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
+            let max = pool.and_then(|p| p.max_jobs).unwrap_or(jobs_at_once(self.config.records.provider_of(cloud)));
             if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
             // A label that names this provider, and none of its runners is added here: said as it is.
             let Some((capacity, runner)) = runner else {
