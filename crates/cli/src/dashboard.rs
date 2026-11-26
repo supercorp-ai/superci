@@ -4523,9 +4523,9 @@ mark();load()})();</script>"#;
             let same = same && d.views.as_ref().is_some_and(|(_, at)| *at > ended);
             // An update that is uploaded while the old version still answers: read anew at every look.
             let restarting = lock(&d.updating).as_ref().is_some_and(|u| d.views.as_ref().is_some_and(|(views, _)| views.iter().any(|v| u.restarting(v))));
-            let same = same && !restarting;
+            let asking = Asking { modal: pending.is_some(), quotas: quota_creds.is_some(), look: look_creds.is_some(), github: expecting };
             match d.views.clone() {
-                Some((views, at)) if same && pending.is_none() && quota_creds.is_none() && look_creds.is_none() && !expecting && now_ms() < at + views_kept_ms() => {
+                Some((views, at)) if kept_views_do(same, restarting, &asking, now_ms(), at) => {
                     look_again = now_ms() > at + 3_000;
                     if now_ms() > at + 3_000 && !d.refreshing {
                         d.refreshing = true;
@@ -6987,6 +6987,17 @@ fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
 {images}
 {kept}
 </div></section>"#, superci_core::cache::MAX_AGE_DAYS, superci_core::cache::MAX_AGE_DAYS)
+}
+
+/// What a page is waiting to ask or hear before the control planes as read a moment ago will do for it: a Modal
+/// sign-in being finished, AWS's quotas or its account's look to be read, GitHub's App expected back.
+struct Asking { modal: bool, quotas: bool, look: bool, github: bool }
+
+/// Whether the control planes as read at `at` are shown again at `now`: the same ones as then (`same`), read after any
+/// move or update ended, none of them being restarted by an update (read anew at every look meanwhile), nothing being
+/// asked that would change them, and read within `views_kept_ms`.
+fn kept_views_do(same: bool, restarting: bool, asking: &Asking, now: u64, at: u64) -> bool {
+    same && !restarting && !asking.modal && !asking.quotas && !asking.look && !asking.github && now < at + views_kept_ms()
 }
 
 /// A size in words: 940 MB, 3.4 GB.
@@ -11296,6 +11307,20 @@ mod rest_tests {
         let d = Dashboard::new();
         let views: Vec<PlaneView> = [cf_plane("p1", NOWHERE), aws_plane("p0", NOWHERE), modal_plane("p2", NOWHERE)].into_iter().map(|p| seen_as(p, serde_json::json!({}))).collect();
         assert!(!d.planes_page(&views).contains("pick act idle"));
+    }
+
+    #[test]
+    fn the_control_planes_read_a_moment_ago_are_shown_again_only_when_nothing_would_change_them() {
+        let none = Asking { modal: false, quotas: false, look: false, github: false };
+        let (at, kept) = (1_000, views_kept_ms());
+        assert!(kept_views_do(true, false, &none, at + 1, at));
+        // Each alone sends the page to read them anew.
+        assert!(!kept_views_do(false, false, &none, at + 1, at), "others than those read");
+        assert!(!kept_views_do(true, true, &none, at + 1, at), "one restarting for an update");
+        for asking in [Asking { modal: true, ..none }, Asking { quotas: true, ..none }, Asking { look: true, ..none }, Asking { github: true, ..none }] {
+            assert!(!kept_views_do(true, false, &asking, at + 1, at), "{}{}{}{}", asking.modal, asking.quotas, asking.look, asking.github);
+        }
+        assert!(!kept_views_do(true, false, &none, at + kept, at), "read too long ago");
     }
 
     #[test]
