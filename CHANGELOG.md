@@ -3,6 +3,8 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.20.5
+- The dashboard's Overview says when its control plane does not take this computer's key (it expired or was replaced), and what to do, half a minute on, as the other pages do. It went on showing "Reading your control plane…" for ever.
+- The sign-in a refused key asks for names the workspace when several are kept on this computer: `superci login --workspace=ID`. `superci login` alone was refused there until told which.
 - A dashboard left running keeps your sign-ins when another program is midway through writing them. It read the half-written file as every sign-in ended, and removed it.
 - Deleting a control plane takes its Cloudflare launcher out just after you signed in to Cloudflare again in a terminal. It was left in Cloudflare, and nothing said so. When Cloudflare does not list your accounts, the launcher is named among what was left.
 - A move bringing AWS runners to a Cloudflare control plane checks their account's sign-in before anything moves: one AWS ended stops it at once, said by its account. It stopped partway through.
