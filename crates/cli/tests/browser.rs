@@ -3308,12 +3308,21 @@ fn the_default_machine_is_picked_on_workflows_and_the_workspace_renamed_in_setti
     // 8 CPUs, arm64, no spot machines: what the picker says runs it, then saved.
     b.click(r#"button[onclick*="'default-machine'"]"#, "Change");
     b.wait("document.getElementById('default-machine').open");
-    b.eval("(() => { const f = document.querySelector('form[action=\"/machine\"]'); f.cpu.value = '8'; f.arch.value = 'arm64'; f.nospot.checked = true; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
+    // (And held to the control plane's AWS region: a region its jobs' network is in.)
+    b.eval("(() => { const f = document.querySelector('form[action=\"/machine\"]'); f.cpu.value = '8'; f.arch.value = 'arm64'; f.nospot.checked = true; f.region.value = 'us-east-1'; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
     b.click(r#"form[action="/machine"] button.primary"#, "Save");
     until("the default machine", || setting("MACHINE").is_some_and(|m| serde_json::from_str::<serde_json::Value>(&m).is_ok_and(|m| m["cpu"] == 8)));
     let machine: serde_json::Value = serde_json::from_str(&setting("MACHINE").unwrap()).unwrap();
-    assert_eq!((machine["arch"].as_str(), machine["spot"].as_bool()), (Some("arm64"), Some(false)), "{machine}");
+    assert_eq!((machine["arch"].as_str(), machine["spot"].as_bool(), machine["region"].as_str()), (Some("arm64"), Some(false), Some("us-east-1")), "{machine}");
     b.wait(&shows("8 CPU"));
+    b.wait(&shows("only in N. Virginia"));
+    // The picker: a region in a job's label, and only AWS's runners said to run it.
+    b.click("button", "Choose a machine…");
+    b.wait("document.getElementById('label-picker').open");
+    b.eval("(() => { const f = document.querySelector('#label-picker form'); f.region.value = 'us-east-1'; f.cpu.value = '4'; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
+    b.wait("document.querySelector('#label-picker [data-label]').textContent === 'superci/cpu=4/region=us-east-1'");
+    assert_eq!(b.eval("[...document.querySelectorAll('#label-picker .fit')].map(x => (x.dataset.aws !== undefined) + ':' + x.classList.contains('no')).join(',')").as_str().map(|s| s.split(',').all(|f| f == "true:false" || f == "false:true")), Some(true));
+    b.eval("document.getElementById('label-picker').close()");
 
     // The workspace's id: its folder on this computer is renamed, and the dashboard goes on in it.
     b.click("nav a", "Settings");
