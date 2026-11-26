@@ -13,6 +13,11 @@ on:
         type: choice
         options: [all, browser, e2e]
         default: all
+      mutants:
+        description: After the run, its mutants tested (every test of every crate only); what this branch changed since main, or all
+        type: choice
+        options: [none, changed, all]
+        default: none
 
 permissions:
   contents: read
@@ -151,7 +156,7 @@ jobs:
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
           if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
           # shellcheck disable=SC2086
-          npx -y supercov@4.20.3 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
+          npx -y supercov@4.29.17 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -179,48 +184,11 @@ jobs:
       SUPERCI_BROWSER_WAIT_S: "120"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/suite
         with:
-          components: llvm-tools-preview
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: coverage-all
-          save-if: ${{ matrix.part == 1 }}
-      # (After the Rust cache: restoring it takes away what else is in its target folder.)
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.PROGRAMS }}
-          key: ${{ needs.prepare.outputs.programs }}
-          fail-on-cache-miss: true
-      # (The Cloudflare Workers' tests, measured: each Worker built again from supercov's copy of its source, with
-      # worker-build, and run by the wrangler on PATH, which supercov reads it through.)
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: worker-build@0.8.7
-      - name: wrangler
-        run: npm install -g wrangler@4.149.0
-      - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
-        run: |
-          uname -r
-          grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
-          sudo modprobe erofs && grep erofs /proc/filesystems
-      # (Public resolvers for the runner and Docker's containers and builds: GitHub's Ubuntu runners could not resolve
-      # Ubuntu's archive through their own, 2026-11-11. Kept beside what the runner sets.)
-      - name: Public resolvers
-        run: |
-          sudo mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' | sudo tee /etc/systemd/resolved.conf.d/public.conf >/dev/null
-          sudo systemctl restart systemd-resolved
-          sudo mkdir -p /etc/docker && { sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'; } | jq '. + {"dns": ["1.1.1.1", "8.8.8.8"]}' | sudo tee /etc/docker/daemon.json.new >/dev/null
-          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json && sudo systemctl restart docker
-      # (The layer store's tests make EROFS files as the converter does, and serve them as root; containerd's own suites
-      # are run against it with Go.)
-      - name: mkfs.erofs
-        run: sudo apt-get install -y -qq erofs-utils >/dev/null
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: crates/layers/conformance/go.mod
-          cache-dependency-path: crates/layers/conformance/go.sum
+          programs: ${{ needs.prepare.outputs.programs }}
+          rust-cache: coverage-all
+          save-rust-cache: ${{ matrix.part == 1 }}
       # (One run: its share of the tests and its sixth of every sweep's faults together. The faults change nothing for
       # the other tests, and a run of the sweeps alone would leave out what only some tests build.)
       - name: Part ${{ matrix.part }} of the tests and slice ${{ matrix.part }} of every sweep's faults, measured
@@ -230,8 +198,11 @@ jobs:
           SUPERCI_SWEEP_FAULTS: "1"
           SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
           SUPERCI_BUILT: ${{ github.workspace }}
+          # (The values the mutants' expressions take, recorded as the tests run: what a mutation pass reads to know
+          # which tests could tell each mutant apart. Weak mutation is read from the merged run with nothing run again.)
+          SUPERCOV_MUTANTS: "1"
         # shellcheck disable=SC2086
-        run: npx -y supercov@4.20.3 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
+        run: npx -y supercov@4.29.17 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -254,7 +225,7 @@ jobs:
           path: .supercov/runs
           merge-multiple: true
       - name: The shards' runs merged
-        run: npx -y supercov@4.20.3 merge
+        run: npx -y supercov@4.29.17 merge
       - name: What the tests reach
         run: .github/coverage-gaps.sh
       - uses: actions/upload-artifact@v4
@@ -268,3 +239,87 @@ jobs:
         with:
           name: gaps
           path: gaps
+
+  # The merged run's mutants (cargo-mutants' own) tested, in eight shares of about the same cost side by side: each
+  # mutant built into one switched copy, and run against only the tests that reached it, by their exact names, until
+  # one fails. A share that runs out of time saves what it decided; the next pass runs the rest.
+  mutants:
+    needs: [prepare, merge]
+    if: ${{ inputs.tests == 'all' && inputs.mutants != 'none' && needs.merge.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      SUPERCI_BUILT: ${{ github.workspace }}
+      SUPERCI_LAYERS_E2E: "1"
+      IMAGES: mirror.gcr.io/library
+      SUPERCI_BROWSER_WAIT_S: "120"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # (main's history, for the lines this branch changed.)
+          fetch-depth: 0
+      - uses: ./.github/actions/suite
+        with:
+          programs: ${{ needs.prepare.outputs.programs }}
+          rust-cache: coverage-all
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: .supercov/runs
+      - name: Share ${{ matrix.shard }} of the mutants, tested
+        run: |
+          set -- --shard ${{ matrix.shard }}/8 --budget 19800
+          if [ "${{ inputs.mutants }}" = changed ]; then set -- "$@" --diff origin/main; fi
+          npx -y supercov@4.29.17 runs latest mutants test "$@"; code=$?
+          # (The run this share saved its verdicts into, for the merge.)
+          mkdir -p .supercov/shares && npx -y supercov@4.29.17 runs latest --json | jq -r '[.. | objects | (.runId? // empty) | strings] | first // empty' > .supercov/shares/${{ matrix.shard }}
+          cat .supercov/shares/${{ matrix.shard }}
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-${{ matrix.shard }}
+          path: .supercov/runs
+          include-hidden-files: true
+
+  # The shares' verdicts, as one run with the coverage: the mutation score, and every mutant the tests let live.
+  mutants-merge:
+    needs: mutants
+    if: ${{ always() && needs.mutants.result != 'skipped' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutants-*
+          path: .supercov/runs
+          merge-multiple: true
+      - name: The shares merged
+        run: |
+          # (Each share's own run; where none could say its id, every run on this source that is not itself a merge.)
+          ids=$(cat .supercov/shares/* 2>/dev/null | grep -v '^$' || true)
+          echo "Shares' runs: ${ids:-none named}"
+          # shellcheck disable=SC2086
+          npx -y supercov@4.29.17 merge $ids
+      - name: The mutants
+        run: |
+          mkdir -p mutants
+          npx -y supercov@4.29.17 runs latest mutants | tee mutants/files.txt
+          npx -y supercov@4.29.17 runs latest mutants --status survived,no-coverage,timeout,error --format jsonl --output mutants/left.jsonl || true
+          npx -y supercov@4.29.17 runs latest mutants --diff origin/main --format markdown --output mutants/changed.md || true
+          wc -l mutants/left.jsonl || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants
+          path: |
+            mutants
+            .supercov/runs
+          include-hidden-files: true
