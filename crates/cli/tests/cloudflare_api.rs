@@ -204,7 +204,8 @@ fn cloudflare_then_modal(workspace: &str) {
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222"]);
     assert!(!ok && said.contains("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."), "{said}");
     // Named, the control plane not answering when asked whether it has AWS runners yet: stopped there, nothing made.
-    let cf_url = served.aws.workers.lock().unwrap().remove("superci.acme.workers.dev").unwrap();
+    // (Still listed in Cloudflare; its address answers nothing.)
+    let cf_url = served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), "http://127.0.0.1:9".into()).unwrap();
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1"]);
     assert!(!ok && said.contains("The control plane did not answer whether it has AWS runners yet") && !said.contains("let aws run jobs") && !said.contains("runs jobs now"), "{said}");
     served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf_url);

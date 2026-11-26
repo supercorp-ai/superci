@@ -7821,7 +7821,10 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted,
         a_lost_job_of_a_run_that_passed_without_it_is_not_run_again,
         functions_are_a_row_a_label_and_a_preemption_go_past,
-        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it
+        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it,
+        a_label_naming_a_region_starts_its_machine_there_alone,
+        jobs_at_once_are_twenty_unless_set_and_a_number_set_above_twenty_is_taken,
+        a_sweep_reads_the_jobs_once_however_many_wait_and_starts_only_what_there_is_room_for
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

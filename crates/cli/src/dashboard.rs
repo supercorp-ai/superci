@@ -7036,6 +7036,8 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "image": m.image, "region": m.region, "ondemand": m.on_demand() });
     // The AWS regions a machine may be held to: those the control plane is set up in (and one set before, if not).
     let mut regions: Vec<String> = v.aws_regions();
+    // (A control plane in AWS, before it has said its regions: its own.)
+    if let (true, Plane::Aws { region, .. }) = (regions.is_empty(), &v.plane) { regions.push(region.clone()) }
     if let Some(r) = m.region.clone().filter(|r| !regions.contains(r)) { regions.push(r) }
     let region_names: Vec<(String, String)> = regions.iter().map(|r| (r.clone(), format!("{} ({r})", region_name(r)))).collect();
     let region_choices: Vec<(&str, &str)> = region_names.iter().map(|(r, n)| (r.as_str(), n.as_str())).collect();

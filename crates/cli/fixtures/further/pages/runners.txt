@@ -7,7 +7,7 @@ A job goes to the first that can run its machine and has room; when that one can
 When all are full, it waits.
 Drag to reorder.
 Not added aws-acme-on-demand is not added to this control plane yet · Add it aws AWS spot Spot machines of any size · x64, arm64 · N.
-Virginia $0.00 this month Ready aws aws-acme Spot machines of any size · x64, arm64 · Ireland, then London 4 at once $0.00 this month Ready modal-acme-two Sandboxes in the Modal workspace acme-two · up to 64 CPU, x64 $0.00 of $50.00 Ready cf-globex Containers sized per job, in a Cloudflare account of its own · up to 4 CPU, 12 GB, x64 Ready Modal Sandboxes · up to 64 CPU, x64 Ready AWS on-demand Taken out of the order: no job goes to it.
+Virginia 20 at once $0.00 this month Ready aws aws-acme Spot machines of any size · x64, arm64 · Ireland, then London 4 at once $0.00 this month Ready modal-acme-two Sandboxes in the Modal workspace acme-two · up to 64 CPU, x64 20 at once $0.00 of $50.00 Ready cf-globex Containers sized per job, in a Cloudflare account of its own · up to 4 CPU, 12 GB, x64 20 at once Ready Modal Sandboxes · up to 64 CPU, x64 20 at once Ready AWS on-demand Taken out of the order: no job goes to it.
 Its settings are kept.
 Put back Modal Functions Taken out of the order: no job goes to it.
 Its settings are kept.
@@ -17,6 +17,7 @@ Put back aws-acme-on-demand Taken out of the order: no job goes to it.
 Its settings are kept.
 Put back aws AWS spot Spot machines of any size · x64, arm64 · N.
 Virginia Jobs at once When this many run, the next job goes to the next provider (or waits).
+Left empty: 20.
 Monthly budget $ $0.00 this month.
 At the budget, jobs go to the next provider.
 Regions US East (N.
@@ -25,6 +26,7 @@ Drag to reorder.
 Your account may run up to 96 spot CPUs at once in these (24 jobs of 4 CPU).
 The runner image is not in Canada, Stockholm yet: copy it in under Control plane, then add the region here.
 Take out of the order Cancel Save aws aws-acme Spot machines of any size · x64, arm64 · Ireland, then London Jobs at once When this many run, the next job goes to the next provider (or waits).
+Left empty: 20.
 Monthly budget $ $0.00 this month.
 At the budget, jobs go to the next provider.
 Regions Europe (Ireland) eu-west-1 Europe (London) eu-west-2 + Add a region… US East (N.
@@ -32,12 +34,15 @@ Virginia) · us-east-1 · closest to GitHub US East (Ohio) · us-east-2 US West 
 Drag to reorder.
 The runner image is not in Canada, Stockholm yet: copy it in under Control plane, then add the region here.
 Take out of the order Cancel Save modal-acme-two Sandboxes in the Modal workspace acme-two · up to 64 CPU, x64 Jobs at once When this many run, the next job goes to the next provider (or waits).
+Left empty: 20.
 Monthly budget $ $0.00 this month.
 At the budget, jobs go to the next provider.
 Take out of the order Cancel Save cf-globex Containers sized per job, in a Cloudflare account of its own · up to 4 CPU, 12 GB, x64 Jobs at once When this many run, the next job goes to the next provider (or waits).
+Left empty: 20.
 Monthly budget $ $0.00 this month.
 At the budget, jobs go to the next provider.
 Take out of the order Cancel Save Modal Sandboxes · up to 64 CPU, x64 Jobs at once When this many run, the next job goes to the next provider (or waits).
+Left empty: 20.
 Monthly budget $ $0.00 this month.
 At the budget, jobs go to the next provider.
 Take out of the order Cancel Save Clouds The accounts your runners start machines in.
