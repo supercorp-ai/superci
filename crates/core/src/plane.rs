@@ -2600,11 +2600,13 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// The regions a place of AWS's (its spot machines, its on-demand ones) starts machines in, in order: its own, of
-    /// those the control plane is set up in; else all of those.
-    fn place_regions(&self, a: &AwsConnection, place: &str) -> Vec<String> {
+    /// those the control plane is set up in; else all of those. With `only` (a job's `region=`), that one alone, when
+    /// it is among them; else none.
+    fn place_regions(&self, a: &AwsConnection, place: &str, only: Option<&str>) -> Vec<String> {
         let all = self.aws_regions(a);
         let own: Vec<String> = self.config.routing.pool(place).map(|p| p.regions.iter().filter(|r| all.contains(r)).cloned().collect()).unwrap_or_default();
-        if own.is_empty() { all } else { own }
+        let regions = if own.is_empty() { all } else { own };
+        match only { Some(only) => regions.into_iter().filter(|r| r == only).collect(), None => regions }
     }
 
     /// Where a place asks for a job's spot machine, step by step. First only the pools within `aws::BAND` of what the
@@ -2614,8 +2616,8 @@ impl<'a> ControlPlane<'a> {
     /// for before a cheap one in the next. Each step: its region, the types it asks for, and the pools it leaves out.
     /// (One region: itself, whole. A region whose prices could not be read goes after those whose could; the first
     /// keeps its place unless another's are known to be lower.)
-    async fn spot_steps(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
-        let regions = self.place_regions(a, place);
+    async fn spot_steps(&self, a: &AwsConnection, place: &str, only: Option<&str>, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
+        let regions = self.place_regions(a, place, only);
         if regions.len() < 2 { return regions.into_iter().map(|r| (r, types.to_vec(), vec![])).collect() }
         let (mut seen, mut each) = (vec![], regions.iter().enumerate());
         loop {
@@ -2898,6 +2900,14 @@ impl<'a> ControlPlane<'a> {
             if gitlab && self.config.records.provider_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
+            // Its label names an AWS region: AWS's runners that start machines there, and no others.
+            if let Some(region) = &spec.region {
+                match &runner {
+                    Runner::Aws(a) if !self.place_regions(a, cloud, Some(region)).is_empty() => {}
+                    Runner::Aws(_) => { never.push(format!("{name} starts no machines in {region}")); continue }
+                    _ => { never.push(format!("{name} is not AWS (region={region})")); continue }
+                }
+            }
             // Its label asks for an on-demand machine: not AWS's spot ones.
             if self.config.records.aws_spot(cloud) && spec.on_demand() { never.push("AWS spot machines are not asked for (spot=false)".into()); continue }
             // (Nor preemptible Functions.)
@@ -3522,7 +3532,7 @@ impl<'a> ControlPlane<'a> {
                         // for each job (it would refuse each one, a second lost every time): the job goes on down the
                         // order. Not longer: once its owner changes that rule, jobs are on spot within ten minutes.
                         if !on_demand && self.store.get(&format!("{notes}{SPOT_NOT_ALLOWED_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000) {
-                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.place_regions(&a, &place).first().cloned().unwrap_or_default()));
+                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.place_regions(&a, &place, spec.region.as_deref()).first().cloned().unwrap_or_default()));
                             quota_only = false;
                             job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
                             job.spot_ending = self.spot_ending(job).await;
@@ -3559,7 +3569,7 @@ impl<'a> ControlPlane<'a> {
                         // Its regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         // (Spot: the region where a job costs least first, the first counted a little cheaper.)
                         // (Spot: first the pools near the cheapest in any region, then each region whole: see `spot_steps`.)
-                        let steps = if on_demand { self.place_regions(&a, &place).into_iter().map(|r| (r, types.clone(), vec![])).collect() } else { self.spot_steps(&a, &place, &types, spec.os(), &creds, now).await };
+                        let steps = if on_demand { self.place_regions(&a, &place, spec.region.as_deref()).into_iter().map(|r| (r, types.clone(), vec![])).collect() } else { self.spot_steps(&a, &place, spec.region.as_deref(), &types, spec.os(), &creds, now).await };
                         let mut each = steps.iter();
                         loop {
                             let Some((region, kinds, out)) = each.next() else { break };

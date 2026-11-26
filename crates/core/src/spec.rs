@@ -1,7 +1,7 @@
 //! What a job asks for. Workflows say `runs-on: superci` for the default machine (set in the dashboard), or say the
 //! machine in the label itself, as `key=value` pairs after its name, in any order: `superci/cpu=8`,
 //! `superci/cpu=8/ram=32/arch=arm64`, `superci/os=windows`, `superci/gpu=l4`, `superci/provider=aws/spot=false`,
-//! `superci/disk=200/disk-speed=500/scratch=ramdisk`, `superci/family=m8a+r8a`. One way to say each thing, and the
+//! `superci/disk=200/disk-speed=500/scratch=ramdisk`, `superci/family=m8a+r8a`, `superci/region=us-east-1`. One way to say each thing, and the
 //! same keys as `superci machine update` takes. Nothing has to be created first; the machine registers with GitHub
 //! under the exact label the job used, so only jobs asking for the same can take it.
 use serde::{Deserialize, Serialize};
@@ -41,10 +41,20 @@ pub struct Spec {
     /// Only these AWS machine families, when a label names any (`family=m8a`, `family=m8a+r8a`): for a job that
     /// must have a certain kind of machine (the newest, say) and would sooner pay or wait than take another.
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub families: Vec<String>,
+    /// Only this AWS region (`region=us-east-1`): for a job that must start where its network is (a NAT gateway, a
+    /// peered VPC in one region). AWS's runners that start machines there; others pass it on down the order.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub region: Option<String>,
 }
 
 /// What a label can say: its keys, in the order they are written when a label is made from a machine.
-pub const KEYS: [&str; 14] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "image", "gpu", "family", "scratch", "provider", "spot", "docker-cache"];
+pub const KEYS: [&str; 15] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "image", "gpu", "family", "scratch", "provider", "region", "spot", "docker-cache"];
+
+/// Whether a word is an AWS region's name: `us-east-1`, `ap-southeast-2`, `us-gov-west-1`.
+pub fn aws_region(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('-').collect();
+    (3..=4).contains(&parts.len()) && parts[0].len() == 2 && parts[..parts.len() - 1].iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase()))
+        && parts[parts.len() - 1].len() <= 2 && parts[parts.len() - 1].bytes().all(|b| b.is_ascii_digit()) && !parts[parts.len() - 1].is_empty()
+}
 
 /// The Ubuntu images a Linux machine can run.
 pub const UBUNTUS: [&str; 2] = ["ubuntu26", "ubuntu24"];
@@ -169,6 +179,7 @@ impl Spec {
             }
             "scratch" => self.scratch = Some(one_of(&["ramdisk", "localdisk"])?),
             "provider" => self.cloud = Some(one_of(&CLOUDS)?),
+            "region" => self.region = Some(if aws_region(value) { value.to_string() } else { return Err(format!("region is an AWS region (us-east-1), not “{value}”")) }),
             "spot" => self.spot = Some(one_of(&["true", "false"])? == "true"),
             "docker-cache" => self.docker_cache = Some(one_of(&["true", "false"])? == "true"),
             _ => return Err(format!("“{key}” is not a key a label has. {HOW}")),
@@ -184,6 +195,7 @@ impl Spec {
         if let (Some(i), true) = (&self.image, self.os() != "linux") { return Err(format!("image={i} is {} for Linux machines, and the label says os={}", if self.own_image().is_some() { "an image" } else { "an Ubuntu" }, self.os())) }
         if let (true, Some(i)) = (self.docker_cache.is_some(), self.image.as_deref().filter(|i| *i != "ubuntu26").filter(|_| self.os() == "linux")) { return Err(format!("the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says image={i}")) }
         if self.docker_cache.is_some() && self.os() != "linux" { return Err(format!("the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says os={}", self.os())) }
+        if let (Some(r), Some(c)) = (&self.region, self.cloud.as_deref().filter(|c| *c != "aws")) { return Err(format!("region={r} is an AWS region, and the label says provider={c}")) }
         if !self.families.is_empty() && self.gpu.is_some() { return Err("a GPU's machine family follows the GPU: say gpu or family, not both".into()) }
         if self.scratch.as_deref() == Some("localdisk") { if let Some(f) = self.families.iter().find(|f| !local(f)) { return Err(format!("{f} machines have no local disk: name a family that has one (m8id, c8id, r8id; m8gd on arm64), or leave family out")) } }
         Ok(())
@@ -200,7 +212,7 @@ impl Spec {
     pub fn pairs(&self) -> Vec<(&'static str, String)> {
         let n = |v: Option<u32>| v.map(|n| n.to_string());
         [("cpu", n(self.cpu)), ("ram", n(self.ram_gb)), ("disk", n(self.disk_gb)), ("disk-speed", n(self.disk_mibs)), ("disk-iops", n(self.disk_iops)), ("arch", self.arch.clone()), ("os", self.os.clone()),
-            ("image", self.image.clone()), ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string())), ("docker-cache", self.docker_cache.map(|s| s.to_string()))]
+            ("image", self.image.clone()), ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("region", self.region.clone()), ("spot", self.spot.map(|s| s.to_string())), ("docker-cache", self.docker_cache.map(|s| s.to_string()))]
             .into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
     }
 
@@ -220,6 +232,8 @@ impl Spec {
             disk_mibs: self.disk_mibs.or(default.disk_mibs), disk_iops: self.disk_iops.or(default.disk_iops),
             scratch: self.scratch.clone().or_else(|| default.scratch.clone()),
             families: if self.families.is_empty() { default.families.clone() } else { self.families.clone() },
+            // (Not the default's region for a label that names another provider.)
+            region: self.region.clone().or_else(|| default.region.clone().filter(|_| self.cloud.as_deref().is_none_or(|c| c == "aws"))),
         }
     }
 
@@ -257,6 +271,7 @@ impl Spec {
         if self.localdisk() { parts.push("local disk".into()) }
         if !self.families.is_empty() { parts.push(format!("only {}", self.families.join(", "))) }
         if let Some(c) = &self.cloud { parts.push(format!("only {c}")) }
+        if let Some(r) = &self.region { parts.push(format!("only in {r}")) }
         if parts.is_empty() { "the default machine".into() } else { parts.join(", ") }
     }
 }
@@ -425,6 +440,20 @@ mod tests {
         assert_eq!(parse("superci/os=windows").or(&arm).cpu, Some(8), "its size still comes along");
         let windows = Spec { os: Some("windows".into()), ..Default::default() };
         assert_eq!((parse("superci").or(&windows).os(), parse("superci/arch=arm64").or(&windows).os(), parse("superci/gpu=t4").or(&windows).os()), ("windows", "linux", "linux"));
+    }
+
+    #[test]
+    fn a_region_is_an_aws_regions_name_said_in_its_place_and_kept_from_the_default_only_for_aws() {
+        let parse = |l: &str| Spec::parse(l, "superci").unwrap();
+        for ok in ["us-east-1", "ap-southeast-2", "us-gov-west-1", "eu-central-2"] { assert!(aws_region(ok), "{ok}") }
+        for bad in ["us-east", "useast1", "us-east-123", "US-EAST-1", "us--1", "u-east-1", "us-east-1-a-b", "us-east-x"] { assert!(!aws_region(bad), "{bad}") }
+        let s = parse("superci/region=us-east-2/cpu=8").unwrap();
+        assert_eq!((s.label("superci"), s.describe()), ("superci/cpu=8/region=us-east-2".to_string(), "8 CPU, only in us-east-2".to_string()));
+        assert_eq!(parse("superci/region=us-east-2/provider=aws").unwrap().label("superci"), "superci/provider=aws/region=us-east-2");
+        assert!(parse("superci/region=us-east-2/provider=modal").unwrap_err().starts_with("region=us-east-2 is an AWS region, and the label says provider=modal"));
+        let default = Spec { region: Some("us-east-2".into()), ..Default::default() };
+        assert_eq!((parse("superci").unwrap().or(&default).region, parse("superci/provider=aws").unwrap().or(&default).region), (Some("us-east-2".into()), Some("us-east-2".into())));
+        assert_eq!((parse("superci/provider=cloudflare").unwrap().or(&default).region, parse("superci/region=us-west-2").unwrap().or(&default).region), (None, Some("us-west-2".into())));
     }
 
     #[test]

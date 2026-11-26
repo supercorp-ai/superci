@@ -508,6 +508,36 @@ fn a_region_with_no_spot_capacity_left_sends_the_machine_to_the_next() {
     assert!(clouds.calls.borrow().iter().any(|c| c.1 == "https://ec2.us-east-2.amazonaws.com/" && c.2.contains("Action=TerminateInstances")));
 }
 
+/// A label naming an AWS region (#39): machines start there alone, past Cloudflare before AWS in the order; a region
+/// no AWS runner starts machines in fails the job, saying so.
+#[test]
+fn a_label_naming_a_region_starts_its_machine_there_alone() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-west-2".into(), "us-east-2".into()];
+    config.containers = true;
+    config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool::of(c)).collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/region=us-east-2")));
+    let tried: Vec<String> = clouds.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances")).map(|c| c.1.clone()).collect();
+    assert!(!tried.is_empty() && tried.iter().all(|u| u == "https://ec2.us-east-2.amazonaws.com/"), "{tried:?}");
+    let j = job(&store, 1);
+    assert_eq!((j["region"].as_str(), j["state"].as_str(), j["cloud"].as_str()), (Some("us-east-2"), Some("launched"), Some("aws")));
+    // Not where AWS is set up to start machines: nowhere, said.
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/region=eu-west-1")));
+    let j = job(&store, 2);
+    assert_eq!(j["state"], "failed");
+    let e = j["error"].as_str().unwrap();
+    assert!(e.starts_with("nowhere to run") && e.contains("only in eu-west-1") && e.contains("AWS starts no machines in eu-west-1") && e.contains("Cloudflare is not AWS (region=eu-west-1)"), "{e}");
+    // A region and another provider do not go together; a region is AWS's.
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/provider=cloudflare/region=us-east-2")));
+    assert!(job(&store, 3)["error"].as_str().unwrap().contains("region=us-east-2 is an AWS region, and the label says provider=cloudflare"), "{}", job(&store, 3));
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/region=virginia")));
+    assert!(job(&store, 4)["error"].as_str().unwrap().contains("region is an AWS region (us-east-1), not “virginia”"), "{}", job(&store, 4));
+}
+
 #[test]
 fn moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_where() {
     let key = "dashboard-session-key-0123";
