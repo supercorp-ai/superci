@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+# (rlib too, so this crate's own tests run: worker-build still takes the cdylib.)
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 superci-core = { path = "../core" }
