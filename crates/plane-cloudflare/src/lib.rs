@@ -40,13 +40,16 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Only the Worker says what the settings are: anything of that name from outside is dropped.
     headers.keys().filter(|k| k.starts_with(SETTINGS)).collect::<Vec<_>>().iter().for_each(|name| header(headers.delete(name)));
     let mut settings: serde_json::Map<String, serde_json::Value> = SETTING_NAMES.iter().filter_map(|n| Some((n.to_string(), env.secret(n).ok()?.to_string().into()))).collect();
-    // One secret for each further organization's GitHub App (GITHUB_APP_<its id>) and GitLab connection; and those
-    // kept for runs from a computer (SECRET_<name>_<scope>), only where they are read (a run made, their list, a move).
+    // One secret for each further organization's GitHub App (GITHUB_APP_<its id>) and GitLab connection; each read
+    // key (READ_KEY_<expires>_<name>, its hash not the key); and those kept for runs from a computer
+    // (SECRET_<name>_<scope>), only where they are read (a run made, their list, a move).
     let path = req.path();
     let kept = path == "/runs" || path == "/secrets" || path == "/move/export";
-    for n in js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).filter(|n| n.starts_with("GITHUB_APP_") || n.starts_with("GITLAB_") || (kept && n.starts_with("SECRET_"))) {
+    for n in js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).filter(|n| n.starts_with("GITHUB_APP_") || n.starts_with("GITLAB_") || n.starts_with("READ_KEY_") || (kept && n.starts_with("SECRET_"))) {
         if let Ok(v) = env.secret(&n) { settings.insert(n, v.to_string().into()); }
     }
+    // Read keys as they are now are the Worker's to say: the Durable Object takes them over its own.
+    settings.insert("KEYS_FRESH".into(), "1".into());
     // In pieces: a header's value has a size limit, and each further organization's App adds its key.
     let all = ascii_json(&serde_json::Value::Object(settings));
     all.as_bytes().chunks(8_000).enumerate().for_each(|(i, piece)| header(headers.set(&format!("{SETTINGS}-{i}"), &String::from_utf8_lossy(piece))));
@@ -179,6 +182,21 @@ impl Http for FetchHttp {
     }
 }
 
+/// The settings and secrets a request runs with: as the Worker handed them (fresh — it reads its secrets new
+/// each request), else as this object started with them. Read keys are the Worker's to say when it says so
+/// (`KEYS_FRESH`: it hands READ_KEY_* too) — a key just written holds at once, one removed is gone; an older
+/// Worker's settings leave them this object's own. Device keys are never the Worker's to hand: this object's
+/// own, as they were at its last start, whichever way the settings came.
+fn settings_and_keys(fresh: Option<&std::collections::BTreeMap<String, String>>, own: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
+    match fresh {
+        Some(f) => {
+            let read_keys_fresh = f.get("KEYS_FRESH").is_some_and(|v| v == "1");
+            f.iter().map(|(k, v)| (k.clone(), v.clone())).chain(own.iter().filter(|(n, _)| n.starts_with("DEVICE_KEY_") || (!read_keys_fresh && n.starts_with("READ_KEY_"))).map(|(k, v)| (k.clone(), v.clone()))).collect()
+        }
+        None => own.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+    }
+}
+
 impl Clock for WorkerClock {
     fn now_ms(&self) -> u64 { Date::now().as_millis() }
 }
@@ -197,17 +215,12 @@ impl Timer for DoTimer<'_> {
 impl PlaneObject {
     /// The control plane's settings (`PLANE_ID`, `LABEL`) and the secrets the dashboard sets from the user's machine,
     /// read as every control plane reads its settings (`Config::read_settings`): as the Worker handed them with this
-    /// request (fresh), else as this object started with them. Its keys are always its own (the Worker hands none).
+    /// request (fresh), else as this object started with them. Device keys are always its own (the Worker hands none).
     fn config(&self, fresh: Option<&std::collections::BTreeMap<String, String>>) -> Config {
         let var = |n: &str| self.env.var(n).map(|v| v.to_string()).ok().filter(|v| !v.is_empty());
         let names: Vec<String> = js_sys::Object::keys(self.env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).collect();
         let own = |n: &String| self.env.secret(n).ok().map(|v| (n.clone(), v.to_string()));
-        let key = |n: &str| n.starts_with("DEVICE_KEY_") || n.starts_with("READ_KEY_");
-        let mut all: Vec<(String, String)> = match fresh {
-            Some(f) => f.iter().filter(|(k, _)| !key(k)).map(|(k, v)| (k.clone(), v.clone())).collect(),
-            None => names.iter().filter(|n| !key(n)).filter_map(own).collect(),
-        };
-        all.extend(names.iter().filter(|n| key(n)).filter_map(own));
+        let all = settings_and_keys(fresh, &names.iter().filter_map(own).collect());
         let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
         if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase(); }
         if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
@@ -253,5 +266,41 @@ impl DurableObject for PlaneObject {
         let plane = ControlPlane { store: &store, http: &FetchHttp, clock: &WorkerClock, timer: &timer, config: &config, cache: &self.cache, containers: Some(&Runners(&self.env, config.cloudflare_location.clone(), config.cloudflare_image.clone())) };
         plane.alarm().await.map_err(Error::RustError)?;
         Response::ok("ok")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings_and_keys;
+    use std::collections::BTreeMap;
+
+    fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> { entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+
+    #[test]
+    fn settings_handed_fresh_say_the_read_keys_and_its_own_the_device_keys() {
+        // The Worker sees a key's new secret within seconds; the object keeps its own until it restarts.
+        let fresh = map(&[("NAME", "acme"), ("KEYS_FRESH", "1"), ("READ_KEY_100_NEW", "hash-new")]);
+        let own = map(&[("NAME", "old"), ("READ_KEY_100_OLD", "hash-old"), ("DEVICE_KEY_100_TEST", "device-secret")]);
+        let all: BTreeMap<String, String> = settings_and_keys(Some(&fresh), &own).into_iter().collect();
+        assert_eq!(all.get("READ_KEY_100_NEW").map(|v| v.as_str()), Some("hash-new"));
+        assert_eq!(all.get("READ_KEY_100_OLD"), None, "a removed read key is gone, not kept from its own");
+        assert_eq!(all.get("DEVICE_KEY_100_TEST").map(|v| v.as_str()), Some("device-secret"));
+        assert_eq!(all.get("NAME").map(|v| v.as_str()), Some("acme"));
+    }
+
+    #[test]
+    fn an_older_workers_settings_leave_the_read_keys_its_own() {
+        let fresh = map(&[("NAME", "acme")]);
+        let own = map(&[("READ_KEY_100_OLD", "hash-old"), ("DEVICE_KEY_100_TEST", "device-secret")]);
+        let all: BTreeMap<String, String> = settings_and_keys(Some(&fresh), &own).into_iter().collect();
+        assert_eq!(all.get("READ_KEY_100_OLD").map(|v| v.as_str()), Some("hash-old"));
+        assert_eq!(all.get("DEVICE_KEY_100_TEST").map(|v| v.as_str()), Some("device-secret"));
+    }
+
+    #[test]
+    fn without_fresh_settings_all_are_its_own() {
+        let own = map(&[("READ_KEY_100_OLD", "hash-old"), ("DEVICE_KEY_100_TEST", "device-secret"), ("NAME", "acme")]);
+        let all: BTreeMap<String, String> = settings_and_keys(None, &own).into_iter().collect();
+        assert_eq!(all, own);
     }
 }
