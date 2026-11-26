@@ -1247,7 +1247,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let accounts: Vec<String> = d.aws_accounts_signed_in().into_iter().map(|(a, _)| a).collect();
             let workspaces = d.modal_workspaces();
             // (Read only where it decides: a control plane that does not say stops the command, nothing guessed.)
-            let aws_first = if cloud == "aws" && args.has("account") && !matches!(plane, Plane::Aws { .. }) { !view(&mut d)?.aws } else { false };
+            // (One that does not answer said nothing: it is not taken as having no AWS runners.)
+            let aws_first = if cloud == "aws" && args.has("account") && !matches!(plane, Plane::Aws { .. }) {
+                match view(&mut d).map(|v| v.online.then_some(!v.aws)) {
+                    Ok(Some(first)) => first,
+                    _ => return Err(Fail::Failed("The control plane did not answer whether it has AWS runners yet, which decides where these go. Nothing was made; try again once it answers (`superci status`).".into())),
+                }
+            } else { false };
             match (cloud, &plane, args.get("account")) {
                 ("aws", Plane::Aws { .. }, _) | ("modal", Plane::Modal { .. }, _) | (_, _, Some(_)) => {}
                 ("aws", _, None) if accounts.len() > 1 => return usage(format!("Say which AWS account: --account=ID. Yours: {}.", accounts.join(", "))),
