@@ -198,9 +198,9 @@ jobs:
           SUPERCI_SWEEP_FAULTS: "1"
           SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
           SUPERCI_BUILT: ${{ github.workspace }}
-          # (The values the mutants' expressions take, recorded as the tests run: what a mutation pass reads to know
-          # which tests could tell each mutant apart. Weak mutation is read from the merged run with nothing run again.)
-          SUPERCOV_MUTANTS: "1"
+          # (No SUPERCOV_MUTANTS=1: supercov 4.29.17 works out each Rust mutant's value as the tests run, and a mutant
+          # that overflows, `now * 31 * 86_400_000` for `now + …`, panics in the code under test and fails it. The
+          # mutation pass runs each mutant's tests without those values.)
         # shellcheck disable=SC2086
         run: npx -y supercov@4.29.17 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
       - uses: actions/upload-artifact@v4

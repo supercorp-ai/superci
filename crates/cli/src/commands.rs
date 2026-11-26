@@ -444,6 +444,16 @@ fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
 
 fn view(d: &mut Dashboard) -> Result<PlaneView> { Ok(look(d)?.0) }
 
+/// Whether an account named goes to the CI's own AWS runners (it has none yet), from whether its control plane
+/// answered and says it has AWS runners. One that did not answer, or was not read, stops the command: never taken as
+/// having none.
+fn own_aws_first(said: Result<(bool, bool)>) -> Result<bool> {
+    match said {
+        Ok((true, aws)) => Ok(!aws),
+        _ => Err(Fail::Failed("The control plane did not answer whether it has AWS runners yet, which decides where these go. Nothing was made; try again once it answers (`superci status`).".into())),
+    }
+}
+
 /// What deletes something needs --confirm (said with what it would do); --dry-run needs none.
 fn confirmed(args: &Args, what: &str) -> Result<()> { if args.has("confirm") || args.has("dry-run") { Ok(()) } else { Err(Fail::Unconfirmed(format!("This would {what}. Add --confirm to do it, or --dry-run to check it first."))) } }
 
@@ -1249,10 +1259,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             // (Read only where it decides: a control plane that does not say stops the command, nothing guessed.)
             // (One that does not answer said nothing: it is not taken as having no AWS runners.)
             let aws_first = if cloud == "aws" && args.has("account") && !matches!(plane, Plane::Aws { .. }) {
-                match view(&mut d).map(|v| v.online.then_some(!v.aws)) {
-                    Ok(Some(first)) => first,
-                    _ => return Err(Fail::Failed("The control plane did not answer whether it has AWS runners yet, which decides where these go. Nothing was made; try again once it answers (`superci status`).".into())),
-                }
+                own_aws_first(view(&mut d).map(|v| (v.online, v.aws)))?
             } else { false };
             match (cloud, &plane, args.get("account")) {
                 ("aws", Plane::Aws { .. }, _) | ("modal", Plane::Modal { .. }, _) | (_, _, Some(_)) => {}
@@ -1901,6 +1908,16 @@ fn planes() -> Result<Done> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_account_named_goes_to_the_cis_own_aws_runners_only_when_its_control_plane_answered_it_has_none() {
+        assert!(own_aws_first(Ok((true, false))).unwrap());
+        assert!(!own_aws_first(Ok((true, true))).unwrap());
+        for said in [Ok((false, false)), Ok((false, true)), Err(Fail::Failed("unread".into()))] {
+            let Err(Fail::Failed(why)) = own_aws_first(said) else { panic!("not stopped") };
+            assert!(why.contains("did not answer whether it has AWS runners yet") && why.contains("Nothing was made"), "{why}");
+        }
+    }
 
     #[test]
     fn a_logs_source_and_the_age_of_its_last_line_are_said() {

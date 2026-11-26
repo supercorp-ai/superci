@@ -3317,7 +3317,8 @@ fn the_default_machine_is_picked_on_workflows_and_the_workspace_renamed_in_setti
     b.wait(&shows("8 CPU"));
     b.wait(&shows("only in N. Virginia"));
     // The picker: a region in a job's label, and only AWS's runners said to run it.
-    b.click("button", "Choose a machine…");
+    // (Its button shows once GitHub or GitLab is connected; the dialog is on the page either way.)
+    b.eval("document.getElementById('label-picker').showModal()");
     b.wait("document.getElementById('label-picker').open");
     b.eval("(() => { const f = document.querySelector('#label-picker form'); f.region.value = 'us-east-1'; f.cpu.value = '4'; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
     b.wait("document.querySelector('#label-picker [data-label]').textContent === 'superci/cpu=4/region=us-east-1'");
