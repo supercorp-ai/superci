@@ -1598,12 +1598,19 @@ impl Dashboard {
         let said = cloudflare::refused(v.plane.url(), &self.status_key)?;
         // (Online, it said a version: one from before versions were said reads as the first.)
         if view::older(v.version.as_deref(), NAMES_SINCE) {
-            return Some(format!("The control plane runs SuperCI {}, which reads this computer's key under its old name. Sign in again where it runs (`superci login`) so it is handed that way, or update the control plane (`superci planes update`).", v.version.as_deref().unwrap_or("of an older version")))
+            return Some(format!("The control plane runs SuperCI {}, which reads this computer's key under its old name. Sign in again where it runs (`{}`) so it is handed that way, or update the control plane (`superci planes update`).", v.version.as_deref().unwrap_or("of an older version"), self.login_command()))
         }
         if said.starts_with(superci_core::plane::KEY_REFUSED) && view::older(Some(DASHBOARD_VERSION), v.version.as_deref().unwrap_or_default()) {
             return Some(format!("The control plane runs SuperCI {}, newer than this SuperCI ({DASHBOARD_VERSION}), and does not take its key: update SuperCI (npx @superci/cli@latest).", v.version.as_deref().unwrap_or_default()))
         }
-        Some("The control plane does not take this computer's key (it expired or was replaced). Sign in again where it runs (`superci login`) to hand it a new one.".to_string())
+        Some(format!("The control plane does not take this computer's key (it expired or was replaced). Sign in again where it runs (`{}`) to hand it a new one.", self.login_command()))
+    }
+
+    /// The sign-in to give: with several workspaces kept on this computer, `superci login` alone refuses until it
+    /// is told which, so the workspace is named.
+    fn login_command(&self) -> String {
+        let several = self.store.as_ref().and_then(|s| s.root()).is_some_and(|r| crate::store::listed(&r, Some(&self.workspace())).len() > 1);
+        if several { format!("superci login --workspace={}", self.workspace()) } else { "superci login".to_string() }
     }
 
     /// Every control plane found in the clouds signed in to, the one in use marked.
@@ -4719,12 +4726,17 @@ mark();load()})();</script>"#;
         let settling = current.is_some_and(|v| v.online && v.status.is_none() && !matches!(v.plane, Plane::Seen { .. }));
         // Until then, pages that list what the control plane has would guess (and offer to add what exists): they wait.
         // Overview does not: its public state is enough, and its numbers and jobs fill in when the key is read.
+        // Half a minute on, one that still does not take the key will not by itself (it is from before the key's name,
+        // or the key expired): why, and what to do, said; looked at again now and then.
+        let waited = settling && current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms());
+        let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v)).map(|why| format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)));
+        // Overview does not wait for the key (its public state is enough), but neither does it show "Reading your
+        // control plane…" for ever: once the key is refused it says why and what to do, and looks again now and then.
+        if let Some(card) = refused.as_deref().filter(|_| section == "overview") {
+            return format!(r#"<div data-refresh="5"></div><div class="bar"><h1 class="page-title">Overview</h1></div><div class="cards">{card}</div>"#);
+        }
         if settling && !["plane", "overview"].contains(&section) {
             let title = section_title(section);
-            // Half a minute on, one that still does not take the key will not by itself (it is from before the key's
-            // name, or the key expired): why, and what to do, said; looked at again now and then.
-            let waited = current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms());
-            let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v)).map(|why| format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)));
             // (Settings keeps what is this computer's own meanwhile: the workspace's id, signing out, removing it.)
             if section == "settings" {
                 let local = self.settings_page(None).replacen(r#"<div class="cards">"#, &format!(r#"<div class="cards">{}"#, refused.as_deref().unwrap_or_default()), 1);

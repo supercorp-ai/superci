@@ -731,6 +731,23 @@ fn a_key_an_older_superci_kept_is_kept_and_handed_under_the_new_name() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// With several workspaces kept here, `superci login` alone is refused until it is told which: the refused key's
+/// sign-in names the workspace.
+#[test]
+fn a_refused_key_names_the_workspace_to_sign_in_to_when_several_are_kept() {
+    let served = serve(|_| {});
+    let home = common::home(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    let other = home.join("workspaces/other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::copy(home.join("workspaces/default/sign-ins.json"), other.join("sign-ins.json")).unwrap();
+    let (code, v) = json(&home, &["runs", "list", "--workspace=default"]);
+    assert_ne!(code, 0, "{v}");
+    let e = v["error"].as_str().unwrap_or_default();
+    assert!(e.contains("does not take this computer's key") && e.contains("`superci login --workspace=default`"), "{e}");
+}
+
 /// A control plane that answers and does not take this computer's key is said as that, with what to do: never as
 /// "no runs yet" or a run not there.
 #[test]
