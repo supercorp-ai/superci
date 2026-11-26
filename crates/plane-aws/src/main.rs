@@ -420,6 +420,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    //! The DynamoDB store against a stand-in for DynamoDB's own API (its calls and answers as AWS gives them, kept in
+    //! memory): what every store promises, the partitions it keeps records in, ends, and moving the layout before
+    //! 0.19.0 over while it is read.
+    use super::*;
+
     #[test]
     fn a_sweep_is_taken_as_cut_off_only_after_a_call_could_have_run_and_half_a_minute_more() {
         use super::cut_off;
@@ -431,10 +436,6 @@ mod tests {
         assert!(!cut_off(5_000, 1_000, 180_000));
     }
 
-    //! The DynamoDB store against a stand-in for DynamoDB's own API (its calls and answers as AWS gives them, kept in
-    //! memory): what every store promises, the partitions it keeps records in, ends, and moving the layout before
-    //! 0.19.0 over while it is read.
-    use super::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
