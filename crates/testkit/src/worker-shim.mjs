@@ -5,8 +5,8 @@
 //   `SUPERCI_STAND_IN`, as `io::stand_in` has it for the other control planes;
 // - each runner's container (Cloudflare Containers, which a local run has none of) is a stand-in too: what the Worker
 //   asks of it is told to the test (`POST <SUPERCI_CONTAINERS>/<op>`), which answers how it goes;
-// - what the test asks of the runtime itself, at `/__test/...` (only here): a Durable Object's alarm now, the
-//   containers as Cloudflare may have them, the class kept from before 0.5.0.
+// - what the test asks of the runtime itself, at `/__test/...` (only here): whether it answers, a Durable Object's
+//   alarm now, the containers as Cloudflare may have them, the class kept from before 0.5.0.
 import * as built from "BUILT";
 
 let standIn = "", containers = "";
@@ -85,6 +85,8 @@ export default class extends built.default {
   async fetch(request) {
     given(this.env);
     const url = new URL(request.url);
+    // (Whether it answers at all: the module loaded, nothing done.)
+    if (url.pathname === "/__test/ready") return new Response("ok");
     if (url.pathname === "/__test/containers") { mode = await request.json(); return new Response("ok") }
     if (url.pathname === "/__test/plane-alarm") return this.env.PLANE.get(this.env.PLANE.idFromName("plane")).fetch("https://plane/__test/alarm");
     if (url.pathname === "/__test/runner-alarm") {
