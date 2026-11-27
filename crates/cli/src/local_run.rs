@@ -355,8 +355,8 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         std::thread::spawn(move || -> Result<bool> {
             let http = crate::aws::Blocking::new();
             let ask = |method: &str, at: &str, body: Vec<u8>| block_on(http.send(Request::new(method, at).with_header("authorization", &format!("Bearer {key}")).with_body(body)));
-            let sent = block_on(http.send(Request::new("PUT", &link).with_body(bytes))).and_then(|r| if r.status < 300 { Ok(()) } else { Err(format!("the bucket said {} to the working tree: {}", r.status, r.body_text().trim())) })
-                .and_then(|_| ask("POST", &format!("{plane}/runs/tree?id={tree}&part=0&sent=1"), vec![]).and_then(|r| if r.status < 300 { Ok(()) } else { Err(format!("the control plane said {} to the working tree's end: {}", r.status, r.body_text().trim())) }));
+            let sent = block_on(http.send(Request::new("PUT", &link).with_body(bytes))).and_then(|r| if superci_core::io::done(r.status) { Ok(()) } else { Err(format!("the bucket said {} to the working tree: {}", r.status, r.body_text().trim())) })
+                .and_then(|_| ask("POST", &format!("{plane}/runs/tree?id={tree}&part=0&sent=1"), vec![]).and_then(|r| if superci_core::io::done(r.status) { Ok(()) } else { Err(format!("the control plane said {} to the working tree's end: {}", r.status, r.body_text().trim())) }));
             if sent.is_err() { let _ = ask("POST", &format!("{plane}/runs/{run}/cancel"), b"{}".to_vec()); }
             sent.map(|_| base)
         })
@@ -485,11 +485,11 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             // (the runner drops lines it cannot send as fast as they come).
             let fetch = |n: u64| -> Option<String> {
                 let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&log={n}")).with_header("authorization", &format!("Bearer {key}"));
-                block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
+                block_on(http.send(r)).ok().filter(|r| superci_core::io::done(r.status)).map(|r| r.body_text())
             };
             let pages = |step: &str| -> Option<String> {
                 let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&step={step}")).with_header("authorization", &format!("Bearer {key}"));
-                block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
+                block_on(http.send(r)).ok().filter(|r| superci_core::io::done(r.status)).map(|r| r.body_text())
             };
             for line in logs[i].take(j, give_up, &fetch, &pages) {
                 if line.starts_with("##[endgroup]") || how.quiet { continue }
@@ -540,7 +540,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 let step_text = |s: &Value| -> String {
                     let at = match s["log"].as_u64() { Some(n) => format!("log={n}"), None => format!("step={}&lines=1", s["id"].as_str().unwrap_or_default()) };
                     let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&{at}")).with_header("authorization", &format!("Bearer {key}"));
-                    block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text()).unwrap_or_default()
+                    block_on(http.send(r)).ok().filter(|r| superci_core::io::done(r.status)).map(|r| r.body_text()).unwrap_or_default()
                 };
                 let mut all = String::new();
                 let mut failed_unsaid: Vec<String> = vec![];
@@ -853,15 +853,7 @@ fn blank(l: &str) -> bool { without_time(&format!("{} ", l.trim_end())).trim().i
 fn which(a: u64, b: u64) -> String { if a == b { format!("line {a}") } else { format!("lines {a}–{b}") } }
 
 /// A log's line without the time the runner put before it ("2026-10-14T21:09:53.1234567Z ").
-fn without_time(line: &str) -> &str {
-    // (A log's first line begins with a byte order mark.)
-    let line = line.trim_start_matches('\u{feff}');
-    let b = line.as_bytes();
-    if b.len() > 20 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) {
-        if let Some(at) = line.find("Z ") { if at < 40 { return &line[at + 2..] } }
-    }
-    line
-}
+fn without_time(line: &str) -> &str { crate::log_view::split_time(line).1 }
 
 #[cfg(test)]
 mod tests {
@@ -878,6 +870,27 @@ mod tests {
         assert_eq!(last_lines(&plain).len(), 40);
     }
 
+
+    /// A zip whose files carry comments (each read past its own): every file unpacked as it was.
+    #[test]
+    fn a_zip_whose_files_carry_comments_is_unpacked_whole() {
+        let dir = std::env::temp_dir().join(format!("superci-unzip-commented-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.zip"), include_bytes!("../tests/fixtures/zip/commented.zip")).unwrap();
+        assert_eq!(unzip(&dir.join("c.zip"), &dir.join("out")).ok(), Some(2));
+        assert_eq!((std::fs::read_to_string(dir.join("out/a.txt")).unwrap(), std::fs::read_to_string(dir.join("out/dir/b.txt")).unwrap()), ("first\n".to_string(), "second\n".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seconds in words, to the minute and past it; a line's time taken off only where it ends within 40 characters.
+    #[test]
+    fn spans_and_times_hold_at_their_edges() {
+        assert_eq!((span(59), span(60)), ("59 s".to_string(), "1m 0s".to_string()));
+        let line = |digits: usize| format!("2026-10-14T21:09:53.{}Z the line", "1".repeat(digits));
+        assert_eq!(without_time(&line(19)), "the line");
+        assert_eq!(without_time(&line(20)), line(20));
+    }
 
     #[test]
     fn a_zip_as_upload_artifact_makes_it_is_unpacked_inside_its_folder() {

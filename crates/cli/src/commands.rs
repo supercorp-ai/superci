@@ -402,6 +402,12 @@ pub fn process_lines(t: &Value, indent: &str) -> Vec<String> {
 
 /// The tests that failed as they were marked to (`test.fail()`), each named where the list of what ran does not show
 /// them, and what that means: their runner prints no error for them, and passes one that failed for another reason.
+/// How long ago a moment was, from now (ms), in words: "just now", "5 min ago", "3 h ago", "2 days ago".
+fn ago(now: u64, ms: u64) -> String {
+    let m = now.saturating_sub(ms) / 60_000;
+    match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) }
+}
+
 pub fn expected_lines(t: &Value, indent: &str) -> Vec<String> {
     let tests = t["failed_as_expected_tests"].as_array().cloned().unwrap_or_default();
     if tests.is_empty() { return vec![] }
@@ -649,7 +655,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let (mut said, mut data) = (vec![], vec![]);
             // (Each run found has its jobs: a run is made of them.)
             of.iter().rev().for_each(|r| {
-                let raw: Vec<&Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).collect();
+                let raw: Vec<&Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a != 0) == r["attempt"].as_u64()).collect();
                 let mut its: Vec<Value> = raw.iter().map(|j| job_words(j)).collect();
                 said.push(run_line(r));
                 said.push(r["link"].as_str().unwrap_or_default().to_string());
@@ -711,7 +717,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let got = crate::cloudflare::plane_get(&url, &key, &match repo { Some(r) => format!("/caches?repo={}", url::form_urlencoded::byte_serialize(r.as_bytes()).collect::<String>()), None => "/caches".into() })
                 .map_err(|e| if e.contains(" 404") { "This control plane keeps no cache yet: update it (`superci planes update`).".to_string() } else { e })?;
             let now = got["now_ms"].as_u64().unwrap_or(0);
-            let ago = |ms: u64| { let m = now.saturating_sub(ms) / 60_000; match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) } };
+            let ago = |ms: u64| ago(now, ms);
             let size = |b: u64| if b >= 1_000_000_000 { format!("{:.1} GB", b as f64 / 1e9) } else { format!("{} MB", b.div_ceil(1_000_000)) };
             let mut said = vec![];
             if repo.is_none() {
@@ -742,7 +748,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let got = d.kept_secrets_said()?;
             let kept = got["secrets"].as_array().cloned().unwrap_or_default();
             let now = got["now_ms"].as_u64().unwrap_or(0);
-            let ago = |ms: u64| { let m = now.saturating_sub(ms) / 60_000; match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) } };
+            let ago = |ms: u64| ago(now, ms);
             let mut said = vec![];
             if kept.is_empty() { said.push("No secrets kept. A run from a computer gets the ones it names: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.".to_string()) }
             for s in &kept {
@@ -1907,6 +1913,17 @@ fn planes() -> Result<Done> {
 
 #[cfg(test)]
 mod tests {
+    /// How long ago, at each change of words; tests that failed as expected listed only past 30 (with 30 or fewer, each
+    /// is among those that ran, listed there).
+    #[test]
+    fn how_long_ago_and_tests_that_failed_as_expected_are_said_at_their_edges() {
+        let now = 10_000_000_000u64;
+        assert_eq!([ago(now, now - 59_999), ago(now, now - 60_000), ago(now, now - 3_599_999), ago(now, now - 3_600_000), ago(now, now - 2_879 * 60_000), ago(now, now - 2_880 * 60_000)],
+            ["just now", "1 min ago", "59 min ago", "1 h ago", "47 h ago", "2 days ago"]);
+        let with = |ran: usize| expected_lines(&serde_json::json!({ "failed_as_expected_tests": [{ "name": "flaky" }], "ran": vec![serde_json::json!({}); ran] }), "");
+        assert!(!with(30).iter().any(|l| l.contains("Failed as expected")) && with(31).iter().any(|l| l.contains("Failed as expected")));
+    }
+
     use super::*;
 
     #[test]

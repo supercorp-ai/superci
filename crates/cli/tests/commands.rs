@@ -218,6 +218,13 @@ fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
     assert!(published.contains(&"us-east-1") && !published.contains(&"ca-central-1"), "{images}");
     assert!(text(&["images", "list"]).contains("us-east-1"));
     assert_eq!(json(&home, &["runners", "order", "cloudflare"]).1["order"], serde_json::json!(["cloudflare"]));
+    // Said to a person: the order, and what it took out; with one label, none shown as the examples', with two the first.
+    let ordered = text(&["runners", "order", "cloudflare"]);
+    assert!(ordered.contains("Order: cloudflare.") && ordered.contains("Taken out: "), "{ordered}");
+    assert!(!text(&["labels", "list"]).contains("(shown in examples)"));
+    text(&["labels", "create", "second"]);
+    assert_eq!(text(&["labels", "list"]).matches("(shown in examples)").count(), 1);
+    text(&["labels", "delete", "second"]);
     let status = json(&home, &["status"]).1;
     assert_eq!(status["signed_in"], "AWS account 111111111111");
     assert!(text(&["status"]).contains("AWS account 111111111111"));
@@ -1366,6 +1373,9 @@ fn changes_are_checked_before_they_are_made_and_githubs_deliveries_are_said_as_g
     let (code, refused) = said(&["machine", "update", "--os=windows", "--image=ubuntu24"]);
     assert!(code == Some(2) && refused.starts_with("superci: image=ubuntu24 is an Ubuntu for Linux machines, and the label says os=windows\n"), "{refused}");
     assert_eq!(said(&["runners", "update", "cloudflare", "--networks=none", "--dry-run"]), (Some(0), "Would update cloudflare: --networks=none. Nothing was changed.\n".to_string()));
+    // (AWS's own networks taken away: none, as said.)
+    let (code, cleared) = said(&["runners", "update", "aws", "--networks=none"]);
+    assert_eq!(code, Some(0), "{cleared}");
     // (AWS has no policy of the role's: all of it is lacking.)
     served.aws.fail("GetRolePolicy", 404, "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><Error><Type>Sender</Type><Code>NoSuchEntity</Code><Message>The role policy with name runner-machines cannot be found.</Message></Error><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ErrorResponse>", None);
     let (code, would) = said(&["planes", "allow", "--dry-run"]);

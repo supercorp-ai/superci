@@ -13574,6 +13574,17 @@ mod runs_suite_in_browser {
         super::seen_in_browser(&served);
     }
 
+    /// A job nothing can run (macOS): followed, it is said as ended with the control plane's word for why.
+    #[test]
+    fn a_followed_job_nothing_can_run_is_said_as_ended_with_why() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  mac:\n    runs-on: superci/os=macos\n    steps:\n      - run: echo\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("ended: failure: ") && said.contains("macOS"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_run_asked_for_in_each_way_it_cannot_be_is_said_and_one_of_two_jobs_is_followed_without_its_logs_wait() {
         let served = serve(|_| {});
