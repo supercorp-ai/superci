@@ -7815,6 +7815,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         the_order_launchers_and_lists_change_by_item_and_keep_what_others_changed,
         a_settings_write_that_is_not_one_or_too_long_is_refused,
         settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
+        a_field_changed_by_hand_in_the_clouds_copy_is_taken_alone,
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
         a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,
