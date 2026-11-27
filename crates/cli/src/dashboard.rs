@@ -3254,7 +3254,8 @@ impl Dashboard {
                 if !which.is_empty() { setting["id"] = which.clone().into() }
                 self.put_secret(&plane, &if which.is_empty() { "GITLAB".to_string() } else { format!("GITLAB_{which}") }, &setting.to_string())?;
                 let (w, u) = (which.clone(), url.clone());
-                wait_for(plane.url(), &self.status_key, move |s| if w.is_empty() { s["gitlab"]["url"] == u.as_str() } else { s["gitlabs"].as_array().is_some_and(|l| l.iter().any(|g| g["id"] == w.as_str() && g["url"] == u.as_str())) });
+                // (Shown by the control plane, or said as not: never taken as connected when it did not take it.)
+                self.shown(&plane, move |s| if w.is_empty() { s["gitlab"]["url"] == u.as_str() } else { s["gitlabs"].as_array().is_some_and(|l| l.iter().any(|g| g["id"] == w.as_str() && g["url"] == u.as_str())) })?;
                 // Connected again: its webhooks get the new secret.
                 if before { let _ = cloudflare::plane_post(plane.url(), &self.status_key, "/gitlab/projects", &serde_json::json!({ "refresh": true, "gitlab": which })); }
                 eprintln!("GitLab connected as {me}");
@@ -8637,6 +8638,8 @@ mod tests {
         // A deploy that stopped on one says it so, and offers choosing another place.
         *lock(&d.deploying) = Some(Deploy { cloud: "aws", place: "account 111111111111 · us-east-1".into(), steps: &aws_plane::DEPLOY_STEPS, at: 0, form: vec![("region", "us-east-1".into())], result: Some(Err(refused.into())) });
         let stopped = d.plane_page();
+        // (In AWS's row alone: the other providers' rows stay as they were.)
+        assert_eq!(stopped.matches("Setting up in").count(), 1, "{stopped}");
         assert!(stopped.contains("AWS refuses this (ec2:DescribeVpcs) in N. Virginia (us-east-1) for the whole account") && !stopped.contains("explicit deny") && stopped.contains(r#"<form method="post" action="/plane/start-over"><button class="button secondary">Choose another place</button></form>"#), "{stopped}");
         let r = d.handle(&Req { method: "POST".into(), path: "/plane/start-over".into(), query: vec![], cookie: None, last: None, body: vec![], host: String::new(), origin: None, fetch_site: None }).unwrap();
         assert!(r.status == 303 && lock(&d.deploying).is_none() && d.plane_page().contains("Set up a control plane"));
@@ -10072,6 +10075,8 @@ mod tests {
             preview(&format!("skeleton-{section}"), &page);
             assert!(page.contains("Reading your control plane"), "{section}");
         }
+        // (Workflows in its own: the default machine's card first.)
+        assert!(skeleton("workflows", "Workflows").contains(r#"<section class="card dm-card"><div class="default-machine">"#));
     }
 
     #[test]

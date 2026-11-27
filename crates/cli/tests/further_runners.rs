@@ -692,6 +692,8 @@ fn a_second_aws_account_gets_its_runners_with_its_own_sign_in() {
     // Its networks only: a bucket's name is the same in every account, and the CI's one cache is in the first.
     let buckets: Vec<(String, String)> = served.aws.asked.lock().unwrap().iter().filter(|x| x["method"] == "PUT" && x["url"].as_str().is_some_and(|u| u.contains(".s3.") && u.contains("lifecycle"))).map(|x| (x["url"].as_str().unwrap().to_string(), x["target"].as_str().unwrap_or_default().to_string())).collect();
     assert!(buckets.iter().all(|(u, _)| u.contains(&format!("superci-plane-{PLANE}-eu-"))), "{buckets:?}");
+    // (Made in the first account, with its sign-in: the further one's never touches the CI's cache.)
+    common::all_signed_by(&served, &format!("superci-plane-{PLANE}-eu-west-1"), "aws:", "aws:ASIAEXAMPLE");
     let (ok, said) = run(&["runners", "update", "aws-acme", "--max-jobs=3"]);
     assert!(ok, "{said}");
     // Its regions, its own: its connection says them, and the first's stay.

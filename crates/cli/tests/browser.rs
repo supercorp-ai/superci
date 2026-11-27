@@ -3492,6 +3492,11 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
         let (status, _, said) = common::post(&link, "/routing", fields);
         assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{fields:?}: {status}");
     }
+    // One not named at all stays as it was, after those named, each once.
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "order"), ("cloud_0", "aws")]);
+    let routing: serde_json::Value = serde_json::from_str(&setting("ROUTING").unwrap_or_default()).unwrap_or_default();
+    let clouds: Vec<&str> = routing["order"].as_array().into_iter().flatten().filter_map(|p| p["cloud"].as_str()).collect();
+    assert!(status < 400 && clouds.first() == Some(&"aws") && clouds.iter().filter(|c| **c == "aws").count() == 1 && clouds.iter().filter(|c| **c == "cloudflare").count() == 1, "{clouds:?}");
     // The default machine: Windows only on x64.
     let (status, _, said) = common::post(&link, "/machine", &[("os", "windows"), ("arch", "arm64")]);
     assert!(status == 400 && common::words(&said).contains("Windows machines are x64"), "{status} {}", common::words(&said));
