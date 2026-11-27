@@ -772,6 +772,9 @@ pub struct Launcher { pub cloud: String, pub url: String }
 /// an older SuperCI goes on writing: see `Stored::taken`).
 pub const SETTINGS: &str = "settings";
 
+/// What a job's start says before why its runner cannot be handed it (see `advance_run`).
+const JOB_REFUSED: &str = "refused: ";
+
 /// The settings record (see `SETTINGS`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Stored {
@@ -4826,9 +4829,12 @@ impl<'a> ControlPlane<'a> {
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
             for (n, i) in start.iter().enumerate() {
                 if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[*i], &secrets, &wf, &called).await {
+                    // A job its runner cannot be handed: ended as failed, saying why (started again, it would be refused
+                    // again, and the run would never end); the next move on goes past it.
+                    if let Some(why) = e.strip_prefix(JOB_REFUSED) { self.unreserve(&key, &jobs[*i], Some(why)).await; continue }
                     // (It, and those reserved with it not started yet: each pending again, for the next move on.)
-                    self.unreserve(&key, &jobs[*i]).await;
-                    for j in &start[n + 1..] { self.unreserve(&key, &jobs[*j]).await }
+                    self.unreserve(&key, &jobs[*i], None).await;
+                    for j in &start[n + 1..] { self.unreserve(&key, &jobs[*j], None).await }
                     return Err(e)
                 }
             }
@@ -4841,7 +4847,8 @@ impl<'a> ControlPlane<'a> {
     /// A job of a run reserved to start whose start failed before its record was written (a call or the store failed
     /// midway): pending again in the run's record, so that the upkeep, moving the run on, starts it again. (With a
     /// record, the job is the upkeep's to start, as any job left launching; nothing is changed.)
-    async fn unreserve(&self, key: &str, inst: &serde_json::Value) {
+    /// `refused`: why its runner cannot be handed it: ended as failed instead, saying that.
+    async fn unreserve(&self, key: &str, inst: &serde_json::Value, refused: Option<&str>) {
         // (A job reserved to start has both.)
         let (id, token) = (inst["job_id"].as_str().unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
         if !matches!(self.store.get(&format!("job:{id}")).await, Ok(None)) { return }
@@ -4854,9 +4861,13 @@ impl<'a> ControlPlane<'a> {
             let Ok(Some(was)) = self.store.get(key).await else { return };
             let Ok(mut run) = serde_json::from_str::<serde_json::Value>(&was) else { return };
             let Some(j) = run["jobs"].as_array_mut().into_iter().flatten().find(|j| j["token"] == token && j["state"] == "started") else { return };
-            j["state"] = "pending".into();
-            let j = j.as_object_mut().expect("a job found by its token is a map");
-            (j.remove("job_id"), j.remove("token"));
+            if let Some(why) = refused {
+                (j["state"], j["result"], j["error"]) = ("done".into(), "failure".into(), why.chars().take(300).collect::<String>().into());
+            } else {
+                j["state"] = "pending".into();
+                let j = j.as_object_mut().expect("a job found by its token is a map");
+                (j.remove("job_id"), j.remove("token"));
+            }
             if !matches!(self.store.swap(key, Some(&was), run.to_string()).await, Ok(false)) { return }
         }
     }
@@ -4987,7 +4998,9 @@ impl<'a> ControlPlane<'a> {
         let given = crate::runner_service::Given { workflow: &own_text, path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
             access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
             strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone(), inputs: if inst["inputs"].is_object() { inst["inputs"].clone() } else { run["inputs"].clone() } };
-        let message = crate::runner_service::job_message(&given)?;
+        // (Refused: a run made by a control plane from before its steps were checked as it was made. Nothing of the job
+        // is written yet; its run ends it, saying why.)
+        let message = crate::runner_service::job_message(&given).map_err(|e| format!("{JOB_REFUSED}{e}"))?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.as_deref().unwrap_or(key_name).to_string(), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };

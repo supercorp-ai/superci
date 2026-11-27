@@ -4415,6 +4415,53 @@ fn the_secrets_a_ci_keeps_go_to_the_runs_from_a_computer_that_name_them_the_narr
     assert!(!store.0.borrow().values().any(|v| v.contains("token-") || v.contains("npm-")), "nothing of them left once cancelled");
 }
 
+/// What a run from a computer cannot have, sent as it is (an older SuperCI checks none of it): a step its runner
+/// cannot be handed, refused saying the job and line; a limit of jobs at once that is no number, in a workflow a job
+/// calls, refused saying which job; nothing made. A run an older control plane made with such a step: its job ends
+/// failed, saying why, and the run ends (it was started again and again, and the run never ended).
+#[test]
+fn what_a_run_cannot_have_is_refused_as_it_is_made_and_a_run_made_before_with_it_ends_that_job() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let ask = |body: serde_json::Value| run(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(body.to_string()));
+    let runs = || store.0.borrow().keys().filter(|k| k.starts_with("run:")).count();
+    let refused = "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - id: a\n        run: sleep 1\n        background: true\n      - wait: [a]\n        if: always()\n";
+    let r = ask(serde_json::json!({ "workflow": refused, "path": ".github/workflows/ci.yml", "repository": "acme/app" }));
+    assert!(r.status == 400 && r.body_text().starts_with("the job t: line 8: a `wait` step always runs; it takes no `if`"), "{}", r.body_text());
+    let called = "on: workflow_call\njobs:\n  t:\n    runs-on: superci\n    strategy:\n      max-parallel: none\n      matrix:\n        n: [1, 2]\n    steps:\n      - run: echo\n";
+    let r = ask(serde_json::json!({ "workflow": "jobs:\n  c:\n    uses: ./.github/workflows/called.yml\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "called": { ".github/workflows/called.yml": called } }));
+    assert!(r.status == 400 && r.body_text().contains("the job c / t's max-parallel is not a number of jobs"), "{}", r.body_text());
+    assert_eq!(runs(), 0, "nothing made");
+    // Made before steps were checked: the second job's step, as its record keeps it, is one its runner cannot be handed.
+    let made = ask(serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    needs: a\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app" }));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let key = format!("run:{run_id}");
+    let mut kept: serde_json::Value = serde_json::from_str(&store.0.borrow()[&key]).unwrap();
+    kept["workflow"] = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    needs: a\n    runs-on: superci\n    steps:\n      - id: s\n        run: sleep 1\n        background: true\n      - wait: [s]\n        if: always()\n".into();
+    store.0.borrow_mut().insert(key.clone(), kept.to_string());
+    let record = || -> serde_json::Value { serde_json::from_str(&store.0.borrow()[&key]).unwrap() };
+    let token = record()["jobs"][0]["token"].as_str().unwrap().to_string();
+    for line in include_str!("fixtures/runner/runner-requests.jsonl").lines() {
+        let r: serde_json::Value = serde_json::from_str(line).unwrap();
+        let path = r["path"].as_str().unwrap().trim_start_matches("/runner/server");
+        let mut req = Request::new(r["method"].as_str().unwrap(), &format!("{PLANE_URL}/runner/{token}{path}"));
+        req.body = r["request"].as_str().unwrap().as_bytes().to_vec();
+        run(req);
+    }
+    let b = record()["jobs"][1].clone();
+    assert_eq!((b["state"].as_str(), b["result"].as_str()), (Some("done"), Some("failure")), "{b}");
+    assert!(b["error"].as_str().unwrap_or_default().starts_with("line 13: a `wait` step always runs; it takes no `if`"), "{b}");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("rjob:") && b["token"].as_str().is_some_and(|t| k.ends_with(t))), "nothing kept for its runner");
+    let status = json(&run(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!((status["over"].as_bool(), status["result"].as_str()), (Some(true), Some("failure")), "{status}");
+}
+
 #[test]
 fn a_run_from_a_computer_of_several_jobs_starts_each_once_what_it_needs_has_ended() {
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
@@ -7816,6 +7863,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_settings_write_that_is_not_one_or_too_long_is_refused,
         settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
         a_field_changed_by_hand_in_the_clouds_copy_is_taken_alone,
+        what_a_run_cannot_have_is_refused_as_it_is_made_and_a_run_made_before_with_it_ends_that_job,
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
         a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,

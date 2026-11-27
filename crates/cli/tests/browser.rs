@@ -19952,6 +19952,22 @@ fn overview_asks_for_the_sign_in_at_once_when_the_key_ended_with_it() {
     assert_eq!(b.eval(r#"!!document.querySelector('main form[action="/aws/signin"] button')"#), serde_json::json!(true));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
+    // Signed in, the key not taken (AWS refuses its write): no sign-in asked for, but why, once the wait is over.
+    let home = common::signed_in(&served);
+    served.aws.params.lock().unwrap().retain(|n, _| !n.contains("/DEVICE_KEY_"));
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k.as_object_mut().unwrap().remove("key");
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.fail("AmazonSSM.PutParameter|DEVICE_KEY_", 400, &superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: ssm:PutParameter"), None);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1")]);
+    b.goto(&link);
+    b.wait(&shows("does not take this computer's key"));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
+    assert!(!page.contains("Sign in to read your control plane"), "{page}");
+    served.aws.fail_none();
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// A workspace whose control plane does not take this computer's key: its Settings still has what is this
