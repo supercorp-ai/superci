@@ -8501,6 +8501,16 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
     served.later(30_000);
     served.upkeep();
     assert!(state(oot)["no_spot"] != true && state(oot)["error"].as_str().unwrap_or_default().contains("out of time"), "{} {}", state(oot)["error"], state(oot)["no_spot"]);
+    // Spot alone, AWS without room and as slow: out of time is what is said, not a wait for a spot machine (it was not
+    // seen that no region had one).
+    fresh();
+    routing(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]"#);
+    let tick = served.ticker();
+    served.aws.during("RunInstances", move || tick(16_000));
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "no"), None);
+    let full = queue("spot full and slow");
+    let said = state(full)["error"].as_str().unwrap_or_default().to_string();
+    assert!(state(full)["state"] == "waiting" && said.contains("(out of time for more tries)") && !said.starts_with("waiting: AWS has no spot machine for it now"), "{}", state(full));
 
 
     // On-demand alone, at the account's limit, a machine of this control plane's ended a moment ago.
@@ -17579,6 +17589,10 @@ fn a_working_trees_parts_are_taken_or_refused_and_no_run_comes_of_them() {
     assert!(status == 200 && said.contains("\"url\":\"https://") && said.contains("\"later\":true"), "{status} {said}");
     let chain = (0..17).map(|i| format!("layer{i:04}")).collect::<Vec<_>>().join(",");
     assert_eq!(send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base={chain}"), vec![]).0, 400);
+    // (Sixteen is as many as a chain may have: taken, its layers looked for.)
+    let sixteen = (0..16).map(|i| format!("layer{i:04}")).collect::<Vec<_>>().join(",");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base={sixteen}"), vec![]);
+    assert!(status == 200 && said.contains("\"base\":false"), "{status} {said}");
     let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base=bgone0123456789"), vec![]);
     assert!(status == 200 && said.contains("\"base\":false"), "a base the bucket no longer has: {status} {said}");
     let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&base=bgone0123456789"), vec![]);

@@ -230,8 +230,7 @@ fn event_payload(root: &Path, text: &str, e: &Event, reference: &str, sha: &str,
         fn over(a: &mut Value, b: Value) { match (a, b) { (Value::Object(a), Value::Object(b)) => for (k, v) in b { over(a.entry(k).or_insert(Value::Null), v) }, (a, b) => *a = b } }
         over(&mut payload, given);
     }
-    let bytes = payload.to_string().len() + inputs.to_string().len();
-    if bytes > superci_core::plane::RUN_EVENT_BYTES { return Err(format!("The event's payload is {} KB; a run takes {} KB at most.", bytes.div_ceil(1024), superci_core::plane::RUN_EVENT_BYTES / 1024)) }
+    if let Some(kb) = superci_core::plane::event_over(&payload, &inputs) { return Err(format!("The event's payload is {kb} KB; a run takes {} KB at most.", superci_core::plane::RUN_EVENT_BYTES / 1024)) }
     Ok((payload, inputs))
 }
 

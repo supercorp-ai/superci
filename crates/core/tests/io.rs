@@ -150,3 +150,48 @@ fn a_machine_is_told_its_work_as_json() {
     assert_eq!(Work::GitLab { url: "https://gitlab.com".into(), token: "t".into() }.json(), serde_json::json!({ "gitlab": { "url": "https://gitlab.com", "token": "t" } }));
     assert_eq!(Work::Fail { jit: "j".into(), why: "w".into() }.json(), serde_json::json!({ "jit": "j", "fail": "w" }));
 }
+
+/// A moment is before another only strictly: what lasts until a moment ends at it. An answer is done only with a
+/// 2xx status: not a redirect, nor anything under 200.
+#[test]
+fn a_moment_is_before_another_only_strictly_and_an_answer_is_done_only_with_a_2xx_status() {
+    use superci_core::io::{before, done};
+    assert!(before(9, 10) && !before(10, 10) && !before(11, 10));
+    assert!(done(200) && done(204) && done(299) && !done(300) && !done(199) && !done(404) && !done(0));
+}
+
+/// The start of a month, around each leap rule: a year a hundred divides is no leap year, one four hundred divides is
+/// (2000, 2400), and the days of each century of the 400-year cycle (checked against Python's calendar).
+#[test]
+fn a_months_start_holds_across_every_leap_rule_of_the_calendar() {
+    for (at, start) in [
+        (951825600000u64, 949363200000u64), // 2000-02-29 12:00
+        (951868800000, 951868800000), // 2000-03-01 00:00
+        (3981312000000, 3978892800000), // 2096-02-29 00:00
+        (4012934400000, 4012934400000), // 2097-03-01 00:00
+        (4102444740000, 4099766400000), // 2099-12-31 23:59
+        (4102444800000, 4102444800000), // 2100-01-01 00:00
+        (4107542340000, 4105123200000), // 2100-02-28 23:59
+        (4107542400000, 4107542400000), // 2100-03-01 00:00
+        (7258075200000, 7255440000000), // 2199-12-31 12:00
+        (7263216000000, 7263216000000), // 2200-03-01 00:00
+        (10387267200000, 10384934400000), // 2299-02-28 00:00
+        (10421567940000, 10418889600000), // 2300-03-31 23:59
+        (13569465540000, 13566787200000), // 2399-12-31 23:59
+        (13574563200000, 13572144000000), // 2400-02-29 00:00
+        (13574649600000, 13574649600000), // 2400-03-01 00:00
+        (13601088000000, 13601088000000), // 2401-01-01 00:00
+    ] {
+        assert_eq!(superci_core::plane::month_start_ms(at), start, "{at}");
+    }
+}
+
+/// An account nothing was spent in comes to nothing, not to minus nothing (an empty sum of floats is -0.0, which a
+/// page would show as "$-0").
+#[test]
+fn an_account_with_no_spend_comes_to_a_plain_zero() {
+    let spent = superci_core::plane::Records::default().account_spend([("modal", 2.5)], "aws");
+    assert!(spent == 0.0 && spent.is_sign_positive(), "{spent}");
+    assert_eq!(superci_core::plane::dollars(spent), "$0");
+    assert_eq!(superci_core::plane::Records::default().account_spend([("aws", 1.5), ("aws-on-demand", 1.0), ("modal", 4.0)], "aws"), 2.5);
+}

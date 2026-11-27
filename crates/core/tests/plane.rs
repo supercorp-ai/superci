@@ -769,11 +769,13 @@ fn a_machine_whose_runner_waits_while_github_keeps_its_job_queued_is_ended_and_t
     assert_eq!(held["held_until_ms"].as_u64(), Some(clock.0.get() + 10 * 60_000));
     assert!(held["earlier_usd"].as_f64().unwrap_or(0.0) > 0.0, "what its machine cost stays in the job's");
     assert!(clouds.0.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://api.github.com/orgs/acme/actions/runners/5"), "its runner withdrawn");
-    // Held: no machine for ten minutes, however often the sweep comes by.
+    // Held: no machine for ten minutes, however often the sweep comes by; a job that still needs care, it looks again
+    // in a minute (not five, as with nothing going).
     for _ in 0..3 {
         clock.0.set(clock.0.get() + 3 * 60_000);
         block_on(plane.alarm()).unwrap();
         assert_eq!((starts(), job(&store, 7)["state"].as_str()), (1, Some("waiting")));
+        assert_eq!(wakes.0.borrow().last(), Some(&60_000));
     }
     // Then a machine again, its hold over.
     clock.0.set(clock.0.get() + 2 * 60_000);
@@ -2754,6 +2756,40 @@ impl Http for Logs {
     }
 }
 
+/// Each kind of key ends at the moment it says: a device's, one that reads and one that also starts runs, taken up to
+/// the millisecond before and refused at it. What GitHub said of its deliveries and GitLab's projects are for a key
+/// that reads, and nothing is there for one without.
+#[test]
+fn keys_end_at_the_moment_they_say_and_what_only_a_reader_may_see_is_nothing_without_one() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let hash = |key: &str| superci_core::crypto::sha256_hex(key.as_bytes());
+    let now = FixedClock.now_ms();
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(now, "device-key-ending-now-01".into()), (now + 1, "device-key-ending-later-1".into())];
+    config.read_keys = [("READ_KEY_1790000000_NOW", format!("{}:runs", hash("superci_read_ending-now-key"))), ("READ_KEY_1790000001_LATER", format!("{}:runs", hash("superci_read_ending-later-key")))].iter()
+        .filter_map(|(n, v)| superci_core::plane::read_key(n, v)).collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let ask = |method: &str, path: &str, key: Option<&str>| {
+        let r = Request::new(method, &format!("{PLANE_URL}{path}"));
+        block_on(plane.handle(match key { Some(k) => r.with_header("authorization", &format!("Bearer {k}")), None => r })).status
+    };
+    // A device's key: what only it may do (its keys listed), refused at its moment, taken a millisecond before.
+    assert_eq!((ask("GET", "/keys", Some("device-key-ending-now-01")), ask("GET", "/keys", Some("device-key-ending-later-1"))), (401, 200));
+    // One that reads: the status.
+    assert_eq!((ask("GET", "/status", Some("superci_read_ending-now-key")), ask("GET", "/status", Some("superci_read_ending-later-key"))), (401, 200));
+    // One that also starts runs: a run asked for (refused for what it asks, once the key is taken).
+    let start = |key: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", &format!("Bearer {key}")).with_body("{}"))).status;
+    assert_eq!((start("superci_read_ending-now-key"), start("superci_read_ending-later-key")), (401, 400));
+    // GitHub's deliveries and GitLab's projects: nothing without a key, refused with one that ended, read with one that reads.
+    for path in ["/github/deliveries", "/gitlab/projects"] {
+        assert_eq!(ask("GET", path, None), 404, "{path}");
+        assert_eq!(ask("GET", path, Some("superci_read_ending-now-key")), 401, "{path}");
+        assert_ne!(ask("GET", path, Some("superci_read_ending-later-key")), 404, "{path}");
+    }
+    assert_eq!(ask("GET", "/gitlab/projects", Some("superci_read_ending-later-key")), 409, "no GitLab connected, said as that");
+}
+
 #[test]
 fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
     let (store, clouds, wakes, cache) = (Mem::default(), Logs(FakeClouds::default()), Wakes::default(), Cache::default());
@@ -3994,6 +4030,8 @@ fn a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine() {
         };
         block_on(futures::future::join(sweep, beginning));
         if at == 0 { steps = gate.n.get(); at = 1; assert!(steps > 5, "{steps} steps"); continue }
+        // (At once: what the sweep wrote over the event kept that its runner began, not only what later sweeps find.)
+        assert_eq!(job(&store, 7)["seen_in_progress"], true, "begun at step {at} of {steps}");
         gate.at.set(usize::MAX);
         for ms in [1_000, 61_000, 600_000] { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap(); }
         let j = job(&store, 7);
@@ -7058,6 +7096,62 @@ fn a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_a
     assert!(log["log"].as_str().is_some_and(|l| l.contains("odd time") && !l.contains(" cut")), "{log}");
 }
 
+/// A GitHub job's pages are read from the newest back until about a megabyte is had: a newest page of just that much
+/// is all that is read, the one before it left out.
+#[test]
+fn a_github_jobs_log_reads_its_newest_pages_back_to_a_megabyte_and_no_further() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    store.0.borrow_mut().insert("job:8".into(), serde_json::json!({ "job_id": 8, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    let line = "2026-10-16T21:18:47.0000000Z newer\n";
+    let mut newer = line.repeat(999_999 / line.len());
+    newer.push_str(&format!("2026-10-16T21:18:48.0000000Z {}\n", "x".repeat(999_999 - newer.len() - 30)));
+    assert_eq!(newer.len(), 999_999);
+    store.0.borrow_mut().insert("glive:8:tl_x_1.log:0000000000001:000".into(), STANDARD.encode("2026-10-16T21:18:46.0000000Z older\n"));
+    store.0.borrow_mut().insert("glive:8:tl_x_1.log:0000000000002:000".into(), STANDARD.encode(&newer));
+    let log = json(&block_on(plane.handle(get("/job/log?id=8").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    let text = log["log"].as_str().unwrap_or_default();
+    assert!(text.contains(" newer") && !text.contains(" older"), "{}", &text[..text.len().min(300)]);
+}
+
+/// A run's lines are answered in parts of about a megabyte and a half: posts are taken until more than that is had (a
+/// post that brings it to just that much is not the last), the rest left for the next ask. Its event, with its inputs,
+/// is taken up to 64 KB, and refused a byte past.
+#[test]
+fn a_runs_lines_come_in_parts_and_its_event_is_taken_up_to_its_limit() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    store.0.borrow_mut().insert("run:51".into(), serde_json::json!({ "at_ms": t, "jobs": [{ "key": "a", "state": "started", "token": "tok-lines-0123456789" }] }).to_string());
+    let post = |n: usize, size: usize| {
+        let head = serde_json::json!({ "step": "s", "lines": [format!("line {n}")] }).to_string();
+        let v = serde_json::json!({ "step": "s", "lines": [format!("line {n}{}", "x".repeat(size - head.len()))] }).to_string();
+        assert_eq!(v.len(), size);
+        store.0.borrow_mut().insert(format!("rline:tok-lines-0123456789:{n:04}"), v);
+    };
+    (post(1, 1_500_000), post(2, 100), post(3, 100));
+    let status = json(&block_on(plane.handle(key(get("/runs/51")))));
+    let job = &status["jobs"][0];
+    assert_eq!((job["posts"].as_array().map(Vec::len), job["next"].as_u64()), (Some(2), Some(2)), "{}", &job.to_string()[..300]);
+    // The event: 64 KB with its inputs taken, a byte more refused, said in KB.
+    let ask = |extra: usize| {
+        let pad = "y".repeat(superci_core::plane::RUN_EVENT_BYTES - serde_json::json!({ "p": "" }).to_string().len() - "null".len() + extra);
+        block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "event": { "p": pad } }).to_string()))))
+    };
+    let over = ask(1);
+    assert!(over.status == 400 && over.body_text().contains("its event's payload is 65 KB; a run takes 64 KB at most"), "{}", over.body_text());
+    let at = ask(0);
+    assert!(!at.body_text().contains("its event's payload"), "{}", at.body_text());
+}
+
 #[test]
 fn a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine() {
     // GitLab's job: its event answered with the store's failure; the look for jobs GitLab did not tell of finds it.
@@ -7864,6 +7958,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
         a_field_changed_by_hand_in_the_clouds_copy_is_taken_alone,
         what_a_run_cannot_have_is_refused_as_it_is_made_and_a_run_made_before_with_it_ends_that_job,
+        keys_end_at_the_moment_they_say_and_what_only_a_reader_may_see_is_nothing_without_one,
+        a_github_jobs_log_reads_its_newest_pages_back_to_a_megabyte_and_no_further,
+        a_runs_lines_come_in_parts_and_its_event_is_taken_up_to_its_limit,
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
         a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,
