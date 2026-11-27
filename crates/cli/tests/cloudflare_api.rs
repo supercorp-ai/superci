@@ -204,14 +204,15 @@ fn cloudflare_then_modal(workspace: &str) {
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222"]);
     assert!(!ok && said.contains("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."), "{said}");
     // Named, the control plane listed a moment before but not answering when asked whether it has AWS runners yet:
-    // stopped there, nothing made. (Each of the command's calls dropped in turn, checked only: one is that question.)
+    // stopped there, nothing made. (Its health calls run beside others in no fixed order, so every call from one of
+    // them on fails: from the last ones on, the listing has answered and that question has not.)
     let ask = ["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1", "--dry-run"];
     served.aws.faults.arm(superci_testkit::Fault::None);
     let _ = run("", &ask);
     served.aws.faults.stop();
     let healths: Vec<usize> = served.aws.faults.calls().iter().enumerate().filter(|(_, c)| c.contains("superci.acme.workers.dev/health")).map(|(i, _)| i + 1).collect();
-    let stopped = healths.iter().find_map(|k| {
-        served.aws.faults.arm(superci_testkit::Fault::Dropped(*k));
+    let stopped = healths.iter().rev().find_map(|k| {
+        served.aws.faults.arm(superci_testkit::Fault::Outage(*k));
         let (ok, said) = run("", &ask);
         served.aws.faults.stop();
         said.contains("The control plane did not answer whether it has AWS runners yet").then_some((ok, said))
