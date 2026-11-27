@@ -1190,10 +1190,21 @@ fn of_job<'a>(jobs: &'a [serde_json::Value], n: &str) -> Vec<&'a serde_json::Val
 /// another workflow of the repository (`called`, by path) stands for that workflow's jobs, each a job of the run
 /// (`caller / job`) after the jobs the caller needs, with the inputs and secrets the caller gives (see `advance_run`).
 /// What cannot be run from a computer is refused, saying why.
-fn run_jobs<'a>(wf: &crate::workflow::Node, names: impl Iterator<Item = &'a String>, called: &std::collections::BTreeMap<String, String>) -> std::result::Result<Vec<serde_json::Value>, String> {
+fn run_jobs<'a>(wf: &crate::workflow::Node, path: &str, names: impl Iterator<Item = &'a String>, called: &std::collections::BTreeMap<String, String>) -> std::result::Result<Vec<serde_json::Value>, String> {
+    // (Its steps as its runner is handed them, made now: a step that cannot be refuses the run, saying which, before
+    // anything starts. Made only when the job starts, it was never started, and the run never ended.)
+    // (A matrix's `max-parallel` written as a number: one that is none refuses the run. An expression is read as the
+    // job starts; one that comes to no number then sets no limit.)
+    let most_at_once = |job: &crate::workflow::Node, said: &str| match job.get("strategy").and_then(|s| s.get("max-parallel")).and_then(|n| n.text()) {
+        Some(t) if !t.contains("${{") && !t.trim().parse::<f64>().is_ok_and(|m| m >= 1.0) => Err(format!("the job {said}'s max-parallel is not a number of jobs")),
+        _ => Ok(()),
+    };
+    let steps = |w: &crate::workflow::Node, path: &str, key: &str, said: &str| crate::workflow::job_parts(w, path, key, &mut String::new).map(|_| ()).map_err(|e| if e.starts_with("line ") { format!("the job {said}: {e}") } else { e });
     let lists = names.map(|name| {
         let job = wf.get("jobs").and_then(|j| j.get(name)).cloned().unwrap_or(crate::workflow::Node::Scalar { text: String::new(), plain: true, line: 0, col: 0 });
         let Some(uses) = job.get("uses").and_then(|u| u.text()) else {
+            steps(wf, path, name, name)?;
+            most_at_once(&job, name)?;
             let (later, combos) = combinations(&job).map_err(|e| format!("the job {name}: {e}"))?;
             let total = combos.len();
             return Ok(combos.into_iter().enumerate().map(|(index, matrix)| serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending", "matrix_later": later })).collect())
@@ -1207,6 +1218,8 @@ fn run_jobs<'a>(wf: &crate::workflow::Node, names: impl Iterator<Item = &'a Stri
         let theirs = workflow.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default().into_iter().map(|(ck, cj)| {
             let cname = ck.text().unwrap_or_default().to_string();
             if cj.get("uses").is_some() { return Err(format!("{path}'s job {cname} calls a workflow in turn: not run from a computer yet")) }
+            steps(&workflow, path, &cname, &format!("{name} / {cname}"))?;
+            most_at_once(&cj, &format!("{name} / {cname}"))?;
             let internal: Vec<String> = crate::workflow::needs(&cj).iter().map(|n| format!("{name}/{n}")).collect();
             let (later, combos) = combinations(&cj).map_err(|e| format!("{path}'s job {cname}: {e}"))?;
             let total = combos.len();
@@ -4567,7 +4580,7 @@ impl<'a> ControlPlane<'a> {
             i += 1;
         }
         let now = self.clock.now_ms();
-        let instances = match run_jobs(&wf, names.iter().filter(|n| wanted.contains(n)), &r.called) { Ok(i) => i, Err(e) => return Ok(Response::text(400, &e)) };
+        let instances = match run_jobs(&wf, &r.path, names.iter().filter(|n| wanted.contains(n)), &r.called) { Ok(i) => i, Err(e) => return Ok(Response::text(400, &e)) };
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
         let run_id = local_id();
         // The secrets this CI keeps that the run may have (see `secrets`): those its workflows name, whose scope holds
@@ -4755,6 +4768,14 @@ impl<'a> ControlPlane<'a> {
                     jobs[i]["name"] = match &call { Some(caller) => format!("{caller} / {name}"), None => name }.into();
                     jobs[i]["needs_said"] = serde_json::Value::Object(needs);
                     if runs {
+                        // Its matrix's `max-parallel`: no more of its jobs going at once; the next starts as one ends.
+                        if let Some(t) = job.and_then(|j| j.get("strategy")).and_then(|s| s.get("max-parallel")).and_then(|n| n.text()) {
+                            let most = read_text(t, &c).ok().and_then(|v| crate::expression::text(&v).trim().parse::<f64>().ok()).filter(|m| *m >= 1.0).map(|m| m as usize);
+                            if let Some(most) = most {
+                                jobs[i]["max_parallel"] = most.into();
+                                if jobs.iter().filter(|o| o["state"] == "started" && o["key"] == jobs[i]["key"]).count() >= most { continue }
+                            }
+                        }
                         // Its `timeout-minutes` and `continue-on-error`, read now (either may be an expression).
                         if let Some(t) = job.and_then(|j| j.get("timeout-minutes")).and_then(|n| n.text()) {
                             let minutes = crate::expression::text(&read_text(t, &c)?).trim().parse::<f64>().map_err(|_| format!("the job {key_name}'s timeout-minutes is not a number"))?;
@@ -4837,7 +4858,7 @@ impl<'a> ControlPlane<'a> {
         // (A called workflow's job: what its caller gives; else a manual start's.)
         c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else { run["inputs"].clone() });
         c.insert("matrix".into(), job["matrix"].clone());
-        c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": job["total"] }));
+        c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": if job["max_parallel"].is_u64() { &job["max_parallel"] } else { &job["total"] } }));
         c.insert("needs".into(), serde_json::Value::Object(needs.clone()));
         c
     }

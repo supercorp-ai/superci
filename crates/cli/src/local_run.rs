@@ -245,6 +245,7 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     let (sha, actor) = (git(&root, &["rev-parse", "HEAD"]).unwrap_or_default(), git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()));
     let (payload, inputs) = event_payload(&root, &text, event, &reference, &sha, &actor)?;
     new_enough(crate::cloudflare::health(plane).as_ref().and_then(|h| h["version"].as_str()))?;
+    steps_read(&path, &text)?;
     if how.dry_run { return dry_run(&root, &path, &text, job) }
     let http = crate::aws::Blocking::new();
     let call = |method: &str, at: &str, body: Vec<u8>| -> Result<Value> {
@@ -377,6 +378,18 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     let followed = follow(plane, key, &run, how, std::time::Instant::now(), true, say);
     sent(sending)?;
     followed
+}
+
+/// Each job's steps, as its runner would be handed them, read before anything is sent: one that cannot be (a `wait`
+/// step with an `if`, say) refuses the run, saying where, as GitHub refuses a workflow file with such a step. (The
+/// control plane read them only as each job started: that job was never started, and the run never ended.)
+fn steps_read(path: &str, text: &str) -> Result<()> {
+    let wf = superci_core::workflow::parse(text).map_err(|e| format!("{path}: {e}"))?;
+    for (k, j) in wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default() {
+        let Some(name) = k.text().filter(|_| j.get("uses").is_none()) else { continue };
+        superci_core::workflow::job_parts(&wf, path, name, &mut String::new).map_err(|e| if e.starts_with("line ") { format!("{path}, the job {name}: {e}.") } else { format!("{}{}.", &e[..1].to_uppercase(), &e[1..]) })?;
+    }
+    Ok(())
 }
 
 /// `superci runs create --dry-run`: what would run, after what can be checked here was (the workflow, its job, the

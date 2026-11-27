@@ -13506,6 +13506,8 @@ mod runs_suite_in_browser {
             (job("    steps:\n      - run: echo\n        id: a\n      - wait: [b]\n"), &[], false),
             (job("    steps:\n      - wait: [a]\n        run: echo\n"), &[], false),
             (job("    steps:\n      - wait-all: true\n        if: always()\n"), &[], false),
+            // (A background step with an `if`, and the `wait` for it with one too, as written in a run that was dropped.)
+            (job("    steps:\n      - id: a\n        run: sleep 1\n        background: true\n        if: github.event_name == 'push'\n      - wait: [a]\n        if: always()\n"), &[], false),
             (job("    steps:\n      - parallel: []\n"), &[], false),
             (job("    steps:\n      - parallel:\n          - run: echo a\n        name: two keys\n"), &[], false),
             (job("    steps:\n      - parallel:\n          - parallel:\n              - run: echo\n"), &[], false),
@@ -13531,8 +13533,22 @@ mod runs_suite_in_browser {
             let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
             assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"), "case {i}: {said}");
             if *ok { assert!(o.status.success(), "case {i}: {said}\n{text}") }
+            // A step that cannot be handed to its runner: refused here, saying where, and nothing started. (Started, its
+            // job was never handed out, and the run never ended.)
+            if i <= 9 {
+                assert!(!o.status.success() && !said.contains("started") && (said.contains(".github/workflows/ci.yml, the job t: line ") || said.contains("has no steps")), "case {i}: {said}");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
+        // The same in a workflow a job calls: refused by the control plane as the run is made, saying which job.
+        let called = "on: workflow_call\njobs:\n  t:\n    runs-on: superci\n    steps:\n      - id: a\n        run: sleep 1\n        background: true\n      - wait: [a]\n        if: always()\n";
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  c:\n    uses: ./.github/workflows/called.yml\n"), (".github/workflows/called.yml", called)]);
+        let runs = served.store.under("run:").len();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("the job c / t: line 9: a `wait` step always runs; it takes no `if`"), "{said}");
+        assert_eq!(served.store.under("run:").len(), runs, "no run made");
+        let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
 
@@ -13631,6 +13647,48 @@ mod runs_suite_in_browser {
             assert_eq!(plain(&r.handed(&served)["contextData"]["matrix"]), serde_json::json!({ "shard": shard as f64, "os": "linux" }));
             r.take();
             r.finish("succeeded");
+        }
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn a_matrix_with_max_parallel_starts_no_more_of_its_jobs_at_once_and_the_next_as_one_ends() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  test:\n    runs-on: superci\n    strategy:\n      max-parallel: 2\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.shard }}\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let states = || served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().map(|j| j["state"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        assert_eq!(states(), ["started", "started", "pending"]);
+        let first = runner_of(&served, &run, "test (1)");
+        assert_eq!(plain(&first.handed(&served)["contextData"]["strategy"])["max-parallel"], 2.0);
+        first.take();
+        first.finish("succeeded");
+        // One ended: the third starts, and no more than two are going.
+        let third = runner_of(&served, &run, "test (3)");
+        assert_eq!(states(), ["done", "started", "started"]);
+        for r in [runner_of(&served, &run, "test (2)"), third] { r.take(); r.finish("succeeded"); }
+        let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+        assert!(record["jobs"].as_array().unwrap().iter().all(|j| j["result"] == "success"), "{record}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let with = |most: &str| checkout_with(&[(".github/workflows/ci.yml", format!("jobs:\n  test:\n    runs-on: superci\n    strategy:\n      max-parallel: {most}\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: echo\n").as_str())]);
+        // Written as no number of jobs (none, 0): the run is refused, saying so, and nothing starts.
+        for most in ["none", "0"] {
+            let dir = with(most);
+            let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+            let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success() && said.contains("the job test's max-parallel is not a number of jobs"), "{most}: {said}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // An expression read as the job starts: one that comes to no number of jobs sets no limit, and both start.
+        for most in ["${{ 'x' }}", "${{ 0 }}"] {
+            let dir = with(most);
+            let before: Vec<String> = served.store.under("run:").into_iter().map(|(k, _)| k).collect();
+            let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+            assert!(o.status.success(), "{most}: {}", String::from_utf8_lossy(&o.stderr));
+            let (_, record) = served.store.under("run:").into_iter().find(|(k, _)| !before.contains(k)).unwrap();
+            assert!(record["jobs"].as_array().unwrap().iter().all(|j| j["state"] == "started"), "{most}: {record}");
+            let _ = std::fs::remove_dir_all(&dir);
         }
         super::seen_in_browser(&served);
     }
