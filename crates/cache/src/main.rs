@@ -841,6 +841,15 @@ fn fetch(agent: &ureq::Agent, (link, at, len): &(String, u64, u64)) -> Result<Ve
 mod tests {
     use super::*;
 
+    /// A time as RFC 3339 on each side of every leap rule, as the control plane's calendar says the day.
+    #[test]
+    fn a_time_is_said_on_its_day_across_every_leap_rule() {
+        for days in [0i64, 11_016, 11_017, 47_540, 47_541, 84_005, 84_065, 157_112, 157_113, 157_114, 157_419] {
+            let (y, m, d) = superci_core::plane::civil(days);
+            assert_eq!(rfc3339(days as u64 * 86_400_000 + 3_661_000), format!("{y:04}-{m:02}-{d:02}T01:01:01Z"), "{days}");
+        }
+    }
+
     #[test]
     fn names_and_tokens() {
         assert_eq!(unpercent("AAAA%2FBB%3D%3D"), "AAAA/BB==");

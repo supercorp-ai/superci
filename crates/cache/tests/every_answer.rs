@@ -286,6 +286,9 @@ fn a_runs_artifacts_say_each_answer_of_the_control_plane_as_twirp_does() {
     assert_eq!(artifacts("FinalizeArtifact", json!({ "name": "logs" })).0, 400);
     let (_, made) = twirp(port, COMPUTER_TOKEN, "CacheService", "CreateCacheEntry", json!({ "key": "cached", "version": "v1" }));
     assert_eq!(call(port, "PUT", &path_of(port, &made["signed_upload_url"]), &[], b"tar").0, 201);
+    // (An upload's address takes only a PUT: anything else said as HTTP says it.)
+    let (s, head, _) = call(port, "GET", &path_of(port, &made["signed_upload_url"]), &[], b"");
+    assert!(s == 405 && head.starts_with("http/1.1 405 method not allowed"), "{head}");
     assert_eq!(artifacts("FinalizeArtifact", json!({ "name": "cached" })).1["msg"], "finished before its upload");
     // Begun and finished with nothing uploaded.
     artifacts("CreateArtifact", json!({ "name": "empty" }));
