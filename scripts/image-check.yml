@@ -1,7 +1,8 @@
 # The check a release runs before it moves the image pins (`IMAGE_BUILDS` in crates/core/src/aws.rs): one job on each
 # kind of image, through a control plane updated with the release's build. It tries what a new build broke before:
 # signals inside containers (RunsOn's Ubuntu 26.04 build of 2 November 2026 denied every one), Docker builds and
-# service containers, the cache, and /tmp in RAM on 26.04 as on GitHub. Run it with scripts/image-check.sh.
+# service containers, the cache, and /tmp on the root disk as on GitHub (its 26.04 image had it in RAM until
+# 20 October 2026). Run it with scripts/image-check.sh.
 name: Image check
 on: workflow_dispatch
 
@@ -44,10 +45,10 @@ jobs:
           printf 'FROM ubuntu:24.04\nRUN echo built > /built\nCMD ["cat", "/built"]\n' > "$dir/Dockerfile"
           docker build -q -t image-check "$dir"
           test "$(docker run --rm image-check)" = built
-      - name: /tmp is in RAM on Ubuntu 26.04
+      - name: /tmp is on the root disk, as on GitHub
         run: |
           findmnt -n -o FSTYPE /tmp || true
-          if grep -q 'VERSION_ID="26' /etc/os-release; then test "$(findmnt -n -o FSTYPE /tmp)" = tmpfs; fi
+          test "$(findmnt -n -o FSTYPE /tmp || true)" != tmpfs
       - name: Tools as on GitHub
         run: node --version && python3 --version && git --version && docker compose version
       - name: Cache saved
