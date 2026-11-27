@@ -446,7 +446,7 @@ mod tests {
     fn a_region_is_an_aws_regions_name_said_in_its_place_and_kept_from_the_default_only_for_aws() {
         let parse = |l: &str| Spec::parse(l, "superci").unwrap();
         for ok in ["us-east-1", "ap-southeast-2", "us-gov-west-1", "eu-central-2"] { assert!(aws_region(ok), "{ok}") }
-        for bad in ["us-east", "useast1", "us-east-123", "US-EAST-1", "us--1", "u-east-1", "us-east-1-a-b", "us-east-x"] { assert!(!aws_region(bad), "{bad}") }
+        for bad in ["us-east", "useast1", "us-east-123", "US-EAST-1", "us--1", "u-east-1", "us-east-1-a-b", "us-east-x", "us-east-"] { assert!(!aws_region(bad), "{bad}") }
         let s = parse("superci/region=us-east-2/cpu=8").unwrap();
         assert_eq!((s.label("superci"), s.describe()), ("superci/cpu=8/region=us-east-2".to_string(), "8 CPU, only in us-east-2".to_string()));
         assert_eq!(parse("superci/region=us-east-2/provider=aws").unwrap().label("superci"), "superci/provider=aws/region=us-east-2");

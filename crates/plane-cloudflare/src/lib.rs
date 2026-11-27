@@ -305,9 +305,11 @@ mod tests {
         let own = map(&[("DEVICE_KEY_100_TEST", "device-secret")]);
         let all: BTreeMap<String, String> = settings_and_keys(Some(&fresh), &own).into_iter().collect();
         assert_eq!((all.get("DEVICE_KEY_100_ELSE"), all.get("DEVICE_KEY_100_TEST").map(|v| v.as_str())), (None, Some("device-secret")));
-        // (Nor a read key from settings that do not say they hand them.)
-        let all: BTreeMap<String, String> = settings_and_keys(Some(&map(&[("READ_KEY_100_NEW", "hash-new")])), &own).into_iter().collect();
-        assert_eq!(all.get("READ_KEY_100_NEW"), None);
+        // (Nor a read key from settings that do not say they hand them: its own kept, and its other settings left
+        // to the ones handed over.)
+        let own = map(&[("DEVICE_KEY_100_TEST", "device-secret"), ("READ_KEY_100_OLD", "hash-old"), ("NAME", "older")]);
+        let all: BTreeMap<String, String> = settings_and_keys(Some(&map(&[("READ_KEY_100_NEW", "hash-new"), ("NAME", "acme")])), &own).into_iter().collect();
+        assert_eq!((all.get("READ_KEY_100_NEW"), all.get("READ_KEY_100_OLD").map(|v| v.as_str()), all.get("NAME").map(|v| v.as_str())), (None, Some("hash-old"), Some("acme")));
     }
 
     #[test]

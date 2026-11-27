@@ -203,6 +203,16 @@ fn cloudflare_then_modal(workspace: &str) {
     // Named, with nowhere for its machines to start: said, nothing made.
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222"]);
     assert!(!ok && said.contains("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."), "{said}");
+    // Named, the control plane listed a moment before but not answering when asked whether it has AWS runners yet:
+    // stopped there, nothing made. (Each of the command's calls dropped in turn, checked only: one is that question.)
+    let stopped = (1..=60).find_map(|k| {
+        served.aws.faults.arm(superci_testkit::Fault::Dropped(k));
+        let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1", "--dry-run"]);
+        served.aws.faults.stop();
+        said.contains("The control plane did not answer whether it has AWS runners yet").then_some((ok, said))
+    });
+    let (ok, said) = stopped.expect("one call is the control plane's answer to whether it has AWS runners");
+    assert!(!ok && said.contains("Nothing was made") && !said.contains("let aws run jobs"), "{said}");
     std::fs::write(&file, before.to_string()).unwrap();
     // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
     step("03-cf-containers");

@@ -52,7 +52,7 @@ impl Runtime {
             while q.is_empty() { q = self.queued.wait(q).unwrap() }
             let (id, event) = q.pop_front().unwrap();
             drop(q);
-            answer(&mut stream, &format!("lambda-runtime-aws-request-id: {id}\r\nlambda-runtime-invoked-function-arn: arn:aws:lambda:us-east-1:111111111111:function:{TABLE}\r\n"), &event.to_string());
+            answer(&mut stream, &format!("lambda-runtime-aws-request-id: {id}\r\nlambda-runtime-invoked-function-arn: arn:aws:lambda:us-east-1:111111111111:function:{TABLE}\r\nlambda-runtime-deadline-ms: {}\r\n", now_ms() + 180_000), &event.to_string());
         } else if let Some(rest) = path.strip_prefix("/2018-06-01/runtime/invocation/") {
             let (id, kind) = rest.split_once('/').unwrap_or_default();
             self.answers.lock().unwrap().insert(id.to_string(), (kind.to_string(), serde_json::from_slice(&body).unwrap_or(Value::Null)));

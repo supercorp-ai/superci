@@ -10878,6 +10878,26 @@ mod rest_tests {
             assert_eq!(r.status, 503, "{id}: {}", words_of(&r));
             assert_eq!((d.selected, d.aws.as_ref().map(|a| a.account_id.as_str()), d.modal.as_ref().map(|m| m.workspace.as_str())), (0, Some("111111111111"), Some("acme")), "{id}");
         }
+        // One found in a signed-in account but not kept here: that one is updated (it does not answer: stopped there),
+        // never the one in use.
+        d.found = vec![aws("p4", "111111111111")];
+        let r = send(&mut d, "/plane/update", &[("plane", "p4")]).unwrap();
+        assert_eq!((r.status, d.selected), (503, 0), "{}", words_of(&r));
+    }
+
+    #[test]
+    fn a_move_to_a_control_plane_in_an_aws_account_not_signed_in_to_stops_before_anything_moves() {
+        let mut d = Dashboard::new();
+        let aws = |id: &str, account: &str, url: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: url.into(), plane_id: id.into(), label: "superci".into() };
+        // (Both answer; the new one serves nothing yet, so it takes a move.)
+        let (from, to) = (plane_answering(serde_json::json!({ "jobs": [] })), plane_answering(serde_json::json!({ "jobs": [] })));
+        d.planes = vec![aws("p0", "111111111111", &from), aws("p1", "222222222222", &to)];
+        d.aws = Some(aws::Session::for_test("111111111111"));
+        crate::aws::clouds::with(&crate::aws::clouds::closed(), || {
+            let said = send(&mut d, "/plane/move", &[("plane", "p1")]).err().unwrap_or_default();
+            assert!(said.contains("Sign in with AWS to account 222222222222 first"), "{said}");
+        });
+        assert!(lock(&d.moving).is_none(), "nothing moved");
     }
 
     #[test]
@@ -11425,6 +11445,9 @@ mod rest_tests {
         // A disk at a speed of its own; a week's usage with none.
         let card = plain(&machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "machine": { "disk_mibs": 500 } }))).0);
         assert!(card.contains("500 MiB/s disk"), "{card}");
+        // Held to a region the control plane no longer says it is in: still a choice in its dialog, where it is set.
+        let card = machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "aws_regions": ["us-east-1"], "machine": { "region": "eu-west-1" } }))).0;
+        assert!(card.contains(r#"<option value="us-east-1""#) && card.contains(r#"<option value="eu-west-1" selected>"#), "{card}");
         let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [], "usage": { "day": { "jobs": 0 } } }));
         assert!(plain(&overview_cards(&v, &[serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": 1 })], "day")).contains("No jobs in the last 24 hours"));
         // Docker's images kept, and Cloudflare's place where its location is not said.

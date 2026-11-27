@@ -245,7 +245,8 @@ jobs:
   # one fails. A share that runs out of time saves what it decided; the next pass runs the rest.
   mutants:
     needs: [prepare, merge]
-    if: ${{ inputs.tests == 'all' && inputs.mutants != 'none' && needs.merge.result == 'success' }}
+    # (always(): merge follows the shard job, skipped when every test runs, and a skip upstream skips this too.)
+    if: ${{ always() && inputs.tests == 'all' && inputs.mutants != 'none' && needs.merge.result == 'success' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 350
     strategy:
