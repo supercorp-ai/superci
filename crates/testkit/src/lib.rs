@@ -280,6 +280,9 @@ impl Served {
     pub fn answers_to_come(&self) -> usize { self.aws.answers_next.lock().unwrap().1.len() }
 }
 
+/// Whether a control plane's settings turn its own containers on (`CONTAINERS` = `on`).
+pub fn containers_on(settings: &[(String, String)]) -> bool { settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on") }
+
 /// The control plane's id, and the AWS account and region it is in.
 pub const PLANE: &str = "testplane0001";
 pub const ACCOUNT: &str = "111111111111";
@@ -325,7 +328,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
                     .map(|(k, v)| (if k == "AGENTS" { "LAUNCHERS".into() } else { k.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1) }, v)).collect();
             }
             // (Its machines are its own containers, as a Cloudflare or Modal control plane's are: on until removed.)
-            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.containers = containers_on(&settings);
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
@@ -1318,7 +1321,7 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
-            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.containers = containers_on(&settings);
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &ending, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
@@ -1399,7 +1402,7 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
-            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.containers = containers_on(&settings);
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &left, config: &config, cache: &cache, containers: Some(&m) };

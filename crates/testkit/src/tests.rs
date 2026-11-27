@@ -595,6 +595,8 @@ fn gitlab_answers_only_for_what_it_has() {
     let (a, _) = lab.pending("a", &["t"], 0);
     let (b, _) = lab.pending("b", &["t"], 0);
     let (_c, _) = lab.pending("c", &["t"], 0);
+    // (A job there is: given in its own project, not in another.)
+    assert_eq!((call("GET", &format!("projects/{project}/jobs/{a}")), call("GET", &format!("projects/1/jobs/{a}"))), (Some(200), None));
     lab.running_on(a, 7, 0);
     lab.running_on(b, 8, 0);
     lab.finish(b, "success", "", 0);
@@ -668,4 +670,15 @@ fn each_account_kept_apart_keeps_its_own() {
     let put = |account: &str, v: &str| http(&aws.url, "PUT", &format!("/api.cloudflare.com/client/v4/accounts/{account}/workers/scripts/superci/secrets"), &[("authorization", "Bearer t")], json!({ "name": "ROUTING", "text": v, "type": "secret_text" }).to_string().as_bytes()).0;
     assert_eq!((put("1111", "one"), put("2222", "two")), (200, 200));
     assert_eq!((aws.worker_settings("superci"), aws.worker_settings_in("2222", "superci")), (vec![("ROUTING".to_string(), "one".to_string())], vec![("ROUTING".to_string(), "two".to_string())]));
+}
+
+/// Answers queued to come are counted until given; a control plane's containers are on only as `CONTAINERS` = `on`.
+#[test]
+fn answers_to_come_are_counted_and_containers_are_on_only_as_said() {
+    let served = serve(|_| {});
+    served.then_answer("/never-asked", &[("/status", &["active"]), ("/status", &[])]);
+    assert_eq!(served.answers_to_come(), 2);
+    let s = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    assert!(crate::containers_on(&s(&[("CONTAINERS", "on")])));
+    assert!(!crate::containers_on(&s(&[("CONTAINERS", "off"), ("OTHER", "on")])) && !crate::containers_on(&[]));
 }
