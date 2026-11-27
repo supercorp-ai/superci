@@ -292,6 +292,26 @@ fn a_jobs_write_dynamodb_refuses_is_no_job_known_before() {
     assert!(item(&aws, &format!("job:{id}")).is_some());
 }
 
+/// DynamoDB leaving every key of a batch read unprocessed, every time: asked eight times, then each read on its own; the
+/// sweep ends, and the job is still there.
+#[test]
+fn a_batch_read_dynamodb_never_processes_is_read_key_by_key() {
+    let aws = aws();
+    let github = aws.github.lock().unwrap().clone().unwrap();
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string());
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("RUNNER_REGION", "us-east-1"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let (id, (body, signature)) = github.queue("tests", "superci/cpu=2", now_ms());
+    let event = url_event("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": signature, "content-type": "application/json" }), &String::from_utf8(body).unwrap());
+    assert_eq!(runtime.invoke(event).1["statusCode"].as_u64(), Some(202));
+    let unprocessed = json!({ "Responses": { TABLE: [] }, "UnprocessedKeys": { TABLE: { "Keys": [{ "p": { "S": "job" }, "k": { "S": format!("job:{id}") } }] } } });
+    aws.fail("DynamoDB_20120810.BatchGetItem", 200, &unprocessed.to_string(), None);
+    let began = Instant::now();
+    assert_eq!(runtime.invoke(json!({ "superci": "sweep" })).1, json!({ "swept": true }));
+    assert!(began.elapsed() < Duration::from_secs(60) && item(&aws, &format!("job:{id}")).is_some());
+}
+
 /// Its settings over several pages of SSM's, one of them not a setting (no value); its instance types from the deploy;
 /// a request with its query, without one, and with a header that is not text; a move's step, read fresh.
 #[test]
