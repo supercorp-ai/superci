@@ -10671,6 +10671,22 @@ mod rest_tests {
         assert!(overview_cards(&v, &[done, failed], "day").contains("1 did not"));
     }
 
+    /// A further AWS account's runners, removed only with that account's sign-in: signed in to it, they are removed
+    /// from their page; signed in to another account only, a sign-in to it is asked for first.
+    #[test]
+    fn a_further_aws_accounts_runners_ask_for_their_own_accounts_sign_in_to_be_removed() {
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [],
+            "accounts": [{ "name": "aws-acme", "provider": "aws", "cloud_id": "222222222222" }], "runners": [{ "name": "aws-acme", "account": "aws-acme" }],
+            "routing": { "order": [{ "cloud": "aws" }, { "cloud": "aws-acme" }] }, "aws_further": [{ "name": "aws-acme", "account_id": "222222222222", "regions": ["eu-west-1"] }] }));
+        let mut d = Dashboard::new();
+        d.aws = Some(aws::Session::for_test("222222222222"));
+        let theirs = plain(&d.runners_page(Some(&v)));
+        d.aws = Some(aws::Session::for_test("111111111111"));
+        let another = plain(&d.runners_page(Some(&v)));
+        assert!(theirs.contains("aws-acme") && !theirs.contains("Sign in with AWS to delete these"), "{theirs}");
+        assert!(another.contains("Sign in with AWS to delete these"), "{another}");
+    }
+
     fn aws_plane(id: &str, url: &str) -> Plane { Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }
     fn cf_plane(id: &str, url: &str) -> Plane { Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme".into(), script: "superci".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }
     fn modal_plane(id: &str, url: &str) -> Plane { Plane::Modal { workspace: "acme".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }

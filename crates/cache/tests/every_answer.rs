@@ -226,6 +226,10 @@ fn githubs_cache_service_says_each_answer_of_the_control_plane_as_github_would()
     assert_eq!(cache(GITHUB_TOKEN, "CreateCacheEntry", json!({ "key": "down", "version": "v1" })).1["ok"], true, "GitHub's own");
     assert_eq!(cache(COMPUTER_TOKEN, "CreateCacheEntry", key.clone()).1, json!({ "ok": false }));
     stand.calm();
+    // Down twice, then up: asked a third time, and the save begins.
+    stand.instead("POST", "/begin", Answer::Json(503, json!({})), Some(2));
+    assert_eq!(cache(COMPUTER_TOKEN, "CreateCacheEntry", json!({ "key": "third-time", "version": "v1" })).1["ok"], true);
+    stand.calm();
     // (An artifact being uploaded beside it, of the same name, is not it.)
     let (_, art) = twirp(port, COMPUTER_TOKEN, "ArtifactService", "CreateArtifact", json!({ "name": "deps" }));
     assert_eq!(call(port, "PUT", &path_of(port, &art["signed_upload_url"]), &[], b"zip").0, 201);
@@ -458,8 +462,10 @@ fn a_download_says_each_answer_of_the_bucket() {
     let gone = superci_testkit::free_port();
     let away = hit(json!([{ "url": format!("http://127.0.0.1:{gone}/o/x"), "size": 10 }]), 10);
     assert!(call(port, "GET", &away, &[], b"").2.len() < 10);
-    // Refused once: asked again, and given.
+    // Refused once, or cut short once: asked again, and given whole.
     stand.instead("GET", "/o/gen/", Answer::Json(503, json!({})), Some(1));
+    assert_eq!(call(port, "GET", &hit(gen(10), 10), &[], b"").2.len(), 10);
+    stand.instead("GET", "/o/gen/", Answer::Raw(b"HTTP/1.1 200 X\r\ncontent-length: 2\r\n\r\nab".to_vec()), Some(1));
     assert_eq!(call(port, "GET", &hit(gen(10), 10), &[], b"").2.len(), 10);
     // A tool's output said larger than its pieces: the download breaks off where they end.
     stand.instead("POST", "/tool-get", Answer::Json(200, json!({ "hit": true, "size": 20, "pieces": gen(10) })), Some(1));
