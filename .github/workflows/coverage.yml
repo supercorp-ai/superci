@@ -110,18 +110,27 @@ jobs:
 
       # (Every test of every crate by its name, the sweeps apart: each part runs every test program, with its own names,
       # so that every part measures the same code; dealt as the end-to-end suites are.)
-      - name: Every test, listed and dealt into twelve parts
+      # (Each test's time as the Test workflow last kept it, or as committed: the parts dealt by it, see below.)
+      - uses: actions/cache/restore@v4
+        if: (inputs.tests || 'all') == 'all'
+        with:
+          path: test-times.json
+          key: test-times-${{ github.run_id }}
+          restore-keys: test-times-
+      - name: Every test, listed and dealt into twelve parts of about the same length
         if: (inputs.tests || 'all') == 'all'
         id: deal-all
         run: |
           cargo test --workspace -- --list --format terse 2>/dev/null | sed -n 's/: test$//p' | sort -u > tests.txt
           wc -l < tests.txt
+          [ -f test-times.json ] || cp .github/test-times.json test-times.json
+          grep -E 'holds?_with_each_call_and_store_operation_failing' tests.txt > sweeps.txt || true
+          grep -v -x -F -f sweeps.txt tests.txt > rest.txt || true
+          python3 .github/test-times.py deal test-times.json rest.txt 12 > parts.json
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
-          import hashlib, json
-          names = open("tests.txt").read().split()
-          sweeps = sorted(n for n in names if "holds_with_each_call_and_store_operation_failing" in n or "hold_with_each_call_and_store_operation_failing" in n)
-          rest = sorted((n for n in names if n not in sweeps), key=lambda n: hashlib.sha256(n.encode()).hexdigest())
-          parts = [{"part": i + 1, "tests": " ".join(rest[i::12]), "sweeps": " ".join(sweeps)} for i in range(12)]
+          import json
+          sweeps = " ".join(sorted(open("sweeps.txt").read().split()))
+          parts = [{"part": i + 1, "tests": " ".join(p), "sweeps": sweeps} for i, p in enumerate(json.load(open("parts.json")))]
           print("parts=" + json.dumps(parts))
           EOF
 
