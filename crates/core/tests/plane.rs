@@ -8196,9 +8196,9 @@ fn a_settings_write_that_is_not_one_or_too_long_is_refused() {
     assert!(p.mem.0.borrow().get("settings").is_none());
 }
 
-/// An older SuperCI writes the cloud's own copy of the settings, knowing no other way: the control plane takes it,
-/// whole, as a new version. An instance that read the copy before (AWS's read it every 15 seconds) does not take
-/// that one back within the minute; a copy written again after is taken.
+/// An older SuperCI (or a hand) writes the cloud's own copy of the settings: the control plane takes what changed in
+/// it, as a new version, and keeps what was changed through it since. An instance that read the copy before (AWS's
+/// read it every 15 seconds) does not take that one back within the minute; a copy written again after is taken.
 #[test]
 fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back() {
     let p = Settled::new(|c| c.routing.max_cpu = Some(16));
@@ -8213,10 +8213,10 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     // As written through it, while its cloud's copy is the one it had.
     let s = read_by(&p, &p.config);
     assert_eq!((s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(90), Some(1)), "{s}");
-    // An older SuperCI wrote the copy: taken, whole.
+    // An older SuperCI wrote the copy: what it changed taken, the time written through the control plane kept.
     p.later(1_000);
     let s = read_by(&p, &instance(&p, 4));
-    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(4), None, Some(2)), "{s}");
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(4), Some(90), Some(2)), "{s}");
     // An instance that has the copy from before: not taken back, within the minute.
     p.later(10_000);
     let s = read_by(&p, &p.config);
@@ -8224,7 +8224,7 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     // Written there again, as it was before, more than a minute on: taken.
     p.later(61_000);
     let s = read_by(&p, &p.config);
-    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(3)), "{s}");
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(90), Some(3)), "{s}");
     // Lost to another write at the same moment: the record as that one left it.
     p.later(61_000);
     p.mem.meddling(|op, k, m| if op == "swap" && k == "settings" { let v = m["settings"].replace("\"version\":3", "\"version\":7"); m.insert("settings".into(), v); });
@@ -8235,6 +8235,49 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     for n in 0..6 { p.later(61_000); read_by(&p, &instance(&p, 20 + n)); }
     let kept: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
     assert_eq!(kept["taken"].as_array().map(|t| t.len()), Some(5));
+}
+
+/// A jobs-at-once limit set by hand in the cloud's own copy (as one did in AWS's Parameter Store) is taken alone:
+/// the limits and launchers set through the control plane since stand. A record from before the copy was kept keeps
+/// it on its next read, and is taken whole until then; a change whose provider was taken out meanwhile, whole too.
+#[test]
+fn a_field_changed_by_hand_in_the_clouds_copy_is_taken_alone() {
+    let p = Settled::new(|c| c.routing.order = vec![Pool::of("aws"), Pool::of("modal")]);
+    assert_eq!(p.write(serde_json::json!([
+        set(&["routing", "order", "modal", "max_jobs"], 5.into(), None),
+        set(&["routing", "max_cpu"], 8.into(), None),
+        set(&["launchers", "modal"], serde_json::json!({ "cloud": "modal", "url": "https://modal.example" }), None),
+    ])).status, 200);
+    let read_by = |config: &Config| {
+        let cache = Cache::default();
+        let plane = ControlPlane { store: &p.mem, http: &p.clouds, clock: &p.clock, timer: &p.wakes, config, cache: &cache, containers: None };
+        json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))
+    };
+    let by_hand = |max: u32| { let mut c = p.config.clone(); c.routing.order[0].max_jobs = Some(max); c };
+    p.later(61_000);
+    let s = read_by(&by_hand(150));
+    let order = |s: &serde_json::Value| (s["routing"]["order"][0]["max_jobs"].as_u64(), s["routing"]["order"][1]["max_jobs"].as_u64(), s["routing"]["max_cpu"].as_u64(), s["launchers"][0]["url"].as_str().map(str::to_string));
+    assert_eq!(order(&s), (Some(150), Some(5), Some(8), Some("https://modal.example".into())), "{s}");
+    // A record from before the copy was kept: its next read keeps the one it took last, and nothing else changes.
+    let before: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+    let mut old = before.clone();
+    old.as_object_mut().unwrap().remove("copy");
+    p.mem.0.borrow_mut().insert("settings".into(), old.to_string());
+    p.later(61_000);
+    let s = read_by(&by_hand(150));
+    let after: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+    assert_eq!((&after, s["settings_version"].as_u64()), (&before, before["version"].as_u64()), "{s}");
+    // Without it, a copy changed there is taken whole (the limits set here go with it), as before it was kept.
+    p.mem.0.borrow_mut().insert("settings".into(), old.to_string());
+    p.later(61_000);
+    let s = read_by(&by_hand(20));
+    assert_eq!(order(&s), (Some(20), None, None, None), "{s}");
+    // A change to a provider the control plane's order no longer has: the copy taken whole.
+    p.later(61_000);
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "order", "aws"], serde_json::Value::Null, None), set(&["routing", "max_cpu"], 4.into(), None)])).status, 200);
+    p.later(61_000);
+    let s = read_by(&by_hand(30));
+    assert_eq!((order(&s).0, s["routing"]["max_cpu"].as_u64()), (Some(30), None), "{s}");
 }
 
 /// A request within ten seconds of a read goes on with what it read (the status sees a write at once); one after reads

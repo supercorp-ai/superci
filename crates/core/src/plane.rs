@@ -781,10 +781,13 @@ pub struct Stored {
     /// Beside `routing` and `launchers`, which an older SuperCI writes whole: it cannot strip these.
     #[serde(flatten)] pub records: Records,
     /// Its cloud's own copy of them as taken (a fingerprint, and when: ms), the newest last. One that differs from
-    /// all of these was written there by an older SuperCI, which knows no other way: it is taken, whole, as that
-    /// version always meant it. One taken in the last minute is a copy an instance read before (AWS's are read every
-    /// 15 seconds), not taken again.
+    /// all of these was written there by an older SuperCI, or by hand: what it changed is taken (see `copy`). One
+    /// taken in the last minute is a copy an instance read before (AWS's are read every 15 seconds), not taken again.
     #[serde(default)] pub taken: Vec<(String, u64)>,
+    /// The newest of those copies (`{ routing, launchers }`): a new one's fields that differ from it are taken, each
+    /// over what the record has, so a field changed there by hand leaves the changes made here since be. Not known
+    /// (a record from before it was kept): the copy is taken whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub copy: Option<serde_json::Value>,
 }
 
 /// The settings as the changes see them (see `settings`).
@@ -1457,6 +1460,9 @@ impl<'a> ControlPlane<'a> {
     /// Its cloud's own copy of the settings (as this instance read it): a fingerprint.
     fn cloud_copy(&self) -> String { crate::crypto::sha256_hex(crate::io::json(&(&self.config.routing, &self.config.launchers)).as_bytes()) }
 
+    /// Its cloud's own copy of the settings, as the changes see them (see `Stored::copy`).
+    fn cloud_doc(&self) -> serde_json::Value { serde_json::json!({ "routing": self.config.routing, "launchers": self.config.launchers }) }
+
     /// The record, with its cloud's copy taken over it when an older SuperCI wrote that copy (one not taken before,
     /// nor in the last minute: see `Stored::taken`). Lost to another write at the same moment: the record as it was
     /// read, for the ten seconds until it is read again.
@@ -1465,9 +1471,19 @@ impl<'a> ControlPlane<'a> {
         let mut stored = read.clone();
         let (copy, now) = (self.cloud_copy(), self.clock.now_ms());
         let newest = stored.taken.last().is_some_and(|(f, _)| *f == copy);
-        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) { return Ok(read) }
+        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) {
+            // (A record from before it kept the copy: the one it took last, kept now, for the next to be taken by its changes.)
+            if !(newest && stored.copy.is_none()) { return Ok(read) }
+            stored.copy = Some(self.cloud_doc());
+            return Ok(if self.store.swap(SETTINGS, Some(&raw), crate::io::json(&stored)).await? { stored } else { read })
+        }
         stored.version += 1;
-        (stored.routing, stored.launchers) = (self.config.routing.clone(), self.config.launchers.clone());
+        // What changed in the copy since the one taken last, over what the record has; whole where that is not known.
+        let doc = self.cloud_doc();
+        let mine = serde_json::json!({ "routing": stored.routing, "launchers": stored.launchers });
+        let changed = stored.copy.as_ref().and_then(|before| crate::settings::apply(&mine, &crate::settings::diff(before, &doc, false)).ok()).and_then(|d| serde_json::from_value::<Document>(d).ok());
+        (stored.routing, stored.launchers) = match changed { Some(d) => (d.routing, d.launchers), None => (self.config.routing.clone(), self.config.launchers.clone()) };
+        stored.copy = Some(doc);
         stored.taken.push((copy, now));
         let n = stored.taken.len();
         stored.taken.drain(..n.saturating_sub(5));
@@ -1478,7 +1494,7 @@ impl<'a> ControlPlane<'a> {
     /// and the record as read. (One that is not settings was refused just before this: see `settled`.)
     async fn settings_now(&self) -> Result<(Stored, Option<String>)> {
         let raw = self.store.get(SETTINGS).await?;
-        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), records: Records::default(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
+        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), records: Records::default(), taken: vec![(self.cloud_copy(), self.clock.now_ms())], copy: Some(self.cloud_doc()) });
         Ok((stored, raw))
     }
 
@@ -1501,7 +1517,7 @@ impl<'a> ControlPlane<'a> {
             };
             let Ok(next) = serde_json::from_value::<Document>(changed) else { return Ok(Response::text(400, "those changes do not make settings SuperCI takes")) };
             if let Some(why) = records_refused(&next.records, &now.records) { return Ok(Response::text(400, &why)) }
-            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, records: next.records, taken: now.taken };
+            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, records: next.records, taken: now.taken, copy: now.copy };
             let written = crate::io::json(&next);
             if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
             if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
