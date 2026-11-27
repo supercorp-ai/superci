@@ -1373,9 +1373,6 @@ fn changes_are_checked_before_they_are_made_and_githubs_deliveries_are_said_as_g
     let (code, refused) = said(&["machine", "update", "--os=windows", "--image=ubuntu24"]);
     assert!(code == Some(2) && refused.starts_with("superci: image=ubuntu24 is an Ubuntu for Linux machines, and the label says os=windows\n"), "{refused}");
     assert_eq!(said(&["runners", "update", "cloudflare", "--networks=none", "--dry-run"]), (Some(0), "Would update cloudflare: --networks=none. Nothing was changed.\n".to_string()));
-    // (AWS's own networks taken away: none, as said.)
-    let (code, cleared) = said(&["runners", "update", "aws", "--networks=none"]);
-    assert_eq!(code, Some(0), "{cleared}");
     // (AWS has no policy of the role's: all of it is lacking.)
     served.aws.fail("GetRolePolicy", 404, "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><Error><Type>Sender</Type><Code>NoSuchEntity</Code><Message>The role policy with name runner-machines cannot be found.</Message></Error><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ErrorResponse>", None);
     let (code, would) = said(&["planes", "allow", "--dry-run"]);

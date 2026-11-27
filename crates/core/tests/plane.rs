@@ -7108,7 +7108,7 @@ fn a_github_jobs_log_reads_its_newest_pages_back_to_a_megabyte_and_no_further() 
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     store.0.borrow_mut().insert("job:8".into(), serde_json::json!({ "job_id": 8, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
     let line = "2026-10-16T21:18:47.0000000Z newer\n";
-    let mut newer = line.repeat(999_999 / line.len());
+    let mut newer = line.repeat((999_999 - 100) / line.len());
     newer.push_str(&format!("2026-10-16T21:18:48.0000000Z {}\n", "x".repeat(999_999 - newer.len() - 30)));
     assert_eq!(newer.len(), 999_999);
     store.0.borrow_mut().insert("glive:8:tl_x_1.log:0000000000001:000".into(), STANDARD.encode("2026-10-16T21:18:46.0000000Z older\n"));
