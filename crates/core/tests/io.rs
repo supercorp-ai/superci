@@ -195,3 +195,12 @@ fn an_account_with_no_spend_comes_to_a_plain_zero() {
     assert_eq!(superci_core::plane::dollars(spent), "$0");
     assert_eq!(superci_core::plane::Records::default().account_spend([("aws", 1.5), ("aws-on-demand", 1.0), ("modal", 4.0)], "aws"), 2.5);
 }
+
+/// A day's calendar date, around each leap rule (checked against Python's calendar).
+#[test]
+fn a_days_date_holds_across_every_leap_rule_of_the_calendar() {
+    use superci_core::plane::civil;
+    for (days, date) in [(0, (1970, 1, 1)), (11016, (2000, 2, 29)), (11017, (2000, 3, 1)), (47540, (2100, 2, 28)), (47541, (2100, 3, 1)), (84005, (2199, 12, 31)), (84065, (2200, 3, 1)), (157112, (2400, 2, 28)), (157113, (2400, 2, 29)), (157114, (2400, 3, 1)), (157419, (2400, 12, 31)), (-1, (1969, 12, 31))] {
+        assert_eq!(civil(days), date, "{days}");
+    }
+}

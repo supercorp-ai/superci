@@ -566,13 +566,8 @@ fn modal_ended_in(workspace: &str) -> String { format!("Modal no longer accepts 
 
 /// A day, as 2026-10-07 (UTC), from unix seconds.
 fn day(unix: u64) -> String {
-    let z = unix as i64 / 86_400 + 719_468;
-    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
-    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 })
+    let (y, m, d) = superci_core::plane::civil(unix as i64 / 86_400);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// When a key ends, from the name it is stored under in a control plane (`DEVICE_KEY_<unix seconds>_<random>`).
@@ -949,7 +944,7 @@ fn asks_said(j: &serde_json::Value) -> String {
         let (kind, spot, what) = (a["kind"].as_str().unwrap_or_default(), a["spot"] == true, a["said"].as_str().unwrap_or_default());
         let market = if spot { "spot " } else { "on-demand " };
         // One request for any of several pools (see `Ask::pools`): what AWS chose among them, or that none had one.
-        if let Some(pools) = a["pools"].as_u64().filter(|p| *p > 0) {
+        if let Some(pools) = a["pools"].as_u64().filter(|p| *p != 0) {
             said.push(match what {
                 "started" => format!("{market}{kind}{}, AWS's choice of {pools} pools", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default()),
                 "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => format!("your account's limit refused {pools} other pools"),
@@ -1028,7 +1023,7 @@ pub fn choice_said(j: &serde_json::Value) -> Option<String> {
 /// making the job to the job running, with how long each step took (ms). What the control plane kept is all that is
 /// said: a job from before, or a machine that could not say its part, has fewer steps.
 pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
-    let n = |v: &serde_json::Value| v.as_u64().filter(|t| *t > 0);
+    let n = |v: &serde_json::Value| v.as_u64().filter(|t| *t != 0);
     let (Some(heard), started) = (n(&j["at_ms"]), n(&j["started_ms"])) else { return serde_json::Value::Null };
     let mut steps: Vec<(String, u64, String)> = vec![];
     let mut step = |what: &str, from: u64, to: u64, more: String| if to >= from && to - from < 86_400_000 { steps.push((what.to_string(), to - from, more)) };
@@ -1194,7 +1189,7 @@ fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
 /// was reached: how many, and where to ask AWS for more.
 fn spot_limit_notice(jobs: &[serde_json::Value]) -> String {
     let since = now_ms().saturating_sub(86_400_000);
-    let hit: Vec<String> = jobs.iter().filter(|j| j["at_ms"].as_u64().is_some_and(|at| at > since)).filter_map(|j| off_spot(j)?.1).collect();
+    let hit: Vec<String> = jobs.iter().filter(|j| j["at_ms"].as_u64().is_some_and(|at| superci_core::io::before(since, at))).filter_map(|j| off_spot(j)?.1).collect();
     let Some(region) = hit.first() else { return String::new() };
     format!(r#"<div class="notice warn"><span>{} in the last day ran on on-demand machines, at about twice the price: your AWS account's spot limit in {} was reached. <a href="{}" target="_blank" rel="noopener">Request more from AWS ↗</a></span></div>"#,
         jobs_word(hit.len() as u32), esc(&region_short(region)), esc(&superci_core::aws::spot_quota_link(region)))
@@ -2068,7 +2063,7 @@ impl Dashboard {
         if let (Some(region), true) = (look.asked_in.as_deref(), look.spot_cpus.is_some() || look.on_demand_cpus.is_some()) {
             let n = |cpus: Option<u32>| cpus.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             let (limit, code) = if spot_refused { (look.on_demand_cpus, superci_core::aws::ON_DEMAND_CPU_QUOTA) } else { (look.spot_cpus, superci_core::aws::SPOT_CPU_QUOTA) };
-            let jobs = limit.map(|c| if c < 8 { "One job of the default size at a time".to_string() } else { format!("{} jobs of the default size at a time", c / 4) }).unwrap_or_default();
+            let jobs = limit.map(default_jobs_at_once).unwrap_or_default();
             // Spot and on-demand are raised apart: one button, each in its menu (only the one jobs can use, when the
             // other is refused).
             let on_demand_refused = matches!(look.on_demand, Some(aws::Answer::Refused(_)));
@@ -2873,7 +2868,7 @@ impl Dashboard {
         let mut tidy: Vec<Box<dyn FnOnce() + Send>> = vec![];
         unkeyed.iter().for_each(|p| {
             // (And the keys an older SuperCI on another device hands under the old name, which nothing here reads.)
-            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").or_else(|| n.strip_prefix("DASHBOARD_KEY_")).and_then(|r| r.split('_').next().unwrap_or_default().parse::<u64>().ok()).is_some_and(|until| until < now)) };
+            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").or_else(|| n.strip_prefix("DASHBOARD_KEY_")).and_then(|r| r.split('_').next().unwrap_or_default().parse::<u64>().ok()).is_some_and(|until| superci_core::io::before(until, now))) };
             match p.clone() {
                 Plane::Cloudflare { account_id, script, .. } => if let Ok(cf) = self.cloudflare() {
                     tidy.push(Box::new(move || for old in expired(cf.secret_names(&account_id, &script).unwrap_or_default()) { let _ = cf.delete_secret(&account_id, &script, &old); }));
@@ -3809,7 +3804,7 @@ impl Dashboard {
                 let same = apps.iter().position(|a| a["owner"].as_str().is_some_and(|o| o.eq_ignore_ascii_case(&app.owner)) && a["host"].as_str() == app.host.as_deref());
                 let name = match same { Some(0) => "GITHUB_APP".to_string(), None if apps.is_empty() => "GITHUB_APP".to_string(), _ => format!("GITHUB_APP_{}", app.id) };
                 self.put_secret(&plane, &name, &json_text(&app))?;
-                if let Some(old) = same.filter(|n| *n > 0).and_then(|n| apps[n]["id"].as_u64()).filter(|old| *old != app.id) { let _ = self.drop_secret(&plane, &format!("GITHUB_APP_{old}")); }
+                if let Some(old) = same.filter(|n| *n != 0).and_then(|n| apps[n]["id"].as_u64()).filter(|old| *old != app.id) { let _ = self.drop_secret(&plane, &format!("GITHUB_APP_{old}")); }
                 self.views = None;
                 self.manifest_state = None;
                 self.github_expected = Some(now_ms() + 600_000);
@@ -7194,6 +7189,12 @@ fn job_link(j: &serde_json::Value) -> String {
 
 /// Overview's cards: the last day's jobs (did they get a machine, how fast, at what cost), the ones that need a look,
 /// the latest; then where they ran.
+/// A wait for a machine in words: "40 s" under a minute, "3 min" from one on.
+fn wait_words(ms: u64) -> String { if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { format!("{} min", ms / 60_000) } }
+
+/// How many jobs of the default size (4 CPUs) an account's limit of CPUs runs at once, in words.
+fn default_jobs_at_once(cpus: u32) -> String { if cpus < 8 { "One job of the default size at a time".to_string() } else { format!("{} jobs of the default size at a time", cpus / 4) } }
+
 fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> String {
     let jobs: Vec<serde_json::Value> = jobs.iter().map(|j| with_hosts(v, j)).collect();
     let now = now_ms();
@@ -7243,7 +7244,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
     let mut per_hour: Vec<Vec<u64>> = vec![vec![]; 24];
     for j in &day { if let (Some(st), Some(at)) = (j["started_ms"].as_u64(), j["at_ms"].as_u64()) { per_hour[slot(j)].push(st.saturating_sub(at)) } }
     let wait_spark = spark(&per_hour.iter_mut().enumerate().map(|(i, w)| { w.sort(); let m = w.get(w.len() / 2).copied().unwrap_or(0); (m as f64, 0.0, if w.is_empty() { format!("{}: no jobs", hour_name(i)) } else { format!("{}: {} s median", hour_name(i), (m + 500) / 1000) }) }).collect::<Vec<_>>());
-    let wait_kpi = kpi(median.map(|m| if m < 60_000 { format!("{} s", (m + 500) / 1000) } else { format!("{} min", m / 60_000) }).unwrap_or_else(|| "—".into()),
+    let wait_kpi = kpi(median.map(wait_words).unwrap_or_else(|| "—".into()),
         "median wait for a machine", wait_spark, if waits.is_empty() { "From queued to running".into() } else { format!("Fastest {} s · slowest {} s", waits[0] / 1000, waits[waits.len() - 1] / 1000) });
     // What it cost, and what GitHub would have charged for the same jobs.
     let top = spent.max(github).max(0.000_001);
@@ -7361,7 +7362,7 @@ fn usage_figures(u: &serde_json::Value, period: &str, jobs: &[serde_json::Value]
     // (Its label in the unit its figure is in: hours from 6,000 minutes on.)
     let minutes_kpi = kpi(minutes(f("machine_minutes")), if f("machine_minutes") >= 6000.0 { "machine hours" } else { "machine minutes" }, minutes_spark, format!("{} min as {host} {} them", n("billed_minutes"), if host.contains(" and ") { "bill" } else { "bills" }));
     // The wait for a machine: each step's median.
-    let secs = |ms: u64| if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { format!("{} min", ms / 60_000) };
+    let secs = wait_words;
     let wait_spark = spark((0..count).map(|i| { let m = steps[i]["wait_median_ms"].as_u64(); (m.unwrap_or(0) as f64, 0.0, match m { Some(m) => format!("{}: {} median", step_name(i), secs(m)), None => format!("{}: no jobs", step_name(i)) }) }).collect());
     let wait_kpi = kpi(u["wait_median_ms"].as_u64().map(secs).unwrap_or_else(|| "—".into()), "median wait for a machine", wait_spark,
         match (u["wait_fastest_ms"].as_u64(), u["wait_slowest_ms"].as_u64()) { (Some(a), Some(b)) => format!("Fastest {} · slowest {}", secs(a), secs(b)), _ => "From queued to running".into() });
@@ -10628,6 +10629,47 @@ mod rest_tests {
 
     /// Where nothing answers (the discard port: refused at once).
     const NOWHERE: &str = "http://127.0.0.1:9";
+
+    /// Each small saying at its edges: seconds and waits in words, a request for pools of none, a price of nothing,
+    /// a start's steps from times of nothing or a day long, a first choice as dear as what was got, the jobs an
+    /// account's limit runs at once, a failed job in its hour, and what was saved when nothing was, or as much.
+    #[test]
+    fn what_the_pages_say_holds_at_each_edge() {
+        assert_eq!((secs(9_949), secs(9_950), secs(59_999)), ("9.9 s".to_string(), "10 s".to_string(), "60 s".to_string()));
+        assert_eq!(secs(60_000), span(60_000));
+        assert_eq!((wait_words(59_499), wait_words(59_999), wait_words(60_000)), ("59 s".to_string(), "60 s".to_string(), "1 min".to_string()));
+        assert_eq!((default_jobs_at_once(7), default_jobs_at_once(8)), ("One job of the default size at a time".to_string(), "2 jobs of the default size at a time".to_string()));
+        // A request said to be for no pools is one for its own type.
+        let one = serde_json::json!({ "asks": [{ "kind": "m8a.large", "spot": true, "said": "started", "zone": "us-east-1a", "pools": 0 }] });
+        assert_eq!(asks_said(&one), "spot m8a.large in us-east-1a");
+        // A price of nothing is not said.
+        let over = serde_json::json!({ "machine_type": "m8a.large", "asks": [{ "kind": "m7a.large", "zone": "us-east-1b", "spot": true, "said": "InsufficientInstanceCapacity", "usd": 0.0 }] });
+        assert_eq!(passed_over(&over), ["m7a.large in us-east-1b"]);
+        // A start heard at no time is none; a step a day long or more is left out, one a moment shorter said.
+        assert!(job_start(&serde_json::json!({ "at_ms": 0, "started_ms": 5 })).is_null());
+        let q = 1_790_000_000_000u64;
+        let steps = |heard: u64| job_start(&serde_json::json!({ "at_ms": heard, "queued_ms": q, "started_ms": heard + 1 }))["steps"].as_array().map_or(0, Vec::len);
+        assert_eq!((steps(q + 86_400_000), steps(q + 86_399_999)), (0, 1));
+        // The first choice as dear as what was got is not said as a cheaper one; a price of nothing not said at all.
+        let machine = |first: f64, got: f64| { let (a, b, c) = aws_machine(&serde_json::json!({ "cloud": "aws", "machine_type": "m8a.large", "cpu": 2, "asks": [
+            { "kind": "m7a.large", "zone": "us-east-1a", "spot": true, "said": "InsufficientInstanceCapacity", "usd": first },
+            { "kind": "m8a.large", "zone": "us-east-1b", "spot": true, "said": "started", "usd": got }] })).unwrap(); format!("{a} {b} {c}") };
+        assert!(!machine(0.03, 0.03).contains("its first choice") && machine(0.02, 0.03).contains("its first choice"), "{}", machine(0.03, 0.03));
+        assert!(!machine(0.02, 0.0).contains("$0.0000 an hour"), "{}", machine(0.02, 0.0));
+        // Usage: a wait of a minute; as much spent as the code host would have charged, or nothing at all.
+        let figures = |usd: f64, host: f64| plain(&usage_figures(&serde_json::json!({ "jobs": 1, "usd": usd, "host_usd": host, "wait_median_ms": 60_000, "steps": [] }), "day", &[]));
+        assert!(figures(2.0, 2.0).contains("1 min") && !figures(2.0, 2.0).contains("saved") && figures(1.0, 2.0).contains("saved"), "{}", figures(2.0, 2.0));
+        assert!(!figures(0.0, 0.0).contains("GitHub: "), "{}", figures(0.0, 0.0));
+        // Overview: a job that failed is counted in its hour; as much spent as GitHub would have charged is no saving.
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [] }));
+        let at = now_ms() - 3_600_000;
+        let mut done = serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws", "machine_id": "i-1", "usd_per_hour": 0.5 });
+        done["cost_usd"] = github_cost(&done).unwrap().into();
+        let failed = serde_json::json!({ "job_id": 2, "run_id": 1, "repo": "acme/web", "state": "failed", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws" });
+        let card = overview_cards(&v, &[done.clone()], "day");
+        assert!(!plain(&card).contains("% less"), "{}", plain(&card));
+        assert!(overview_cards(&v, &[done, failed], "day").contains("1 did not"));
+    }
 
     fn aws_plane(id: &str, url: &str) -> Plane { Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }
     fn cf_plane(id: &str, url: &str) -> Plane { Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme".into(), script: "superci".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }

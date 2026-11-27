@@ -56,7 +56,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let bearer = headers.get("authorization").expect("a header's name").and_then(|a| a.strip_prefix("Bearer ").map(str::to_string)).unwrap_or_default();
     if bearer.len() >= 16 {
         let now = js_sys::Date::now() as u64;
-        if let Some((until, _)) = device_keys(&env).into_iter().find(|(until, k)| *until > now && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
+        if let Some((until, _)) = device_keys(&env).into_iter().find(|(until, k)| superci_core::io::before(now, *until) && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
             header(headers.set(VOUCHED, &until.to_string()));
         }
     }

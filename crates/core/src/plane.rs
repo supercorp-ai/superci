@@ -1076,17 +1076,23 @@ enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
 /// (no connected place can run its machine), each with why. A place comes with the machine it starts for the job.
 enum Placement { Run(Vec<(String, Runner, Size)>), Wait(String), Fail(String) }
 
+/// The calendar date of a day counted from 1970-01-01 (UTC): year, month (1–12), day of the month (1–31), by
+/// Howard Hinnant's algorithm.
+pub fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    (yoe + era * 400 + i64::from(m <= 2), m as u32, d as u32)
+}
+
 /// The start of this month (UTC), in ms.
 pub fn month_start_ms(now_ms: u64) -> u64 {
     let days = now_ms / 86_400_000;
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm), then back to the 1st of that month.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let day = doy - (153 * ((5 * doy + 2) / 153) + 2) / 5; // 0-based day of month
-    (days as i64 - day) as u64 * 86_400_000
+    let (_, _, d) = civil(days as i64);
+    (days - u64::from(d - 1)) * 86_400_000
 }
 
 /// A job's estimated machine cost so far (USD).
