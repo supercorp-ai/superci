@@ -224,7 +224,7 @@ fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
     assert!(!text(&["labels", "list"]).contains("(shown in examples)"));
     text(&["labels", "create", "second"]);
     assert_eq!(text(&["labels", "list"]).matches("(shown in examples)").count(), 1);
-    text(&["labels", "delete", "second"]);
+    text(&["labels", "delete", "second", "--confirm"]);
     let status = json(&home, &["status"]).1;
     assert_eq!(status["signed_in"], "AWS account 111111111111");
     assert!(text(&["status"]).contains("AWS account 111111111111"));

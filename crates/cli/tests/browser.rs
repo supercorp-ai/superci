@@ -13580,7 +13580,7 @@ mod runs_suite_in_browser {
         }
         let o = child.wait_with_output().unwrap();
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-        assert!(!o.status.success() && said.contains("ended: failure: ") && said.contains("macOS"), "{said}");
+        assert!(!o.status.success() && said.contains("Ended: failure: nowhere to run macOS"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
