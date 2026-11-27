@@ -22,7 +22,7 @@ on:
         options: [none, changed, all]
         default: none
       files:
-        description: With mutants, only these source files' (space between), on top of what changed if that was chosen
+        description: With mutants, only these source files' mutants (paths, space between)
         type: string
         default: ""
 
