@@ -218,9 +218,9 @@ fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
     assert!(published.contains(&"us-east-1") && !published.contains(&"ca-central-1"), "{images}");
     assert!(text(&["images", "list"]).contains("us-east-1"));
     assert_eq!(json(&home, &["runners", "order", "cloudflare"]).1["order"], serde_json::json!(["cloudflare"]));
-    // Said to a person: the order, and what it took out; with one label, none shown as the examples', with two the first.
+    // Said to a person: the order (nothing taken out, as it has no other); with one label, none shown as the examples', with two the first.
     let ordered = text(&["runners", "order", "cloudflare"]);
-    assert!(ordered.contains("Order: cloudflare.") && ordered.contains("Taken out: "), "{ordered}");
+    assert!(ordered.contains("Order: cloudflare.") && !ordered.contains("Taken out"), "{ordered}");
     assert!(!text(&["labels", "list"]).contains("(shown in examples)"));
     text(&["labels", "create", "second"]);
     assert_eq!(text(&["labels", "list"]).matches("(shown in examples)").count(), 1);

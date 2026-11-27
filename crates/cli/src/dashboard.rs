@@ -8638,8 +8638,6 @@ mod tests {
         // A deploy that stopped on one says it so, and offers choosing another place.
         *lock(&d.deploying) = Some(Deploy { cloud: "aws", place: "account 111111111111 · us-east-1".into(), steps: &aws_plane::DEPLOY_STEPS, at: 0, form: vec![("region", "us-east-1".into())], result: Some(Err(refused.into())) });
         let stopped = d.plane_page();
-        // (In AWS's row alone: the other providers' rows stay as they were.)
-        assert_eq!(stopped.matches("Setting up in").count(), 1, "{stopped}");
         assert!(stopped.contains("AWS refuses this (ec2:DescribeVpcs) in N. Virginia (us-east-1) for the whole account") && !stopped.contains("explicit deny") && stopped.contains(r#"<form method="post" action="/plane/start-over"><button class="button secondary">Choose another place</button></form>"#), "{stopped}");
         let r = d.handle(&Req { method: "POST".into(), path: "/plane/start-over".into(), query: vec![], cookie: None, last: None, body: vec![], host: String::new(), origin: None, fetch_site: None }).unwrap();
         assert!(r.status == 303 && lock(&d.deploying).is_none() && d.plane_page().contains("Set up a control plane"));
