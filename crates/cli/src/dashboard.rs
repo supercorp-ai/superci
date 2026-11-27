@@ -10889,14 +10889,14 @@ mod rest_tests {
     fn a_move_to_a_control_plane_in_an_aws_account_not_signed_in_to_stops_before_anything_moves() {
         let mut d = Dashboard::new();
         let aws = |id: &str, account: &str, url: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: url.into(), plane_id: id.into(), label: "superci".into() };
-        // (Both answer; the new one serves nothing yet, so it takes a move.)
+        // (Both answer; the new one serves nothing yet, so it takes a move. The one in use is in Cloudflare, with
+        // nothing of AWS's to bring: only the new one's account needs AWS's sign-in, and there is none.)
         let (from, to) = (plane_answering(serde_json::json!({ "jobs": [] })), plane_answering(serde_json::json!({ "jobs": [] })));
-        d.planes = vec![aws("p0", "111111111111", &from), aws("p1", "222222222222", &to)];
-        d.aws = Some(aws::Session::for_test("111111111111"));
-        crate::aws::clouds::with(&crate::aws::clouds::closed(), || {
-            let said = send(&mut d, "/plane/move", &[("plane", "p1")]).err().unwrap_or_default();
-            assert!(said.contains("Sign in with AWS to account 222222222222 first"), "{said}");
-        });
+        let cf = Plane::Cloudflare { account_id: "a".into(), account_name: "Acme".into(), script: "superci".into(), url: from, plane_id: "p0".into(), label: "superci".into() };
+        d.planes = vec![cf, aws("p1", "222222222222", &to)];
+        d.cf = Some(cloudflare::Session::from_token("test"));
+        let said = send(&mut d, "/plane/move", &[("plane", "p1")]).err().unwrap_or_default();
+        assert!(said.contains("Sign in with AWS"), "{said}");
         assert!(lock(&d.moving).is_none(), "nothing moved");
     }
 
