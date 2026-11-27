@@ -13569,7 +13569,16 @@ mod runs_suite_in_browser {
     fn a_followed_job_nothing_can_run_is_said_as_ended_with_why() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  mac:\n    runs-on: superci/os=macos\n    steps:\n      - run: echo\n")]);
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).output().unwrap();
+        // (Followed: the control plane's upkeep moves the run on, as its schedule would; a minute at most.)
+        let mut child = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > end { let _ = child.kill(); panic!("the run was never said to end") }
+            served.later(30_000);
+            served.upkeep();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        let o = child.wait_with_output().unwrap();
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
         assert!(!o.status.success() && said.contains("ended: failure: ") && said.contains("macOS"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
