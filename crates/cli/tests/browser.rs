@@ -19920,6 +19920,31 @@ fn overview_says_its_control_plane_refuses_the_key_rather_than_reading_for_ever(
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// This computer's key ended with its AWS sign-in (none can be handed until it signs in again): Overview says so at
+/// once, with the sign-in, rather than reading for ever or waiting to say it.
+#[test]
+fn overview_asks_for_the_sign_in_at_once_when_the_key_ended_with_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k.as_object_mut().unwrap().remove("aws");
+    k.as_object_mut().unwrap().remove("key");
+    k["aws_ended"] = true.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "600")]);
+    b.goto(&link);
+    b.wait(&format!("{} && {}", shows("Sign in to read your control plane"), shows("This computer's key for it has ended, and so has your AWS sign-in")));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
+    assert!(!page.contains("Reading your control plane") && !page.contains("superci login"), "{page}");
+    assert_eq!(b.eval(r#"!!document.querySelector('main form[action="/aws/signin"] button')"#), serde_json::json!(true));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A workspace whose control plane does not take this computer's key: its Settings still has what is this
 /// computer's own (its id, removing it when there are others), under the card that says why, and it is removed.
 #[test]

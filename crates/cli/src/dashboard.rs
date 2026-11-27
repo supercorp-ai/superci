@@ -4728,8 +4728,14 @@ mark();load()})();</script>"#;
         // Overview does not: its public state is enough, and its numbers and jobs fill in when the key is read.
         // Half a minute on, one that still does not take the key will not by itself (it is from before the key's name,
         // or the key expired): why, and what to do, said; looked at again now and then.
-        let waited = settling && current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms());
-        let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v)).map(|why| format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)));
+        // Its cloud's sign-in has ended, and this session's key was never handed: none can be until it is signed in to
+        // again, so that is said at once, with the sign-in.
+        let ended = current.filter(|v| settling && !self.keyed.contains(v.plane.plane_id()) && !self.signed_in_at(&v.plane));
+        let waited = settling && (ended.is_some() || current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms()));
+        let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v).map(|why| match ended {
+            Some(_) => format!(r#"<section class="card"><div class="card-head"><h2>Sign in to read your control plane</h2></div><p class="note">This computer's key for it has ended, and so has your {0} sign-in. Signing in hands it a new key.</p>{1}</section>"#, provider_name(v.plane.cloud()), signin_button(v.plane.cloud(), &format!("Sign in with {}", provider_name(v.plane.cloud())), true)),
+            None => format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)),
+        }));
         // Overview does not wait for the key (its public state is enough), but neither does it show "Reading your
         // control plane…" for ever: once the key is refused it says why and what to do, and looks again now and then.
         if let Some(card) = refused.as_deref().filter(|_| section == "overview") {
