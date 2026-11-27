@@ -253,7 +253,7 @@ const WAKING: &str = "aws:waking";
 #[async_trait(?Send)]
 impl Timer for Scheduled<'_> {
     async fn wake_in(&self, ms: u64) -> io::Result<()> {
-        if ms > SOON_MS || self.function.is_empty() { return Ok(()) }
+        if superci_core::io::before(SOON_MS, ms) || self.function.is_empty() { return Ok(()) }
         let at = now_ms() + ms;
         // (Nothing here fails what asked: the schedule's sweep comes within the minute whatever happens.)
         if !self.store.put_if_absent(WAKING, at.to_string()).await.unwrap_or(false) {

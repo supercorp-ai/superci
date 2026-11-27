@@ -275,7 +275,7 @@ async fn evict_within(store: &dyn Store, now: u64, limit: u64, unused: u64) -> R
         let (mut kept, mut entries) = (0u64, entries.into_iter());
         loop {
             let Some((k, e)) = entries.next() else { break };
-            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > unused || too_old(&e, now) } else { now.saturating_sub(e.made) > UNFINISHED_MS };
+            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > unused || too_old(&e, now) } else { crate::io::before(UNFINISHED_MS, now.saturating_sub(e.made)) };
             if !old && (!e.done || kept + e.size <= limit) { kept += e.size; continue }
             store.delete(&k).await?;
             gone.push((e.region.clone(), e.pieces.iter().map(|(p, _)| format!("{}/{p}", e.prefix(&ns))).collect()));

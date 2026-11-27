@@ -172,6 +172,18 @@ fn a_network_deleted_holds_with_each_call_failing() {
     once(with_machines(true, true, false), |aws| deleted(aws, &[]));
     // Nothing there: nothing done.
     swept(|| Box::new(|_: &str, _: &Request| (200, String::new())), |aws| deleted(aws, &[]));
+    // One network found both as its own and as the shared one: deleted once.
+    let both: Answer = Box::new(|w, r| {
+        let asked = String::from_utf8_lossy(&r.body).to_string();
+        match w {
+            "DescribeVpcs" if asked.contains("superci-network") || asked.contains("p1") => (200, "<vpcId>vpc-both</vpcId>".into()),
+            "DescribeVpcs" | "DescribeInstances" => (200, String::new()),
+            _ => ok(),
+        }
+    });
+    let aws = Aws { answer: both, fail: None, n: Cell::new(0), calls: RefCell::default() };
+    deleted(&aws, &[]).unwrap();
+    assert_eq!(aws.calls.borrow().iter().filter(|c| *c == "DeleteVpc").count(), 1, "{:?}", aws.calls.borrow());
 }
 
 /// S3 holding a bucket (`there`, or not: its HEAD answered `head`), its objects listed `pages` times before it is
