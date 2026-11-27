@@ -419,6 +419,20 @@ mod tests {
         }
     }
 
+    /// Quoting at its edges: the last code point Unicode has and one past it, the highest octal byte and one past it,
+    /// hex digits either case, a NUL inside quotes (a character, not the end), and quotes never closed.
+    #[test]
+    fn quoting_holds_at_its_edges() {
+        assert_eq!(unquote("\"\\U0010ffff\""), Ok("\u{10ffff}".to_string()));
+        assert_eq!(unquote("\"\\U00110000\""), Err(QUOTE_SYNTAX));
+        assert_eq!(unquote("\"\\101\""), Ok("A".to_string()));
+        assert!(unquote("\"\\377\"").is_ok() && unquote("\"\\400\"") == Err(QUOTE_SYNTAX));
+        assert_eq!([digit_val('a' as i32), digit_val('A' as i32), digit_val('f' as i32), digit_val('F' as i32), digit_val('9' as i32), digit_val('g' as i32)], [10, 10, 15, 15, 9, 16]);
+        let a = |path: &[String]| (path[0] == "name").then(|| "a\0b".to_string());
+        assert!(Filters::parse_all(&["name==\"a\0b\""]).unwrap().matches(&a));
+        assert!(Filters::parse_all(&["name==\"abc"]).unwrap_err().contains("quoted literal not terminated"), "{}", Filters::parse_all(&["name==\"abc"]).unwrap_err());
+    }
+
     #[test]
     fn several_filters_match_when_any_does_and_a_bad_one_is_an_invalid_argument() {
         let a = |path: &[String]| (path[0] == "name").then(|| "x".to_string());

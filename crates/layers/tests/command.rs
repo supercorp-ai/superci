@@ -216,6 +216,8 @@ async fn keep_says_what_was_kept_whatever_the_control_plane_answers() {
     let last = p.lock().unwrap().reports.last().cloned().unwrap();
     assert_eq!((last["served"].as_u64(), last["pulled"].as_u64()), (Some(1), Some(5)), "{last}");
     assert!(last["uploaded"].as_u64().unwrap() >= 1 && last["had"].as_u64().unwrap() >= 1 && last["refused"].as_u64().unwrap() >= 1 && last["failed"].as_u64().unwrap() >= 1, "{last}");
+    // (What was uploaded counted in bytes too: never none for a layer that went.)
+    assert!(last["uploaded_bytes"].as_u64().unwrap_or(0) > 0, "{last}");
     // A layer kept by another digest (no file of it here, as sha256: not offered), and an answer naming as a layer
     // what is a path, not a digest: never read.
     let big = b"a layer kept by its sha512".to_vec();

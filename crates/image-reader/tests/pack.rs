@@ -49,6 +49,9 @@ fn an_image_is_packed_in_pieces_with_its_hot_list_and_reader_under_its_indexs_ch
     // Packed again: the same directory, nothing left of the work.
     let (ok, again) = pack(&[d.join("image.sqsh").to_str().unwrap(), out.to_str().unwrap(), "--piece", "65536", "--hot", d.join("used.json").to_str().unwrap(), "--reader", d.join("reader").to_str().unwrap()]);
     assert!(ok && again.lines().next() == said.lines().next() && !out.join(".packing").exists(), "{again}");
+    // No piece size given: pieces of 4 MiB (the image in one).
+    let (ok, whole) = pack(&[d.join("image.sqsh").to_str().unwrap(), d.join("whole").to_str().unwrap()]);
+    assert!(ok && whole.contains("1 pieces of 4194304 bytes"), "{whole}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

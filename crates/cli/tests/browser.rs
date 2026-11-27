@@ -17760,6 +17760,11 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         { "digest": digest('b'), "size": 1000, "sources": [{ "registry": "ghcr.io", "repository": "acme/app" }, { "registry": "evil.example", "repository": "x" }, { "registry": "eu.gcr.io", "repository": "p/i" }, { "registry": "us-docker.pkg.dev", "repository": "../up" }] },
         { "digest": digest('c'), "size": 0 }, { "digest": digest('d'), "size": 999_999_999_999u64 }, { "digest": "sha256:short", "size": 10 }] }));
     assert!(status == 200 && said["layers"].is_object(), "{status} {said}");
+    // As large as a layer is converted: asked for; a byte more, not.
+    let (_, most) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": digest('e'), "size": 4u64 << 30 }, { "digest": digest('f'), "size": (4u64 << 30) + 1 }] }));
+    assert!(most["layers"][digest('e')]["do"] == "upload" && most["layers"][digest('f')]["do"] != "upload", "{most}");
+    // An upload's id of sixteen characters at least: one of fifteen not even looked for.
+    assert_eq!((call("layers-uploaded", serde_json::json!({ "id": "fifteen-chars-a" })).0, call("layers-uploaded", serde_json::json!({ "id": "sixteen-chars-ab" })).0), (400, 404));
     // Its uploads said done: one with no id, one no upload has, and one it was given (nothing put there).
     let given = said["layers"].as_object().unwrap().values().find_map(|a| a["id"].as_str().map(str::to_string)).unwrap_or_default();
     assert!(!given.is_empty(), "an upload link for one of them: {said}");

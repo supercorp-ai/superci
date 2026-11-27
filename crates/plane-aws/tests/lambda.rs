@@ -409,6 +409,12 @@ fn the_converter_says_which_step_s3_or_mkfs_did_not_take() {
     let mut sized = job(&blob, &key, bucket);
     sized["size"] = json!(blob.len() + 5);
     assert!(error(&runtime.invoke(sized).1).contains("bytes), not"), "the size it was said to be");
+    // As large as a layer is converted: taken (then found not to be that size); a byte more, not.
+    let mut most = job(&blob, &key, bucket);
+    most["size"] = json!(4u64 << 30);
+    assert!(error(&runtime.invoke(most.clone()).1).contains("bytes), not"), "the most there is taken");
+    most["size"] = json!((4u64 << 30) + 1);
+    assert!(error(&runtime.invoke(most).1).starts_with("a blob of 4294967297 bytes (converted up to 4294967296)"));
     let (runtime, at) = Runtime::serve();
     let _f = start(&at, "http://127.0.0.1:9", &[("SUPERCI_CONVERTER", "1"), ("LAMBDA_TASK_ROOT", dir.to_str().unwrap())]);
     let done = runtime.invoke(job(&blob, "layers/staging/x", bucket)).1;

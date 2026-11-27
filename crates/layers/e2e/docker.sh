@@ -189,6 +189,10 @@ usual=$(grep -c "pulled as usual" /var/log/superci-layers.log || true)
 echo "  served from the store: $served; pulled as usual: $usual; blobs read from the store: $(grep -c 'read from the store' /var/log/superci-layers.log || true)"
 grep "pulled as usual" /var/log/superci-layers.log | grep -q "$broken" || { echo "the broken layer was not pulled as usual" >&2; exit 1; }
 [ "$served" -ge 3 ] && [ "$usual" -ge 1 ]
+# Each layer's file mounted read-only, with no devices and no set-user-ID programs taken from it.
+mounts=$(awk '$3 == "erofs" {print $4}' /proc/mounts)
+[ -n "$mounts" ] || { echo "no layer's file mounted" >&2; exit 1; }
+echo "$mounts" | while read -r opts; do case ",$opts," in *,ro,*) ;; *) echo "a layer mounted $opts" >&2; exit 1 ;; esac; case ",$opts," in *,nosuid,*) ;; *) echo "a layer mounted $opts" >&2; exit 1 ;; esac; case ",$opts," in *,nodev,*) ;; *) echo "a layer mounted $opts" >&2; exit 1 ;; esac; done
 # Nothing offered while the job runs. After it (as a machine does before it goes off): Busybox's layers, which the
 # store lacks, offered with where they came from and uploaded whole; what came from the store said.
 [ ! -e /root/bucket/proposed.txt ] || { echo "offered during the job" >&2; exit 1; }
