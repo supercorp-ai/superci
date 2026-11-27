@@ -5,7 +5,10 @@ name: Coverage
 # the end-to-end suites (the browser's and the CLI's own, each driving the `superci` program), without unit tests.
 # The browser suite and the end-to-end suites are measured in eight shards side by side (GitHub's runners are free for
 # a public repository), their runs merged into one.
+# On a pull request to main, every test is measured, and it merges only at 100% (the merge job's last step).
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       tests:
@@ -21,6 +24,11 @@ on:
 
 permissions:
   contents: read
+
+# (A pull request's newer push stops its run before; a run by hand goes on.)
+concurrency:
+  group: coverage-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # What `./build.sh` makes that the tests need (the program crates carry it): kept between runs while the sources it
@@ -86,10 +94,10 @@ jobs:
           path: ${{ env.PROGRAMS }}
           key: ${{ steps.key.outputs.programs }}
       - name: The tests, listed and dealt into shards
-        if: inputs.tests != 'all'
+        if: (inputs.tests || 'all') != 'all'
         id: deal
         run: |
-          if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
+          if [ "${{ inputs.tests || 'all' }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
           cargo test -p superci "$@" -- --list --format terse | sed -n 's/: test$//p' | sort -u > tests.txt
           wc -l < tests.txt
           # (Dealt in turn, in an order that mixes the suites' long and short tests, the same for the same names.)
@@ -103,7 +111,7 @@ jobs:
       # (Every test of every crate by its name, the sweeps apart: each part runs every test program, with its own names,
       # so that every part measures the same code; dealt as the end-to-end suites are.)
       - name: Every test, listed and dealt into six parts
-        if: inputs.tests == 'all'
+        if: (inputs.tests || 'all') == 'all'
         id: deal-all
         run: |
           cargo test --workspace -- --list --format terse 2>/dev/null | sed -n 's/: test$//p' | sort -u > tests.txt
@@ -119,7 +127,7 @@ jobs:
 
   shard:
     needs: prepare
-    if: inputs.tests != 'all'
+    if: (inputs.tests || 'all') != 'all'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
@@ -154,7 +162,7 @@ jobs:
         run: |
           # (Its tests skip themselves where there is no Chrome: a measure of skipped tests would say nothing.)
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
-          if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
+          if [ "${{ inputs.tests || 'all' }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
           # shellcheck disable=SC2086
           npx -y supercov@4.29.18 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
       - uses: actions/upload-artifact@v4
@@ -169,7 +177,7 @@ jobs:
   # images: its kernel mounts EROFS files, so the layer store's setup is measured switching Docker over.
   all:
     needs: prepare
-    if: inputs.tests == 'all'
+    if: (inputs.tests || 'all') == 'all'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
@@ -213,6 +221,7 @@ jobs:
 
   # The shards' runs, as one: what the tests reach, and each file's conditions still to show.
   merge:
+    name: 100% coverage
     needs: [shard, all]
     # (Also when a shard was cut off at its time limit: the others' runs, merged, still say what they reach.)
     if: ${{ always() && (needs.shard.result != 'skipped' || needs.all.result != 'skipped') }}
@@ -229,6 +238,14 @@ jobs:
         run: npx -y supercov@4.29.18 merge
       - name: What the tests reach
         run: .github/coverage-gaps.sh
+      # Every test: each part passed, and every line, branch and MC/DC condition reached (a pull request to main
+      # merges only then).
+      - name: Every test passed
+        if: (inputs.tests || 'all') == 'all'
+        run: test "${{ needs.all.result }}" = success || { echo "A part of the tests failed or did not finish (${{ needs.all.result }})" >&2; exit 1; }
+      - name: 100% of lines, branches and MC/DC conditions
+        if: (inputs.tests || 'all') == 'all'
+        run: .github/coverage-gate.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -246,8 +263,9 @@ jobs:
   # one fails. A share that runs out of time saves what it decided; the next pass runs the rest.
   mutants:
     needs: [prepare, merge]
-    # (always(): merge follows the shard job, skipped when every test runs, and a skip upstream skips this too.)
-    if: ${{ always() && inputs.tests == 'all' && inputs.mutants != 'none' && needs.merge.result == 'success' }}
+    # (always(): merge follows the shard job, skipped when every test runs, and a skip upstream skips this too. A merge
+    # short of 100% still has the merged run its mutants are read from.)
+    if: ${{ always() && (inputs.tests || 'all') == 'all' && (inputs.mutants || 'none') != 'none' && (needs.merge.result == 'success' || needs.merge.result == 'failure') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 350
     strategy:
@@ -275,7 +293,7 @@ jobs:
       - name: Share ${{ matrix.shard }} of the mutants, tested
         run: |
           set -- --shard ${{ matrix.shard }}/8 --budget 19800
-          if [ "${{ inputs.mutants }}" = changed ]; then set -- "$@" --diff origin/main; fi
+          if [ "${{ inputs.mutants || 'none' }}" = changed ]; then set -- "$@" --diff origin/main; fi
           # (The command named: supercov 4.29.18 refuses the measured run's own, every test's name after --exact, as
           # no stable Cargo invocation. It runs the #[ignore]d live tests too, which fail without their sign-ins: the
           # verdicts are reached, and the command exits 2 as they cannot gate.)

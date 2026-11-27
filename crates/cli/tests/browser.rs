@@ -13549,6 +13549,13 @@ mod runs_suite_in_browser {
         assert!(!o.status.success() && said.contains("the job c / t: line 9: a `wait` step always runs; it takes no `if`"), "{said}");
         assert_eq!(served.store.under("run:").len(), runs, "no run made");
         let _ = std::fs::remove_dir_all(&dir);
+        // A called workflow's job with no steps: refused by the control plane as it is, not said as a line.
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  c:\n    uses: ./.github/workflows/called.yml\n"), (".github/workflows/called.yml", "on: workflow_call\njobs:\n  t:\n    runs-on: superci\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("has no steps") && !said.contains("the job c / t:"), "{said}");
+        assert_eq!(served.store.under("run:").len(), runs, "no run made");
+        let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
 
@@ -13654,11 +13661,13 @@ mod runs_suite_in_browser {
     #[test]
     fn a_matrix_with_max_parallel_starts_no_more_of_its_jobs_at_once_and_the_next_as_one_ends() {
         let served = serve(|_| {});
-        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  test:\n    runs-on: superci\n    strategy:\n      max-parallel: 2\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.shard }}\n")]);
+        // (Beside a job of its own, going all along: only the matrix's own jobs count toward its limit.)
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  lint:\n    runs-on: superci\n    steps:\n      - run: echo\n  test:\n    runs-on: superci\n    strategy:\n      max-parallel: 2\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.shard }}\n")]);
         let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let run = run_of(&served);
-        let states = || served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().map(|j| j["state"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        let states = || served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().filter(|j| j["name"] != "lint").map(|j| j["state"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        let lint = runner_of(&served, &run, "lint");
         assert_eq!(states(), ["started", "started", "pending"]);
         let first = runner_of(&served, &run, "test (1)");
         assert_eq!(plain(&first.handed(&served)["contextData"]["strategy"])["max-parallel"], 2.0);
@@ -13667,7 +13676,7 @@ mod runs_suite_in_browser {
         // One ended: the third starts, and no more than two are going.
         let third = runner_of(&served, &run, "test (3)");
         assert_eq!(states(), ["done", "started", "started"]);
-        for r in [runner_of(&served, &run, "test (2)"), third] { r.take(); r.finish("succeeded"); }
+        for r in [runner_of(&served, &run, "test (2)"), third, lint] { r.take(); r.finish("succeeded"); }
         let record = served.store.under(&format!("run:{run}"))[0].1.clone();
         assert!(record["jobs"].as_array().unwrap().iter().all(|j| j["result"] == "success"), "{record}");
         let _ = std::fs::remove_dir_all(&dir);
