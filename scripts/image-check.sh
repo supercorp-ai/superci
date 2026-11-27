@@ -30,3 +30,8 @@ for i in "${!jobs[@]}"; do
   if wait "${pids[$i]}"; then echo "passed  ${jobs[$i]}"; else echo "FAILED  ${jobs[$i]}"; failed+=("${jobs[$i]}"); tail -40 "$tree/${jobs[$i]}.log"; fi
 done
 [ ${#failed[@]} -eq 0 ] || { echo "Failed: ${failed[*]}"; exit 1; }
+# Every kind passed: the builds now pinned noted as checked, for the release to see (commit it).
+if [ ${#jobs[@]} -eq 7 ]; then
+  sed -n 's/^pub const IMAGE_RELEASE: &str = "\(.*\)";/\1/p' "$here/../crates/core/src/aws.rs" > "$here/image-check.passed"
+  echo "All passed: scripts/image-check.passed now names $(cat "$here/image-check.passed")."
+fi

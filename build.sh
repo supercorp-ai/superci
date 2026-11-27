@@ -24,5 +24,8 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl -p superci-layers
 cargo zigbuild --release --target aarch64-unknown-linux-musl -p superci-layers
 # The image reader (Linux x86_64), published beside an image for Cloudflare's containers.
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p image-reader
+# (SUPERCI_PROGRAMS_ONLY=1: what the program carries alone, for a release that builds the program for each system on
+# its own machine.)
+[ "${SUPERCI_PROGRAMS_ONLY:-}" = 1 ] && exit 0
 cargo build --release -p superci
 ls -l target/release/superci
