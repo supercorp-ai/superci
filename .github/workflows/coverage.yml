@@ -125,11 +125,13 @@ jobs:
         if: (inputs.tests || 'all') == 'all'
         id: deal-all
         run: |
-          cargo test --workspace -- --list --format terse 2>/dev/null | sed -n 's/: test$//p' | sort -u > tests.txt
+          # (Each test with its program: cargo says which program it runs before that program's list.)
+          cargo test --workspace -- --list --format terse 2>&1 | awk '/^ *Running / { prog = $NF; next } /: test$/ { sub(/: test$/, ""); print prog "\t" $0 }' | sort -u > listed.txt
+          cut -f2 listed.txt | sort -u > tests.txt
           wc -l < tests.txt
           [ -f test-times.json ] || cp .github/test-times.json test-times.json
           grep -E 'holds?_with_each_call_and_store_operation_failing' tests.txt > sweeps.txt || true
-          grep -v -x -F -f sweeps.txt tests.txt > rest.txt || true
+          awk -F '\t' 'NR == FNR { sweep[$0] = 1; next } !($2 in sweep)' sweeps.txt listed.txt > rest.txt
           python3 .github/test-times.py deal test-times.json rest.txt 12 > parts.json
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json
