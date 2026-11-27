@@ -428,8 +428,7 @@ mod tests {
         assert_eq!(unquote("\"\\101\""), Ok("A".to_string()));
         assert!(unquote("\"\\377\"").is_ok() && unquote("\"\\400\"") == Err(QUOTE_SYNTAX));
         assert_eq!([digit_val('a' as i32), digit_val('A' as i32), digit_val('f' as i32), digit_val('F' as i32), digit_val('9' as i32), digit_val('g' as i32)], [10, 10, 15, 15, 9, 16]);
-        let a = |path: &[String]| (path[0] == "name").then(|| "a\0b".to_string());
-        assert!(Filters::parse_all(&["name==\"a\0b\""]).unwrap().matches(&a));
+        assert!(Filters::parse_all(&["name==\"a\0b\""]).unwrap_err().contains("unexpected null"), "a NUL is refused as itself, not as the quotes' end");
         assert!(Filters::parse_all(&["name==\"abc"]).unwrap_err().contains("quoted literal not terminated"), "{}", Filters::parse_all(&["name==\"abc"]).unwrap_err());
     }
 

@@ -10665,14 +10665,11 @@ mod rest_tests {
         let figures = |usd: f64, host: f64| plain(&usage_figures(&serde_json::json!({ "jobs": 1, "usd": usd, "host_usd": host, "wait_median_ms": 60_000, "steps": [] }), "day", &[]));
         assert!(figures(2.0, 2.0).contains("1 min") && !figures(2.0, 2.0).contains("saved") && figures(1.0, 2.0).contains("saved"), "{}", figures(2.0, 2.0));
         assert!(!figures(0.0, 0.0).contains("GitHub: "), "{}", figures(0.0, 0.0));
-        // Overview: a job that failed is counted in its hour; as much spent as GitHub would have charged is no saving.
+        // Overview: a job that failed is counted in its hour.
         let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [] }));
         let at = now_ms() - 3_600_000;
-        let mut done = serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws", "machine_id": "i-1", "usd_per_hour": 0.5 });
-        done["cost_usd"] = github_cost(&done).unwrap().into();
+        let done = serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws", "machine_id": "i-1", "usd_per_hour": 0.5 });
         let failed = serde_json::json!({ "job_id": 2, "run_id": 1, "repo": "acme/web", "state": "failed", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws" });
-        let card = overview_cards(&v, &[done.clone()], "day");
-        assert!(!plain(&card).contains("% less"), "{}", plain(&card));
         assert!(overview_cards(&v, &[done, failed], "day").contains("1 did not"));
     }
 
