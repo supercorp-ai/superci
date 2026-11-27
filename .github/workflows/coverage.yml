@@ -275,7 +275,9 @@ jobs:
         run: |
           set -- --shard ${{ matrix.shard }}/8 --budget 19800
           if [ "${{ inputs.mutants }}" = changed ]; then set -- "$@" --diff origin/main; fi
-          npx -y supercov@4.29.17 runs latest mutants test "$@"; code=$?
+          # (The command named: the measured run's own, every test's name after --exact, is not one supercov 4.29.17
+          # can narrow to a mutant's tests.)
+          npx -y supercov@4.29.17 runs latest mutants test "$@" -- cargo test --workspace --no-fail-fast; code=$?
           # (The run this share saved its verdicts into, for the merge.)
           mkdir -p .supercov/shares && npx -y supercov@4.29.17 runs latest --json | jq -r '[.. | objects | (.runId? // empty) | strings] | first // empty' > .supercov/shares/${{ matrix.shard }}
           cat .supercov/shares/${{ matrix.shard }}
