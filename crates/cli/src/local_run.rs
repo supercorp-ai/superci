@@ -384,7 +384,8 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
 /// step with an `if`, say) refuses the run, saying where, as GitHub refuses a workflow file with such a step. (The
 /// control plane read them only as each job started: that job was never started, and the run never ended.)
 fn steps_read(path: &str, text: &str) -> Result<()> {
-    let wf = superci_core::workflow::parse(text).map_err(|e| format!("{path}: {e}"))?;
+    // (A file that is not YAML: the control plane says so, as it always did.)
+    let Ok(wf) = superci_core::workflow::parse(text) else { return Ok(()) };
     for (k, j) in wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default() {
         let Some(name) = k.text().filter(|_| j.get("uses").is_none()) else { continue };
         superci_core::workflow::job_parts(&wf, path, name, &mut String::new).map_err(|e| if e.starts_with("line ") { format!("{path}, the job {name}: {e}.") } else { format!("{}{}.", &e[..1].to_uppercase(), &e[1..]) })?;
