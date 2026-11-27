@@ -156,7 +156,7 @@ jobs:
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
           if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
           # shellcheck disable=SC2086
-          npx -y supercov@4.29.17 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
+          npx -y supercov@4.29.18 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -198,11 +198,12 @@ jobs:
           SUPERCI_SWEEP_FAULTS: "1"
           SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
           SUPERCI_BUILT: ${{ github.workspace }}
-          # (No SUPERCOV_MUTANTS=1: supercov 4.29.17 works out each Rust mutant's value as the tests run, and a mutant
-          # that overflows, `now * 31 * 86_400_000` for `now + …`, panics in the code under test and fails it. The
-          # mutation pass runs each mutant's tests without those values.)
+          # (The values its mutants' verdicts read, recorded as the tests run: a mutant no test infects is decided
+          # without running. With 4.29.17 one that overflowed, `now * 31 * 86_400_000` for `now + …`, panicked in the
+          # code under test.)
+          SUPERCOV_MUTANTS: "1"
         # shellcheck disable=SC2086
-        run: npx -y supercov@4.29.17 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
+        run: npx -y supercov@4.29.18 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -225,7 +226,7 @@ jobs:
           path: .supercov/runs
           merge-multiple: true
       - name: The shards' runs merged
-        run: npx -y supercov@4.29.17 merge
+        run: npx -y supercov@4.29.18 merge
       - name: What the tests reach
         run: .github/coverage-gaps.sh
       - uses: actions/upload-artifact@v4
@@ -275,11 +276,11 @@ jobs:
         run: |
           set -- --shard ${{ matrix.shard }}/8 --budget 19800
           if [ "${{ inputs.mutants }}" = changed ]; then set -- "$@" --diff origin/main; fi
-          # (The command named: the measured run's own, every test's name after --exact, is not one supercov 4.29.17
-          # can narrow to a mutant's tests.)
-          npx -y supercov@4.29.17 runs latest mutants test "$@" -- cargo test --workspace --no-fail-fast; code=$?
+          # (The measured run's own command, narrowed to each mutant's tests: a plain `cargo test --workspace` runs
+          # the live tests too, which fail without their sign-ins, and then no verdict may gate.)
+          npx -y supercov@4.29.18 runs latest mutants test "$@"; code=$?
           # (The run this share saved its verdicts into, for the merge.)
-          mkdir -p .supercov/shares && npx -y supercov@4.29.17 runs latest --json | jq -r '[.. | objects | (.runId? // empty) | strings] | first // empty' > .supercov/shares/${{ matrix.shard }}
+          mkdir -p .supercov/shares && npx -y supercov@4.29.18 runs latest --json | jq -r '[.. | objects | (.runId? // empty) | strings] | first // empty' > .supercov/shares/${{ matrix.shard }}
           cat .supercov/shares/${{ matrix.shard }}
           exit $code
       - uses: actions/upload-artifact@v4
@@ -310,13 +311,13 @@ jobs:
           ids=$(cat .supercov/shares/* 2>/dev/null | grep -v '^$' || true)
           echo "Shares' runs: ${ids:-none named}"
           # shellcheck disable=SC2086
-          npx -y supercov@4.29.17 merge $ids
+          npx -y supercov@4.29.18 merge $ids
       - name: The mutants
         run: |
           mkdir -p mutants
-          npx -y supercov@4.29.17 runs latest mutants | tee mutants/files.txt
-          npx -y supercov@4.29.17 runs latest mutants --status survived,no-coverage,timeout,error --format jsonl --output mutants/left.jsonl || true
-          npx -y supercov@4.29.17 runs latest mutants --diff origin/main --format markdown --output mutants/changed.md || true
+          npx -y supercov@4.29.18 runs latest mutants | tee mutants/files.txt
+          npx -y supercov@4.29.18 runs latest mutants --status survived,no-coverage,timeout,error --format jsonl --output mutants/left.jsonl || true
+          npx -y supercov@4.29.18 runs latest mutants --diff origin/main --format markdown --output mutants/changed.md || true
           wc -l mutants/left.jsonl || true
       - uses: actions/upload-artifact@v4
         if: always()
