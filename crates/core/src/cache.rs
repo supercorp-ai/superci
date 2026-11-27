@@ -401,7 +401,7 @@ pub fn gitlab_ns(connection: &str, project: u64) -> String { format!("gl{}x{proj
 
 pub async fn machine(store: &dyn Store, token: &str, now: u64) -> Result<Option<Machine>> {
     if token.len() < 16 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(None) }
-    Ok(get_json::<Machine>(store, &format!("cachem:{token}")).await?.filter(|m| m.until > now))
+    Ok(get_json::<Machine>(store, &format!("cachem:{token}")).await?.filter(|m| crate::io::before(now, m.until)))
 }
 
 pub async fn add_machine(store: &dyn Store, token: &str, m: &Machine) -> Result<()> {

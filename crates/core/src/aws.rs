@@ -520,7 +520,7 @@ pub const BAND: f64 = 1.25;
 pub fn on_demand_estimate(kind: &str) -> Option<f64> {
     let per_cpu = crate::spec::FAMILIES.iter().find(|(f, _)| *f == kind.split('.').next().unwrap_or_default())?.1;
     let cpu = cpus(kind);
-    (cpu > 0).then(|| on_demand_usd_per_hour(cpu, cpu * per_cpu))
+    (cpu != 0).then(|| on_demand_usd_per_hour(cpu, cpu * per_cpu))
 }
 
 /// With so many spot pools left after the first has no machine, they are asked in one request (see `fleet`).
@@ -923,7 +923,7 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
 pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now_ms: u64) -> Result<()> {
     let bucket = crate::cache::bucket(plane_id, region);
     let url = format!("https://{bucket}.s3.{region}.amazonaws.com/");
-    let said = |r: crate::io::Response| -> Result<crate::io::Response> { if r.status < 300 { Ok(r) } else { Err(aws_error(&r.body_text(), r.status)) } };
+    let said = |r: crate::io::Response| -> Result<crate::io::Response> { if crate::io::done(r.status) { Ok(r) } else { Err(aws_error(&r.body_text(), r.status)) } };
     let head = s3(http, "HEAD", &url, region, creds, vec![], &[], now_ms).await?;
     match head.status {
         200 => {}

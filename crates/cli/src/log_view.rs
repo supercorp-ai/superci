@@ -575,6 +575,13 @@ mod tests {
         data
     }
 
+    /// A zip whose files carry comments and extra fields (as Python's zipfile and others write them): each read past them.
+    #[test]
+    fn a_zip_whose_files_carry_comments_is_read_whole() {
+        let files = zip_files(include_bytes!("../tests/fixtures/zip/commented.zip")).unwrap();
+        assert_eq!(files, vec![("a.txt".to_string(), b"first\n".to_vec()), ("dir/b.txt".to_string(), b"second\n".to_vec())]);
+    }
+
     #[test]
     fn a_zips_files_are_read_and_a_damaged_one_says_where() {
         let good = zip(&[("job_x/1_Set up.txt", b"\xef\xbb\xbfone", 0), ("job_x/notes.txt", b"n", 0), ("job_x/_x.txt", b"n", 0), ("other/2_x.txt", b"two", 0)]);

@@ -204,3 +204,18 @@ fn a_days_date_holds_across_every_leap_rule_of_the_calendar() {
         assert_eq!(civil(days), date, "{days}");
     }
 }
+
+/// Every secret an expression names, the second as well as the first; a runner's token good from now for six hours;
+/// an artifact's number the same each time, and never 0.
+#[test]
+fn secrets_named_tokens_timed_and_artifacts_numbered_hold() {
+    use base64::Engine;
+    assert_eq!(superci_core::secrets::named(&["run: ${{ secrets.ALPHA || secrets.beta }}"]), Some(["ALPHA".to_string(), "BETA".to_string()].into_iter().collect()));
+    let token = superci_core::runner_service::access_token(1_790_000_000_123);
+    let claims: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!((claims["iat"].as_u64(), claims["exp"].as_u64()), (Some(1_790_000_000), Some(1_790_000_000 + 6 * 3600)));
+    let entry = superci_core::cache::Entry { id: "entry-0123".into(), ..Default::default() };
+    let id = superci_core::cache::artifact_id(&entry);
+    assert!(id != 0 && id == superci_core::cache::artifact_id(&entry.clone()), "{id}");
+    assert_eq!(id, u64::from_str_radix(&superci_core::crypto::sha256_hex(b"entry-0123")[..12], 16).unwrap());
+}

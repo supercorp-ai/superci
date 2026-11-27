@@ -2172,14 +2172,15 @@ fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_pr
     list["manifests"] = serde_json::json!([{ "digest": "sha256:1111", "platform": { "os": "windows", "architecture": "amd64" } }, { "digest": "sha256:2222", "platform": { "os": "linux", "architecture": "arm64" } }]);
     list["manifests"].as_array_mut().unwrap().extend(amd64);
     let long = list.to_string() + &" ".repeat(1_100_000);
-    // Not visible at once, then being prepared twice over; and the Worker's containers of one size from before.
+    // Not visible at once, then being prepared three times over (said once: every half minute); and the Worker's containers of one size from before.
     let scripts = recorded_answers(&recording, "GET", "/workers/scripts");
     let mut before: serde_json::Value = serde_json::from_str(scripts[1]["answer"].as_str().unwrap()).unwrap();
     before["result"].as_array_mut().unwrap().push(serde_json::json!({ "id": format!("superci-runners-{}", superci_testkit::PLANE), "migration_tag": "v2" }));
     let apps = recorded_answers(&recording, "GET", "/containers/applications");
     let (ok, said) = run(&[
         { let mut r = index.clone(); r["answer"] = long.clone().into(); r }, answered(&prepare, 400, serde_json::json!({ "success": false, "errors": [{ "code": 1, "message": "IMAGE_REGISTRY_DOESNT_CONTAIN_IMAGE" }], "result": null })),
-        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), prepare.clone(),
+        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })),
+        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), prepare.clone(),
         scripts[0].clone(), answered(&scripts[1], 200, before),
         answered(&apps[0], 200, serde_json::json!({ "success": true, "result": [{ "name": format!("superci-runners-{}", superci_testkit::PLANE) }] })), apps[0].clone(),
     ]);

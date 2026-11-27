@@ -272,6 +272,26 @@ fn a_queued_job_gets_its_machine_after_the_webhook_is_answered_as_aws_answered()
     assert!(github.unanswered.lock().unwrap().is_empty(), "{:?}", github.unanswered.lock().unwrap());
 }
 
+/// A job's first write refused by DynamoDB for something else than its being there already: the event is not taken
+/// (GitHub delivers it again), never taken as a job known before; delivered again, it is.
+#[test]
+fn a_jobs_write_dynamodb_refuses_is_no_job_known_before() {
+    let aws = aws();
+    let github = aws.github.lock().unwrap().clone().unwrap();
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string());
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("RUNNER_REGION", "us-east-1"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let (id, (body, signature)) = github.queue("tests", "superci/cpu=2", now_ms());
+    let event = url_event("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": signature, "content-type": "application/json" }), &String::from_utf8(body).unwrap());
+    aws.fail("DynamoDB_20120810.PutItem|attribute_not_exists", 400, &superci_testkit::json_error("ValidationException", "One or more parameter values were invalid"), Some(1));
+    let (_, answer) = runtime.invoke(event.clone());
+    assert!(answer["statusCode"].as_u64().is_some_and(|s| s >= 500) && item(&aws, &format!("job:{id}")).is_none(), "{answer}");
+    let (_, answer) = runtime.invoke(event);
+    assert_eq!(answer["statusCode"].as_u64(), Some(202), "{answer}");
+    assert!(item(&aws, &format!("job:{id}")).is_some());
+}
+
 /// Its settings over several pages of SSM's, one of them not a setting (no value); its instance types from the deploy;
 /// a request with its query, without one, and with a header that is not text; a move's step, read fresh.
 #[test]

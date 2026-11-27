@@ -139,7 +139,7 @@ fn file_sha256(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn said(r: superci_core::io::Response, what: &str) -> Result<superci_core::io::Response, String> {
-    if r.status < 300 { Ok(r) } else { Err(format!("{what}: S3 answered {} {}", r.status, r.body_text().chars().take(300).collect::<String>())) }
+    if superci_core::io::done(r.status) { Ok(r) } else { Err(format!("{what}: S3 answered {} {}", r.status, r.body_text().chars().take(300).collect::<String>())) }
 }
 
 /// A file put in the bucket: in one request when small, else in parts (of `part` bytes), four at once.
@@ -172,7 +172,7 @@ fn upload(http: &(dyn Http + Sync), creds: &Credentials, region: &str, url: &str
                     loop {
                         tries += 1;
                         let last = match block_on(aws::s3(http, "PUT", &format!("{url}?partNumber={}&uploadId={}", n + 1, aws::rfc3986(&id)), region, creds, body.clone(), &[], now())) {
-                            Ok(r) if r.status < 300 => return r.header("etag").map(str::to_string).ok_or_else(|| "S3 gave no ETag".to_string()),
+                            Ok(r) if superci_core::io::done(r.status) => return r.header("etag").map(str::to_string).ok_or_else(|| "S3 gave no ETag".to_string()),
                             Ok(r) => format!("S3 answered {}", r.status),
                             Err(e) => e,
                         };
