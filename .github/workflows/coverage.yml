@@ -21,6 +21,10 @@ on:
         type: choice
         options: [none, changed, all]
         default: none
+      files:
+        description: With mutants, only these source files' (space between), on top of what changed if that was chosen
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -300,9 +304,12 @@ jobs:
           name: coverage
           path: .supercov/runs
       - name: Share ${{ matrix.shard }} of the mutants, tested
+        env:
+          FILES: ${{ inputs.files }}
         run: |
           set -- --shard ${{ matrix.shard }}/16 --budget 19800
           if [ "${{ inputs.mutants || 'none' }}" = changed ]; then set -- "$@" --diff origin/main; fi
+          for f in $FILES; do set -- "$@" --file "$f"; done
           # (The command named: supercov 4.29.18 refuses the measured run's own, every test's name after --exact, as
           # no stable Cargo invocation. It runs the #[ignore]d live tests too, which fail without their sign-ins: the
           # verdicts are reached, and the command exits 2 as they cannot gate.)
