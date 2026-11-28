@@ -895,14 +895,11 @@ fn a_region_an_older_control_plane_would_drop_is_refused_saying_to_update_it() {
     let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
     assert!(!o.status.success() && e.contains("Holding jobs to one AWS region needs a newer control plane") && e.contains("superci planes update"), "{e}");
     assert_eq!(machine(), before, "nothing written");
-    let _ = std::fs::remove_dir_all(&home);
-    // A control plane of this version keeps it. (Its own stand-in: one that answered as older read this computer's key
-    // under its old name, as an update moves.)
-    let served = serve(|_| {});
-    let home = common::signed_in(&served);
+    // One from 0.20.5 on keeps it.
+    *served.aws.old_version.lock().unwrap() = Some("0.20.5".into());
     let o = superci(&home, &["machine", "update", "--region=us-east-1"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let kept: serde_json::Value = serde_json::from_str(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "MACHINE").unwrap().1).unwrap();
+    let kept: serde_json::Value = serde_json::from_str(&machine().unwrap()).unwrap();
     assert_eq!(kept["region"].as_str(), Some("us-east-1"), "{kept}");
     let _ = std::fs::remove_dir_all(&home);
 }
