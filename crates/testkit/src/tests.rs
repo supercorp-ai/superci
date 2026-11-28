@@ -693,3 +693,13 @@ fn what_a_test_needs_and_is_not_here_fails_a_run_that_skips_nothing() {
     assert!(said.contains("Chrome is not here, and this run skips nothing"), "{said}");
     assert_eq!(skips(), std::env::var_os("SUPERCI_NO_SKIPS").is_none());
 }
+
+/// In a run that skips nothing, Chrome and the Cloudflare control plane (its built Worker, under Node) are there for
+/// the tests that ask for them: none of those passes by being skipped.
+#[test]
+fn a_run_that_skips_nothing_has_chrome_and_the_cloudflare_control_plane() {
+    if skips() { return }
+    assert!(Browser::open(800, 600).is_some(), "Chrome");
+    let plane = serve_cloudflare().expect("the Cloudflare control plane");
+    assert!(plane.url.starts_with("http://"), "{}", plane.url);
+}
