@@ -682,3 +682,14 @@ fn answers_to_come_are_counted_and_containers_are_on_only_as_said() {
     assert!(crate::containers_on(&s(&[("CONTAINERS", "on")])));
     assert!(!crate::containers_on(&s(&[("CONTAINERS", "off"), ("OTHER", "on")])) && !crate::containers_on(&[]));
 }
+
+/// What a test needs and is not here: skipped where skipping is allowed, a failure where this run skips nothing; and
+/// this run's own setting read as it is (Coverage and its mutants set `SUPERCI_NO_SKIPS`).
+#[test]
+fn what_a_test_needs_and_is_not_here_fails_a_run_that_skips_nothing() {
+    assert_eq!(needed(Some(1), "Chrome", false), Some(1));
+    assert_eq!(needed(None::<u8>, "Chrome", true), None);
+    let said = catch_unwind(|| needed(None::<u8>, "Chrome", false)).err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+    assert!(said.contains("Chrome is not here, and this run skips nothing"), "{said}");
+    assert_eq!(skips(), std::env::var_os("SUPERCI_NO_SKIPS").is_none());
+}

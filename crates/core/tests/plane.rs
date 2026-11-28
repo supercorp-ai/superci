@@ -5218,6 +5218,29 @@ fn a_gitlab_job_whose_events_never_come_is_seen_running_and_over_by_asking_gitla
     assert_eq!(job()["ended_ms"].as_u64().unwrap() - job()["started_ms"].as_u64().unwrap(), 42_000);
 }
 
+/// A machine keeps the images its job pulled only where the region's bucket has this version's `superci-layers`:
+/// where it has not (yet), the machine is started without that step.
+#[test]
+fn a_machine_keeps_its_images_only_where_the_bucket_has_the_layers_program() {
+    for there in [true, false] {
+        let bucket = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/");
+        let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+            if r.method != "HEAD" { return None }
+            if r.url == format!("{bucket}{}", superci_core::cache::program_key("x86_64")) { return Some(Response::new(200, "application/octet-stream", "")) }
+            (r.url == format!("{bucket}{}", superci_core::cache::layers_key("x86_64"))).then(|| Response::new(if there { 200 } else { 404 }, "application/octet-stream", ""))
+        });
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(webhook("queued", None)));
+        let script = user_data_of(&launches(&clouds.0)[0]);
+        assert!(script.contains(&format!("c='{PLANE_URL}/cache/")), "{script}");
+        assert_eq!(script.contains("superci-layers keep") || script.contains("$f keep --link"), there, "{there}: {script}");
+    }
+}
+
 #[test]
 fn a_gitlab_machine_whose_jobs_event_never_came_learns_its_job_by_asking_gitlab() {
     let program = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64"));
@@ -5522,10 +5545,11 @@ fn what_a_machine_sent_to_the_internet_is_added_to_its_jobs_cost_once_cloudwatch
         run(webhook("in_progress", Some(&runner)));
         run(webhook("completed", Some(&runner)));
         let before = job(&store, 7)["cost_usd"].as_f64().unwrap();
-        // Not yet: CloudWatch counts a while after.
+        // Not yet, twelve minutes on: CloudWatch counts a while after. Asked then any time in the two days after.
+        clock.0.set(clock.0.get() + 12 * 60_000);
         block_on(plane.alarm()).unwrap();
         assert!(job(&store, 7).get("sent_gb").is_none());
-        clock.0.set(clock.0.get() + 13 * 60_000);
+        clock.0.set(clock.0.get() + 36 * 3_600_000);
         block_on(plane.alarm()).unwrap();
         let j = job(&store, 7);
         assert_eq!(j["sent_gb"].as_f64(), said, "{j}");
@@ -5858,6 +5882,83 @@ fn spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_
         if virginia_full { assert_eq!(asked[0], ("us-east-2".to_string(), "c8a.xlarge".to_string()), "{asked:?}") }
         assert_eq!(asked.iter().filter(|(r, t)| r == "us-east-2" && t == "c8a.xlarge").count(), ohio_asks, "Ohio's c8a pools asked at most once each: {asked:?}");
     }
+}
+
+/// Spot pools noted as having had no machine: not asked within a minute of it, asked after the others for a quarter
+/// of an hour, then the note dropped (to the millisecond).
+#[test]
+fn a_spot_pool_with_no_machine_lately_is_skipped_a_minute_then_asked_last_then_forgotten() {
+    let now = FixedClock.now_ms();
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| {
+        if body.contains("Action=DescribeSpotPriceHistory") {
+            let items = ["a", "b", "c"].map(|z| format!("<item><instanceType>c8a.xlarge</instanceType><availabilityZone>us-east-1{z}</availabilityZone><spotPrice>0.10</spotPrice></item>")).concat();
+            return Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
+        }
+        (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| Response::new(500, "text/xml", "<Response><Errors><Error><Code>InsufficientInstanceCapacity</Code><Message>no room</Message></Error></Errors></Response>"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    for (pool, ago) in [("c8a.xlarge:us-east-1a", 59_999), ("c8a.xlarge:us-east-1b", 60_000), ("m7i.large:us-east-1d", 900_000), ("m7i.large:us-east-1e", 899_999)] {
+        store.0.borrow_mut().insert(format!("aws:pool:us-east-1:{pool}"), (now - ago).to_string());
+    }
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-east-1".into()];
+    config.instance_types = vec!["c8a.xlarge".into()];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let zones: Vec<String> = launches(&clouds.0).iter().filter(|f| field(f, "InstanceMarketOptions.MarketType") == "spot").map(|f| field(f, "Placement.AvailabilityZone")).collect();
+    assert_eq!(zones, ["us-east-1c", "us-east-1b"], "{zones:?}");
+    let kept = store.0.borrow();
+    assert!(!kept.contains_key("aws:pool:us-east-1:m7i.large:us-east-1d") && kept.contains_key("aws:pool:us-east-1:m7i.large:us-east-1e"));
+}
+
+/// A job's machine running past the longest a job may run (an hour here), and five minutes over: ended at the sweep,
+/// saying so; one at those five minutes exactly runs on.
+#[test]
+fn a_machine_past_the_longest_time_of_a_job_is_ended_saying_so() {
+    let t = FixedClock.now_ms();
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.max_minutes = Some(60);
+    for (id, ran) in [(1u64, 65 * 60_000 + 1), (2, 65 * 60_000)] {
+        store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t - ran, "launched_ms": t - ran, "installation_id": 42,
+            "cloud": "aws", "machine_id": format!("i-{id}"), "region": "us-east-1", "seen_in_progress": true, "began": true, "label": "superci" }).to_string());
+    }
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.alarm()).unwrap();
+    let (over, on) = (job(&store, 1), job(&store, 2));
+    assert_eq!((over["state"].as_str(), over["error"].as_str()), (Some("swept"), Some("it ran past its longest time (1 hour), and its machine was ended")), "{over}");
+    assert_eq!(on["state"], "running", "{on}");
+}
+
+/// After the pools near the cheapest, each region whole goes by what is left in it: Ohio, whose cheapest left is
+/// dearer than N. Virginia's c8a was but cheaper than its r8a, is asked before N. Virginia's r8a.
+#[test]
+fn after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it() {
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+        let region = if r.url.contains("us-east-2") { "us-east-2" } else { "us-east-1" };
+        if body.contains("Action=DescribeSpotPriceHistory") {
+            let rows: &[(&str, f64)] = if region == "us-east-2" { &[("c8a.xlarge", 0.30), ("r8a.xlarge", 0.40)] } else { &[("c8a.xlarge", 0.10), ("r8a.xlarge", 0.60)] };
+            let items = rows.iter().map(|(t, p)| format!("<item><instanceType>{t}</instanceType><availabilityZone>{region}a</availabilityZone><spotPrice>{p}</spotPrice></item>")).collect::<String>();
+            return Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
+        }
+        (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| Response::new(500, "text/xml", "<Response><Errors><Error><Code>InsufficientInstanceCapacity</Code><Message>no room</Message></Error></Errors></Response>"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+    config.instance_types = ["c8a.xlarge", "r8a.xlarge"].map(String::from).to_vec();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let mut regions: Vec<&str> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances") && c.2.contains("MarketType=spot"))
+        .map(|c| if c.1.contains("us-east-2") { "us-east-2" } else { "us-east-1" }).collect();
+    regions.dedup();
+    assert_eq!(regions, ["us-east-1", "us-east-2", "us-east-1"]);
 }
 
 /// Settings with an App, GitLab, a dashboard key and a move token.
@@ -7096,6 +7197,28 @@ fn a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_a
     assert!(log["log"].as_str().is_some_and(|l| l.contains("odd time") && !l.contains(" cut")), "{log}");
 }
 
+/// A job that ended: its log is GitHub's alone, what its machine sent after GitHub's last line not read; while it
+/// runs, those lines follow GitHub's.
+#[test]
+fn an_ended_jobs_log_is_githubs_alone_and_a_running_ones_has_its_machines_newer_lines_after() {
+    let t = 1_790_000_000_000u64;
+    for (state, machine_lines) in [("done", false), ("running", true)] {
+        let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app/actions/jobs/5/logs")
+            .then(|| Response::new(200, "text/plain", "2026-10-16T21:18:46.0000000Z from github\n")));
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        store.0.borrow_mut().insert("job:5".into(), serde_json::json!({ "job_id": 5, "run_id": 3, "repo": "acme/app", "state": state, "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true, "began": true }).to_string());
+        store.0.borrow_mut().insert("glive:5:tl_x_1.log:0000000000000:000".into(), STANDARD.encode("2026-10-16T21:18:47.0000000Z from its machine\n"));
+        let log = json(&block_on(plane.handle(get("/job/log?id=5").with_header("authorization", "Bearer dashboard-session-key-1"))));
+        let text = log["log"].as_str().unwrap_or_default();
+        assert!(text.contains("from github") && text.contains("from its machine") == machine_lines, "{state}: {log}");
+        assert_eq!(log["source"], if machine_lines { "GitHub's, then what its machine sent after it" } else { "GitHub's" }, "{state}: {log}");
+    }
+}
+
 /// A GitHub job's pages are read from the newest back until about a megabyte is had: a newest page of just that much
 /// is all that is read, the one before it left out.
 #[test]
@@ -7428,6 +7551,16 @@ fn a_jobs_sent_data_still_to_be_added_keeps_it_cared_for() {
     let j = |sent: Option<f64>| serde_json::from_value::<superci_core::plane::Job>(serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "installation_id": 42, "cloud": "aws", "runner": null, "runner_id": null, "machine_id": null, "machine_type": null, "error": null, "seen_in_progress": true, "state": "done", "at_ms": now - 86_400_000, "ended_ms": now - 86_400_000,
         "began": true, "region": "us-east-1", "cost_from": "2026-09-20T00:00:00Z", "sent_gb": sent })).unwrap();
     assert!(superci_core::plane::needs_care(&j(None), now) && !superci_core::plane::needs_care(&j(Some(0.5)), now));
+}
+
+/// A job that ended, with nothing else left for it: cared for half an hour from its end (a moment ago), then not.
+#[test]
+fn a_job_that_ended_a_moment_ago_is_cared_for_half_an_hour() {
+    let ended = 1_790_000_000_000u64;
+    let j = serde_json::from_value::<superci_core::plane::Job>(serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "installation_id": 42, "cloud": "aws", "runner": null, "runner_id": null, "machine_id": null, "machine_type": null, "error": null, "seen_in_progress": true, "state": "done", "at_ms": ended - 600_000, "ended_ms": ended,
+        "began": true })).unwrap();
+    assert!(superci_core::plane::needs_care(&j, ended) && superci_core::plane::needs_care(&j, ended + 30 * 60_000 - 1));
+    assert!(!superci_core::plane::needs_care(&j, ended + 30 * 60_000));
 }
 
 /// A further AWS account: connected with the role made there, its two runners under its word, a job's machine started
@@ -7791,6 +7924,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_provider_in_the_order_that_is_not_connected_is_said,
         bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
         a_jobs_sent_data_still_to_be_added_keeps_it_cared_for,
+        a_job_that_ended_a_moment_ago_is_cared_for_half_an_hour,
         a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
         several_aws_accounts_each_case_a_job_at_a_time,
         the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be,
@@ -7801,6 +7935,12 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,
         machines_start_in_the_control_planes_own_network_cheapest_zone_first_else_the_default_one,
         a_region_with_no_spot_capacity_left_sends_the_machine_to_the_next,
+        after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it,
+        a_copy_read_a_minute_ago_is_taken_again_and_an_older_one_is_not_kept_as_the_copy,
+        an_ended_jobs_log_is_githubs_alone_and_a_running_ones_has_its_machines_newer_lines_after,
+        a_machine_keeps_its_images_only_where_the_bucket_has_the_layers_program,
+        a_machine_past_the_longest_time_of_a_job_is_ended_saying_so,
+        a_spot_pool_with_no_machine_lately_is_skipped_a_minute_then_asked_last_then_forgotten,
         moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_where,
         a_network_or_an_image_aws_says_is_gone_is_looked_up_anew_for_the_next_job,
         a_cloudflare_control_plane_starts_containers_itself,
@@ -8381,6 +8521,38 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     for n in 0..6 { p.later(61_000); read_by(&p, &instance(&p, 20 + n)); }
     let kept: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
     assert_eq!(kept["taken"].as_array().map(|t| t.len()), Some(5));
+}
+
+/// A copy taken back a minute ago, to the millisecond, is taken again (59,999 ms on, not); a record from before the copy
+/// was kept, read with an older copy than the one it took last, is left as it is (the last one is kept, not that).
+#[test]
+fn a_copy_read_a_minute_ago_is_taken_again_and_an_older_one_is_not_kept_as_the_copy() {
+    let p = Settled::new(|c| c.routing.max_cpu = Some(16));
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "max_minutes"], 90.into(), None)])).status, 200);
+    let copy_of = |c: &Config| superci_core::crypto::sha256_hex(superci_core::io::json(&(&c.routing, &c.launchers)).as_bytes());
+    let other = { let mut c = p.config.clone(); c.routing.max_cpu = Some(4); c };
+    let (mine, theirs) = (copy_of(&p.config), copy_of(&other));
+    let read_by = |config: &Config| {
+        let cache = Cache::default();
+        let plane = ControlPlane { store: &p.mem, http: &p.clouds, clock: &p.clock, timer: &p.wakes, config, cache: &cache, containers: None };
+        json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))
+    };
+    let record = |taken: serde_json::Value, copy: bool| {
+        let mut r: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+        r["taken"] = taken;
+        if copy { r["copy"] = serde_json::json!({ "routing": other.routing, "launchers": other.launchers }) } else { r.as_object_mut().unwrap().remove("copy"); }
+        p.mem.0.borrow_mut().insert("settings".into(), r.to_string());
+        r
+    };
+    let now = p.clock.0.get();
+    let put = record(serde_json::json!([[mine, now - 59_999], [theirs, now - 1_000]]), true);
+    let version = put["version"].as_u64().unwrap();
+    assert_eq!(read_by(&p.config)["settings_version"].as_u64(), Some(version));
+    record(serde_json::json!([[mine, now - 60_000], [theirs, now - 1_000]]), true);
+    assert_eq!(read_by(&p.config)["settings_version"].as_u64(), Some(version + 1));
+    let put = record(serde_json::json!([[mine, now - 1_000], [theirs, now - 500]]), false);
+    read_by(&p.config);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&p.mem.0.borrow()["settings"]).unwrap(), put);
 }
 
 /// A jobs-at-once limit set by hand in the cloud's own copy (as one did in AWS's Parameter Store) is taken alone:

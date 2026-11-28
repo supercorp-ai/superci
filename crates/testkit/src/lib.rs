@@ -34,6 +34,17 @@ use serde_json::{json, Value};
 use superci_core::io::{self, Clock, Containers, Request, Store, Timer, Work};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
+/// What a test needs (Chrome, Node and the built Worker), or `None` where it is not here: the test is then skipped,
+/// unless this run skips nothing (`SUPERCI_NO_SKIPS`, set by Coverage and its mutants), where it panics, so that a
+/// change that keeps it from starting fails the tests rather than leaving them passed unrun.
+pub(crate) fn needed<T>(got: Option<T>, what: &str, skips: bool) -> Option<T> {
+    if got.is_none() && !skips { panic!("{what} is not here, and this run skips nothing (SUPERCI_NO_SKIPS)") }
+    got
+}
+
+/// Whether a test may be skipped for want of what it needs: not where `SUPERCI_NO_SKIPS` is set.
+pub(crate) fn skips() -> bool { std::env::var_os("SUPERCI_NO_SKIPS").is_none() }
+
 /// A port free now, for a program a test starts to listen on: below the ports the system gives out (from 32768 on
 /// Linux, 49152 on macOS), so that no other test's listener and no connection is given it meanwhile, and another each
 /// time in this program.

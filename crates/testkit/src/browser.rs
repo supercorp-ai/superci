@@ -25,7 +25,7 @@ fn pipe() -> (i32, i32) {
 
 impl Browser {
     /// A fresh Chrome (a profile of its own) with one tab, `width` × `height`.
-    pub fn open(width: u32, height: u32) -> Option<Browser> { Browser::open_among(&CHROMES, width, height) }
+    pub fn open(width: u32, height: u32) -> Option<Browser> { crate::needed(Browser::open_among(&CHROMES, width, height), "Chrome", crate::skips()) }
 
     /// The same, with the first of these that is there; `None` where none is. (One that is there and does not start
     /// is no test passed: it panics. One whose first tab does not come, as when many start at once on a busy runner, is

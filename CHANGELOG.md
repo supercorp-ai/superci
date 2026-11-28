@@ -16,6 +16,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A move bringing AWS runners to a Cloudflare control plane checks their account's sign-in before anything moves: one AWS ended stops it at once, said by its account. It stopped partway through.
 - A setting changed by hand in the control plane's cloud (AWS's `ROUTING` parameter, say, for one provider's jobs at once) is taken alone: the limits, order and launchers set in the dashboard or with `superci` since stand. The control plane took that copy whole, putting back whatever it held from before. Found by alen-hubora (github.com/alen-hubora). Update your control plane for it.
 - `superci runs create` refuses a workflow with a step its runner cannot be handed (a `wait` step with an `if`, say), saying the job and line, before anything is sent; the control plane refuses one in a workflow a job calls. Such a job was never started and said nothing: the jobs that need it were never started either, and `runs create` never returned. In a run made before you update the control plane, such a job ends failed, saying why, and the run ends.
+- A job ended for running past a longest time of one hour says "1 hour", not "1 hours".
 - A matrix's `max-parallel` holds in a run from a computer: no more of its jobs run at once, and the next starts as one ends (`strategy.max-parallel` says it). All its jobs started together.
 
 ## 0.20.4 — 2026-11-11

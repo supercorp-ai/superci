@@ -35,6 +35,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # (Nothing a test needs, Chrome, Node or the built Worker, may be missing here: such a test fails, not skipped.)
+  SUPERCI_NO_SKIPS: "1"
   # What `./build.sh` makes that the tests need (the program crates carry it): kept between runs while the sources it
   # is built from are the same, so a run that changes tests alone does not build it again.
   PROGRAMS: |

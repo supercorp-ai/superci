@@ -560,7 +560,8 @@ mod tests {
         assert!(gone[0].1[0].starts_with("c/gh77/") && gone[0].1[0].ends_with("/p0"));
         assert!(run(lookup(&store, &main_branch(), "b", &[], V, 0)).unwrap().is_none());
         assert_eq!(run(kept(&store, "gh77")).unwrap(), (2, 30));
-        // A week unused (as set by default): gone.
+        // A week unused (as set by default): gone, a millisecond past it (not at it).
+        assert_eq!(run(evict(&store, 3 + Settings::default().unused_ms(), &Settings::default())).unwrap().len(), 0);
         assert_eq!(run(evict(&store, 3 + Settings::default().unused_ms() + 1, &Settings::default())).unwrap().len(), 1);
         assert_eq!(run(kept(&store, "gh77")).unwrap(), (1, 15));
         // Used every hour, but saved MAX_AGE_DAYS ago: no hit, saved anew, and gone at the next sweep.

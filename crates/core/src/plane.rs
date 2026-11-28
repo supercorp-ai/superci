@@ -5599,13 +5599,14 @@ impl<'a> ControlPlane<'a> {
             // Its machine's age (a job may have waited long for room before it got one).
             let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
             let longest = self.machine_minutes(&j.cloud) as u64;
-            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || before((longest + 5) * 60_000, age);
+            let past = before((longest + 5) * 60_000, age);
+            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || past;
             if !stale { active += 1; continue; }
             self.stop_machine(&plane_url, &j).await;
             self.withdraw_runner(&j).await;
             // (Said, when it is known: a job that ran past its longest time.)
-            if j.state != "orphan" && before((longest + 5) * 60_000, age) && j.error.is_none() {
-                j.error = Some(format!("it ran past its longest time ({}), and its machine was ended", if longest % 60 == 0 { format!("{} hours", longest / 60) } else { format!("{longest} minutes") }));
+            if j.state != "orphan" && past && j.error.is_none() {
+                j.error = Some(format!("it ran past its longest time ({}), and its machine was ended", match (longest / 60, longest % 60) { (1, 0) => "1 hour".to_string(), (h, 0) => format!("{h} hours"), _ => format!("{longest} minutes") }));
             }
             j.state = "swept".into();
             j.ended_ms.get_or_insert(now);

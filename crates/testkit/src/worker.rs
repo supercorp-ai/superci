@@ -137,7 +137,7 @@ impl Drop for Worker {
 
 impl Worker {
     /// Started with these settings (as its secrets), where Node and the built Worker are (`None`, said, elsewhere).
-    pub fn start(setup: &Setup, settings: &[(String, String)]) -> Option<Worker> { Worker::start_with(setup, settings, "npx") }
+    pub fn start(setup: &Setup, settings: &[(String, String)]) -> Option<Worker> { crate::needed(Worker::start_with(setup, settings, "npx"), "The built Worker or Node", crate::skips()) }
 
     fn start_with(setup: &Setup, settings: &[(String, String)], npx: &str) -> Option<Worker> {
         if !setup.built.exists() { eprintln!("the Worker is not built (./build.sh): skipped"); return None }

@@ -215,10 +215,18 @@ fn cloudflare_then_modal(workspace: &str) {
         served.aws.faults.arm(superci_testkit::Fault::Outage(*k));
         let (ok, said) = run("", &ask);
         served.aws.faults.stop();
-        said.contains("The control plane did not answer whether it has AWS runners yet").then_some((ok, said))
+        said.contains("The control plane did not answer whether it has AWS runners yet").then_some((*k, ok, said))
     });
-    let (ok, said) = stopped.unwrap_or_else(|| panic!("one of its health calls is the control plane's answer to whether it has AWS runners: {healths:?}"));
+    let (k, ok, said) = stopped.unwrap_or_else(|| panic!("one of its health calls is the control plane's answer to whether it has AWS runners: {healths:?}"));
     assert!(!ok && said.contains("Nothing was made") && !said.contains("let aws run jobs"), "{said}");
+    // Where that answer decides nothing (no account named, or not AWS's runners), it is not asked: the same outage
+    // stops neither.
+    for (args, want) in [(&["runners", "create", "aws", "--plane=cfplane00002", "--region=us-east-1", "--dry-run"][..], "Say which AWS account"), (&["runners", "create", "cloudflare", "--plane=cfplane00002", "--dry-run"], "let cloudflare run jobs")] {
+        served.aws.faults.arm(superci_testkit::Fault::Outage(k));
+        let (_, said) = run("", args);
+        served.aws.faults.stop();
+        assert!(said.contains(want) && !said.contains("did not answer whether it has AWS runners"), "{args:?}: {said}");
+    }
     std::fs::write(&file, before.to_string()).unwrap();
     // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
     step("03-cf-containers");
