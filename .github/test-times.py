@@ -34,7 +34,9 @@ def deal(times_path, tests_path, n):
     names = sorted({x for _, x in rows})
     known = [times[x] for x in names if x in times]
     average = sum(known) / len(known) if known else 1.0
-    cost = {x: times.get(x, average) for x in names}
+    # (A tenth of a second at least: the quick tests, most of them unit tests that take nothing, are spread over the
+    # parts as they come, not all dealt to whichever part is shortest when they come, as nothing would change it.)
+    cost = {x: max(times.get(x, average), 0.1) for x in names}
     parts, totals = [[] for _ in range(n)], [0.0] * n
     for x in sorted(names, key=lambda x: (-cost[x], x)):
         i = totals.index(min(totals))
