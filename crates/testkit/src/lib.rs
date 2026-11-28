@@ -333,8 +333,10 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(id.clone());
             let mut settings = a.settings(&id);
-            // (One from before reads its launchers and its devices' keys under their old names, and not the new ones.)
-            if a.old_version.lock().unwrap().is_some() {
+            // (One from before 0.19.13 reads its launchers and its devices' keys under their old names, and not the new
+            // ones.)
+            let renamed = |v: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(v) >= n("0.19.13") };
+            if a.old_version.lock().unwrap().as_deref().is_some_and(|v| !renamed(v)) {
                 settings = settings.into_iter().filter(|(k, _)| k != "LAUNCHERS" && !k.starts_with("DEVICE_KEY_"))
                     .map(|(k, v)| (if k == "AGENTS" { "LAUNCHERS".into() } else { k.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1) }, v)).collect();
             }
