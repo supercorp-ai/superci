@@ -34,6 +34,17 @@ use serde_json::{json, Value};
 use superci_core::io::{self, Clock, Containers, Request, Store, Timer, Work};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
+/// What a test needs (Chrome, Node and the built Worker), or `None` where it is not here: the test is then skipped,
+/// unless this run skips nothing (`SUPERCI_NO_SKIPS`, set by Coverage and its mutants), where it panics, so that a
+/// change that keeps it from starting fails the tests rather than leaving them passed unrun.
+pub(crate) fn needed<T>(got: Option<T>, what: &str, skips: bool) -> Option<T> {
+    if got.is_none() && !skips { panic!("{what} is not here, and this run skips nothing (SUPERCI_NO_SKIPS)") }
+    got
+}
+
+/// Whether a test may be skipped for want of what it needs: not where `SUPERCI_NO_SKIPS` is set.
+pub(crate) fn skips() -> bool { std::env::var_os("SUPERCI_NO_SKIPS").is_none() }
+
 /// A port free now, for a program a test starts to listen on: below the ports the system gives out (from 32768 on
 /// Linux, 49152 on macOS), so that no other test's listener and no connection is given it meanwhile, and another each
 /// time in this program.
@@ -280,6 +291,9 @@ impl Served {
     pub fn answers_to_come(&self) -> usize { self.aws.answers_next.lock().unwrap().1.len() }
 }
 
+/// Whether a control plane's settings turn its own containers on (`CONTAINERS` = `on`).
+pub fn containers_on(settings: &[(String, String)]) -> bool { settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on") }
+
 /// The control plane's id, and the AWS account and region it is in.
 pub const PLANE: &str = "testplane0001";
 pub const ACCOUNT: &str = "111111111111";
@@ -319,13 +333,15 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(id.clone());
             let mut settings = a.settings(&id);
-            // (One from before reads its launchers and its devices' keys under their old names, and not the new ones.)
-            if a.old_version.lock().unwrap().is_some() {
+            // (One from before 0.19.13 reads its launchers and its devices' keys under their old names, and not the new
+            // ones.)
+            let renamed = |v: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(v) >= n("0.19.13") };
+            if a.old_version.lock().unwrap().as_deref().is_some_and(|v| !renamed(v)) {
                 settings = settings.into_iter().filter(|(k, _)| k != "LAUNCHERS" && !k.starts_with("DEVICE_KEY_"))
                     .map(|(k, v)| (if k == "AGENTS" { "LAUNCHERS".into() } else { k.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1) }, v)).collect();
             }
             // (Its machines are its own containers, as a Cloudflare or Modal control plane's are: on until removed.)
-            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.containers = containers_on(&settings);
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
@@ -387,10 +403,12 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
             let o = v.as_object_mut().expect("a status is an object");
             let l = o.remove("launchers").unwrap_or_default();
             o.insert("agents".into(), l);
-            // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0.)
+            // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0, a
+            // machine held to one region in 0.20.5.)
             let older = |than: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(&version) < n(than) };
             if older("0.15.0") { o.remove("account_limits"); }
             if older("0.16.0") { o.remove("daily_limits"); }
+            if older("0.20.5") { o.remove("region_label"); }
             v.to_string().into_bytes()
         }
         _ => res.body,
@@ -1318,7 +1336,7 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
-            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.containers = containers_on(&settings);
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &ending, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
@@ -1399,7 +1417,7 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); return }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
-            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.containers = containers_on(&settings);
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &left, config: &config, cache: &cache, containers: Some(&m) };

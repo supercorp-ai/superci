@@ -566,13 +566,8 @@ fn modal_ended_in(workspace: &str) -> String { format!("Modal no longer accepts 
 
 /// A day, as 2026-10-07 (UTC), from unix seconds.
 fn day(unix: u64) -> String {
-    let z = unix as i64 / 86_400 + 719_468;
-    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
-    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 })
+    let (y, m, d) = superci_core::plane::civil(unix as i64 / 86_400);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// When a key ends, from the name it is stored under in a control plane (`DEVICE_KEY_<unix seconds>_<random>`).
@@ -949,7 +944,7 @@ fn asks_said(j: &serde_json::Value) -> String {
         let (kind, spot, what) = (a["kind"].as_str().unwrap_or_default(), a["spot"] == true, a["said"].as_str().unwrap_or_default());
         let market = if spot { "spot " } else { "on-demand " };
         // One request for any of several pools (see `Ask::pools`): what AWS chose among them, or that none had one.
-        if let Some(pools) = a["pools"].as_u64().filter(|p| *p > 0) {
+        if let Some(pools) = a["pools"].as_u64().filter(|p| *p != 0) {
             said.push(match what {
                 "started" => format!("{market}{kind}{}, AWS's choice of {pools} pools", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default()),
                 "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => format!("your account's limit refused {pools} other pools"),
@@ -1028,7 +1023,7 @@ pub fn choice_said(j: &serde_json::Value) -> Option<String> {
 /// making the job to the job running, with how long each step took (ms). What the control plane kept is all that is
 /// said: a job from before, or a machine that could not say its part, has fewer steps.
 pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
-    let n = |v: &serde_json::Value| v.as_u64().filter(|t| *t > 0);
+    let n = |v: &serde_json::Value| v.as_u64().filter(|t| *t != 0);
     let (Some(heard), started) = (n(&j["at_ms"]), n(&j["started_ms"])) else { return serde_json::Value::Null };
     let mut steps: Vec<(String, u64, String)> = vec![];
     let mut step = |what: &str, from: u64, to: u64, more: String| if to >= from && to - from < 86_400_000 { steps.push((what.to_string(), to - from, more)) };
@@ -1194,7 +1189,7 @@ fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
 /// was reached: how many, and where to ask AWS for more.
 fn spot_limit_notice(jobs: &[serde_json::Value]) -> String {
     let since = now_ms().saturating_sub(86_400_000);
-    let hit: Vec<String> = jobs.iter().filter(|j| j["at_ms"].as_u64().is_some_and(|at| at > since)).filter_map(|j| off_spot(j)?.1).collect();
+    let hit: Vec<String> = jobs.iter().filter(|j| j["at_ms"].as_u64().is_some_and(|at| superci_core::io::before(since, at))).filter_map(|j| off_spot(j)?.1).collect();
     let Some(region) = hit.first() else { return String::new() };
     format!(r#"<div class="notice warn"><span>{} in the last day ran on on-demand machines, at about twice the price: your AWS account's spot limit in {} was reached. <a href="{}" target="_blank" rel="noopener">Request more from AWS ↗</a></span></div>"#,
         jobs_word(hit.len() as u32), esc(&region_short(region)), esc(&superci_core::aws::spot_quota_link(region)))
@@ -2068,7 +2063,7 @@ impl Dashboard {
         if let (Some(region), true) = (look.asked_in.as_deref(), look.spot_cpus.is_some() || look.on_demand_cpus.is_some()) {
             let n = |cpus: Option<u32>| cpus.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             let (limit, code) = if spot_refused { (look.on_demand_cpus, superci_core::aws::ON_DEMAND_CPU_QUOTA) } else { (look.spot_cpus, superci_core::aws::SPOT_CPU_QUOTA) };
-            let jobs = limit.map(|c| if c < 8 { "One job of the default size at a time".to_string() } else { format!("{} jobs of the default size at a time", c / 4) }).unwrap_or_default();
+            let jobs = limit.map(default_jobs_at_once).unwrap_or_default();
             // Spot and on-demand are raised apart: one button, each in its menu (only the one jobs can use, when the
             // other is refused).
             let on_demand_refused = matches!(look.on_demand, Some(aws::Answer::Refused(_)));
@@ -2873,7 +2868,7 @@ impl Dashboard {
         let mut tidy: Vec<Box<dyn FnOnce() + Send>> = vec![];
         unkeyed.iter().for_each(|p| {
             // (And the keys an older SuperCI on another device hands under the old name, which nothing here reads.)
-            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").or_else(|| n.strip_prefix("DASHBOARD_KEY_")).and_then(|r| r.split('_').next().unwrap_or_default().parse::<u64>().ok()).is_some_and(|until| until < now)) };
+            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").or_else(|| n.strip_prefix("DASHBOARD_KEY_")).and_then(|r| r.split('_').next().unwrap_or_default().parse::<u64>().ok()).is_some_and(|until| superci_core::io::before(until, now))) };
             match p.clone() {
                 Plane::Cloudflare { account_id, script, .. } => if let Ok(cf) = self.cloudflare() {
                     tidy.push(Box::new(move || for old in expired(cf.secret_names(&account_id, &script).unwrap_or_default()) { let _ = cf.delete_secret(&account_id, &script, &old); }));
@@ -3259,7 +3254,8 @@ impl Dashboard {
                 if !which.is_empty() { setting["id"] = which.clone().into() }
                 self.put_secret(&plane, &if which.is_empty() { "GITLAB".to_string() } else { format!("GITLAB_{which}") }, &setting.to_string())?;
                 let (w, u) = (which.clone(), url.clone());
-                wait_for(plane.url(), &self.status_key, move |s| if w.is_empty() { s["gitlab"]["url"] == u.as_str() } else { s["gitlabs"].as_array().is_some_and(|l| l.iter().any(|g| g["id"] == w.as_str() && g["url"] == u.as_str())) });
+                // (Shown by the control plane, or said as not: never taken as connected when it did not take it.)
+                self.shown(&plane, move |s| if w.is_empty() { s["gitlab"]["url"] == u.as_str() } else { s["gitlabs"].as_array().is_some_and(|l| l.iter().any(|g| g["id"] == w.as_str() && g["url"] == u.as_str())) })?;
                 // Connected again: its webhooks get the new secret.
                 if before { let _ = cloudflare::plane_post(plane.url(), &self.status_key, "/gitlab/projects", &serde_json::json!({ "refresh": true, "gitlab": which })); }
                 eprintln!("GitLab connected as {me}");
@@ -3809,7 +3805,7 @@ impl Dashboard {
                 let same = apps.iter().position(|a| a["owner"].as_str().is_some_and(|o| o.eq_ignore_ascii_case(&app.owner)) && a["host"].as_str() == app.host.as_deref());
                 let name = match same { Some(0) => "GITHUB_APP".to_string(), None if apps.is_empty() => "GITHUB_APP".to_string(), _ => format!("GITHUB_APP_{}", app.id) };
                 self.put_secret(&plane, &name, &json_text(&app))?;
-                if let Some(old) = same.filter(|n| *n > 0).and_then(|n| apps[n]["id"].as_u64()).filter(|old| *old != app.id) { let _ = self.drop_secret(&plane, &format!("GITHUB_APP_{old}")); }
+                if let Some(old) = same.filter(|n| *n != 0).and_then(|n| apps[n]["id"].as_u64()).filter(|old| *old != app.id) { let _ = self.drop_secret(&plane, &format!("GITHUB_APP_{old}")); }
                 self.views = None;
                 self.manifest_state = None;
                 self.github_expected = Some(now_ms() + 600_000);
@@ -4076,6 +4072,11 @@ impl Dashboard {
                 if spec.spot == Some(true) { spec.spot = None }
                 if spec.arch.is_some() && spec.os.as_deref() == Some("windows") { return Ok(message(400, "Windows machines are x64", "Choose x64 for Windows, or Linux for arm64.")) }
                 if let Err(e) = spec.check() { return Ok(message(400, "That machine does not go together", &esc(&e))) }
+                // (A control plane from before `region=` drops it unsaid, and its jobs start in any region: refused
+                // before anything is written.)
+                if spec.region.is_some() && !status_soon(plane.url(), &self.status_key).is_some_and(|s| s["region_label"] == true) {
+                    return Ok(message(409, "Update the control plane first", "Holding jobs to one AWS region needs a newer control plane: update it on the Control plane page (or `superci planes update`), then set the region."))
+                }
                 let want = json_value(&spec);
                 self.put_secret(&plane, "MACHINE", &want.to_string())?;
                 self.shown(&plane, |s| s["machine"] == want)?;
@@ -4523,9 +4524,9 @@ mark();load()})();</script>"#;
             let same = same && d.views.as_ref().is_some_and(|(_, at)| *at > ended);
             // An update that is uploaded while the old version still answers: read anew at every look.
             let restarting = lock(&d.updating).as_ref().is_some_and(|u| d.views.as_ref().is_some_and(|(views, _)| views.iter().any(|v| u.restarting(v))));
-            let same = same && !restarting;
+            let asking = Asking { modal: pending.is_some(), quotas: quota_creds.is_some(), look: look_creds.is_some(), github: expecting };
             match d.views.clone() {
-                Some((views, at)) if same && pending.is_none() && quota_creds.is_none() && look_creds.is_none() && !expecting && now_ms() < at + views_kept_ms() => {
+                Some((views, at)) if kept_views_do(same, restarting, &asking, now_ms(), at) => {
                     look_again = now_ms() > at + 3_000;
                     if now_ms() > at + 3_000 && !d.refreshing {
                         d.refreshing = true;
@@ -4728,8 +4729,14 @@ mark();load()})();</script>"#;
         // Overview does not: its public state is enough, and its numbers and jobs fill in when the key is read.
         // Half a minute on, one that still does not take the key will not by itself (it is from before the key's name,
         // or the key expired): why, and what to do, said; looked at again now and then.
-        let waited = settling && current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms());
-        let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v)).map(|why| format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)));
+        // Its cloud's sign-in has ended, and this session's key was never handed: none can be until it is signed in to
+        // again, so that is said at once, with the sign-in.
+        let ended = current.filter(|v| settling && !self.keyed.contains(v.plane.plane_id()) && !self.signed_in_at(&v.plane));
+        let waited = settling && (ended.is_some() || current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms()));
+        let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v).map(|why| match ended {
+            Some(_) => format!(r#"<section class="card"><div class="card-head"><h2>Sign in to read your control plane</h2></div><p class="note">This computer's key for it has ended, and so has your {0} sign-in. Signing in hands it a new key.</p>{1}</section>"#, provider_name(v.plane.cloud()), signin_button(v.plane.cloud(), &format!("Sign in with {}", provider_name(v.plane.cloud())), true)),
+            None => format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)),
+        }));
         // Overview does not wait for the key (its public state is enough), but neither does it show "Reading your
         // control plane…" for ever: once the key is refused it says why and what to do, and looks again now and then.
         if let Some(card) = refused.as_deref().filter(|_| section == "overview") {
@@ -6503,12 +6510,12 @@ document.addEventListener('input',function(e){if(e.target.name==='own_url')super
 document.addEventListener('click',function(e){var cp=e.target.closest&&e.target.closest('[data-copy]');if(!cp)return;var d=cp.closest('dialog'),t=d.superciText,er=d.querySelector('.prompt-copy-error');
 navigator.clipboard.writeText(t).then(function(){if(t!==d.superciText)return;cp.classList.add('is-copied');cp.querySelector('svg').outerHTML='<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 4 4 8-8"/></svg>';cp.querySelector('span').textContent='Copied'},function(){er.hidden=false;er.textContent='Copy failed. Select the prompt and copy it manually.'})});
 function superciPick(f){var d=JSON.parse(f.dataset.default),label=f.dataset.mode==='label',g=function(n){var e=f.elements[n];return !e?'':e.type==='checkbox'?(e.checked&&!e.disabled):e.value};
-var cpu=+g('cpu')||0,ram=+g('ram')||0,disk=+g('disk')||0,arch=g('arch'),os=g('os'),gpu=g('gpu'),od=g('nospot'),img=g('image');
+var cpu=+g('cpu')||0,ram=+g('ram')||0,disk=+g('disk')||0,arch=g('arch'),os=g('os'),gpu=g('gpu'),od=g('nospot'),img=g('image'),rg=g('region');
 // (An Ubuntu is for Linux: no choice while the machine is Windows.)
 var ie=f.elements.image,win=(os||(label?d.os:os))==='windows';if(ie)ie.disabled=win;if(win)img='';
-if(label){var parts=[];if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(img)parts.push('image='+img);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');f.querySelector('[data-label]').textContent=f.dataset.base+(parts.length?'/'+parts.join('/'):'');
-ram=ram||(cpu?0:d.ram);cpu=cpu||d.cpu;disk=disk||d.disk;arch=arch||d.arch;os=os||d.os;if(!img&&!win)img=d.image||''}
-f.querySelectorAll('.fit').forEach(function(x){var got=null;JSON.parse(x.dataset.caps).some(function(k){got=superciFit(k,cpu,ram,disk,arch,os,gpu,img);return got});x.classList.toggle('no',!got);var s=x.querySelector('[data-size]');if(s)s.textContent=got?got.cpu+' CPU · '+got.ram+' GB'+(got.gpu?' · '+got.gpu.toUpperCase():''):''})}
+if(label){var parts=[];if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(img)parts.push('image='+img);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(rg)parts.push('region='+rg);if(od)parts.push('spot=false');f.querySelector('[data-label]').textContent=f.dataset.base+(parts.length?'/'+parts.join('/'):'');
+ram=ram||(cpu?0:d.ram);cpu=cpu||d.cpu;disk=disk||d.disk;arch=arch||d.arch;os=os||d.os;if(!img&&!win)img=d.image||'';rg=rg||d.region||''}
+f.querySelectorAll('.fit').forEach(function(x){var got=null;JSON.parse(x.dataset.caps).some(function(k){got=superciFit(k,cpu,ram,disk,arch,os,gpu,img);return got});if(rg&&x.dataset.aws===undefined)got=null;x.classList.toggle('no',!got);var s=x.querySelector('[data-size]');if(s)s.textContent=got?got.cpu+' CPU · '+got.ram+' GB'+(got.gpu?' · '+got.gpu.toUpperCase():''):''})}
 (function(){var dragged=null;
 window.superciRegions=function(f){f.querySelectorAll('input[data-rg]').forEach(function(i){i.remove()});f.querySelectorAll('.rg').forEach(function(li,n){var x=document.createElement('input');x.type='hidden';x.name='region_'+n;x.value=li.dataset.region;x.setAttribute('data-rg','');f.appendChild(x)})};
 window.superciRegionRemove=function(b){var li=b.closest('.rg'),list=li.parentNode;if(list.querySelectorAll('.rg').length<2)return;var sel=list.parentNode.querySelector('.rg-add'),o=document.createElement('option');o.value=li.dataset.region;o.textContent=li.dataset.name+' · '+li.dataset.region;sel.appendChild(o);li.remove()};
@@ -6722,7 +6729,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         let state = if no_spot.is_some() { pill("open", "not allowed") } else { pill("good", "ready") };
         let spent = v.spend(&p.cloud);
         let mut limits = vec![];
-        if let Some(n) = p.max_jobs { limits.push(format!("{n} at once")) }
+        limits.push(format!("{} at once", p.max_jobs.unwrap_or_else(|| superci_core::plane::jobs_at_once(v.records().provider_of(&p.cloud)))));
         if let Some(cap) = p.monthly_usd { limits.push(format!("{} of {}", usd(spent), usd(cap))) }
         // Modal's Functions: their preemptions this month (all of Modal's together).
         let preempted = v.status.as_ref().and_then(|s| s["preempted"]["month"].as_u64()).unwrap_or(0);
@@ -6741,6 +6748,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
             esc(&p.cloud), logo(&logo_key, 32), esc(&name), esc(&what), esc(&name)));
         // Its settings, alike for every row: jobs at once, a monthly budget, and where it starts machines.
+        let default_jobs = superci_core::plane::jobs_at_once(v.records().provider_of(&p.cloud));
         let value = |n: Option<String>| n.map(|n| format!(r#" value="{n}""#)).unwrap_or_default();
         let budget = format!(r#"<label class="field"><span>Monthly budget</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{}></span><small>{} this month. At the budget, jobs go to the next provider.</small></label>"#,
             value(p.monthly_usd.map(|n| format!("{n:.0}"))), usd(spent));
@@ -6754,8 +6762,8 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
             } else { String::new() };
         // (Taking it out keeps its settings; nothing is deleted anywhere.)
         let take_out = r#"<button type="button" class="button secondary sm" style="margin-right:auto" onclick="var f=this.form;f.elements.action.value='take_out';f.requestSubmit()">Take out of the order</button>"#;
-        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body" onsubmit="superciRegions(this)"><input type="hidden" name="action" value="pool"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div><label class="field"><span>Jobs at once</span><input type="number" name="max" min="1" max="999" placeholder="No limit"{}><small>When this many run, the next job goes to the next provider (or waits).</small></label>{budget}{place}<div class="dlg-foot">{take_out}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
-            esc(&p.cloud), esc(&current), logo(&logo_key, 36), esc(&name), esc(&what), value(p.max_jobs.map(|n| n.to_string()))));
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body" onsubmit="superciRegions(this)"><input type="hidden" name="action" value="pool"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div><label class="field"><span>Jobs at once</span><input type="number" name="max" min="1" max="999" placeholder="{}"{}><small>When this many run, the next job goes to the next provider (or waits). Left empty: {}.</small></label>{budget}{place}<div class="dlg-foot">{take_out}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+            esc(&p.cloud), esc(&current), logo(&logo_key, 36), esc(&name), esc(&what), default_jobs, value(p.max_jobs.map(|n| n.to_string())), default_jobs));
     });
     let waiting: Vec<&serde_json::Value> = jobs.iter().filter(|j| j["state"] == "waiting").collect();
     let waiting = match waiting.as_slice() {
@@ -6988,6 +6996,17 @@ fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
 </div></section>"#, superci_core::cache::MAX_AGE_DAYS, superci_core::cache::MAX_AGE_DAYS)
 }
 
+/// What a page is waiting to ask or hear before the control planes as read a moment ago will do for it: a Modal
+/// sign-in being finished, AWS's quotas or its account's look to be read, GitHub's App expected back.
+struct Asking { modal: bool, quotas: bool, look: bool, github: bool }
+
+/// Whether the control planes as read at `at` are shown again at `now`: the same ones as then (`same`), read after any
+/// move or update ended, none of them being restarted by an update (read anew at every look meanwhile), nothing being
+/// asked that would change them, and read within `views_kept_ms`.
+fn kept_views_do(same: bool, restarting: bool, asking: &Asking, now: u64, at: u64) -> bool {
+    same && !restarting && !asking.modal && !asking.quotas && !asking.look && !asking.github && now < at + views_kept_ms()
+}
+
 /// A size in words: 940 MB, 3.4 GB.
 pub(crate) fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else if bytes >= 10_000_000 { format!("{} MB", (bytes + 500_000) / 1_000_000) } else if bytes >= 1_000_000 { format!("{:.1} MB", bytes as f64 / 1e6) } else { format!("{} KB", bytes.div_ceil(1000)) } }
 
@@ -7015,13 +7034,22 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         let opts = opts.iter().map(|(val, text)| format!(r#"<option value="{val}"{}>{text}</option>"#, if current == Some(*val) { " selected" } else { "" })).collect::<String>();
         format!(r#"<label class="field"><span>{label}</span><select name="{name}">{}{opts}</select></label>"#, if first.is_empty() { String::new() } else { format!(r#"<option value="">{first}</option>"#) })
     };
-    let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND && !v.records().modal_function(&p.cloud)).map(|p| { let (key, name) = (p.cloud.clone(), cloud_name(&p.cloud).to_string()); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
+    let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND && !v.records().modal_function(&p.cloud)).map(|p| { let (key, name) = (p.cloud.clone(), cloud_name(&p.cloud).to_string()); format!(r#"<span class="fit" data-caps="{}"{}>{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), if v.records().provider_of(&p.cloud) == "aws" { " data-aws" } else { "" }, logo(&key, 18), esc(&name)) }).collect::<String>();
     // The disk's speed on AWS: by the machine's size unless set (what AWS includes, at no extra price, or a number).
     let speed = m.disk_mibs.map(|s| s.to_string());
     let custom = speed.clone().filter(|s| !["125", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
     let mut speeds: Vec<(&str, &str)> = vec![("125", "Standard, 125 MiB/s"), ("250", "250 MiB/s"), ("500", "500 MiB/s"), ("1000", "1,000 MiB/s")];
     if let Some((val, text)) = &custom { speeds.push((val, text)) }
-    let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "image": m.image, "ondemand": m.on_demand() });
+    let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "image": m.image, "region": m.region, "ondemand": m.on_demand() });
+    // The AWS regions a machine may be held to: those the control plane is set up in (and one set before, if not).
+    let mut regions: Vec<String> = v.aws_regions();
+    // (A control plane in AWS, before it has said its regions: its own.)
+    if let (true, Plane::Aws { region, .. }) = (regions.is_empty(), &v.plane) { regions.push(region.clone()) }
+    if let Some(r) = m.region.clone().filter(|r| !regions.contains(r)) { regions.push(r) }
+    let region_names: Vec<(String, String)> = regions.iter().map(|r| (r.clone(), format!("{} ({r})", region_name(r)))).collect();
+    let region_choices: Vec<(&str, &str)> = region_names.iter().map(|(r, n)| (r.as_str(), n.as_str())).collect();
+    // (None without AWS, or with a control plane from before `region=`, which would drop it unsaid.)
+    let region = |first: &str, current: Option<&str>| if region_choices.is_empty() || !v.region_label() { String::new() } else { choice("region", "Region (AWS)", first, &region_choices, current) };
     // The default: what it is, in words, and its dialog.
     let mut parts = vec![m.cpu.map(|c| format!("{c} CPU")).unwrap_or_else(|| "Each provider's standard size".into())];
     if let Some(r) = m.ram_gb { parts.push(format!("{r} GB")) }
@@ -7035,13 +7063,15 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     if !m.families.is_empty() { parts.push(m.families.join(", ")) }
     match m.docker_cache { Some(false) => parts.push("no Docker image cache".into()), Some(true) => parts.push("Docker image cache from the start".into()), None => {} }
     if let Some(provider) = &m.cloud { parts.push(format!("only {}", cloud_name(provider))) }
+    if let Some(region) = &m.region { parts.push(format!("only in {}", region_short(region))) }
     let dialog = format!(r#"<dialog class="dlg" id="default-machine" onclick="if(event.target===this)this.close()"><form method="post" action="/machine" class="dlg-body picker" data-mode="default" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Default machine</strong><small>For <code>runs-on: {base}</code>, and any part a label leaves out.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picker-fields">{}{}{}{}{}{}</div>{}<label class="check"><input type="checkbox" name="nospot"{}> No spot machines</label><div class="fits"><span class="note">Runs on</span>{}</div><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
         esc(&default.to_string()),
         select("cpu", "CPU", "Provider's standard", &CPUS, m.cpu), select("ram", "Memory", "4 GB per CPU", &RAMS, m.ram_gb), select("disk", "Disk", "Provider's standard", &DISKS, m.disk_gb),
         choice("disk-speed", "Disk speed (AWS)", "By machine size", &speeds, speed.as_deref()),
         choice("arch", "Architecture", "", &[("x64", "x64"), ("arm64", "arm64")], Some(m.arch())),
         // (Beside the system: which Ubuntu, unset as GitHub's `ubuntu-latest` is.)
-        format!("{}{}", choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())), choice("image", "Ubuntu", "As ubuntu-latest", &UBUNTU_CHOICES, m.image.as_deref())),
+        format!("{}{}{}", choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())), choice("image", "Ubuntu", "As ubuntu-latest", &UBUNTU_CHOICES, m.image.as_deref()),
+            region("Any", m.region.as_deref())),
         // (What the dialog does not show is kept as it is.)
         m.pairs().iter().filter(|(key, _)| ["disk-iops", "gpu", "family", "scratch", "provider", "docker-cache"].contains(key)).map(|(key, value)| format!(r#"<input type="hidden" name="{key}" value="{}">"#, esc(value))).collect::<String>(),
         if m.on_demand() { " checked" } else { "" }, pools());
@@ -7054,7 +7084,8 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         select("cpu", "CPU", "Default", &CPUS, None), select("ram", "Memory", "Default", &RAMS, None), select("disk", "Disk", "Default", &DISKS, None),
         choice("arch", "Architecture", "Default", &[("x64", "x64"), ("arm64", "arm64")], None),
         format!("{}{}", choice("os", "System", "Default", &[("linux", "Linux"), ("windows", "Windows")], None), choice("image", "Ubuntu", "Default", &UBUNTU_CHOICES, None)),
-        choice("gpu", "GPU", "None", &[("gpu", "Any (least costly)"), ("t4", "T4"), ("l4", "L4"), ("a10g", "A10G"), ("l40s", "L40S"), ("a100", "A100"), ("h100", "H100"), ("h200", "H200"), ("b200", "B200")], None), pools());
+        format!("{}{}", choice("gpu", "GPU", "None", &[("gpu", "Any (least costly)"), ("t4", "T4"), ("l4", "L4"), ("a10g", "A10G"), ("l40s", "L40S"), ("a100", "A100"), ("h100", "H100"), ("h200", "H200"), ("b200", "B200")], None),
+            region("Default", None)), pools());
     (format!(r#"<section class="card dm-card">{default_row}{dialog}</section>"#), picker)
 }
 
@@ -7164,6 +7195,12 @@ fn job_link(j: &serde_json::Value) -> String {
 
 /// Overview's cards: the last day's jobs (did they get a machine, how fast, at what cost), the ones that need a look,
 /// the latest; then where they ran.
+/// A wait for a machine in words: "40 s" under a minute, "3 min" from one on.
+fn wait_words(ms: u64) -> String { if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { format!("{} min", ms / 60_000) } }
+
+/// How many jobs of the default size (4 CPUs) an account's limit of CPUs runs at once, in words.
+fn default_jobs_at_once(cpus: u32) -> String { if cpus < 8 { "One job of the default size at a time".to_string() } else { format!("{} jobs of the default size at a time", cpus / 4) } }
+
 fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> String {
     let jobs: Vec<serde_json::Value> = jobs.iter().map(|j| with_hosts(v, j)).collect();
     let now = now_ms();
@@ -7213,7 +7250,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
     let mut per_hour: Vec<Vec<u64>> = vec![vec![]; 24];
     for j in &day { if let (Some(st), Some(at)) = (j["started_ms"].as_u64(), j["at_ms"].as_u64()) { per_hour[slot(j)].push(st.saturating_sub(at)) } }
     let wait_spark = spark(&per_hour.iter_mut().enumerate().map(|(i, w)| { w.sort(); let m = w.get(w.len() / 2).copied().unwrap_or(0); (m as f64, 0.0, if w.is_empty() { format!("{}: no jobs", hour_name(i)) } else { format!("{}: {} s median", hour_name(i), (m + 500) / 1000) }) }).collect::<Vec<_>>());
-    let wait_kpi = kpi(median.map(|m| if m < 60_000 { format!("{} s", (m + 500) / 1000) } else { format!("{} min", m / 60_000) }).unwrap_or_else(|| "—".into()),
+    let wait_kpi = kpi(median.map(wait_words).unwrap_or_else(|| "—".into()),
         "median wait for a machine", wait_spark, if waits.is_empty() { "From queued to running".into() } else { format!("Fastest {} s · slowest {} s", waits[0] / 1000, waits[waits.len() - 1] / 1000) });
     // What it cost, and what GitHub would have charged for the same jobs.
     let top = spent.max(github).max(0.000_001);
@@ -7331,7 +7368,7 @@ fn usage_figures(u: &serde_json::Value, period: &str, jobs: &[serde_json::Value]
     // (Its label in the unit its figure is in: hours from 6,000 minutes on.)
     let minutes_kpi = kpi(minutes(f("machine_minutes")), if f("machine_minutes") >= 6000.0 { "machine hours" } else { "machine minutes" }, minutes_spark, format!("{} min as {host} {} them", n("billed_minutes"), if host.contains(" and ") { "bill" } else { "bills" }));
     // The wait for a machine: each step's median.
-    let secs = |ms: u64| if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { format!("{} min", ms / 60_000) };
+    let secs = wait_words;
     let wait_spark = spark((0..count).map(|i| { let m = steps[i]["wait_median_ms"].as_u64(); (m.unwrap_or(0) as f64, 0.0, match m { Some(m) => format!("{}: {} median", step_name(i), secs(m)), None => format!("{}: no jobs", step_name(i)) }) }).collect());
     let wait_kpi = kpi(u["wait_median_ms"].as_u64().map(secs).unwrap_or_else(|| "—".into()), "median wait for a machine", wait_spark,
         match (u["wait_fastest_ms"].as_u64(), u["wait_slowest_ms"].as_u64()) { (Some(a), Some(b)) => format!("Fastest {} · slowest {}", secs(a), secs(b)), _ => "From queued to running".into() });
@@ -9310,7 +9347,7 @@ mod tests {
         assert!(html.matches(r#"<label class="check"><input type="checkbox" name="nospot"> No spot machines</label>"#).count() == 2 && !html.contains("ondemand\"") && !html.contains("On-demand only"), "{html}");
         // The picker writes a label as key=value pairs after its name.
         let shell = String::from_utf8(Dashboard::page("workflows").body).unwrap();
-        assert!(shell.contains("if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(img)parts.push('image='+img);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');") && shell.contains("f.dataset.base+(parts.length?'/'+parts.join('/'):'')"), "the script");
+        assert!(shell.contains("if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(img)parts.push('image='+img);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(rg)parts.push('region='+rg);if(od)parts.push('spot=false');") && shell.contains("f.dataset.base+(parts.length?'/'+parts.join('/'):'')"), "the script");
         assert!(html.contains("<code>superci/cpu=8</code>, <code>superci/arch=arm64</code> or <code>superci/cpu=16/ram=64</code>"));
         // The picker starts at Default for everything (the label is plain), each field naming only what is picked.
         assert!(html.contains(r#"data-mode="label""#) && html.contains(r#"<option value="">Default</option>"#) && html.contains(r#"<span class="hl" data-label>superci</span>"#));
@@ -10041,6 +10078,8 @@ mod tests {
             preview(&format!("skeleton-{section}"), &page);
             assert!(page.contains("Reading your control plane"), "{section}");
         }
+        // (Workflows in its own: the default machine's card first.)
+        assert!(skeleton("workflows", "Workflows").contains(r#"<section class="card dm-card"><div class="default-machine">"#));
     }
 
     #[test]
@@ -10599,6 +10638,44 @@ mod rest_tests {
     /// Where nothing answers (the discard port: refused at once).
     const NOWHERE: &str = "http://127.0.0.1:9";
 
+    /// Each small saying at its edges: seconds and waits in words, a request for pools of none, a price of nothing,
+    /// a start's steps from times of nothing or a day long, a first choice as dear as what was got, the jobs an
+    /// account's limit runs at once, a failed job in its hour, and what was saved when nothing was, or as much.
+    #[test]
+    fn what_the_pages_say_holds_at_each_edge() {
+        assert_eq!((secs(9_949), secs(9_950), secs(59_999)), ("9.9 s".to_string(), "10 s".to_string(), "60 s".to_string()));
+        assert_eq!(secs(60_000), span(60_000));
+        assert_eq!((wait_words(59_499), wait_words(59_999), wait_words(60_000)), ("59 s".to_string(), "60 s".to_string(), "1 min".to_string()));
+        assert_eq!((default_jobs_at_once(7), default_jobs_at_once(8)), ("One job of the default size at a time".to_string(), "2 jobs of the default size at a time".to_string()));
+        // A request said to be for no pools is one for its own type.
+        let one = serde_json::json!({ "asks": [{ "kind": "m8a.large", "spot": true, "said": "started", "zone": "us-east-1a", "pools": 0 }] });
+        assert_eq!(asks_said(&one), "spot m8a.large in us-east-1a");
+        // A price of nothing is not said.
+        let over = serde_json::json!({ "machine_type": "m8a.large", "asks": [{ "kind": "m7a.large", "zone": "us-east-1b", "spot": true, "said": "InsufficientInstanceCapacity", "usd": 0.0 }] });
+        assert_eq!(passed_over(&over), ["m7a.large in us-east-1b"]);
+        // A start heard at no time is none; a step a day long or more is left out, one a moment shorter said.
+        assert!(job_start(&serde_json::json!({ "at_ms": 0, "started_ms": 5 })).is_null());
+        let q = 1_790_000_000_000u64;
+        let steps = |heard: u64| job_start(&serde_json::json!({ "at_ms": heard, "queued_ms": q, "started_ms": heard + 1 }))["steps"].as_array().map_or(0, Vec::len);
+        assert_eq!((steps(q + 86_400_000), steps(q + 86_399_999)), (0, 1));
+        // The first choice as dear as what was got is not said as a cheaper one; a price of nothing not said at all.
+        let machine = |first: f64, got: f64| { let (a, b, c) = aws_machine(&serde_json::json!({ "cloud": "aws", "machine_type": "m8a.large", "cpu": 2, "asks": [
+            { "kind": "m7a.large", "zone": "us-east-1a", "spot": true, "said": "InsufficientInstanceCapacity", "usd": first },
+            { "kind": "m8a.large", "zone": "us-east-1b", "spot": true, "said": "started", "usd": got }] })).unwrap(); format!("{a} {b} {c}") };
+        assert!(!machine(0.03, 0.03).contains("its first choice") && machine(0.02, 0.03).contains("its first choice"), "{}", machine(0.03, 0.03));
+        assert!(!machine(0.02, 0.0).contains("$0.0000 an hour"), "{}", machine(0.02, 0.0));
+        // Usage: a wait of a minute; as much spent as the code host would have charged, or nothing at all.
+        let figures = |usd: f64, host: f64| plain(&usage_figures(&serde_json::json!({ "jobs": 1, "usd": usd, "host_usd": host, "wait_median_ms": 60_000, "steps": [] }), "day", &[]));
+        assert!(figures(2.0, 2.0).contains("1 min") && !figures(2.0, 2.0).contains("saved") && figures(1.0, 2.0).contains("saved"), "{}", figures(2.0, 2.0));
+        assert!(!figures(0.0, 0.0).contains("GitHub: "), "{}", figures(0.0, 0.0));
+        // Overview: a job that failed is counted in its hour.
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [] }));
+        let at = now_ms() - 3_600_000;
+        let done = serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws", "machine_id": "i-1", "usd_per_hour": 0.5 });
+        let failed = serde_json::json!({ "job_id": 2, "run_id": 1, "repo": "acme/web", "state": "failed", "at_ms": at, "started_ms": at + 60_000, "ended_ms": at + 120_000, "cpu": 2, "cloud": "aws" });
+        assert!(overview_cards(&v, &[done, failed], "day").contains("1 did not"));
+    }
+
     fn aws_plane(id: &str, url: &str) -> Plane { Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }
     fn cf_plane(id: &str, url: &str) -> Plane { Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme".into(), script: "superci".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }
     fn modal_plane(id: &str, url: &str) -> Plane { Plane::Modal { workspace: "acme".into(), url: url.into(), plane_id: id.into(), label: "superci".into() } }
@@ -10854,6 +10931,26 @@ mod rest_tests {
             assert_eq!(r.status, 503, "{id}: {}", words_of(&r));
             assert_eq!((d.selected, d.aws.as_ref().map(|a| a.account_id.as_str()), d.modal.as_ref().map(|m| m.workspace.as_str())), (0, Some("111111111111"), Some("acme")), "{id}");
         }
+        // One found in a signed-in account but not kept here: that one is updated (it does not answer: stopped there),
+        // never the one in use.
+        d.found = vec![aws("p4", "111111111111")];
+        let r = send(&mut d, "/plane/update", &[("plane", "p4")]).unwrap();
+        assert_eq!((r.status, d.selected), (503, 0), "{}", words_of(&r));
+    }
+
+    #[test]
+    fn a_move_to_a_control_plane_in_an_aws_account_not_signed_in_to_stops_before_anything_moves() {
+        let mut d = Dashboard::new();
+        let aws = |id: &str, account: &str, url: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: url.into(), plane_id: id.into(), label: "superci".into() };
+        // (Both answer; the new one serves nothing yet, so it takes a move. The one in use is in Cloudflare, with
+        // nothing of AWS's to bring: only the new one's account needs AWS's sign-in, and there is none.)
+        let (from, to) = (plane_answering(serde_json::json!({ "jobs": [] })), plane_answering(serde_json::json!({ "jobs": [] })));
+        let cf = Plane::Cloudflare { account_id: "a".into(), account_name: "Acme".into(), script: "superci".into(), url: from, plane_id: "p0".into(), label: "superci".into() };
+        d.planes = vec![cf, aws("p1", "222222222222", &to)];
+        d.cf = Some(cloudflare::Session::from_token("test"));
+        let said = send(&mut d, "/plane/move", &[("plane", "p1")]).err().unwrap_or_default();
+        assert!(said.contains("Sign in with AWS"), "{said}");
+        assert!(lock(&d.moving).is_none(), "nothing moved");
     }
 
     #[test]
@@ -11288,10 +11385,28 @@ mod rest_tests {
     }
 
     #[test]
+    fn the_control_planes_read_a_moment_ago_are_shown_again_only_when_nothing_would_change_them() {
+        let none = Asking { modal: false, quotas: false, look: false, github: false };
+        let (at, kept) = (1_000, views_kept_ms());
+        assert!(kept_views_do(true, false, &none, at + 1, at));
+        // Each alone sends the page to read them anew.
+        assert!(!kept_views_do(false, false, &none, at + 1, at), "others than those read");
+        assert!(!kept_views_do(true, true, &none, at + 1, at), "one restarting for an update");
+        for asking in [Asking { modal: true, ..none }, Asking { quotas: true, ..none }, Asking { look: true, ..none }, Asking { github: true, ..none }] {
+            assert!(!kept_views_do(true, false, &asking, at + 1, at), "{}{}{}{}", asking.modal, asking.quotas, asking.look, asking.github);
+        }
+        assert!(!kept_views_do(true, false, &none, at + kept, at), "read too long ago");
+    }
+
+    #[test]
     fn a_places_budget_and_a_repository_without_its_name_are_shown() {
         let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": { "order": [{ "cloud": "aws", "monthly_usd": 50.0, "max_jobs": 4 }] } })) };
         let card = pools_card(&v, &HashMap::new(), None, &HashMap::new(), None);
         assert!(card.contains(r#"name="usd" min="1" step="1" placeholder="No limit" value="50""#) && card.contains("4 at once"), "{card}");
+        // A provider with no number set says the 20 it runs at once, on its row and in its settings: never "No limit".
+        let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": { "order": [{ "cloud": "aws" }] } })) };
+        let card = pools_card(&v, &HashMap::new(), None, &HashMap::new(), None);
+        assert!(card.contains(r#"name="max" min="1" max="999" placeholder="20">"#) && card.contains("Left empty: 20.") && card.contains("20 at once"), "{card}");
         let cache = plain(&cache_card(&v, Some(&serde_json::json!({ "now_ms": 1, "repos": [{ "id": "gh123", "entries": 1, "bytes": 10, "used_ms": 1 }] }))));
         assert!(cache.contains("Repository 123"), "{cache}");
     }
@@ -11383,6 +11498,13 @@ mod rest_tests {
         // A disk at a speed of its own; a week's usage with none.
         let card = plain(&machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "machine": { "disk_mibs": 500 } }))).0);
         assert!(card.contains("500 MiB/s disk"), "{card}");
+        // Held to a region the control plane no longer says it is in: still a choice in its dialog, where it is set.
+        let card = machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "aws_regions": ["us-east-1"], "machine": { "region": "eu-west-1" }, "region_label": true }))).0;
+        assert!(card.contains(r#"<option value="us-east-1""#) && card.contains(r#"<option value="eu-west-1" selected>"#), "{card}");
+        // A control plane from before `region=` (it would drop the region unsaid): no region to choose, in the dialog or
+        // the picker.
+        let (card, picker) = machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "aws_regions": ["us-east-1"] })));
+        assert!(!card.contains(r#"name="region""#) && !picker.contains(r#"name="region""#) && card.contains(r#"name="cpu""#), "{card}");
         let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [], "usage": { "day": { "jobs": 0 } } }));
         assert!(plain(&overview_cards(&v, &[serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": 1 })], "day")).contains("No jobs in the last 24 hours"));
         // Docker's images kept, and Cloudflare's place where its location is not said.

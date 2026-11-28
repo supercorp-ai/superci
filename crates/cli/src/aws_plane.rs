@@ -48,6 +48,18 @@ pub struct Deployed { pub url: String }
 /// answers several times faster than at 256 MB, and is paid by the millisecond, so it costs about the same.
 const MEMORY_MB: u32 = 1024;
 
+/// How long one call of the function may run, in seconds. A sweep of a CI with hundreds of jobs waiting runs longer
+/// than a minute, and one cut off at 60 s left jobs waiting for half an hour; Lambda bills only the time a call took.
+/// The sweep that finds another going waits this long and more before it takes it as cut off (see the function's own
+/// `main`), so two never start a machine for the same job.
+const TIMEOUT_S: u32 = 180;
+
+/// A setting of the function as it should be: ours, or the one set on it when that is more (set in AWS by its owner,
+/// for a CI that needs it: an update keeps it).
+fn at_least(function: &Value, setting: &str, ours: u32) -> u32 {
+    function["Configuration"][setting].as_u64().and_then(|n| u32::try_from(n).ok()).map_or(ours, |set| set.max(ours))
+}
+
 /// The converter's: the most every account may give (new accounts may give no more), its disk the most there is
 /// (a blob and its EROFS file at once), and the longest a function may run.
 const CONVERTER_MEMORY_MB: u32 = 3008;
@@ -115,15 +127,15 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     let role_arn = format!("arn:aws:iam::{account_id}:role/{name}");
     let env = json!({ "Variables": { "PLANE_ID": plane_id, "LABEL": label, "TABLE": name, "RUNNER_REGION": region } });
     let zip = STANDARD.encode(BOOTSTRAP_ZIP);
-    let exists = a.lambda("GET", &format!("/2015-03-31/functions/{name}"), None).is_ok();
-    if exists {
+    if let Ok(function) = a.lambda("GET", &format!("/2015-03-31/functions/{name}"), None) {
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/code"), Some(json!({ "ZipFile": zip, "Architectures": ["arm64"] })))?;
-        // Its size as set now (one set up before had a smaller one: slower to start and to answer).
+        // Its size and time as set now (one set up before had less: slower to start and to answer, sweeps cut off),
+        // or more where its owner set more.
         wait_ready(&a, &name)?;
-        a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(json!({ "MemorySize": MEMORY_MB, "Timeout": 60 })))?;
+        a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(json!({ "MemorySize": at_least(&function, "MemorySize", MEMORY_MB), "Timeout": at_least(&function, "Timeout", TIMEOUT_S) })))?;
     } else {
         create_function(&a, json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap",
-            "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
+            "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": TIMEOUT_S, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
             "Tags": { "superci-plane": plane_id } }))?;
     }
     wait_ready(&a, &name)?;
@@ -307,6 +319,16 @@ pub fn about(creds: &Credentials, region: &str, plane_id: &str) -> Result<(Optio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_update_sets_the_functions_memory_and_time_or_keeps_more_set_on_it() {
+        use super::{at_least, MEMORY_MB, TIMEOUT_S};
+        let set = |timeout: u64, memory: u64| serde_json::json!({ "Configuration": { "Timeout": timeout, "MemorySize": memory } });
+        assert_eq!((at_least(&set(60, 256), "Timeout", TIMEOUT_S), at_least(&set(60, 256), "MemorySize", MEMORY_MB)), (180, 1024));
+        assert_eq!((at_least(&set(300, 2048), "Timeout", TIMEOUT_S), at_least(&set(300, 2048), "MemorySize", MEMORY_MB)), (300, 2048));
+        assert_eq!(at_least(&serde_json::json!({}), "Timeout", TIMEOUT_S), 180, "an answer without it");
+        assert_eq!(at_least(&set(1 << 40, 0), "Timeout", TIMEOUT_S), 180, "nothing Lambda could hold");
+    }
+
     use super::*;
     use crate::aws::clouds::{self, answer, aws_error, with};
 

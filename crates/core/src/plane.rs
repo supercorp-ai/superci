@@ -17,7 +17,7 @@ use crate::cache;
 use crate::crypto::{safe_eq, sha256_hex, verify_hub_signature, SigningKeyStore};
 use crate::github::{self, App, Owner};
 use crate::gitlab::{self, GitLab};
-use crate::io::{Containers, get_json, put_json, Clock, Http, Request, Response, Result, Store, Timer, Work};
+use crate::io::{before, done, Containers, get_json, put_json, Clock, Http, Request, Response, Result, Store, Timer, Work};
 use crate::spec::{aws_instance_types, disk_speed, Capacity, Size, Spec, DISK_IOPS_INCLUDED, DISK_MIBS_INCLUDED};
 
 pub const AUDIENCE: &str = "superci";
@@ -218,6 +218,9 @@ impl Config {
     pub fn gitlabs(&self) -> impl Iterator<Item = &GitLab> { self.gitlab.iter().chain(self.more_gitlabs.iter()) }
 }
 
+/// What a sweep read once (see `Cache::sweeping`).
+struct Sweeping { jobs: Vec<(String, Job)>, spend: Option<(HashMap<String, f64>, HashMap<String, f64>)> }
+
 /// What a runtime keeps between requests while it is alive (credentials, tokens, the image id).
 #[derive(Default)]
 pub struct Cache {
@@ -229,6 +232,10 @@ pub struct Cache {
     settings: RefCell<Option<(u64, Option<Stored>)>>,
     /// Whether the jobs' indexes are complete (once they are, they stay so).
     indexed: std::cell::Cell<bool>,
+    /// While a sweep runs: the live jobs as it read them, with each job it has written since, and the spend as it read
+    /// it. Each waiting job it tries again is placed against these, not against every job and day read again: with
+    /// hundreds waiting that was hundreds of thousands of reads, and a sweep that ran past its time (see `sweep`).
+    sweeping: RefCell<Option<Sweeping>>,
     /// Runners' links known to be a job's (`rjob:<token>`), until when; and a count for posts of lines in one
     /// millisecond (see `ControlPlane::lines_in`).
     runner_links: RefCell<HashMap<String, u64>>,
@@ -570,7 +577,7 @@ pub fn needs_care(j: &Job, now: u64) -> bool {
     !over(j) || j.rerun.as_ref().is_some_and(|r| r.state == "pending") || j.fail_pending.is_some()
         || (j.region.is_some() && j.cost_from.is_some() && j.sent_gb.is_none() && now < ended + 2 * 86_400_000)
         || (!(j.began || j.over || j.failed_fast) && now.saturating_sub(j.at_ms) < 86_400_000)
-        || now < ended + LIVE_AFTER_MS
+        || before(now, ended + LIVE_AFTER_MS)
 }
 
 /// A day's totals (UTC), from the jobs queued in it: what each place's machines cost (see `place_of`), and its hours.
@@ -765,6 +772,13 @@ pub struct Launcher { pub cloud: String, pub url: String }
 /// an older SuperCI goes on writing: see `Stored::taken`).
 pub const SETTINGS: &str = "settings";
 
+/// How much of a GitHub job's pages its log reads from the end: about a megabyte, in whole base64 groups (a page kept
+/// in the store counts three bytes for each four it is written in).
+const LIVE_LOG_BYTES: usize = 999_999;
+
+/// What a job's start says before why its runner cannot be handed it (see `advance_run`).
+const JOB_REFUSED: &str = "refused: ";
+
 /// The settings record (see `SETTINGS`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Stored {
@@ -774,10 +788,13 @@ pub struct Stored {
     /// Beside `routing` and `launchers`, which an older SuperCI writes whole: it cannot strip these.
     #[serde(flatten)] pub records: Records,
     /// Its cloud's own copy of them as taken (a fingerprint, and when: ms), the newest last. One that differs from
-    /// all of these was written there by an older SuperCI, which knows no other way: it is taken, whole, as that
-    /// version always meant it. One taken in the last minute is a copy an instance read before (AWS's are read every
-    /// 15 seconds), not taken again.
+    /// all of these was written there by an older SuperCI, or by hand: what it changed is taken (see `copy`). One
+    /// taken in the last minute is a copy an instance read before (AWS's are read every 15 seconds), not taken again.
     #[serde(default)] pub taken: Vec<(String, u64)>,
+    /// The newest of those copies (`{ routing, launchers }`): a new one's fields that differ from it are taken, each
+    /// over what the record has, so a field changed there by hand leaves the changes made here since be. Not known
+    /// (a record from before it was kept): the copy is taken whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub copy: Option<serde_json::Value>,
 }
 
 /// The settings as the changes see them (see `settings`).
@@ -1003,6 +1020,10 @@ pub const MAX_CPU: u32 = 32;
 /// Jobs at once in a cloud unless the dashboard sets another.
 pub const JOBS_AT_ONCE: u32 = 20;
 
+/// How many jobs a provider's runners run at once when the order sets no number for them: what the dashboard and the
+/// CLI show for one left empty, so it is never taken for no limit.
+pub fn jobs_at_once(provider: &str) -> u32 { if provider == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE } }
+
 fn matches_repo(pattern: &str, repo: &str) -> bool {
     pattern == "*" || pattern.eq_ignore_ascii_case(repo)
         || pattern.strip_suffix("/*").is_some_and(|owner| repo.split('/').next().is_some_and(|o| o.eq_ignore_ascii_case(owner)))
@@ -1055,17 +1076,23 @@ enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
 /// (no connected place can run its machine), each with why. A place comes with the machine it starts for the job.
 enum Placement { Run(Vec<(String, Runner, Size)>), Wait(String), Fail(String) }
 
+/// The calendar date of a day counted from 1970-01-01 (UTC): year, month (1–12), day of the month (1–31), by
+/// Howard Hinnant's algorithm.
+pub fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    (yoe + era * 400 + i64::from(m <= 2), m as u32, d as u32)
+}
+
 /// The start of this month (UTC), in ms.
 pub fn month_start_ms(now_ms: u64) -> u64 {
     let days = now_ms / 86_400_000;
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm), then back to the 1st of that month.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let day = doy - (153 * ((5 * doy + 2) / 153) + 2) / 5; // 0-based day of month
-    (days as i64 - day) as u64 * 86_400_000
+    let (_, _, d) = civil(days as i64);
+    (days - u64::from(d - 1)) * 86_400_000
 }
 
 /// A job's estimated machine cost so far (USD).
@@ -1179,10 +1206,21 @@ fn of_job<'a>(jobs: &'a [serde_json::Value], n: &str) -> Vec<&'a serde_json::Val
 /// another workflow of the repository (`called`, by path) stands for that workflow's jobs, each a job of the run
 /// (`caller / job`) after the jobs the caller needs, with the inputs and secrets the caller gives (see `advance_run`).
 /// What cannot be run from a computer is refused, saying why.
-fn run_jobs<'a>(wf: &crate::workflow::Node, names: impl Iterator<Item = &'a String>, called: &std::collections::BTreeMap<String, String>) -> std::result::Result<Vec<serde_json::Value>, String> {
+fn run_jobs<'a>(wf: &crate::workflow::Node, path: &str, names: impl Iterator<Item = &'a String>, called: &std::collections::BTreeMap<String, String>) -> std::result::Result<Vec<serde_json::Value>, String> {
+    // (Its steps as its runner is handed them, made now: a step that cannot be refuses the run, saying which, before
+    // anything starts. Made only when the job starts, it was never started, and the run never ended.)
+    // (A matrix's `max-parallel` written as a number: one that is none refuses the run. An expression is read as the
+    // job starts; one that comes to no number then sets no limit.)
+    let most_at_once = |job: &crate::workflow::Node, said: &str| match job.get("strategy").and_then(|s| s.get("max-parallel")).and_then(|n| n.text()) {
+        Some(t) if !t.contains("${{") && !t.trim().parse::<f64>().is_ok_and(|m| m >= 1.0) => Err(format!("the job {said}'s max-parallel is not a number of jobs")),
+        _ => Ok(()),
+    };
+    let steps = |w: &crate::workflow::Node, path: &str, key: &str, said: &str| crate::workflow::job_parts(w, path, key, &mut String::new).map(|_| ()).map_err(|e| if e.starts_with("line ") { format!("the job {said}: {e}") } else { e });
     let lists = names.map(|name| {
         let job = wf.get("jobs").and_then(|j| j.get(name)).cloned().unwrap_or(crate::workflow::Node::Scalar { text: String::new(), plain: true, line: 0, col: 0 });
         let Some(uses) = job.get("uses").and_then(|u| u.text()) else {
+            steps(wf, path, name, name)?;
+            most_at_once(&job, name)?;
             let (later, combos) = combinations(&job).map_err(|e| format!("the job {name}: {e}"))?;
             let total = combos.len();
             return Ok(combos.into_iter().enumerate().map(|(index, matrix)| serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending", "matrix_later": later })).collect())
@@ -1196,6 +1234,8 @@ fn run_jobs<'a>(wf: &crate::workflow::Node, names: impl Iterator<Item = &'a Stri
         let theirs = workflow.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default().into_iter().map(|(ck, cj)| {
             let cname = ck.text().unwrap_or_default().to_string();
             if cj.get("uses").is_some() { return Err(format!("{path}'s job {cname} calls a workflow in turn: not run from a computer yet")) }
+            steps(&workflow, path, &cname, &format!("{name} / {cname}"))?;
+            most_at_once(&cj, &format!("{name} / {cname}"))?;
             let internal: Vec<String> = crate::workflow::needs(&cj).iter().map(|n| format!("{name}/{n}")).collect();
             let (later, combos) = combinations(&cj).map_err(|e| format!("{path}'s job {cname}: {e}"))?;
             let total = combos.len();
@@ -1269,6 +1309,12 @@ fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>,
 
 /// A run from a computer's event payload and inputs, at most (bytes).
 pub const RUN_EVENT_BYTES: usize = 64 * 1024;
+
+/// A run's event with its inputs, in KB, when it is more than a run takes (`RUN_EVENT_BYTES`); none when it fits.
+pub fn event_over(event: &serde_json::Value, inputs: &serde_json::Value) -> Option<usize> {
+    let bytes = event.to_string().len() + inputs.to_string().len();
+    (bytes > RUN_EVENT_BYTES).then(|| bytes.div_ceil(1024))
+}
 
 /// A run from a computer's event, in its `github` context: its payload (`github.event`), and for a pull request its
 /// branches (`head_ref`, `base_ref`), as GitHub gives them.
@@ -1433,6 +1479,9 @@ impl<'a> ControlPlane<'a> {
     /// Its cloud's own copy of the settings (as this instance read it): a fingerprint.
     fn cloud_copy(&self) -> String { crate::crypto::sha256_hex(crate::io::json(&(&self.config.routing, &self.config.launchers)).as_bytes()) }
 
+    /// Its cloud's own copy of the settings, as the changes see them (see `Stored::copy`).
+    fn cloud_doc(&self) -> serde_json::Value { serde_json::json!({ "routing": self.config.routing, "launchers": self.config.launchers }) }
+
     /// The record, with its cloud's copy taken over it when an older SuperCI wrote that copy (one not taken before,
     /// nor in the last minute: see `Stored::taken`). Lost to another write at the same moment: the record as it was
     /// read, for the ten seconds until it is read again.
@@ -1441,9 +1490,19 @@ impl<'a> ControlPlane<'a> {
         let mut stored = read.clone();
         let (copy, now) = (self.cloud_copy(), self.clock.now_ms());
         let newest = stored.taken.last().is_some_and(|(f, _)| *f == copy);
-        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) { return Ok(read) }
+        if newest || stored.taken.iter().any(|(f, at)| *f == copy && now.saturating_sub(*at) < SETTINGS_TAKEN_MS) {
+            // (A record from before it kept the copy: the one it took last, kept now, for the next to be taken by its changes.)
+            if !(newest && stored.copy.is_none()) { return Ok(read) }
+            stored.copy = Some(self.cloud_doc());
+            return Ok(if self.store.swap(SETTINGS, Some(&raw), crate::io::json(&stored)).await? { stored } else { read })
+        }
         stored.version += 1;
-        (stored.routing, stored.launchers) = (self.config.routing.clone(), self.config.launchers.clone());
+        // What changed in the copy since the one taken last, over what the record has; whole where that is not known.
+        let doc = self.cloud_doc();
+        let mine = serde_json::json!({ "routing": stored.routing, "launchers": stored.launchers });
+        let changed = stored.copy.as_ref().and_then(|before| crate::settings::apply(&mine, &crate::settings::diff(before, &doc, false)).ok()).and_then(|d| serde_json::from_value::<Document>(d).ok());
+        (stored.routing, stored.launchers) = match changed { Some(d) => (d.routing, d.launchers), None => (self.config.routing.clone(), self.config.launchers.clone()) };
+        stored.copy = Some(doc);
         stored.taken.push((copy, now));
         let n = stored.taken.len();
         stored.taken.drain(..n.saturating_sub(5));
@@ -1454,7 +1513,7 @@ impl<'a> ControlPlane<'a> {
     /// and the record as read. (One that is not settings was refused just before this: see `settled`.)
     async fn settings_now(&self) -> Result<(Stored, Option<String>)> {
         let raw = self.store.get(SETTINGS).await?;
-        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), records: Records::default(), taken: vec![(self.cloud_copy(), self.clock.now_ms())] });
+        let stored = raw.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| Stored { version: 0, routing: self.config.routing.clone(), launchers: self.config.launchers.clone(), records: Records::default(), taken: vec![(self.cloud_copy(), self.clock.now_ms())], copy: Some(self.cloud_doc()) });
         Ok((stored, raw))
     }
 
@@ -1477,7 +1536,7 @@ impl<'a> ControlPlane<'a> {
             };
             let Ok(next) = serde_json::from_value::<Document>(changed) else { return Ok(Response::text(400, "those changes do not make settings SuperCI takes")) };
             if let Some(why) = records_refused(&next.records, &now.records) { return Ok(Response::text(400, &why)) }
-            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, records: next.records, taken: now.taken };
+            let next = Stored { version: now.version + 1, routing: next.routing, launchers: next.launchers, records: next.records, taken: now.taken, copy: now.copy };
             let written = crate::io::json(&next);
             if written.len() >= SETTINGS_MAX_BYTES { return Ok(Response::json(&serde_json::json!({ "error": "a setting longer than 60 kB" })).with_status(413)) }
             if self.store.swap(SETTINGS, raw.as_deref(), written.clone()).await? {
@@ -1660,7 +1719,7 @@ impl<'a> ControlPlane<'a> {
             // after five minutes).
             ("GET", "/github/public-repos") if self.dashboard(&req) => {
                 let now = self.clock.now_ms();
-                if let Some((repos, until)) = self.cache.public_repos.borrow().clone() { if now < until { return Ok(Response::json(&serde_json::json!({ "repos": repos }))) } }
+                if let Some((repos, until)) = self.cache.public_repos.borrow().clone() { if before(now, until) { return Ok(Response::json(&serde_json::json!({ "repos": repos }))) } }
                 if self.config.app.is_none() { return Err("no GitHub App".into()) }
                 // Each App by itself: one that GitHub no longer answers for (deleted there) does not hide the others'.
                 let (mut repos, mut failed) = (vec![], vec![]);
@@ -1974,7 +2033,7 @@ impl<'a> ControlPlane<'a> {
     fn dashboard(&self, req: &Request) -> bool {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         let now = self.clock.now_ms();
-        self.config.device_keys.iter().any(|(until, key)| *until > now && key.len() >= 16 && safe_eq(given.as_bytes(), key.as_bytes()))
+        self.config.device_keys.iter().any(|(until, key)| before(now, *until) && key.len() >= 16 && safe_eq(given.as_bytes(), key.as_bytes()))
     }
 
     /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
@@ -1989,7 +2048,7 @@ impl<'a> ControlPlane<'a> {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if given.len() < 16 { return false }
         let (hash, now) = (sha256_hex(given.as_bytes()), self.clock.now_ms());
-        self.config.read_keys.iter().any(|(until, _, kept)| *until > now && safe_eq(hash.as_bytes(), kept.split(':').next().unwrap_or_default().as_bytes()))
+        self.config.read_keys.iter().any(|(until, _, kept)| before(now, *until) && safe_eq(hash.as_bytes(), kept.split(':').next().unwrap_or_default().as_bytes()))
     }
 
     /// A run key the request comes with, one that may start runs from a computer (see `RunKey`), and
@@ -1998,7 +2057,7 @@ impl<'a> ControlPlane<'a> {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if given.len() < 16 { return None }
         let (hash, now) = (sha256_hex(given.as_bytes()), self.clock.now_ms());
-        self.config.read_keys.iter().filter(|(until, _, _)| *until > now).find_map(|(_, name, kept)| {
+        self.config.read_keys.iter().filter(|(until, _, _)| before(now, *until)).find_map(|(_, name, kept)| {
             let (h, more) = kept.split_once(':')?;
             if !safe_eq(hash.as_bytes(), h.as_bytes()) { return None }
             RunKey::of(more).map(|_| RunKey { name: name.clone() })
@@ -2050,7 +2109,7 @@ impl<'a> ControlPlane<'a> {
             let from_github = match self.github_for(&j).await { Some((app, token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) };
             // A job still running: GitHub has its log only as far as its runner has sent it in blocks (minutes behind,
             // at times), then what its machine sent after that. Not yet from GitHub: what its machine sent alone.
-            let live = if active(&j) || !matches!(&from_github, Ok(l) if !l.is_empty()) { self.live_log(key.trim_start_matches("job:"), 1_000_000).await.unwrap_or_default() } else { vec![] };
+            let live = if active(&j) || !matches!(&from_github, Ok(l) if !l.is_empty()) { self.live_log(key.trim_start_matches("job:"), LIVE_LOG_BYTES).await.unwrap_or_default() } else { vec![] };
             match from_github {
                 Ok(l) if !l.is_empty() => {
                     let after = newer_lines(&live, last_time(&l).as_deref().unwrap_or_default());
@@ -2165,6 +2224,9 @@ impl<'a> ControlPlane<'a> {
             // (And images of its own, `Routing::images`; and Modal's Functions, `MODAL_FUNCTIONS`.)
             "runner_images": true,
             "function_mode": true,
+            // (And a machine held to one AWS region, `region=`: one from before drops it from the default machine
+            // unsaid, and jobs then start in any region.)
+            "region_label": true,
             "spend_today": day_spend,
             // Modal Functions preempted this month (UTC), and jobs run again for it (see `MODAL_FUNCTIONS`).
             "preempted": self.preempted(now).await,
@@ -2204,7 +2266,7 @@ impl<'a> ControlPlane<'a> {
     /// What the App asks GitHub for (asked again after ten minutes).
     async fn app_permissions(&self, app: &App) -> Option<serde_json::Value> {
         let now = self.clock.now_ms();
-        if let Some((p, until)) = self.cache.app_permissions.borrow().get(&app.id).cloned() { if now < until { return Some(p) } }
+        if let Some((p, until)) = self.cache.app_permissions.borrow().get(&app.id).cloned() { if before(now, until) { return Some(p) } }
         let said = github::app_now(self.http, app, now).await.ok()?;
         let p = said["permissions"].clone();
         self.cache.app_permissions.borrow_mut().insert(app.id, (p.clone(), now + 600_000));
@@ -2219,7 +2281,7 @@ impl<'a> ControlPlane<'a> {
     /// The GitLab token's scopes (asked again after ten minutes).
     async fn gitlab_scopes(&self, gl: &GitLab) -> Option<Vec<String>> {
         let now = self.clock.now_ms();
-        if let Some((s, until)) = self.cache.gitlab_scopes.borrow().get(&gl.id).cloned() { if now < until { return Some(s) } }
+        if let Some((s, until)) = self.cache.gitlab_scopes.borrow().get(&gl.id).cloned() { if before(now, until) { return Some(s) } }
         let s = gitlab::token_scopes(self.http, gl).await.ok()?;
         self.cache.gitlab_scopes.borrow_mut().insert(gl.id.clone(), (s.clone(), now + 600_000));
         Some(s)
@@ -2360,7 +2422,7 @@ impl<'a> ControlPlane<'a> {
     pub(crate) async fn aws_creds(&self, plane_url: &str, a: &AwsConnection) -> Result<Credentials> {
         if a.role_arn.is_empty() { return self.config.aws_own_creds.clone().ok_or_else(|| "no AWS credentials in this runtime".to_string()); }
         let now = self.clock.now_ms();
-        if let Some(c) = self.cache.creds.borrow().get(&a.role_arn) { if c.expires_at_ms > now + 300_000 { return Ok(c.clone()); } }
+        if let Some(c) = self.cache.creds.borrow().get(&a.role_arn) { if before(now + 300_000, c.expires_at_ms) { return Ok(c.clone()); } }
         let signing = self.identity().await?.signing;
         let secs = now / 1000;
         let token = signing.jwt(&serde_json::json!({ "iss": plane_url, "sub": format!("plane:{}", self.config.plane_id), "aud": AUDIENCE, "iat": secs, "exp": secs + 300 }))?;
@@ -2371,7 +2433,7 @@ impl<'a> ControlPlane<'a> {
 
     async fn installation_token(&self, app: &App, installation_id: u64) -> Result<String> {
         let now = self.clock.now_ms();
-        if let Some((t, until)) = self.cache.tokens.borrow().get(&installation_id) { if *until > now { return Ok(t.clone()); } }
+        if let Some((t, until)) = self.cache.tokens.borrow().get(&installation_id) { if before(now, *until) { return Ok(t.clone()); } }
         let t = github::installation_token(self.http, app, installation_id, now).await?;
         self.cache.tokens.borrow_mut().insert(installation_id, (t.clone(), now + 45 * 60_000));
         Ok(t)
@@ -2596,11 +2658,13 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// The regions a place of AWS's (its spot machines, its on-demand ones) starts machines in, in order: its own, of
-    /// those the control plane is set up in; else all of those.
-    fn place_regions(&self, a: &AwsConnection, place: &str) -> Vec<String> {
+    /// those the control plane is set up in; else all of those. With `only` (a job's `region=`), that one alone, when
+    /// it is among them; else none.
+    fn place_regions(&self, a: &AwsConnection, place: &str, only: Option<&str>) -> Vec<String> {
         let all = self.aws_regions(a);
         let own: Vec<String> = self.config.routing.pool(place).map(|p| p.regions.iter().filter(|r| all.contains(r)).cloned().collect()).unwrap_or_default();
-        if own.is_empty() { all } else { own }
+        let regions = if own.is_empty() { all } else { own };
+        match only { Some(only) => regions.into_iter().filter(|r| r == only).collect(), None => regions }
     }
 
     /// Where a place asks for a job's spot machine, step by step. First only the pools within `aws::BAND` of what the
@@ -2610,15 +2674,15 @@ impl<'a> ControlPlane<'a> {
     /// for before a cheap one in the next. Each step: its region, the types it asks for, and the pools it leaves out.
     /// (One region: itself, whole. A region whose prices could not be read goes after those whose could; the first
     /// keeps its place unless another's are known to be lower.)
-    async fn spot_steps(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
-        let regions = self.place_regions(a, place);
+    async fn spot_steps(&self, a: &AwsConnection, place: &str, only: Option<&str>, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
+        let regions = self.place_regions(a, place, only);
         if regions.len() < 2 { return regions.into_iter().map(|r| (r, types.to_vec(), vec![])).collect() }
         let (mut seen, mut each) = (vec![], regions.iter().enumerate());
         loop {
             let Some((i, r)) = each.next() else { break };
             // (Kept two minutes: a burst of jobs asks AWS once, and spot prices move by the hour.)
             let key = format!("{r}/{os}/{}", types.join(","));
-            let kept = self.cache.spot_prices.borrow().get(&key).filter(|(_, until)| *until > now).map(|(prices, _)| prices.clone());
+            let kept = self.cache.spot_prices.borrow().get(&key).filter(|(_, until)| before(now, *until)).map(|(prices, _)| prices.clone());
             let prices = match kept {
                 Some(prices) => prices,
                 None => {
@@ -2638,13 +2702,15 @@ impl<'a> ControlPlane<'a> {
         seen.sort_by(|(x, ..), (y, ..)| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         let mut steps = vec![];
         if let Some(band) = seen.iter().filter_map(|(_, _, _, worth)| worth.values().copied().reduce(f64::min)).reduce(f64::min).map(|lowest| lowest * aws::BAND) {
+            // (Near the cheapest: within the band. What is not is the rest of its region.)
+            let within = |w: f64| w <= band;
             steps.extend(seen.iter().filter_map(|(_, r, prices, worth)| {
-                let near = |pool: &(String, String)| worth.get(pool).is_some_and(|w| *w <= band);
+                let near = |pool: &(String, String)| worth.get(pool).is_some_and(|w| within(*w));
                 let kinds: Vec<String> = types.iter().filter(|t| worth.keys().any(|pool| pool.0 == **t && near(pool))).cloned().collect();
                 (!kinds.is_empty()).then(|| (r.clone(), kinds, prices.keys().filter(|pool| !near(pool)).cloned().collect()))
             }));
             // (Then each region whole where what is left in it costs least: its pools near the cheapest were asked.)
-            seen.iter_mut().for_each(|((key, _), _, _, worth)| if let Some(rest) = worth.values().copied().filter(|w| *w > band).reduce(f64::min) { *key = rest });
+            seen.iter_mut().for_each(|((key, _), _, _, worth)| if let Some(rest) = worth.values().copied().filter(|w| !within(*w)).reduce(f64::min) { *key = rest });
             seen.sort_by(|(x, ..), (y, ..)| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         }
         steps.extend(seen.into_iter().map(|(_, r, ..)| (r, types.to_vec(), vec![])));
@@ -2654,14 +2720,9 @@ impl<'a> ControlPlane<'a> {
     /// The current machine image in a region for a machine (Linux x64 or arm64, Linux with NVIDIA's drivers for GPUs,
     /// Windows), with its disk's size (looked up at most every six hours).
     async fn image(&self, region: &str, spec: &Spec, creds: &Credentials, now: u64) -> Result<(String, u32)> {
-        // The Ubuntu asked for, else as GitHub's `ubuntu-latest` is now (24.04, 26.04 from 2026-11-19).
-        let ubuntu = spec.ubuntu(now);
-        let base = self.config.image_name.replace("ubuntu24", ubuntu);
-        let pattern = if spec.os() == "windows" { base.replace(&format!("-{ubuntu}-full-"), "-windows25-full-") }
-            else if spec.gpu.is_some() { base.replace(&format!("-{ubuntu}-full-"), &format!("-{ubuntu}-gpu-")) }
-            else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base };
+        let pattern = image_pattern(&self.config.image_name, spec, now);
         let key = format!("{region}/{pattern}");
-        if let Some((image, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| *until > now) { return Ok(image.clone()) }
+        if let Some((image, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| before(now, *until)) { return Ok(image.clone()) }
         // The build this version pins; once its maker has deleted it, the oldest newer one, noted for the status.
         let kind = aws::image_flavor(&pattern);
         let pinned = aws::pinned_build(kind);
@@ -2680,7 +2741,7 @@ impl<'a> ControlPlane<'a> {
     /// chosen by the prices of the first type. Not known (AWS did not say): all of them, as given.
     async fn offered(&self, region: &str, types: &[String], creds: &Credentials, now: u64) -> Vec<String> {
         let key = format!("{region}/{}", types.join(","));
-        if let Some((have, _)) = self.cache.types.borrow().get(&key).filter(|(_, until)| *until > now) { return have.clone() }
+        if let Some((have, _)) = self.cache.types.borrow().get(&key).filter(|(_, until)| before(now, *until)) { return have.clone() }
         let have = match aws::offered_types(self.http, region, creds, types, now).await { Ok(have) if !have.is_empty() => have, _ => types.to_vec() };
         self.cache.types.borrow_mut().insert(key, (have.clone(), now + 6 * 3_600_000));
         have
@@ -2694,9 +2755,9 @@ impl<'a> ControlPlane<'a> {
     async fn pools_to_skip(&self, account: &str, region: &str, spot: bool, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
         let notes = aws_notes(account);
-        if spot { for (key, at) in self.store.list(&format!("{notes}pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| now < at + 60_000) { pools.push(pool_of(&key)) } } }
+        if spot { for (key, at) in self.store.list(&format!("{notes}pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| before(now, at + 60_000)) { pools.push(pool_of(&key)) } } }
         for (key, at) in self.store.list(&format!("{notes}unoffered:{region}:")).await.unwrap_or_default() {
-            if at.parse::<u64>().is_ok_and(|at| now < at + 86_400_000) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
+            if at.parse::<u64>().is_ok_and(|at| before(now, at + 86_400_000)) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
         }
         pools
     }
@@ -2704,7 +2765,7 @@ impl<'a> ControlPlane<'a> {
     async fn pools_to_avoid(&self, account: &str, region: &str, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
         for (key, at) in self.store.list(&format!("{}pool:{region}:", aws_notes(account))).await.unwrap_or_default() {
-            if at.parse::<u64>().is_ok_and(|at| now < at + 900_000) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
+            if at.parse::<u64>().is_ok_and(|at| before(now, at + 900_000)) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
         }
         pools
     }
@@ -2798,7 +2859,7 @@ impl<'a> ControlPlane<'a> {
         // (The networks set in the dashboard are the first account's: a further one uses its own.)
         let given = self.config.aws_networks.get(region).filter(|_| a.name.is_empty());
         let key = match given { Some(g) => format!("{region} {}", serde_json::to_string(g).unwrap_or_default()), None => format!("{}{region}", aws_notes(a.account())) };
-        if let Some((n, _)) = self.cache.network.borrow().get(&key).filter(|(_, until)| *until > now) { return Ok(n.clone()) }
+        if let Some((n, _)) = self.cache.network.borrow().get(&key).filter(|(_, until)| before(now, *until)) { return Ok(n.clone()) }
         let found = match given {
             Some(given) => aws::given_network(self.http, region, creds, given, now).await.map(Some),
             None => aws::find_network(self.http, region, creds, &self.config.plane_id, now).await,
@@ -2888,7 +2949,7 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
-            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if self.config.records.provider_of(cloud) == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
+            let max = pool.and_then(|p| p.max_jobs).unwrap_or(jobs_at_once(self.config.records.provider_of(cloud)));
             if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
             // A label that names this provider, and none of its runners is added here: said as it is.
             let Some((capacity, runner)) = runner else {
@@ -2899,6 +2960,14 @@ impl<'a> ControlPlane<'a> {
             if gitlab && self.config.records.provider_of(cloud) == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
+            // Its label names an AWS region: AWS's runners that start machines there, and no others.
+            if let Some(region) = &spec.region {
+                match &runner {
+                    Runner::Aws(a) if !self.place_regions(a, cloud, Some(region)).is_empty() => {}
+                    Runner::Aws(_) => { never.push(format!("{name} starts no machines in {region}")); continue }
+                    _ => { never.push(format!("{name} is not AWS (region={region})")); continue }
+                }
+            }
             // Its label asks for an on-demand machine: not AWS's spot ones.
             if self.config.records.aws_spot(cloud) && spec.on_demand() { never.push("AWS spot machines are not asked for (spot=false)".into()); continue }
             // (Nor preemptible Functions.)
@@ -3080,6 +3149,7 @@ impl<'a> ControlPlane<'a> {
     }
 
     async fn live_jobs(&self) -> Result<Vec<(String, Job)>> {
+        if let Some(s) = self.cache.sweeping.borrow().as_ref() { return Ok(s.jobs.clone()) }
         let now = self.clock.now_ms();
         if !self.indexed().await {
             return Ok(self.store.list("job:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).filter(|(_, j)| needs_care(j, now)).collect())
@@ -3170,9 +3240,13 @@ impl<'a> ControlPlane<'a> {
 
     /// What machines cost this month and today, by place (see `place_of`).
     async fn spend(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
+        if let Some(spend) = self.cache.sweeping.borrow().as_ref().and_then(|s| s.spend.clone()) { return Ok(spend) }
         let now = self.clock.now_ms();
         let (_, spend) = self.hours((now - month_start_ms(now)) / 86_400_000).await?;
-        Ok(month_and_day(now, spend))
+        let spend = month_and_day(now, spend);
+        // (A sweep reads it once: what its jobs add meanwhile is counted from the next.)
+        if let Some(s) = self.cache.sweeping.borrow_mut().as_mut() { s.spend = Some(spend.clone()) }
+        Ok(spend)
     }
 
     /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
@@ -3290,7 +3364,7 @@ impl<'a> ControlPlane<'a> {
         for (done, (key, j)) in jobs.iter().enumerate() {
             if done == budget { self.store.put("runs-count-at", key.clone()).await?; return Ok(false) }
             // (Only what the days kept hold: a job counted, of a run, recent enough.)
-            if j.counted_usd.is_none() || j.run_id == 0 || j.at_ms + DAY_KEPT_MS < now { continue }
+            if j.counted_usd.is_none() || j.run_id == 0 || before(j.at_ms + DAY_KEPT_MS, now) { continue }
             if self.store.put_if_absent(&run_mark(j), String::new()).await? {
                 self.store.put_until(&run_mark(j), String::new(), j.at_ms + JOB_KEPT_MS).await?;
                 self.count(j, &Hour { runs: 1, ..Default::default() }).await?;
@@ -3336,6 +3410,10 @@ impl<'a> ControlPlane<'a> {
             let add = self.counting(&mut write);
             if self.store.swap_until(key, was.as_deref(), crate::io::json(&write), Self::job_end(&write, self.clock.now_ms())).await? {
                 job.rev.set(write.rev.get());
+                // (A sweep places its next jobs knowing this one as it is now.)
+                if let Some(s) = self.cache.sweeping.borrow_mut().as_mut() {
+                    match s.jobs.iter_mut().find(|(k, _)| k == key) { Some((_, j)) => *j = write.clone(), None => s.jobs.push((key.to_string(), write.clone())) }
+                }
                 self.indexes(key, &write, was.is_none(), add).await?;
                 return Ok(())
             }
@@ -3522,8 +3600,8 @@ impl<'a> ControlPlane<'a> {
                         // An organization that allowed no spot machine within the last ten minutes is not asked again
                         // for each job (it would refuse each one, a second lost every time): the job goes on down the
                         // order. Not longer: once its owner changes that rule, jobs are on spot within ten minutes.
-                        if !on_demand && self.store.get(&format!("{notes}{SPOT_NOT_ALLOWED_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000) {
-                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.place_regions(&a, &place).first().cloned().unwrap_or_default()));
+                        if !on_demand && self.store.get(&format!("{notes}{SPOT_NOT_ALLOWED_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| before(now, at + 600_000)) {
+                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.place_regions(&a, &place, spec.region.as_deref()).first().cloned().unwrap_or_default()));
                             quota_only = false;
                             job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
                             job.spot_ending = self.spot_ending(job).await;
@@ -3560,7 +3638,7 @@ impl<'a> ControlPlane<'a> {
                         // Its regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         // (Spot: the region where a job costs least first, the first counted a little cheaper.)
                         // (Spot: first the pools near the cheapest in any region, then each region whole: see `spot_steps`.)
-                        let steps = if on_demand { self.place_regions(&a, &place).into_iter().map(|r| (r, types.clone(), vec![])).collect() } else { self.spot_steps(&a, &place, &types, spec.os(), &creds, now).await };
+                        let steps = if on_demand { self.place_regions(&a, &place, spec.region.as_deref()).into_iter().map(|r| (r, types.clone(), vec![])).collect() } else { self.spot_steps(&a, &place, spec.region.as_deref(), &types, spec.os(), &creds, now).await };
                         let mut each = steps.iter();
                         loop {
                             let Some((region, kinds, out)) = each.next() else { break };
@@ -3582,7 +3660,7 @@ impl<'a> ControlPlane<'a> {
                             skip.extend(out.iter().cloned());
                             // The spot pools left after the best has no machine are asked in one request, unless
                             // this role lately could not.
-                            let fleet = !on_demand && !self.store.get(&format!("{notes}{NO_FLEET_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000);
+                            let fleet = !on_demand && !self.store.get(&format!("{notes}{NO_FLEET_KEY}")).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| before(now, at + 600_000));
                             // GitHub's cache, kept in this region's bucket, for a Linux machine of a GitHub job.
                             // (A GitLab job's machine is known by its runner's id: the job that runner takes is its own.)
                             let cache_runner = if gitlab { format!("gl:{}", gitlab::local(&job.gitlab, job.runner_id.unwrap_or_default())) } else { name.clone() };
@@ -4336,7 +4414,7 @@ impl<'a> ControlPlane<'a> {
         }
         let Some(Some(c)) = creds else { return Ok(None) };
         let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, object), region, c, vec![], &[], self.clock.now_ms()).await?;
-        Ok((got.status < 300).then_some(got.body))
+        Ok((done(got.status)).then_some(got.body))
     }
 
     /// A post of a job's lines from its runner (see `runner_service::feed`), kept under when it came (to the
@@ -4344,7 +4422,7 @@ impl<'a> ControlPlane<'a> {
     /// to be a job's (asked of the store once per runtime, then remembered).
     async fn lines_in(&self, token: &str, sub: &str, req: &Request) -> Result<Response> {
         let now = self.clock.now_ms();
-        let known = self.cache.runner_links.borrow().get(token).is_some_and(|until| *until > now);
+        let known = self.cache.runner_links.borrow().get(token).is_some_and(|until| before(now, *until));
         if !known {
             if self.store.get(&format!("rjob:{token}")).await?.is_none() { return Ok(nothing_here()) }
             self.cache.runner_links.borrow_mut().insert(token.to_string(), now + 3_600_000);
@@ -4367,7 +4445,7 @@ impl<'a> ControlPlane<'a> {
         if let Some((region, creds)) = self.tree_bucket(plane_url, now).await? {
             let object = format!("live/{id}/{file}-{at:013}");
             let put = aws::s3(self.http, "PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, &creds, body.to_vec(), &[], now).await?;
-            if put.status < 300 { return self.store.put_until(&mark, format!("s3:{region}:{}", body.len()), until).await }
+            if done(put.status) { return self.store.put_until(&mark, format!("s3:{region}:{}", body.len()), until).await }
         }
         // (Something is always sent: see `/hello`.)
         let mut pieces = body.chunks(crate::runner_service::LOG_PIECE).enumerate();
@@ -4519,8 +4597,7 @@ impl<'a> ControlPlane<'a> {
             #[serde(default)] event: serde_json::Value, #[serde(default)] inputs: serde_json::Value }
         let r: NewRun = match serde_json::from_slice(&req.body) { Ok(r) => r, Err(e) => return Ok(Response::text(400, &format!("not a run: {e}"))) };
         // (Kept with the run: a few KB, as GitHub's.)
-        let event_bytes = r.event.to_string().len() + r.inputs.to_string().len();
-        if event_bytes > RUN_EVENT_BYTES { return Ok(Response::text(400, &format!("its event's payload is {} KB; a run takes {} KB at most", event_bytes.div_ceil(1024), RUN_EVENT_BYTES / 1024))) }
+        if let Some(kb) = event_over(&r.event, &r.inputs) { return Ok(Response::text(400, &format!("its event's payload is {kb} KB; a run takes {} KB at most", RUN_EVENT_BYTES / 1024))) }
         let wf = match crate::workflow::parse(&r.workflow) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &e)) };
         let jobs = wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default();
         let names: Vec<String> = jobs.iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect();
@@ -4542,7 +4619,7 @@ impl<'a> ControlPlane<'a> {
             i += 1;
         }
         let now = self.clock.now_ms();
-        let instances = match run_jobs(&wf, names.iter().filter(|n| wanted.contains(n)), &r.called) { Ok(i) => i, Err(e) => return Ok(Response::text(400, &e)) };
+        let instances = match run_jobs(&wf, &r.path, names.iter().filter(|n| wanted.contains(n)), &r.called) { Ok(i) => i, Err(e) => return Ok(Response::text(400, &e)) };
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
         let run_id = local_id();
         // The secrets this CI keeps that the run may have (see `secrets`): those its workflows name, whose scope holds
@@ -4730,6 +4807,14 @@ impl<'a> ControlPlane<'a> {
                     jobs[i]["name"] = match &call { Some(caller) => format!("{caller} / {name}"), None => name }.into();
                     jobs[i]["needs_said"] = serde_json::Value::Object(needs);
                     if runs {
+                        // Its matrix's `max-parallel`: no more of its jobs going at once; the next starts as one ends.
+                        if let Some(t) = job.and_then(|j| j.get("strategy")).and_then(|s| s.get("max-parallel")).and_then(|n| n.text()) {
+                            let most = read_text(t, &c).ok().and_then(|v| crate::expression::text(&v).trim().parse::<f64>().ok()).filter(|m| *m >= 1.0).map(|m| m as usize);
+                            if let Some(most) = most {
+                                jobs[i]["max_parallel"] = most.into();
+                                if jobs.iter().filter(|o| o["state"] == "started" && o["key"] == jobs[i]["key"]).count() >= most { continue }
+                            }
+                        }
                         // Its `timeout-minutes` and `continue-on-error`, read now (either may be an expression).
                         if let Some(t) = job.and_then(|j| j.get("timeout-minutes")).and_then(|n| n.text()) {
                             let minutes = crate::expression::text(&read_text(t, &c)?).trim().parse::<f64>().map_err(|_| format!("the job {key_name}'s timeout-minutes is not a number"))?;
@@ -4764,9 +4849,12 @@ impl<'a> ControlPlane<'a> {
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
             for (n, i) in start.iter().enumerate() {
                 if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[*i], &secrets, &wf, &called).await {
+                    // A job its runner cannot be handed: ended as failed, saying why (started again, it would be refused
+                    // again, and the run would never end); the next move on goes past it.
+                    if let Some(why) = e.strip_prefix(JOB_REFUSED) { self.unreserve(&key, &jobs[*i], Some(why)).await; continue }
                     // (It, and those reserved with it not started yet: each pending again, for the next move on.)
-                    self.unreserve(&key, &jobs[*i]).await;
-                    for j in &start[n + 1..] { self.unreserve(&key, &jobs[*j]).await }
+                    self.unreserve(&key, &jobs[*i], None).await;
+                    for j in &start[n + 1..] { self.unreserve(&key, &jobs[*j], None).await }
                     return Err(e)
                 }
             }
@@ -4779,7 +4867,8 @@ impl<'a> ControlPlane<'a> {
     /// A job of a run reserved to start whose start failed before its record was written (a call or the store failed
     /// midway): pending again in the run's record, so that the upkeep, moving the run on, starts it again. (With a
     /// record, the job is the upkeep's to start, as any job left launching; nothing is changed.)
-    async fn unreserve(&self, key: &str, inst: &serde_json::Value) {
+    /// `refused`: why its runner cannot be handed it: ended as failed instead, saying that.
+    async fn unreserve(&self, key: &str, inst: &serde_json::Value, refused: Option<&str>) {
         // (A job reserved to start has both.)
         let (id, token) = (inst["job_id"].as_str().unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
         if !matches!(self.store.get(&format!("job:{id}")).await, Ok(None)) { return }
@@ -4792,9 +4881,13 @@ impl<'a> ControlPlane<'a> {
             let Ok(Some(was)) = self.store.get(key).await else { return };
             let Ok(mut run) = serde_json::from_str::<serde_json::Value>(&was) else { return };
             let Some(j) = run["jobs"].as_array_mut().into_iter().flatten().find(|j| j["token"] == token && j["state"] == "started") else { return };
-            j["state"] = "pending".into();
-            let j = j.as_object_mut().expect("a job found by its token is a map");
-            (j.remove("job_id"), j.remove("token"));
+            if let Some(why) = refused {
+                (j["state"], j["result"], j["error"]) = ("done".into(), "failure".into(), why.chars().take(300).collect::<String>().into());
+            } else {
+                j["state"] = "pending".into();
+                let j = j.as_object_mut().expect("a job found by its token is a map");
+                (j.remove("job_id"), j.remove("token"));
+            }
             if !matches!(self.store.swap(key, Some(&was), run.to_string()).await, Ok(false)) { return }
         }
     }
@@ -4812,7 +4905,7 @@ impl<'a> ControlPlane<'a> {
         // (A called workflow's job: what its caller gives; else a manual start's.)
         c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else { run["inputs"].clone() });
         c.insert("matrix".into(), job["matrix"].clone());
-        c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": job["total"] }));
+        c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": if job["max_parallel"].is_u64() { &job["max_parallel"] } else { &job["total"] } }));
         c.insert("needs".into(), serde_json::Value::Object(needs.clone()));
         c
     }
@@ -4925,7 +5018,9 @@ impl<'a> ControlPlane<'a> {
         let given = crate::runner_service::Given { workflow: &own_text, path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
             access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
             strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone(), inputs: if inst["inputs"].is_object() { inst["inputs"].clone() } else { run["inputs"].clone() } };
-        let message = crate::runner_service::job_message(&given)?;
+        // (Refused: a run made by a control plane from before its steps were checked as it was made. Nothing of the job
+        // is written yet; its run ends it, saying why.)
+        let message = crate::runner_service::job_message(&given).map_err(|e| format!("{JOB_REFUSED}{e}"))?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.as_deref().unwrap_or(key_name).to_string(), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };
@@ -5146,7 +5241,7 @@ impl<'a> ControlPlane<'a> {
                 let seq = self.store.list(&format!("rlog:{token}:{n:04}:")).await?.len();
                 let object = format!("runs/{token}/log-{n:04}-{seq:04}");
                 let put = aws::s3(self.http, "PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, &creds, req.body.clone(), &[], now).await?;
-                if put.status < 300 {
+                if done(put.status) {
                     self.store.put_until(&format!("rlog:{token}:{n:04}:{seq:04}"), format!("s3:{region}"), now + crate::runner_service::KEPT_MS).await?;
                     return Ok(Response::new(200, "application/json", ""))
                 }
@@ -5279,6 +5374,14 @@ impl<'a> ControlPlane<'a> {
     }
 
     async fn alarm_settled(&self) -> Result<()> {
+        let done = self.sweep().await;
+        *self.cache.sweeping.borrow_mut() = None;
+        done
+    }
+
+    /// The sweep: each job still cared for, looked at once (see `alarm`). What it reads of the live jobs and the spend
+    /// it reads once (see `Cache::sweeping`); what another request writes meanwhile, the next sweep sees.
+    async fn sweep(&self) -> Result<()> {
         let now = self.clock.now_ms();
         // The store's own upkeep: what an earlier layout left is moved, a little each minute; what has passed its end
         // goes, once an hour (where the store does not remove it by itself).
@@ -5294,6 +5397,7 @@ impl<'a> ControlPlane<'a> {
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         if self.indexed().await { let _ = self.recount_runs(150).await; }
         let kept = self.live_jobs().await?;
+        *self.cache.sweeping.borrow_mut() = Some(Sweeping { jobs: kept.clone(), spend: None });
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
@@ -5312,7 +5416,7 @@ impl<'a> ControlPlane<'a> {
                 match get_json::<Job>(self.store, &key).await? { Some(fresh) if fresh.state == "waiting" => j = fresh, _ => continue }
                 if now.saturating_sub(j.at_ms) > 24 * 3_600_000 { j.state = "failed".into(); j.error = Some("waited a day for room".into()); self.keep(&key, &j).await?; continue }
                 // Held after GitHub kept it from a runner that waited for it: no machine yet (see `HELD_MS`).
-                if j.held_until_ms.is_some_and(|t| now < t) { active += 1; continue }
+                if j.held_until_ms.is_some_and(|t| before(now, t)) { active += 1; continue }
                 j.held_until_ms = None;
                 self.start(&plane_url, &mut j).await?;
                 if j.state == "waiting" { waiting += 1 }
@@ -5351,7 +5455,7 @@ impl<'a> ControlPlane<'a> {
                 continue;
             }
             // An AWS machine that ended a while ago: what it sent, once CloudWatch has counted it, added to its cost.
-            if self.config.records.provider_of(&j.cloud) == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && j.ended_ms.is_some_and(|e| now > e + 12 * 60_000 && now < e + 2 * 86_400_000) {
+            if self.config.records.provider_of(&j.cloud) == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && j.ended_ms.is_some_and(|e| now > e + 12 * 60_000 && before(now, e + 2 * 86_400_000)) {
                 if self.settle_sent(&plane_url, &mut j).await { self.keep(&key, &j).await?; }
                 continue;
             }
@@ -5361,7 +5465,7 @@ impl<'a> ControlPlane<'a> {
             if j.state == "launched" && !j.seen_in_progress {
                 let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
                 let (wait, up_by) = if self.config.records.provider_of(&j.cloud) == "aws" { (8 * 60_000, 90_000) } else { (3 * 60_000, 60_000) };
-                let late = age > wait;
+                let late = before(wait, age);
                 // Once it has had time to come up and has begun nothing, GitHub is asked at every sweep whether the
                 // job it is for still waits (one request): a machine nobody waits for is ended then, not minutes later.
                 // (At once, when its job is known to have ended before any runner took it and the start missed the note.)
@@ -5498,13 +5602,14 @@ impl<'a> ControlPlane<'a> {
             // Its machine's age (a job may have waited long for room before it got one).
             let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
             let longest = self.machine_minutes(&j.cloud) as u64;
-            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || age > (longest + 5) * 60_000;
+            let past = before((longest + 5) * 60_000, age);
+            let stale = j.state == "orphan" || (!j.seen_in_progress && age > 10 * 60_000) || past;
             if !stale { active += 1; continue; }
             self.stop_machine(&plane_url, &j).await;
             self.withdraw_runner(&j).await;
             // (Said, when it is known: a job that ran past its longest time.)
-            if j.state != "orphan" && age > (longest + 5) * 60_000 && j.error.is_none() {
-                j.error = Some(format!("it ran past its longest time ({}), and its machine was ended", if longest % 60 == 0 { format!("{} hours", longest / 60) } else { format!("{longest} minutes") }));
+            if j.state != "orphan" && past && j.error.is_none() {
+                j.error = Some(format!("it ran past its longest time ({}), and its machine was ended", match (longest / 60, longest % 60) { (1, 0) => "1 hour".to_string(), (h, 0) => format!("{h} hours"), _ => format!("{longest} minutes") }));
             }
             j.state = "swept".into();
             j.ended_ms.get_or_insert(now);
@@ -5534,7 +5639,7 @@ impl<'a> ControlPlane<'a> {
             let mut parts = k.trim_start_matches(&format!("{notes}template:")).splitn(2, ':');
             let (Some(region), Some(name)) = (parts.next(), parts.next()) else { continue };
             // (Not one of a moment ago: its removal may be on its way.)
-            if at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 30_000) { continue }
+            if at.parse::<u64>().is_ok_and(|at| before(now.saturating_sub(at), 30_000)) { continue }
             let connection = if account == "aws" { self.aws_connection().await } else { get_json::<AwsConnection>(self.store, &format!("aws:connection:{account}")).await };
             let removed = match connection { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
             if removed.is_ok() || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
@@ -5579,7 +5684,7 @@ impl<'a> ControlPlane<'a> {
         if let Err(e) = self.sweep_layers(&plane_url, now).await { let _ = self.store.put("layers-sweep-error", e).await; }
         // Machines that kept their jobs' images and are still there a while after: ended now.
         for (k, v) in self.store.list("keeping:").await.unwrap_or_default() {
-            if v.parse::<u64>().is_ok_and(|due| due > now) { continue }
+            if v.parse::<u64>().is_ok_and(|due| before(now, due)) { continue }
             if let Some(j) = get_json::<Job>(self.store, &format!("job:{}", k.trim_start_matches("keeping:"))).await.ok().flatten() { self.stop_machine(&plane_url, &j).await; }
             let _ = self.store.delete(&k).await;
         }
@@ -5729,7 +5834,7 @@ impl<'a> ControlPlane<'a> {
     /// ten minutes; the dashboard makes the bucket and puts the program there).
     async fn cache_ready(&self, region: &str, arch: &str, creds: &Credentials, now: u64) -> bool {
         let at = format!("{region} {arch}");
-        if let Some((ready, _)) = self.cache.cache_ready.borrow().get(&at).filter(|(_, until)| *until > now) { return *ready }
+        if let Some((ready, _)) = self.cache.cache_ready.borrow().get(&at).filter(|(_, until)| before(now, *until)) { return *ready }
         let url = aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &cache::program_key(arch));
         let ready = matches!(aws::s3(self.http, "HEAD", &url, region, creds, vec![], &[], now).await, Ok(r) if r.status == 200);
         self.cache.cache_ready.borrow_mut().insert(at, (ready, now + 600_000));
@@ -5762,7 +5867,7 @@ impl<'a> ControlPlane<'a> {
     /// Whether a region's bucket has this version's `superci-layers` for an architecture (looked at as `cache_ready`).
     async fn layers_ready(&self, region: &str, arch: &str, creds: &Credentials, now: u64) -> bool {
         let at = format!("layers {region} {arch}");
-        if let Some((ready, _)) = self.cache.cache_ready.borrow().get(&at).filter(|(_, until)| *until > now) { return *ready }
+        if let Some((ready, _)) = self.cache.cache_ready.borrow().get(&at).filter(|(_, until)| before(now, *until)) { return *ready }
         let url = aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &cache::layers_key(arch));
         let ready = matches!(aws::s3(self.http, "HEAD", &url, region, creds, vec![], &[], now).await, Ok(r) if r.status == 200);
         self.cache.cache_ready.borrow_mut().insert(at, (ready, now + 600_000));
@@ -6089,7 +6194,7 @@ impl<'a> ControlPlane<'a> {
         if now.saturating_sub(last) < 3_600_000 { return Ok(()) }
         self.store.put("cache-swept", now.to_string()).await?;
         for (k, v) in self.store.list("cachem:").await? {
-            if serde_json::from_str::<cache::Machine>(&v).map(|m| m.until < now).unwrap_or(true) { self.store.delete(&k).await? }
+            if serde_json::from_str::<cache::Machine>(&v).map(|m| before(m.until, now)).unwrap_or(true) { self.store.delete(&k).await? }
         }
         let mut gone = cache::evict(self.store, now, &self.config.routing.cache).await?;
         // The artifacts of runs from a computer that are no longer kept.
@@ -6136,6 +6241,17 @@ fn tree_object(tree: &str, part: u32) -> String { format!("runs/{tree}/{part:05}
 /// A tree's part as kept (`region|object`; the region alone before bases were kept).
 fn tree_place(kept: &str, tree: &str, part: u32) -> (String, String) {
     match kept.split_once('|') { Some((region, object)) => (region.to_string(), object.to_string()), None => (kept.to_string(), tree_object(tree, part)) }
+}
+
+/// The name pattern of the image a machine boots, from the control plane's own (`runs-on-v2.2-ubuntu24-full-x64-*`):
+/// the Ubuntu asked for, else as GitHub's `ubuntu-latest` is now (24.04, 26.04 from 2026-11-19); Linux x64 or arm64,
+/// Linux with NVIDIA's drivers for GPUs, or Windows.
+pub fn image_pattern(base: &str, spec: &Spec, now: u64) -> String {
+    let ubuntu = spec.ubuntu(now);
+    let base = base.replace("ubuntu24", ubuntu);
+    if spec.os() == "windows" { base.replace(&format!("-{ubuntu}-full-"), "-windows25-full-") }
+    else if spec.gpu.is_some() { base.replace(&format!("-{ubuntu}-full-"), &format!("-{ubuntu}-gpu-")) }
+    else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base }
 }
 
 #[cfg(test)]
@@ -6185,6 +6301,40 @@ mod price_tests {
         assert_eq!(MODAL_GPU_USD_PER_SECOND.map(|(g, _)| g), crate::spec::GPUS);
         for (gpu, per_second) in MODAL_GPU_USD_PER_SECOND { assert_eq!(modal_gpu_usd_per_hour(Some(gpu)), per_second * 3600.0, "{gpu}") }
         assert_eq!((modal_gpu_usd_per_hour(Some("a10g")), modal_gpu_usd_per_hour(None), modal_gpu_usd_per_hour(Some("v100"))), (0.000306 * 3600.0, 0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    /// The check a release runs before it moves the pins (scripts/image-check.yml) has a job on each kind pinned, and
+    /// none on a kind not pinned: a kind added to the pins is checked, and the check does not drift from what jobs boot.
+    #[test]
+    fn the_image_check_boots_each_pinned_kind_of_image_once() {
+        let workflow = crate::workflow::parse(include_str!("../../../scripts/image-check.yml")).unwrap();
+        let jobs = workflow.get("jobs").unwrap().pairs();
+        let mut kinds: Vec<String> = jobs.iter().map(|(name, job)| {
+            let name = name.text().unwrap();
+            let label = job.get("runs-on").and_then(|l| l.text()).unwrap_or_else(|| panic!("{name} has a label"));
+            let spec = Spec::parse(label, "superci").unwrap().unwrap_or_else(|e| panic!("{name}: {e}"));
+            aws::image_flavor(&image_pattern(&Config::new("p".into()).image_name, &spec, 0)).to_string()
+        }).collect();
+        kinds.sort();
+        let mut pinned: Vec<String> = aws::IMAGE_BUILDS.iter().map(|(k, _)| k.to_string()).collect();
+        pinned.sort();
+        assert_eq!(kinds, pinned);
+    }
+
+    #[test]
+    fn a_machine_boots_the_ubuntu_it_asks_for_else_ubuntu_latest_with_its_arch_gpu_or_windows() {
+        let base = "runs-on-v2.2-ubuntu24-full-x64-*";
+        let at = |label: &str, now: u64| image_pattern(base, &Spec::parse(label, "superci").unwrap().unwrap(), now);
+        let after = crate::spec::UBUNTU_26_FROM_MS;
+        assert_eq!((at("superci", after - 1), at("superci", after)), ("runs-on-v2.2-ubuntu24-full-x64-*".into(), "runs-on-v2.2-ubuntu26-full-x64-*".into()));
+        assert_eq!(at("superci/arch=arm64/image=ubuntu24", after), "runs-on-v2.2-ubuntu24-full-arm64-*");
+        assert_eq!(at("superci/gpu=t4", after), "runs-on-v2.2-ubuntu26-gpu-x64-*");
+        assert_eq!(at("superci/os=windows", after), "runs-on-v2.2-windows25-full-x64-*");
     }
 }
 

@@ -56,7 +56,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let bearer = headers.get("authorization").expect("a header's name").and_then(|a| a.strip_prefix("Bearer ").map(str::to_string)).unwrap_or_default();
     if bearer.len() >= 16 {
         let now = js_sys::Date::now() as u64;
-        if let Some((until, _)) = device_keys(&env).into_iter().find(|(until, k)| *until > now && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
+        if let Some((until, _)) = device_keys(&env).into_iter().find(|(until, k)| superci_core::io::before(now, *until) && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
             header(headers.set(VOUCHED, &until.to_string()));
         }
     }
@@ -191,7 +191,9 @@ fn settings_and_keys(fresh: Option<&std::collections::BTreeMap<String, String>>,
     match fresh {
         Some(f) => {
             let read_keys_fresh = f.get("KEYS_FRESH").is_some_and(|v| v == "1");
-            f.iter().map(|(k, v)| (k.clone(), v.clone())).chain(own.iter().filter(|(n, _)| n.starts_with("DEVICE_KEY_") || (!read_keys_fresh && n.starts_with("READ_KEY_"))).map(|(k, v)| (k.clone(), v.clone()))).collect()
+            // (Never a device key from the settings handed over, whatever they hold; nor a read key from a Worker
+            // that does not say it hands them.)
+            f.iter().filter(|(k, _)| !k.starts_with("DEVICE_KEY_") && (read_keys_fresh || !k.starts_with("READ_KEY_"))).map(|(k, v)| (k.clone(), v.clone())).chain(own.iter().filter(|(n, _)| n.starts_with("DEVICE_KEY_") || (!read_keys_fresh && n.starts_with("READ_KEY_"))).map(|(k, v)| (k.clone(), v.clone()))).collect()
         }
         None => own.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     }
@@ -295,6 +297,19 @@ mod tests {
         let all: BTreeMap<String, String> = settings_and_keys(Some(&fresh), &own).into_iter().collect();
         assert_eq!(all.get("READ_KEY_100_OLD").map(|v| v.as_str()), Some("hash-old"));
         assert_eq!(all.get("DEVICE_KEY_100_TEST").map(|v| v.as_str()), Some("device-secret"));
+    }
+
+    #[test]
+    fn a_device_key_among_the_settings_handed_over_is_never_taken() {
+        let fresh = map(&[("KEYS_FRESH", "1"), ("DEVICE_KEY_100_ELSE", "planted"), ("READ_KEY_100_NEW", "hash-new")]);
+        let own = map(&[("DEVICE_KEY_100_TEST", "device-secret")]);
+        let all: BTreeMap<String, String> = settings_and_keys(Some(&fresh), &own).into_iter().collect();
+        assert_eq!((all.get("DEVICE_KEY_100_ELSE"), all.get("DEVICE_KEY_100_TEST").map(|v| v.as_str())), (None, Some("device-secret")));
+        // (Nor a read key from settings that do not say they hand them: its own kept, and its other settings left
+        // to the ones handed over.)
+        let own = map(&[("DEVICE_KEY_100_TEST", "device-secret"), ("READ_KEY_100_OLD", "hash-old"), ("NAME", "older")]);
+        let all: BTreeMap<String, String> = settings_and_keys(Some(&map(&[("READ_KEY_100_NEW", "hash-new"), ("NAME", "acme")])), &own).into_iter().collect();
+        assert_eq!((all.get("READ_KEY_100_NEW"), all.get("READ_KEY_100_OLD").map(|v| v.as_str()), all.get("NAME").map(|v| v.as_str())), (None, Some("hash-old"), Some("acme")));
     }
 
     #[test]

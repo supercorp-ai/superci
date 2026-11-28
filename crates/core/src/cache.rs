@@ -275,7 +275,7 @@ async fn evict_within(store: &dyn Store, now: u64, limit: u64, unused: u64) -> R
         let (mut kept, mut entries) = (0u64, entries.into_iter());
         loop {
             let Some((k, e)) = entries.next() else { break };
-            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > unused || too_old(&e, now) } else { now.saturating_sub(e.made) > UNFINISHED_MS };
+            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > unused || too_old(&e, now) } else { crate::io::before(UNFINISHED_MS, now.saturating_sub(e.made)) };
             if !old && (!e.done || kept + e.size <= limit) { kept += e.size; continue }
             store.delete(&k).await?;
             gone.push((e.region.clone(), e.pieces.iter().map(|(p, _)| format!("{}/{p}", e.prefix(&ns))).collect()));
@@ -401,7 +401,7 @@ pub fn gitlab_ns(connection: &str, project: u64) -> String { format!("gl{}x{proj
 
 pub async fn machine(store: &dyn Store, token: &str, now: u64) -> Result<Option<Machine>> {
     if token.len() < 16 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(None) }
-    Ok(get_json::<Machine>(store, &format!("cachem:{token}")).await?.filter(|m| m.until > now))
+    Ok(get_json::<Machine>(store, &format!("cachem:{token}")).await?.filter(|m| crate::io::before(now, m.until)))
 }
 
 pub async fn add_machine(store: &dyn Store, token: &str, m: &Machine) -> Result<()> {
@@ -560,7 +560,8 @@ mod tests {
         assert!(gone[0].1[0].starts_with("c/gh77/") && gone[0].1[0].ends_with("/p0"));
         assert!(run(lookup(&store, &main_branch(), "b", &[], V, 0)).unwrap().is_none());
         assert_eq!(run(kept(&store, "gh77")).unwrap(), (2, 30));
-        // A week unused (as set by default): gone.
+        // A week unused (as set by default): gone, a millisecond past it (not at it).
+        assert_eq!(run(evict(&store, 3 + Settings::default().unused_ms(), &Settings::default())).unwrap().len(), 0);
         assert_eq!(run(evict(&store, 3 + Settings::default().unused_ms() + 1, &Settings::default())).unwrap().len(), 1);
         assert_eq!(run(kept(&store, "gh77")).unwrap(), (1, 15));
         // Used every hour, but saved MAX_AGE_DAYS ago: no hit, saved anew, and gone at the next sweep.

@@ -1,0 +1,4 @@
+# The profile CI runs the tests with: a JUnit report of each test's time, which the Coverage workflow deals its parts
+# by (see .github/test-times.py).
+[profile.ci.junit]
+path = "junit.xml"

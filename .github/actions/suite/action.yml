@@ -1,0 +1,75 @@
+name: The whole suite's machine
+description: >
+  What every test of every crate needs on GitHub's Ubuntu 26.04 runner, for the Coverage workflow's measured parts and
+  its mutation pass alike: Rust with its coverage tools and wasm, the programs ./build.sh made, worker-build and
+  wrangler for the Workers' tests, the kernel's EROFS and mkfs.erofs for the layer store's, Go for containerd's suites.
+
+inputs:
+  programs:
+    description: The cache key the prepare job kept the programs under
+    required: true
+  rust-cache:
+    description: The Rust cache's shared key
+    required: true
+  save-rust-cache:
+    description: Whether this job saves the Rust cache
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: llvm-tools-preview
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.rust-cache }}
+        save-if: ${{ inputs.save-rust-cache == 'true' }}
+    # (After the Rust cache: restoring it takes away what else is in its target folder.)
+    - uses: actions/cache/restore@v4
+      with:
+        path: |
+          crates/plane-cloudflare/build
+          crates/runners-cloudflare/build
+          crates/plane-aws/build
+          crates/plane-modal/build
+          target/x86_64-unknown-linux-musl/release/superci-cache
+          target/x86_64-unknown-linux-musl/release/superci-layers
+          target/aarch64-unknown-linux-musl/release/superci-cache
+          target/aarch64-unknown-linux-musl/release/superci-layers
+          target/x86_64-pc-windows-gnu/release/superci-cache.exe
+        key: ${{ inputs.programs }}
+        fail-on-cache-miss: true
+    # (The Cloudflare Workers' tests, measured: each Worker built again from supercov's copy of its source, with
+    # worker-build, and run by the wrangler on PATH, which supercov reads it through.)
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: worker-build@0.8.7
+    - name: wrangler
+      shell: bash
+      run: npm install -g wrangler@4.149.0
+    - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
+      shell: bash
+      run: |
+        uname -r
+        grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
+        sudo modprobe erofs && grep erofs /proc/filesystems
+    # (Public resolvers for the runner and Docker's containers and builds: GitHub's Ubuntu runners could not resolve
+    # Ubuntu's archive through their own, 2026-11-11. Kept beside what the runner sets.)
+    - name: Public resolvers
+      shell: bash
+      run: |
+        sudo mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\n' | sudo tee /etc/systemd/resolved.conf.d/public.conf >/dev/null
+        sudo systemctl restart systemd-resolved
+        sudo mkdir -p /etc/docker && { sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'; } | jq '. + {"dns": ["1.1.1.1", "8.8.8.8"]}' | sudo tee /etc/docker/daemon.json.new >/dev/null
+        sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json && sudo systemctl restart docker
+    # (The layer store's tests make EROFS files as the converter does, and serve them as root; containerd's own suites
+    # are run against it with Go.)
+    - name: mkfs.erofs
+      shell: bash
+      run: sudo apt-get install -y -qq erofs-utils >/dev/null
+    - uses: actions/setup-go@v6
+      with:
+        go-version-file: crates/layers/conformance/go.mod
+        cache-dependency-path: crates/layers/conformance/go.sum

@@ -54,7 +54,8 @@ fn one_machine_is_started_and_ended_as_the_control_plane_starts_a_jobs() {
     // Whatever AWS answers each step is said (here what the recording has of it).
     for args in [&["launch", "us-east-1"][..], &["launch", "us-east-1", "on-demand", "c8a.large,c7a.large", "--disk=40", "--extra-disk=20:500"]] {
         let said = answer(&home, args);
-        assert!(said.starts_with("started ") || said.starts_with("not started: "), "{args:?}: {said}");
+        // (Without a script of its own: ended again at once, never left running.)
+        assert!((said.starts_with("started ") && said.contains(", ended: ")) || said.starts_with("not started: "), "{args:?}: {said}");
     }
     let script = common::temp("debug-user-data").join("user-data.sh");
     std::fs::write(&script, "#!/bin/bash\npoweroff\n").unwrap();

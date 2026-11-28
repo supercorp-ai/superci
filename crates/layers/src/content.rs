@@ -535,6 +535,20 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 mod tests {
     use super::*;
 
+    /// Days and dates both ways across every leap rule (Python's calendar's numbers), and a time's parts at their
+    /// edges: the 23rd hour and a leap second taken, the 24th hour and a 61st second not.
+    #[test]
+    fn days_and_times_hold_across_every_leap_rule_and_at_their_edges() {
+        for (days, date) in [(0, (1970, 1, 1)), (11_016, (2000, 2, 29)), (11_017, (2000, 3, 1)), (47_540, (2100, 2, 28)), (47_541, (2100, 3, 1)), (84_005, (2199, 12, 31)),
+            (84_065, (2200, 3, 1)), (157_112, (2400, 2, 28)), (157_113, (2400, 2, 29)), (157_114, (2400, 3, 1)), (157_419, (2400, 12, 31)), (-1, (1969, 12, 31)), (31, (1970, 2, 1)), (59, (1970, 3, 1))] {
+            assert_eq!(civil_from_days(days), date, "{days}");
+            assert_eq!(days_from_civil(date.0, date.1, date.2), days, "{date:?}");
+        }
+        assert_eq!(parse_rfc3339("2100-02-28T23:59:60Z"), Some((47_540 * 86_400 + 86_400) * 1_000_000_000));
+        assert_eq!(parse_rfc3339("2100-03-01T00:00:00Z"), Some(47_541 * 86_400 * 1_000_000_000));
+        assert_eq!((parse_rfc3339("2100-02-28T24:00:00Z"), parse_rfc3339("2100-02-28T23:59:61Z")), (None, None));
+    }
+
     fn store() -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("superci-layers-cs-{}-{}", std::process::id(), crate::meta::now()));
         std::fs::create_dir_all(&dir).unwrap();

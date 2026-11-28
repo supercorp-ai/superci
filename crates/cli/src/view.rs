@@ -111,6 +111,8 @@ impl PlaneView {
     pub fn budget_stopped_ms(&self) -> Option<u64> { self.status.as_ref().and_then(|s| s["aws_budget_stopped_ms"].as_u64()) }
     /// Whether this control plane keeps a limit for the whole CI and for a cloud account (one from before does not).
     pub fn account_limits(&self) -> bool { self.status.as_ref().is_some_and(|s| s["account_limits"] == true) }
+    /// Whether the control plane keeps a machine held to one AWS region (`region=`): an older one drops it unsaid.
+    pub fn region_label(&self) -> bool { self.status.as_ref().is_some_and(|s| s["region_label"] == true) }
     /// Whether this control plane starts Cloudflare containers itself.
     pub fn own_containers(&self) -> bool { self.status.as_ref().is_some_and(|s| s["containers"] == true) }
     /// The clouds connected for jobs, AWS first.

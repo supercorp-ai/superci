@@ -241,13 +241,19 @@ struct Scheduled<'a> { http: &'a dyn Http, store: &'a Dynamo<'a>, region: &'a st
 /// Where a sweep that is going notes itself (when it began, ms).
 const SWEEPING: &str = "aws:sweeping";
 
+/// Whether a sweep noted as going since `since` was cut off: it began longer ago than a call may run (`runs_for`, this
+/// call's whole time: the function's own, as every call's), and half a minute more. Never sooner than a minute and a
+/// half, as before the function's time was raised: a sweep still going is never taken for cut off, and two never start
+/// a machine for the same job.
+fn cut_off(since: u64, now: u64, runs_for: u64) -> bool { now.saturating_sub(since) >= (runs_for + 30_000).max(90_000) }
+
 /// Where a sweep that is on its way is noted (when it is for, ms). One still there well after its time never came.
 const WAKING: &str = "aws:waking";
 
 #[async_trait(?Send)]
 impl Timer for Scheduled<'_> {
     async fn wake_in(&self, ms: u64) -> io::Result<()> {
-        if ms > SOON_MS || self.function.is_empty() { return Ok(()) }
+        if superci_core::io::before(SOON_MS, ms) || self.function.is_empty() { return Ok(()) }
         let at = now_ms() + ms;
         // (Nothing here fails what asked: the schedule's sweep comes within the minute whatever happens.)
         if !self.store.put_if_absent(WAKING, at.to_string()).await.unwrap_or(false) {
@@ -259,7 +265,7 @@ impl Timer for Scheduled<'_> {
         let url = format!("https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations", self.region, self.function);
         let headers = vec![("content-type".to_string(), "application/json".to_string()), ("x-amz-invocation-type".to_string(), "Event".to_string())];
         let sent = match aws::sigv4("POST", &url, &headers, body.as_bytes(), &own_credentials(), self.region, "lambda", &aws::amz_date(now_ms())) {
-            Ok(signed) => { let mut r = Request::new("POST", &url).with_body(body); r.headers = signed; self.http.send(r).await.is_ok_and(|r| r.status < 300) }
+            Ok(signed) => { let mut r = Request::new("POST", &url).with_body(body); r.headers = signed; self.http.send(r).await.is_ok_and(|r| superci_core::io::done(r.status)) }
             Err(_) => false,
         };
         if !sent { let _ = self.store.delete(WAKING).await; }
@@ -354,6 +360,8 @@ fn main() {
         let Ok(mut next) = runtime.get(&format!("http://{api}/2018-06-01/runtime/invocation/next")).call() else { continue };
         let id = next.headers().get("lambda-runtime-aws-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let account_id = next.headers().get("lambda-runtime-invoked-function-arn").and_then(|v| v.to_str().ok()).and_then(|a| a.split(':').nth(4)).unwrap_or_default().to_string();
+        // How long this call may run (the function's time, as set: Lambda says when it ends).
+        let runs_for = next.headers().get("lambda-runtime-deadline-ms").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).map_or(0, |end| end.saturating_sub(now_ms()));
         let event: Value = next.body_mut().read_json().unwrap_or_default();
         // Whoever comes with a key (the dashboard, a command) gets the settings as they are now, not as they
         // were up to fifteen seconds ago: a change is seen at once, and the next one starts from it. A key not
@@ -372,12 +380,12 @@ fn main() {
             refreshed?;
             // One sweep at a time: the schedule's and the function's own could otherwise each start a machine for
             // the same waiting job. One that finds another going leaves it to that one (which asks for the next
-            // itself); a note older than a minute and a half is of a sweep that was cut off.
+            // itself); a note older than the function may run is of a sweep that was cut off.
             let sweep = || -> io::Result<Value> {
                 let now = now_ms();
                 if !block_on(store.put_if_absent(SWEEPING, now.to_string())).unwrap_or(true) {
                     let since = block_on(store.get(SWEEPING)).ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-                    if now.saturating_sub(since) < 90_000 { return Ok(json!({ "swept": false })) }
+                    if !cut_off(since, now, runs_for) { return Ok(json!({ "swept": false })) }
                     let _ = block_on(store.put(SWEEPING, now.to_string()));
                 }
                 let done = block_on(plane.alarm()).map(|_| json!({ "swept": true }));
@@ -416,6 +424,18 @@ mod tests {
     //! memory): what every store promises, the partitions it keeps records in, ends, and moving the layout before
     //! 0.19.0 over while it is read.
     use super::*;
+
+    #[test]
+    fn a_sweep_is_taken_as_cut_off_only_after_a_call_could_have_run_and_half_a_minute_more() {
+        use super::cut_off;
+        // The function's time of 60 s (and none said): a minute and a half, as it was.
+        assert_eq!((cut_off(0, 89_999, 60_000), cut_off(0, 90_000, 60_000), cut_off(0, 90_000, 0)), (false, true, true));
+        // 180 s: a sweep 100 s along is still going; one 210 s along was cut off.
+        assert_eq!((cut_off(0, 100_000, 180_000), cut_off(0, 209_999, 180_000), cut_off(0, 210_000, 180_000)), (false, false, true));
+        // A note from the future (another clock) is going.
+        assert!(!cut_off(5_000, 1_000, 180_000));
+    }
+
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 

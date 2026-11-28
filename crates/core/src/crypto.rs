@@ -151,7 +151,7 @@ pub fn verify_es256_jwt(token: &str, jwk: &serde_json::Value, now_secs: u64) -> 
     let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     key.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).map_err(|_| "bad signature".to_string())?;
     let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    if claims["exp"].as_u64().is_none_or(|exp| exp < now_secs) { return Err("expired".into()); }
+    if claims["exp"].as_u64().is_none_or(|exp| crate::io::before(exp, now_secs)) { return Err("expired".into()); }
     Ok(claims)
 }
 
@@ -172,7 +172,7 @@ pub fn verify_rs256_jwt(token: &str, jwks: &serde_json::Value, now_secs: u64) ->
     // (Any bytes make a signature: checking it is what can fail.)
     Signature::try_from(sig.as_slice()).and_then(|sig| VerifyingKey::<Sha256>::new(key).verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)).map_err(|_| "bad signature".to_string())?;
     let claims: serde_json::Value = serde_json::from_slice(&decode(parts[1])?).map_err(|e| e.to_string())?;
-    if claims["exp"].as_u64().is_none_or(|exp| exp < now_secs) { return Err("expired".into()); }
+    if claims["exp"].as_u64().is_none_or(|exp| crate::io::before(exp, now_secs)) { return Err("expired".into()); }
     if claims["nbf"].as_u64().is_some_and(|nbf| nbf > now_secs + 60) { return Err("not yet valid".into()); }
     Ok(claims)
 }

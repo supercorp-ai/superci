@@ -52,7 +52,7 @@ impl Runtime {
             while q.is_empty() { q = self.queued.wait(q).unwrap() }
             let (id, event) = q.pop_front().unwrap();
             drop(q);
-            answer(&mut stream, &format!("lambda-runtime-aws-request-id: {id}\r\nlambda-runtime-invoked-function-arn: arn:aws:lambda:us-east-1:111111111111:function:{TABLE}\r\n"), &event.to_string());
+            answer(&mut stream, &format!("lambda-runtime-aws-request-id: {id}\r\nlambda-runtime-invoked-function-arn: arn:aws:lambda:us-east-1:111111111111:function:{TABLE}\r\nlambda-runtime-deadline-ms: {}\r\n", now_ms() + 180_000), &event.to_string());
         } else if let Some(rest) = path.strip_prefix("/2018-06-01/runtime/invocation/") {
             let (id, kind) = rest.split_once('/').unwrap_or_default();
             self.answers.lock().unwrap().insert(id.to_string(), (kind.to_string(), serde_json::from_slice(&body).unwrap_or(Value::Null)));
@@ -272,6 +272,46 @@ fn a_queued_job_gets_its_machine_after_the_webhook_is_answered_as_aws_answered()
     assert!(github.unanswered.lock().unwrap().is_empty(), "{:?}", github.unanswered.lock().unwrap());
 }
 
+/// A job's first write refused by DynamoDB for something else than its being there already: the event is not taken
+/// (GitHub delivers it again), never taken as a job known before; delivered again, it is.
+#[test]
+fn a_jobs_write_dynamodb_refuses_is_no_job_known_before() {
+    let aws = aws();
+    let github = aws.github.lock().unwrap().clone().unwrap();
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string());
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("RUNNER_REGION", "us-east-1"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let (id, (body, signature)) = github.queue("tests", "superci/cpu=2", now_ms());
+    let event = url_event("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": signature, "content-type": "application/json" }), &String::from_utf8(body).unwrap());
+    aws.fail("DynamoDB_20120810.PutItem|attribute_not_exists", 400, &superci_testkit::json_error("ValidationException", "One or more parameter values were invalid"), Some(1));
+    let (_, answer) = runtime.invoke(event.clone());
+    assert!(answer["statusCode"].as_u64().is_some_and(|s| s >= 500) && item(&aws, &format!("job:{id}")).is_none(), "{answer}");
+    let (_, answer) = runtime.invoke(event);
+    assert_eq!(answer["statusCode"].as_u64(), Some(202), "{answer}");
+    assert!(item(&aws, &format!("job:{id}")).is_some());
+}
+
+/// DynamoDB leaving every key of a batch read unprocessed, every time: asked eight times, then each read on its own; the
+/// sweep ends, and the job is still there.
+#[test]
+fn a_batch_read_dynamodb_never_processes_is_read_key_by_key() {
+    let aws = aws();
+    let github = aws.github.lock().unwrap().clone().unwrap();
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string());
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("RUNNER_REGION", "us-east-1"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let (id, (body, signature)) = github.queue("tests", "superci/cpu=2", now_ms());
+    let event = url_event("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": signature, "content-type": "application/json" }), &String::from_utf8(body).unwrap());
+    assert_eq!(runtime.invoke(event).1["statusCode"].as_u64(), Some(202));
+    let unprocessed = json!({ "Responses": { TABLE: [] }, "UnprocessedKeys": { TABLE: { "Keys": [{ "p": { "S": "job" }, "k": { "S": format!("job:{id}") } }] } } });
+    aws.fail("DynamoDB_20120810.BatchGetItem", 200, &unprocessed.to_string(), None);
+    let began = Instant::now();
+    assert_eq!(runtime.invoke(json!({ "superci": "sweep" })).1, json!({ "swept": true }));
+    assert!(began.elapsed() < Duration::from_secs(60) && item(&aws, &format!("job:{id}")).is_some());
+}
+
 /// Its settings over several pages of SSM's, one of them not a setting (no value); its instance types from the deploy;
 /// a request with its query, without one, and with a header that is not text; a move's step, read fresh.
 #[test]
@@ -389,6 +429,12 @@ fn the_converter_says_which_step_s3_or_mkfs_did_not_take() {
     let mut sized = job(&blob, &key, bucket);
     sized["size"] = json!(blob.len() + 5);
     assert!(error(&runtime.invoke(sized).1).contains("bytes), not"), "the size it was said to be");
+    // As large as a layer is converted: taken (then found not to be that size); a byte more, not.
+    let mut most = job(&blob, &key, bucket);
+    most["size"] = json!(4u64 << 30);
+    assert!(error(&runtime.invoke(most.clone()).1).contains("bytes), not"), "the most there is taken");
+    most["size"] = json!((4u64 << 30) + 1);
+    assert!(error(&runtime.invoke(most).1).starts_with("a blob of 4294967297 bytes (converted up to 4294967296)"));
     let (runtime, at) = Runtime::serve();
     let _f = start(&at, "http://127.0.0.1:9", &[("SUPERCI_CONVERTER", "1"), ("LAMBDA_TASK_ROOT", dir.to_str().unwrap())]);
     let done = runtime.invoke(job(&blob, "layers/staging/x", bucket)).1;

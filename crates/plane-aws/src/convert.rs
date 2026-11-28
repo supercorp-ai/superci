@@ -22,7 +22,7 @@ use superci_core::io::Http;
 pub const MKFS: [&str; 9] = ["--tar=f", "--aufs", "-zlz4hc", "-C131072", "-Enoinline_data", "-T0", "--mkfs-time", "-U", "39bb3f52-5f38-4d6c-a25a-5ea4cc1d8b11"];
 
 /// A blob larger than this is not converted (the function's disk keeps the blob and the file at once).
-pub const MOST_BYTES: u64 = 4 << 30;
+pub use superci_core::layers::MOST_BYTES;
 
 /// An upload's part (S3 takes 10,000 at most: 640 GB).
 const PART: usize = 64 << 20;
@@ -139,7 +139,7 @@ fn file_sha256(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn said(r: superci_core::io::Response, what: &str) -> Result<superci_core::io::Response, String> {
-    if r.status < 300 { Ok(r) } else { Err(format!("{what}: S3 answered {} {}", r.status, r.body_text().chars().take(300).collect::<String>())) }
+    if superci_core::io::done(r.status) { Ok(r) } else { Err(format!("{what}: S3 answered {} {}", r.status, r.body_text().chars().take(300).collect::<String>())) }
 }
 
 /// A file put in the bucket: in one request when small, else in parts (of `part` bytes), four at once.
@@ -172,7 +172,7 @@ fn upload(http: &(dyn Http + Sync), creds: &Credentials, region: &str, url: &str
                     loop {
                         tries += 1;
                         let last = match block_on(aws::s3(http, "PUT", &format!("{url}?partNumber={}&uploadId={}", n + 1, aws::rfc3986(&id)), region, creds, body.clone(), &[], now())) {
-                            Ok(r) if r.status < 300 => return r.header("etag").map(str::to_string).ok_or_else(|| "S3 gave no ETag".to_string()),
+                            Ok(r) if superci_core::io::done(r.status) => return r.header("etag").map(str::to_string).ok_or_else(|| "S3 gave no ETag".to_string()),
                             Ok(r) => format!("S3 answered {}", r.status),
                             Err(e) => e,
                         };

@@ -90,7 +90,7 @@ fn runners_are_launched_and_stopped_as_the_control_plane_asks() {
     assert!(status == 200 && id.len() == 64 && started["kind"] == "container", "{status} {said}");
     assert_eq!(w.containers.ops("start").len(), 1);
     let (status, said) = asked(&w, "/stop", &t, json!({ "id": id }));
-    assert!(status == 200 && said.contains("stopped"), "{status} {said}");
+    assert!(status == 200 && said.contains("stopped") && !said.contains("\"id\""), "a stop's answer is the runner's own: {status} {said}");
     assert_eq!(w.containers.ops("destroy").len(), 1);
     assert_eq!(asked(&w, "/launch", &t, json!({ "name": "job-2", "jit": "eyJqaXQiOnRydWV9", "location": "auto" })).0, 200);
     assert_eq!(asked(&w, "/stop", &t, json!({ "id": "job-2" })).0, 200);

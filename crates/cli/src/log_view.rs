@@ -235,7 +235,7 @@ fn gitlab_text(raw: &str) -> &str {
 }
 
 /// A line's time (when it begins with one, as GitHub's and GitLab's runners write) and the rest.
-fn split_time(raw: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_time(raw: &str) -> (Option<&str>, &str) {
     let r = raw.trim_start_matches('\u{feff}');
     let b = r.as_bytes();
     if b.len() > 20 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) {
@@ -573,6 +573,13 @@ mod tests {
         data.extend(dir_at.to_le_bytes());
         data.extend([0, 0]);
         data
+    }
+
+    /// A zip whose files carry comments and extra fields (as Python's zipfile and others write them): each read past them.
+    #[test]
+    fn a_zip_whose_files_carry_comments_is_read_whole() {
+        let files = zip_files(include_bytes!("../tests/fixtures/zip/commented.zip")).unwrap();
+        assert_eq!(files, vec![("a.txt".to_string(), b"first\n".to_vec()), ("dir/b.txt".to_string(), b"second\n".to_vec())]);
     }
 
     #[test]

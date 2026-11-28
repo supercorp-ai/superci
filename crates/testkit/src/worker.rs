@@ -137,9 +137,9 @@ impl Drop for Worker {
 
 impl Worker {
     /// Started with these settings (as its secrets), where Node and the built Worker are (`None`, said, elsewhere).
-    pub fn start(setup: &Setup, settings: &[(String, String)]) -> Option<Worker> { Worker::start_with(setup, settings, "npx") }
+    pub fn start(setup: &Setup, settings: &[(String, String)]) -> Option<Worker> { crate::needed(Worker::start_with(setup, settings, "npx"), "The built Worker or Node", crate::skips()) }
 
-    fn start_with(setup: &Setup, settings: &[(String, String)], npx: &str) -> Option<Worker> {
+    pub(crate) fn start_with(setup: &Setup, settings: &[(String, String)], npx: &str) -> Option<Worker> {
         if !setup.built.exists() { eprintln!("the Worker is not built (./build.sh): skipped"); return None }
         if !Command::new(npx).arg("--version").output().is_ok_and(|o| o.status.success()) { eprintln!("no Node here: skipped"); return None }
         build_once(&setup.built, std::env::var_os("SUPERCOV_RUN_ID"), "worker-build");
@@ -172,6 +172,9 @@ impl Worker {
             .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).process_group(0).spawn().unwrap();
         let w = Worker { child, url: format!("http://127.0.0.1:{port}"), dir, aws, github, containers };
         w.until_within("wrangler did not start", Duration::from_secs(120), || w.log().contains("Ready on"));
+        // ("Ready on" is wrangler's; the Worker's module may still be loading, and its first request on a busy machine
+        // waited past a test's minute. A test gets it once it answers.)
+        w.until_within("the Worker did not answer", Duration::from_secs(180), || answers(&w.url));
         *w.aws.plane_url.lock().unwrap() = w.url.clone();
         Some(w)
     }
@@ -201,6 +204,19 @@ impl Worker {
     fn until_within(&self, what: &str, time: Duration, f: impl Fn() -> bool) {
         assert!(crate::within(time, f), "{what}:\n{}", self.log());
     }
+}
+
+/// Whether a Worker answers `/__test/ready` (within ten seconds a try: a request it has not answered by then is asked
+/// again, never waited on for a minute).
+fn answers(url: &str) -> bool {
+    let addr: std::net::SocketAddr = url.trim_start_matches("http://").parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok().map(|mut s| {
+        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = s.write_all(format!("GET /__test/ready HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n").as_bytes());
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        out
+    }).is_some_and(|out| out.starts_with(b"HTTP/1.1 200"))
 }
 
 /// A Worker's secrets, as `wrangler dev` reads them.

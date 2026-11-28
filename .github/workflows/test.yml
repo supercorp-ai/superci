@@ -1,10 +1,19 @@
 name: Test
 
-# Builds everything the program carries inside it and the program, and runs the tests, on every push and pull request.
+# Builds everything the program carries inside it and the program, and runs the tests, on every push to main. On a
+# pull request the tests and sweeps are left to the Coverage workflow, which runs every one of them measured (and main
+# takes only what passes there): here, what it does not do. By hand (Actions → Test), `only` runs just the tests a
+# nextest filter names (`test(=name) | test(=other)`), for a quick look at a few before the whole run.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: A nextest filter (test(=name) | test(=other)); empty, every test and sweep
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -126,6 +135,7 @@ jobs:
   # compiled into the tests are where they were). Each sweep's scenario runs once here.
   test:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -152,13 +162,53 @@ jobs:
       - name: mkfs.erofs
         run: sudo apt-get install -y -qq erofs-utils >/dev/null
       - name: Part ${{ matrix.part }} of the tests
-        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --partition count:${{ matrix.part }}/4 --no-fail-fast
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -- --profile ci --partition count:${{ matrix.part }}/4 --no-fail-fast
+          if [ -n "$ONLY" ]; then set -- "$@" -E "$ONLY"; fi
+          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite "$@"
+      # (Each test's time, for Coverage's parts: see `times`.)
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.only == ''
+        with:
+          name: junit-${{ matrix.part }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  # Each test's time from this run, over the last kept, kept for the Coverage workflow to deal its parts by (newest
+  # first, `.github/test-times.json` where none is kept): the parts stay of about the same length as tests come and go.
+  times:
+    needs: test
+    if: always() && needs.test.result != 'skipped' && inputs.only == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache/restore@v4
+        with:
+          path: test-times.json
+          key: test-times-${{ github.run_id }}
+          restore-keys: test-times-
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+      - name: Each test's time
+        run: |
+          [ -f test-times.json ] || cp .github/test-times.json test-times.json
+          python3 .github/test-times.py merge test-times.json junit/*/junit.xml > merged.json && mv merged.json test-times.json
+      - uses: actions/cache/save@v4
+        with:
+          path: test-times.json
+          key: test-times-${{ github.run_id }}
 
   # Each sweep again with each of its calls and store operations failing in turn, and the core's control plane tests
   # likewise (in process): six machines side by side, each making every sweep's n-th fault from its own (a sweep can
   # take longer than all the others together, so its faults are shared out, not the sweeps).
   sweeps:
     needs: build
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.only == '')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

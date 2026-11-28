@@ -45,11 +45,29 @@ jobs:
             if [ "$answer" = "201" ] || [ "$answer" = "200" ]; then echo "$package: trusted"; else echo "$package: $answer $(jq -c 'del(.token)' "$RUNNER_TEMP/answer.json" 2>/dev/null)"; failed=1; fi
           done
           [ "$failed" = 0 ] || { echo "npm does not trust this workflow for every package: set each one's Trusted publisher on npmjs.com (supercorp-ai/superci, publish.yml, Allow npm publish)." >&2; exit 1; }
+      - name: The pinned images passed the live image check
+        # (scripts/image-check.sh writes what it passed on into scripts/image-check.passed: a release moves no pin that
+        # no job has booted.)
+        run: |
+          pinned=$(sed -n 's/^pub const IMAGE_RELEASE: &str = "\(.*\)";/\1/p' crates/core/src/aws.rs)
+          grep -qx "$pinned" scripts/image-check.passed 2>/dev/null || { echo "The pinned image builds ($pinned) have not passed scripts/image-check.sh: run it on the release's build, and commit scripts/image-check.passed." >&2; exit 1; }
+      - name: The pinned Linux images are still RunsOn's
+        # A release boots the builds it pins (IMAGE_BUILDS in crates/core/src/aws.rs). RunsOn keeps only its last three
+        # Linux builds: a pin among them moves only after scripts/image-check.sh passed on the new ones; one already
+        # gone is a release that would ask its users to update, and update them to nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned=$(sed -n 's/^pub const IMAGE_RELEASE: &str = "\(.*\)";/\1/p' crates/core/src/aws.rs)
+          kept=$(gh release list -R runs-on/runner-images-for-aws --limit 30 --json tagName --jq '[.[].tagName | select(startswith("linux-"))][:3][]')
+          echo "Pinned: linux-$pinned. RunsOn keeps: $(echo $kept)"
+          echo "$kept" | grep -qx "linux-$pinned" || { echo "RunsOn no longer has the pinned Linux build (linux-$pinned). Move the pins (IMAGE_BUILDS, IMAGE_RELEASE) after scripts/image-check.sh passed on its newest builds." >&2; exit 1; }
 
-  build:
-    # A Mac builds them all: its own two, and Linux's and Windows' through zig.
+  # What the program carries inside it (the control planes, the runner agent, the cache and layer store programs), built
+  # once; then the program for each system on a machine of its own, side by side; then packed and tried.
+  programs:
     needs: trust
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -62,37 +80,124 @@ jobs:
           grep -q "^## $RELEASE_VERSION " CHANGELOG.md || { echo "CHANGELOG.md has no entry for $RELEASE_VERSION." >&2; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
+          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
       # What was compiled before (dependencies above all), kept between releases: the same release build, sooner.
-      # (A run from a tag reads what one from main saved.)
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: publish
-      - uses: actions/setup-node@v6
+          shared-key: publish-programs
+      - uses: mlugg/setup-zig@v2
         with:
-          node-version: "24"
-          package-manager-cache: false
-      - name: The build's tools (zig)
-        run: brew install zig
-      # (cargo-zigbuild built, downloaded; worker-build has no build to download: compiled once, then kept by the Rust
-      # cache.)
+          version: 0.16.0
+          use-cache: false
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
       - name: worker-build
         run: cargo install --locked worker-build@0.8.7
-      - name: Build everything and pack the npm packages
-        run: ./scripts/npm-pack.sh
-      - name: Whether this commit's tests passed already (the Test workflow)
+      - name: What the program carries
+        run: SUPERCI_PROGRAMS_ONLY=1 ./build.sh
+      # (Only a run that ran every test counts: the Test workflow's on a push to main, or Coverage's of every test. Test
+      # on a pull request leaves the tests to Coverage, and passing there says nothing of them.)
+      - name: Whether this commit's tests passed already
         id: tested
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=test.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length 2>/dev/null || echo 0)
-          echo "passed=$([ "${n:-0}" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          test_push=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=test.yml --commit "$GITHUB_SHA" --event push --status success --json databaseId --jq length 2>/dev/null || echo 0)
+          coverage=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=coverage.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length 2>/dev/null || echo 0)
+          echo "passed=$([ "${test_push:-0}" -gt 0 ] || [ "${coverage:-0}" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: The tests
         if: steps.tested.outputs.passed != 'true'
         run: cargo test --workspace
+      - name: The crates pack and build as crates.io would get them
+        run: ./scripts/crates-publish.sh --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: programs
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            crates/plane-cloudflare/build
+            crates/runners-cloudflare/build
+            crates/plane-aws/build
+            crates/plane-modal/build
+            target/x86_64-unknown-linux-musl/release/superci-cache
+            target/x86_64-unknown-linux-musl/release/superci-layers
+            target/aarch64-unknown-linux-musl/release/superci-cache
+            target/aarch64-unknown-linux-musl/release/superci-layers
+            target/x86_64-pc-windows-gnu/release/superci-cache.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: embedded
+          path: |
+            crates/cli/embedded/
+            crates/programs-*/embedded/
+          if-no-files-found: error
+          retention-days: 7
+
+  cli:
+    needs: programs
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-15, zig: false }
+          - { target: x86_64-apple-darwin, os: macos-15, zig: false }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: x86_64-pc-windows-gnu, os: ubuntu-latest, zig: true }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-${{ matrix.target }}
+      # (After the Rust cache: what it restores of target/ would take the programs' place.)
+      - uses: actions/download-artifact@v4
+        with:
+          name: programs
+      - uses: mlugg/setup-zig@v2
+        if: matrix.zig
+        with:
+          version: 0.16.0
+          use-cache: false
+      - uses: taiki-e/install-action@v2
+        if: matrix.zig
+        with:
+          tool: cargo-zigbuild
+      - name: The program for ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.zig }}" = true ]; then cargo zigbuild --release --target ${{ matrix.target }} -p superci; else cargo build --release --target ${{ matrix.target }} -p superci; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/superci${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 7
+
+  pack:
+    needs: cli
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+      - name: Pack the npm packages from each system's program
+        run: |
+          for d in bins/bin-*; do t=${d#bins/bin-}; mkdir -p "target/$t/release" && cp "$d"/* "target/$t/release/"; done
+          chmod +x target/*/release/superci 2>/dev/null || true
+          ./scripts/npm-pack.sh --no-build
       - name: Try what was packed, through npx
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -106,20 +211,10 @@ jobs:
           path: target/npm/*.tgz
           if-no-files-found: error
           retention-days: 7
-      - name: The crates pack and build as crates.io would get them
-        run: ./scripts/crates-publish.sh --dry-run
-      - uses: actions/upload-artifact@v4
-        with:
-          name: embedded
-          path: |
-            crates/cli/embedded/
-            crates/programs-*/embedded/
-          if-no-files-found: error
-          retention-days: 7
 
   windows:
     # The package for Windows, on Windows: installed as npm would, asked its version, and its dashboard opened.
-    needs: build
+    needs: pack
     strategy:
       fail-fast: false
       matrix:
@@ -153,7 +248,7 @@ jobs:
           grep -q 'SuperCI' page.html
 
   publish:
-    needs: [build, windows]
+    needs: [pack, windows]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 45

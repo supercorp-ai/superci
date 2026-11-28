@@ -111,7 +111,7 @@ fn machine() -> Option<(Machine, Store, String)> {
     let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let name = format!("superci-layers-machine-{}-{n}", std::process::id());
     // (The store on a disk, as on a machine: the kernel mounts an EROFS file from a filesystem that reads pages itself,
-    // which neither a container's own overlay nor tmpfs is: /tmp is tmpfs on Ubuntu 26.04. Cargo's folder is on disk.)
+    // which neither a container's own overlay nor tmpfs is: /tmp may be tmpfs. Cargo's folder is on disk.)
     let store = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-store-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&store).unwrap();
     let store = Store(store);

@@ -243,6 +243,13 @@ pub trait Clock {
     fn now_ms(&self) -> u64;
 }
 
+/// Whether `at` is still before `until` (the moment a key, a kept answer or a wait lasts to): every such check says it
+/// this one way, so each ends at the moment it says, not a moment after.
+pub fn before(at: u64, until: u64) -> bool { at < until }
+
+/// An HTTP answer that says what was asked was done (2xx); a redirect or an error is not.
+pub fn done(status: u16) -> bool { (200..300).contains(&status) }
+
 #[async_trait(?Send)]
 pub trait Timer {
     /// Calls the control plane's `alarm` at the latest after `ms` (an earlier pending wake-up stays).

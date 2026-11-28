@@ -218,6 +218,13 @@ fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
     assert!(published.contains(&"us-east-1") && !published.contains(&"ca-central-1"), "{images}");
     assert!(text(&["images", "list"]).contains("us-east-1"));
     assert_eq!(json(&home, &["runners", "order", "cloudflare"]).1["order"], serde_json::json!(["cloudflare"]));
+    // Said to a person: the order (nothing taken out, as it has no other); with one label, none shown as the examples', with two the first.
+    let ordered = text(&["runners", "order", "cloudflare"]);
+    assert!(ordered.contains("Order: cloudflare.") && !ordered.contains("Taken out"), "{ordered}");
+    assert!(!text(&["labels", "list"]).contains("(shown in examples)"));
+    text(&["labels", "create", "second"]);
+    assert_eq!(text(&["labels", "list"]).matches("(shown in examples)").count(), 1);
+    text(&["labels", "delete", "second", "--confirm"]);
     let status = json(&home, &["status"]).1;
     assert_eq!(status["signed_in"], "AWS account 111111111111");
     assert!(text(&["status"]).contains("AWS account 111111111111"));
@@ -241,6 +248,9 @@ fn the_control_plane_is_updated_as_aws_answered_a_real_account() {
     // Its new function went up; its role, table, address and schedule were checked.
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
     assert!(asked.iter().any(|a| a.starts_with("PUT https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0001/code")), "{asked:?}");
+    // Its time raised from the 60 s it had to 180 (#41).
+    let configured = served.aws.asked.lock().unwrap().iter().find(|a| a["method"] == "PUT" && a["url"] == "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0001/configuration").cloned().unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(configured["asked"].as_str().unwrap()).unwrap(), serde_json::json!({ "MemorySize": 1024, "Timeout": 180 }));
     // The layer store's converter beside it, made (new in this version), not tried again when it fails.
     assert!(asked.iter().any(|a| a == "PUT https://lambda.us-east-1.amazonaws.com/2019-09-25/functions/superci-plane-testplane0001-convert/event-invoke-config"), "{asked:?}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
@@ -869,6 +879,28 @@ fn a_limit_an_older_control_plane_does_not_keep_is_refused_saying_to_update_it()
         assert!(!o.status.success() && e.contains(said) && e.contains("superci planes update"), "{version}: {e}");
         assert_eq!(routing(), before, "nothing written");
     }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A default machine held to one AWS region, on a control plane from before `region=` (which would drop it unsaid, and
+/// start its jobs in any region): refused before anything is written, saying to update it; once updated, kept.
+#[test]
+fn a_region_an_older_control_plane_would_drop_is_refused_saying_to_update_it() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let machine = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "MACHINE").map(|(_, v)| v);
+    let before = machine();
+    *served.aws.old_version.lock().unwrap() = Some("0.20.4".into());
+    let o = superci(&home, &["machine", "update", "--region=us-east-1"]);
+    let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success() && e.contains("Holding jobs to one AWS region needs a newer control plane") && e.contains("superci planes update"), "{e}");
+    assert_eq!(machine(), before, "nothing written");
+    // One from 0.20.5 on keeps it.
+    *served.aws.old_version.lock().unwrap() = Some("0.20.5".into());
+    let o = superci(&home, &["machine", "update", "--region=us-east-1"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let kept: serde_json::Value = serde_json::from_str(&machine().unwrap()).unwrap();
+    assert_eq!(kept["region"].as_str(), Some("us-east-1"), "{kept}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2159,14 +2191,15 @@ fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_pr
     list["manifests"] = serde_json::json!([{ "digest": "sha256:1111", "platform": { "os": "windows", "architecture": "amd64" } }, { "digest": "sha256:2222", "platform": { "os": "linux", "architecture": "arm64" } }]);
     list["manifests"].as_array_mut().unwrap().extend(amd64);
     let long = list.to_string() + &" ".repeat(1_100_000);
-    // Not visible at once, then being prepared twice over; and the Worker's containers of one size from before.
+    // Not visible at once, then being prepared three times over (said once: every half minute); and the Worker's containers of one size from before.
     let scripts = recorded_answers(&recording, "GET", "/workers/scripts");
     let mut before: serde_json::Value = serde_json::from_str(scripts[1]["answer"].as_str().unwrap()).unwrap();
     before["result"].as_array_mut().unwrap().push(serde_json::json!({ "id": format!("superci-runners-{}", superci_testkit::PLANE), "migration_tag": "v2" }));
     let apps = recorded_answers(&recording, "GET", "/containers/applications");
     let (ok, said) = run(&[
         { let mut r = index.clone(); r["answer"] = long.clone().into(); r }, answered(&prepare, 400, serde_json::json!({ "success": false, "errors": [{ "code": 1, "message": "IMAGE_REGISTRY_DOESNT_CONTAIN_IMAGE" }], "result": null })),
-        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), prepare.clone(),
+        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })),
+        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), prepare.clone(),
         scripts[0].clone(), answered(&scripts[1], 200, before),
         answered(&apps[0], 200, serde_json::json!({ "success": true, "result": [{ "name": format!("superci-runners-{}", superci_testkit::PLANE) }] })), apps[0].clone(),
     ]);

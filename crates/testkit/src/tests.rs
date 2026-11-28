@@ -595,6 +595,8 @@ fn gitlab_answers_only_for_what_it_has() {
     let (a, _) = lab.pending("a", &["t"], 0);
     let (b, _) = lab.pending("b", &["t"], 0);
     let (_c, _) = lab.pending("c", &["t"], 0);
+    // (A job there is: given in its own project, not in another.)
+    assert_eq!((call("GET", &format!("projects/{project}/jobs/{a}")), call("GET", &format!("projects/1/jobs/{a}"))), (Some(200), None));
     lab.running_on(a, 7, 0);
     lab.running_on(b, 8, 0);
     lab.finish(b, "success", "", 0);
@@ -668,4 +670,36 @@ fn each_account_kept_apart_keeps_its_own() {
     let put = |account: &str, v: &str| http(&aws.url, "PUT", &format!("/api.cloudflare.com/client/v4/accounts/{account}/workers/scripts/superci/secrets"), &[("authorization", "Bearer t")], json!({ "name": "ROUTING", "text": v, "type": "secret_text" }).to_string().as_bytes()).0;
     assert_eq!((put("1111", "one"), put("2222", "two")), (200, 200));
     assert_eq!((aws.worker_settings("superci"), aws.worker_settings_in("2222", "superci")), (vec![("ROUTING".to_string(), "one".to_string())], vec![("ROUTING".to_string(), "two".to_string())]));
+}
+
+/// Answers queued to come are counted until given; a control plane's containers are on only as `CONTAINERS` = `on`.
+#[test]
+fn answers_to_come_are_counted_and_containers_are_on_only_as_said() {
+    let served = serve(|_| {});
+    served.then_answer("/never-asked", &[("/status", &["active"]), ("/status", &[])]);
+    assert_eq!(served.answers_to_come(), 2);
+    let s = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    assert!(crate::containers_on(&s(&[("CONTAINERS", "on")])));
+    assert!(!crate::containers_on(&s(&[("CONTAINERS", "off"), ("OTHER", "on")])) && !crate::containers_on(&[]));
+}
+
+/// What a test needs and is not here: skipped where skipping is allowed, a failure where this run skips nothing; and
+/// this run's own setting read as it is (Coverage and its mutants set `SUPERCI_NO_SKIPS`).
+#[test]
+fn what_a_test_needs_and_is_not_here_fails_a_run_that_skips_nothing() {
+    assert_eq!(needed(Some(1), "Chrome", false), Some(1));
+    assert_eq!(needed(None::<u8>, "Chrome", true), None);
+    let said = catch_unwind(|| needed(None::<u8>, "Chrome", false)).err().and_then(|e| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+    assert!(said.contains("Chrome is not here, and this run skips nothing"), "{said}");
+    assert_eq!(skips(), std::env::var_os("SUPERCI_NO_SKIPS").is_none());
+}
+
+/// In a run that skips nothing, Chrome and the Cloudflare control plane (its built Worker, under Node) are there for
+/// the tests that ask for them: none of those passes by being skipped.
+#[test]
+fn a_run_that_skips_nothing_has_chrome_and_the_cloudflare_control_plane() {
+    if skips() { return }
+    assert!(Browser::open(800, 600).is_some(), "Chrome");
+    let plane = serve_cloudflare().expect("the Cloudflare control plane");
+    assert!(plane.url.starts_with("http://"), "{}", plane.url);
 }

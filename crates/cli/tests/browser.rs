@@ -3308,12 +3308,22 @@ fn the_default_machine_is_picked_on_workflows_and_the_workspace_renamed_in_setti
     // 8 CPUs, arm64, no spot machines: what the picker says runs it, then saved.
     b.click(r#"button[onclick*="'default-machine'"]"#, "Change");
     b.wait("document.getElementById('default-machine').open");
-    b.eval("(() => { const f = document.querySelector('form[action=\"/machine\"]'); f.cpu.value = '8'; f.arch.value = 'arm64'; f.nospot.checked = true; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
+    // (And held to the control plane's AWS region: a region its jobs' network is in.)
+    b.eval("(() => { const f = document.querySelector('form[action=\"/machine\"]'); f.cpu.value = '8'; f.arch.value = 'arm64'; f.nospot.checked = true; f.region.value = 'us-east-1'; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
     b.click(r#"form[action="/machine"] button.primary"#, "Save");
     until("the default machine", || setting("MACHINE").is_some_and(|m| serde_json::from_str::<serde_json::Value>(&m).is_ok_and(|m| m["cpu"] == 8)));
     let machine: serde_json::Value = serde_json::from_str(&setting("MACHINE").unwrap()).unwrap();
-    assert_eq!((machine["arch"].as_str(), machine["spot"].as_bool()), (Some("arm64"), Some(false)), "{machine}");
+    assert_eq!((machine["arch"].as_str(), machine["spot"].as_bool(), machine["region"].as_str()), (Some("arm64"), Some(false), Some("us-east-1")), "{machine}");
     b.wait(&shows("8 CPU"));
+    b.wait(&shows("only in N. Virginia"));
+    // The picker: a region in a job's label, and only AWS's runners said to run it.
+    // (Its button shows once GitHub or GitLab is connected; the dialog is on the page either way.)
+    b.eval("document.getElementById('label-picker').showModal()");
+    b.wait("document.getElementById('label-picker').open");
+    b.eval("(() => { const f = document.querySelector('#label-picker form'); f.region.value = 'us-east-1'; f.cpu.value = '4'; f.dispatchEvent(new Event('change', {bubbles: true})); })()");
+    b.wait("document.querySelector('#label-picker [data-label]').textContent === 'superci/cpu=4/region=us-east-1'");
+    assert_eq!(b.eval("[...document.querySelectorAll('#label-picker .fit')].map(x => (x.dataset.aws !== undefined) + ':' + x.classList.contains('no')).join(',')").as_str().map(|s| s.split(',').all(|f| f == "true:false" || f == "false:true")), Some(true));
+    b.eval("document.getElementById('label-picker').close()");
 
     // The workspace's id: its folder on this computer is renamed, and the dashboard goes on in it.
     b.click("nav a", "Settings");
@@ -3482,6 +3492,11 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
         let (status, _, said) = common::post(&link, "/routing", fields);
         assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{fields:?}: {status}");
     }
+    // One not named at all stays as it was, after those named, each once.
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "order"), ("cloud_0", "aws")]);
+    let routing: serde_json::Value = serde_json::from_str(&setting("ROUTING").unwrap_or_default()).unwrap_or_default();
+    let clouds: Vec<&str> = routing["order"].as_array().into_iter().flatten().filter_map(|p| p["cloud"].as_str()).collect();
+    assert!(status < 400 && clouds.first() == Some(&"aws") && clouds.iter().filter(|c| **c == "aws").count() == 1 && clouds.iter().filter(|c| **c == "cloudflare").count() == 1, "{clouds:?}");
     // The default machine: Windows only on x64.
     let (status, _, said) = common::post(&link, "/machine", &[("os", "windows"), ("arch", "arm64")]);
     assert!(status == 400 && common::words(&said).contains("Windows machines are x64"), "{status} {}", common::words(&said));
@@ -13496,6 +13511,8 @@ mod runs_suite_in_browser {
             (job("    steps:\n      - run: echo\n        id: a\n      - wait: [b]\n"), &[], false),
             (job("    steps:\n      - wait: [a]\n        run: echo\n"), &[], false),
             (job("    steps:\n      - wait-all: true\n        if: always()\n"), &[], false),
+            // (A background step with an `if`, and the `wait` for it with one too, as written in a run that was dropped.)
+            (job("    steps:\n      - id: a\n        run: sleep 1\n        background: true\n        if: github.event_name == 'push'\n      - wait: [a]\n        if: always()\n"), &[], false),
             (job("    steps:\n      - parallel: []\n"), &[], false),
             (job("    steps:\n      - parallel:\n          - run: echo a\n        name: two keys\n"), &[], false),
             (job("    steps:\n      - parallel:\n          - parallel:\n              - run: echo\n"), &[], false),
@@ -13521,9 +13538,50 @@ mod runs_suite_in_browser {
             let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
             assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"), "case {i}: {said}");
             if *ok { assert!(o.status.success(), "case {i}: {said}\n{text}") }
+            // A step that cannot be handed to its runner: refused here, saying where, and nothing started. (Started, its
+            // job was never handed out, and the run never ended.)
+            if i <= 9 {
+                assert!(!o.status.success() && !said.contains("started") && (said.contains(".github/workflows/ci.yml, the job t: line ") || said.contains("has no steps")), "case {i}: {said}");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
+        // The same in a workflow a job calls: refused by the control plane as the run is made, saying which job.
+        let called = "on: workflow_call\njobs:\n  t:\n    runs-on: superci\n    steps:\n      - id: a\n        run: sleep 1\n        background: true\n      - wait: [a]\n        if: always()\n";
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  c:\n    uses: ./.github/workflows/called.yml\n"), (".github/workflows/called.yml", called)]);
+        let runs = served.store.under("run:").len();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("the job c / t: line 9: a `wait` step always runs; it takes no `if`"), "{said}");
+        assert_eq!(served.store.under("run:").len(), runs, "no run made");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A called workflow's job with no steps: refused by the control plane as it is, not said as a line.
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  c:\n    uses: ./.github/workflows/called.yml\n"), (".github/workflows/called.yml", "on: workflow_call\njobs:\n  t:\n    runs-on: superci\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("has no steps") && !said.contains("the job c / t:"), "{said}");
+        assert_eq!(served.store.under("run:").len(), runs, "no run made");
+        let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
+    }
+
+    /// A job nothing can run (macOS): followed, it is said as ended with the control plane's word for why.
+    #[test]
+    fn a_followed_job_nothing_can_run_is_said_as_ended_with_why() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  mac:\n    runs-on: superci/os=macos\n    steps:\n      - run: echo\n")]);
+        // (Followed: the control plane's upkeep moves the run on, as its schedule would; a minute at most.)
+        let mut child = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > end { let _ = child.kill(); panic!("the run was never said to end") }
+            served.later(30_000);
+            served.upkeep();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        let o = child.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("Ended: failure: nowhere to run macOS"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13621,6 +13679,50 @@ mod runs_suite_in_browser {
             assert_eq!(plain(&r.handed(&served)["contextData"]["matrix"]), serde_json::json!({ "shard": shard as f64, "os": "linux" }));
             r.take();
             r.finish("succeeded");
+        }
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn a_matrix_with_max_parallel_starts_no_more_of_its_jobs_at_once_and_the_next_as_one_ends() {
+        let served = serve(|_| {});
+        // (Beside a job of its own, going all along: only the matrix's own jobs count toward its limit.)
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  lint:\n    runs-on: superci\n    steps:\n      - run: echo\n  test:\n    runs-on: superci\n    strategy:\n      max-parallel: 2\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.shard }}\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let states = || served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().filter(|j| j["name"] != "lint").map(|j| j["state"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        let lint = runner_of(&served, &run, "lint");
+        assert_eq!(states(), ["started", "started", "pending"]);
+        let first = runner_of(&served, &run, "test (1)");
+        assert_eq!(plain(&first.handed(&served)["contextData"]["strategy"])["max-parallel"], 2.0);
+        first.take();
+        first.finish("succeeded");
+        // One ended: the third starts, and no more than two are going.
+        let third = runner_of(&served, &run, "test (3)");
+        assert_eq!(states(), ["done", "started", "started"]);
+        for r in [runner_of(&served, &run, "test (2)"), third, lint] { r.take(); r.finish("succeeded"); }
+        let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+        assert!(record["jobs"].as_array().unwrap().iter().all(|j| j["result"] == "success"), "{record}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let with = |most: &str| checkout_with(&[(".github/workflows/ci.yml", format!("jobs:\n  test:\n    runs-on: superci\n    strategy:\n      max-parallel: {most}\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: echo\n").as_str())]);
+        // Written as no number of jobs (none, 0): the run is refused, saying so, and nothing starts.
+        for most in ["none", "0"] {
+            let dir = with(most);
+            let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+            let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success() && said.contains("the job test's max-parallel is not a number of jobs"), "{most}: {said}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // An expression read as the job starts: one that comes to no number of jobs sets no limit, and both start.
+        for most in ["${{ 'x' }}", "${{ 0 }}"] {
+            let dir = with(most);
+            let before: Vec<String> = served.store.under("run:").into_iter().map(|(k, _)| k).collect();
+            let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+            assert!(o.status.success(), "{most}: {}", String::from_utf8_lossy(&o.stderr));
+            let (_, record) = served.store.under("run:").into_iter().find(|(k, _)| !before.contains(k)).unwrap();
+            assert!(record["jobs"].as_array().unwrap().iter().all(|j| j["state"] == "started"), "{most}: {record}");
+            let _ = std::fs::remove_dir_all(&dir);
         }
         super::seen_in_browser(&served);
     }
@@ -17502,6 +17604,10 @@ fn a_working_trees_parts_are_taken_or_refused_and_no_run_comes_of_them() {
     assert!(status == 200 && said.contains("\"url\":\"https://") && said.contains("\"later\":true"), "{status} {said}");
     let chain = (0..17).map(|i| format!("layer{i:04}")).collect::<Vec<_>>().join(",");
     assert_eq!(send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base={chain}"), vec![]).0, 400);
+    // (Sixteen is as many as a chain may have: taken, its layers looked for.)
+    let sixteen = (0..16).map(|i| format!("layer{i:04}")).collect::<Vec<_>>().join(",");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base={sixteen}"), vec![]);
+    assert!(status == 200 && said.contains("\"base\":false"), "{status} {said}");
     let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base=bgone0123456789"), vec![]);
     assert!(status == 200 && said.contains("\"base\":false"), "a base the bucket no longer has: {status} {said}");
     let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&base=bgone0123456789"), vec![]);
@@ -17653,6 +17759,11 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         { "digest": digest('b'), "size": 1000, "sources": [{ "registry": "ghcr.io", "repository": "acme/app" }, { "registry": "evil.example", "repository": "x" }, { "registry": "eu.gcr.io", "repository": "p/i" }, { "registry": "us-docker.pkg.dev", "repository": "../up" }] },
         { "digest": digest('c'), "size": 0 }, { "digest": digest('d'), "size": 999_999_999_999u64 }, { "digest": "sha256:short", "size": 10 }] }));
     assert!(status == 200 && said["layers"].is_object(), "{status} {said}");
+    // As large as a layer is converted: asked for; a byte more, not.
+    let (_, most) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": digest('e'), "size": 4u64 << 30 }, { "digest": digest('f'), "size": (4u64 << 30) + 1 }] }));
+    assert!(most["layers"][digest('e')]["do"] == "upload" && most["layers"][digest('f')]["do"] != "upload", "{most}");
+    // An upload's id of sixteen characters at least: one of fifteen not even looked for.
+    assert_eq!((call("layers-uploaded", serde_json::json!({ "id": "fifteen-chars-a" })).0, call("layers-uploaded", serde_json::json!({ "id": "sixteen-chars-ab" })).0), (400, 404));
     // Its uploads said done: one with no id, one no upload has, and one it was given (nothing put there).
     let given = said["layers"].as_object().unwrap().values().find_map(|a| a["id"].as_str().map(str::to_string)).unwrap_or_default();
     assert!(!given.is_empty(), "an upload link for one of them: {said}");
@@ -19848,6 +19959,47 @@ fn overview_says_its_control_plane_refuses_the_key_rather_than_reading_for_ever(
     b.wait(&format!("{} && {}", shows("does not take this computer's key"), shows("superci login")));
     let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
     assert!(!page.contains("Reading your control plane"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// This computer's key ended with its AWS sign-in (none can be handed until it signs in again): Overview says so at
+/// once, with the sign-in, rather than reading for ever or waiting to say it.
+#[test]
+fn overview_asks_for_the_sign_in_at_once_when_the_key_ended_with_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k.as_object_mut().unwrap().remove("aws");
+    k.as_object_mut().unwrap().remove("key");
+    k["aws_ended"] = true.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "600")]);
+    b.goto(&link);
+    b.wait(&format!("{} && {}", shows("Sign in to read your control plane"), shows("This computer's key for it has ended, and so has your AWS sign-in")));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
+    assert!(!page.contains("Reading your control plane") && !page.contains("superci login"), "{page}");
+    assert_eq!(b.eval(r#"!!document.querySelector('main form[action="/aws/signin"] button')"#), serde_json::json!(true));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Signed in, the key not taken (AWS refuses its write): no sign-in asked for, but why, once the wait is over.
+    let home = common::signed_in(&served);
+    served.aws.params.lock().unwrap().retain(|n, _| !n.contains("/DEVICE_KEY_"));
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k.as_object_mut().unwrap().remove("key");
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.fail("AmazonSSM.PutParameter|DEVICE_KEY_", 400, &superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: ssm:PutParameter"), None);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1")]);
+    b.goto(&link);
+    b.wait(&shows("does not take this computer's key"));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
+    assert!(!page.contains("Sign in to read your control plane"), "{page}");
+    served.aws.fail_none();
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

@@ -81,9 +81,7 @@ const ERROR_CHARS: usize = 6000;
 
 /// A log line as text: without its time (GitHub's), GitLab's stream mark, colour codes and carriage returns.
 fn plain(raw: &str) -> String {
-    let r = raw.trim_start_matches('\u{feff}');
-    let b = r.as_bytes();
-    let r = if b.len() > 20 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) { r.find("Z ").filter(|at| *at < 40).map(|at| &r[at + 2..]).unwrap_or(r) } else { r };
+    let r = crate::log_view::split_time(raw).1;
     let b = r.as_bytes();
     let r = if b.len() >= 4 && b[..2].iter().all(u8::is_ascii_digit) && (b[2] == b'O' || b[2] == b'E') && (b[3] == b' ' || b[3] == b'+') { r[3..].trim_start_matches('+').trim_start_matches(' ') } else { r };
     let mut out = String::with_capacity(r.len());

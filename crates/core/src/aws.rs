@@ -241,19 +241,20 @@ pub async fn latest_image(http: &dyn Http, region: &str, creds: &Credentials, ow
 }
 
 /// The build of each kind of image this version of SuperCI boots: the stamp its maker's image names end with
-/// (`runs-on-v2.2-ubuntu26-full-x64-20261102081426`). A build is never taken as it comes out: the maker's Ubuntu
+/// (`runs-on-v2.2-ubuntu26-full-x64-20261125104817`). A build is never taken as it comes out: the maker's Ubuntu
 /// 26.04 build of 2 November 2026 came with a kernel under which every signal inside a container was denied, on every
-/// job at once. A release moves these to builds its own jobs ran on. The newest of a kind:
+/// job at once. A release moves these to builds its own jobs ran on (`scripts/image-check.sh`, a job on each kind; Publish
+/// refuses a release whose Linux build RunsOn no longer keeps). The newest of a kind:
 /// `aws ec2 describe-images --region us-east-1 --owners 135269210855 --filters Name=name,Values=runs-on-v2.2-KIND-*`.
 pub const IMAGE_BUILDS: [(&str, &str); 7] = [
-    ("ubuntu24-full-x64", "20261102081424"), ("ubuntu24-full-arm64", "20261102081430"),
-    ("ubuntu26-full-x64", "20261102081426"), ("ubuntu26-full-arm64", "20261102081425"),
-    ("ubuntu24-gpu-x64", "20261022130417"), ("ubuntu26-gpu-x64", "20260821141648"), ("windows25-full-x64", "20261022175853"),
+    ("ubuntu24-full-x64", "20261125104805"), ("ubuntu24-full-arm64", "20261126074613"),
+    ("ubuntu26-full-x64", "20261125104817"), ("ubuntu26-full-arm64", "20261125104811"),
+    ("ubuntu24-gpu-x64", "20261126085630"), ("ubuntu26-gpu-x64", "20260821141648"), ("windows25-full-x64", "20261125075304"),
 ];
 
-/// The maker's release of the pinned Ubuntu 24.04 build (the stamp of its tag, `linux-20261102081230`, a little before
+/// The maker's release of the pinned Ubuntu 24.04 build (the stamp of its tag, `linux-20261125104721`, a little before
 /// its images' own): where a copy into a region the maker does not publish in comes from.
-pub const IMAGE_RELEASE: &str = "20261102081230";
+pub const IMAGE_RELEASE: &str = "20261125104721";
 
 /// The build this version boots of a kind of image (`ubuntu26-full-x64`; see `image_flavor`), when it pins one.
 pub fn pinned_build(kind: &str) -> Option<&'static str> { IMAGE_BUILDS.iter().find(|(k, _)| *k == kind).map(|(_, b)| *b) }
@@ -519,7 +520,7 @@ pub const BAND: f64 = 1.25;
 pub fn on_demand_estimate(kind: &str) -> Option<f64> {
     let per_cpu = crate::spec::FAMILIES.iter().find(|(f, _)| *f == kind.split('.').next().unwrap_or_default())?.1;
     let cpu = cpus(kind);
-    (cpu > 0).then(|| on_demand_usd_per_hour(cpu, cpu * per_cpu))
+    (cpu != 0).then(|| on_demand_usd_per_hour(cpu, cpu * per_cpu))
 }
 
 /// With so many spot pools left after the first has no machine, they are asked in one request (see `fleet`).
@@ -922,7 +923,7 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
 pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now_ms: u64) -> Result<()> {
     let bucket = crate::cache::bucket(plane_id, region);
     let url = format!("https://{bucket}.s3.{region}.amazonaws.com/");
-    let said = |r: crate::io::Response| -> Result<crate::io::Response> { if r.status < 300 { Ok(r) } else { Err(aws_error(&r.body_text(), r.status)) } };
+    let said = |r: crate::io::Response| -> Result<crate::io::Response> { if crate::io::done(r.status) { Ok(r) } else { Err(aws_error(&r.body_text(), r.status)) } };
     let head = s3(http, "HEAD", &url, region, creds, vec![], &[], now_ms).await?;
     match head.status {
         200 => {}

@@ -508,6 +508,36 @@ fn a_region_with_no_spot_capacity_left_sends_the_machine_to_the_next() {
     assert!(clouds.calls.borrow().iter().any(|c| c.1 == "https://ec2.us-east-2.amazonaws.com/" && c.2.contains("Action=TerminateInstances")));
 }
 
+/// A label naming an AWS region (#39): machines start there alone, past Cloudflare before AWS in the order; a region
+/// no AWS runner starts machines in fails the job, saying so.
+#[test]
+fn a_label_naming_a_region_starts_its_machine_there_alone() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-west-2".into(), "us-east-2".into()];
+    config.containers = true;
+    config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool::of(c)).collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/region=us-east-2")));
+    let tried: Vec<String> = clouds.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances")).map(|c| c.1.clone()).collect();
+    assert!(!tried.is_empty() && tried.iter().all(|u| u == "https://ec2.us-east-2.amazonaws.com/"), "{tried:?}");
+    let j = job(&store, 1);
+    assert_eq!((j["region"].as_str(), j["state"].as_str(), j["cloud"].as_str()), (Some("us-east-2"), Some("launched"), Some("aws")));
+    // Not where AWS is set up to start machines: nowhere, said.
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/region=eu-west-1")));
+    let j = job(&store, 2);
+    assert_eq!(j["state"], "failed");
+    let e = j["error"].as_str().unwrap();
+    assert!(e.starts_with("nowhere to run") && e.contains("only in eu-west-1") && e.contains("AWS starts no machines in eu-west-1") && e.contains("Cloudflare is not AWS (region=eu-west-1)"), "{e}");
+    // A region and another provider do not go together; a region is AWS's.
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/provider=cloudflare/region=us-east-2")));
+    assert!(job(&store, 3)["error"].as_str().unwrap().contains("region=us-east-2 is an AWS region, and the label says provider=cloudflare"), "{}", job(&store, 3));
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci/region=virginia")));
+    assert!(job(&store, 4)["error"].as_str().unwrap().contains("region is an AWS region (us-east-1), not “virginia”"), "{}", job(&store, 4));
+}
+
 #[test]
 fn moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_where() {
     let key = "dashboard-session-key-0123";
@@ -739,11 +769,13 @@ fn a_machine_whose_runner_waits_while_github_keeps_its_job_queued_is_ended_and_t
     assert_eq!(held["held_until_ms"].as_u64(), Some(clock.0.get() + 10 * 60_000));
     assert!(held["earlier_usd"].as_f64().unwrap_or(0.0) > 0.0, "what its machine cost stays in the job's");
     assert!(clouds.0.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://api.github.com/orgs/acme/actions/runners/5"), "its runner withdrawn");
-    // Held: no machine for ten minutes, however often the sweep comes by.
+    // Held: no machine for ten minutes, however often the sweep comes by; a job that still needs care, it looks again
+    // in a minute (not five, as with nothing going).
     for _ in 0..3 {
         clock.0.set(clock.0.get() + 3 * 60_000);
         block_on(plane.alarm()).unwrap();
         assert_eq!((starts(), job(&store, 7)["state"].as_str()), (1, Some("waiting")));
+        assert_eq!(wakes.0.borrow().last(), Some(&60_000));
     }
     // Then a machine again, its hold over.
     clock.0.set(clock.0.get() + 2 * 60_000);
@@ -1327,6 +1359,52 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     run(labelled("queued", 6, "acme/app", None, "superci/cores=8"));
     assert!(job(&store, 6)["error"].as_str().unwrap().contains("“cores” is not a key a label has"));
     assert_eq!(launches(&clouds).len(), 3);
+}
+
+/// With no number set, a provider runs 20 jobs at once (what the dashboard and the CLI show for it); a number set
+/// above that is taken as it is: the 21st job starts.
+#[test]
+fn jobs_at_once_are_twenty_unless_set_and_a_number_set_above_twenty_is_taken() {
+    for (max_jobs, last) in [(None, "waiting"), (Some(25), "launched")] {
+        let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        config.containers = true;
+        config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs, monthly_usd: None }];
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+        for id in 1..=21 { block_on(plane.handle(job_event("queued", id, "acme/app", None))); }
+        assert!((1..=20).all(|id| job(&store, id)["state"] == "launched"), "{max_jobs:?}");
+        assert_eq!(job(&store, 21)["state"], last, "{max_jobs:?}");
+        if max_jobs.is_none() { assert_eq!(job(&store, 21)["error"], "waiting: Cloudflare runs 20 at once") }
+    }
+    assert_eq!((superci_core::plane::jobs_at_once("cloudflare"), superci_core::plane::jobs_at_once("aws"), superci_core::plane::jobs_at_once("modal")), (20, 20, 20));
+}
+
+/// A sweep with many jobs waiting for room reads the live jobs and the spend once, not again for each job it tries
+/// (with hundreds waiting, that ran a sweep past its time: #41); and each job it starts counts at once against the
+/// next, so no more start than there is room for.
+#[test]
+fn a_sweep_reads_the_jobs_once_however_many_wait_and_starts_only_what_there_is_room_for() {
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: Some(5), monthly_usd: None }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    for id in 1..=45 { block_on(plane.handle(job_event("queued", id, "acme/app", None))); }
+    let state = |id: u64| job(&store, id)["state"].as_str().unwrap_or_default().to_string();
+    assert_eq!(((1..=45).filter(|id| state(*id) == "launched").count(), (1..=45).filter(|id| state(*id) == "waiting").count()), (5, 40));
+    // Two finish; the sweep starts two of the forty, and no more.
+    for id in 1..=2 { block_on(plane.handle(job_event("completed", id, "acme/app", Some(&format!("superci-{PLANE_ID}-{id}"))))); }
+    let ops = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counted = ops.clone();
+    store.meddling(move |_, _, _| counted.set(counted.get() + 1));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(((1..=45).filter(|id| state(*id) == "launched").count(), (1..=45).filter(|id| state(*id) == "waiting").count()), (5, 38));
+    // Each job waiting costs the operations of its own record (read, placed, written); the live jobs and the month's
+    // days are read once. Read again for each, as before, it was some 80 more each (45 jobs and the days so far).
+    eprintln!("{} store operations for a sweep of 40 jobs waiting", ops.get());
+    assert!(ops.get() < 40 * 30, "{} store operations for 40 jobs waiting", ops.get());
 }
 
 #[test]
@@ -2678,6 +2756,40 @@ impl Http for Logs {
     }
 }
 
+/// Each kind of key ends at the moment it says: a device's, one that reads and one that also starts runs, taken up to
+/// the millisecond before and refused at it. What GitHub said of its deliveries and GitLab's projects are for a key
+/// that reads, and nothing is there for one without.
+#[test]
+fn keys_end_at_the_moment_they_say_and_what_only_a_reader_may_see_is_nothing_without_one() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let hash = |key: &str| superci_core::crypto::sha256_hex(key.as_bytes());
+    let now = FixedClock.now_ms();
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(now, "device-key-ending-now-01".into()), (now + 1, "device-key-ending-later-1".into())];
+    config.read_keys = [("READ_KEY_1790000000_NOW", format!("{}:runs", hash("superci_read_ending-now-key"))), ("READ_KEY_1790000001_LATER", format!("{}:runs", hash("superci_read_ending-later-key")))].iter()
+        .filter_map(|(n, v)| superci_core::plane::read_key(n, v)).collect();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let ask = |method: &str, path: &str, key: Option<&str>| {
+        let r = Request::new(method, &format!("{PLANE_URL}{path}"));
+        block_on(plane.handle(match key { Some(k) => r.with_header("authorization", &format!("Bearer {k}")), None => r })).status
+    };
+    // A device's key: what only it may do (its keys listed), refused at its moment, taken a millisecond before.
+    assert_eq!((ask("GET", "/keys", Some("device-key-ending-now-01")), ask("GET", "/keys", Some("device-key-ending-later-1"))), (401, 200));
+    // One that reads: the status.
+    assert_eq!((ask("GET", "/status", Some("superci_read_ending-now-key")), ask("GET", "/status", Some("superci_read_ending-later-key"))), (401, 200));
+    // One that also starts runs: a run asked for (refused for what it asks, once the key is taken).
+    let start = |key: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", &format!("Bearer {key}")).with_body("{}"))).status;
+    assert_eq!((start("superci_read_ending-now-key"), start("superci_read_ending-later-key")), (401, 400));
+    // GitHub's deliveries and GitLab's projects: nothing without a key, refused with one that ended, read with one that reads.
+    for path in ["/github/deliveries", "/gitlab/projects"] {
+        assert_eq!(ask("GET", path, None), 404, "{path}");
+        assert_eq!(ask("GET", path, Some("superci_read_ending-now-key")), 401, "{path}");
+        assert_ne!(ask("GET", path, Some("superci_read_ending-later-key")), 404, "{path}");
+    }
+    assert_eq!(ask("GET", "/gitlab/projects", Some("superci_read_ending-later-key")), 409, "no GitLab connected, said as that");
+}
+
 #[test]
 fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
     let (store, clouds, wakes, cache) = (Mem::default(), Logs(FakeClouds::default()), Wakes::default(), Cache::default());
@@ -3918,6 +4030,8 @@ fn a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine() {
         };
         block_on(futures::future::join(sweep, beginning));
         if at == 0 { steps = gate.n.get(); at = 1; assert!(steps > 5, "{steps} steps"); continue }
+        // (At once: what the sweep wrote over the event kept that its runner began, not only what later sweeps find.)
+        assert_eq!(job(&store, 7)["seen_in_progress"], true, "begun at step {at} of {steps}");
         gate.at.set(usize::MAX);
         for ms in [1_000, 61_000, 600_000] { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap(); }
         let j = job(&store, 7);
@@ -4337,6 +4451,53 @@ fn the_secrets_a_ci_keeps_go_to_the_runs_from_a_computer_that_name_them_the_narr
     let cancelled = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs/{run_id}/cancel")).with_header("authorization", "Bearer dashboard-session-key-1")));
     assert_eq!(cancelled.status, 200);
     assert!(!store.0.borrow().values().any(|v| v.contains("token-") || v.contains("npm-")), "nothing of them left once cancelled");
+}
+
+/// What a run from a computer cannot have, sent as it is (an older SuperCI checks none of it): a step its runner
+/// cannot be handed, refused saying the job and line; a limit of jobs at once that is no number, in a workflow a job
+/// calls, refused saying which job; nothing made. A run an older control plane made with such a step: its job ends
+/// failed, saying why, and the run ends (it was started again and again, and the run never ended).
+#[test]
+fn what_a_run_cannot_have_is_refused_as_it_is_made_and_a_run_made_before_with_it_ends_that_job() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let ask = |body: serde_json::Value| run(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(body.to_string()));
+    let runs = || store.0.borrow().keys().filter(|k| k.starts_with("run:")).count();
+    let refused = "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - id: a\n        run: sleep 1\n        background: true\n      - wait: [a]\n        if: always()\n";
+    let r = ask(serde_json::json!({ "workflow": refused, "path": ".github/workflows/ci.yml", "repository": "acme/app" }));
+    assert!(r.status == 400 && r.body_text().starts_with("the job t: line 8: a `wait` step always runs; it takes no `if`"), "{}", r.body_text());
+    let called = "on: workflow_call\njobs:\n  t:\n    runs-on: superci\n    strategy:\n      max-parallel: none\n      matrix:\n        n: [1, 2]\n    steps:\n      - run: echo\n";
+    let r = ask(serde_json::json!({ "workflow": "jobs:\n  c:\n    uses: ./.github/workflows/called.yml\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "called": { ".github/workflows/called.yml": called } }));
+    assert!(r.status == 400 && r.body_text().contains("the job c / t's max-parallel is not a number of jobs"), "{}", r.body_text());
+    assert_eq!(runs(), 0, "nothing made");
+    // Made before steps were checked: the second job's step, as its record keeps it, is one its runner cannot be handed.
+    let made = ask(serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    needs: a\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app" }));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let key = format!("run:{run_id}");
+    let mut kept: serde_json::Value = serde_json::from_str(&store.0.borrow()[&key]).unwrap();
+    kept["workflow"] = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    needs: a\n    runs-on: superci\n    steps:\n      - id: s\n        run: sleep 1\n        background: true\n      - wait: [s]\n        if: always()\n".into();
+    store.0.borrow_mut().insert(key.clone(), kept.to_string());
+    let record = || -> serde_json::Value { serde_json::from_str(&store.0.borrow()[&key]).unwrap() };
+    let token = record()["jobs"][0]["token"].as_str().unwrap().to_string();
+    for line in include_str!("fixtures/runner/runner-requests.jsonl").lines() {
+        let r: serde_json::Value = serde_json::from_str(line).unwrap();
+        let path = r["path"].as_str().unwrap().trim_start_matches("/runner/server");
+        let mut req = Request::new(r["method"].as_str().unwrap(), &format!("{PLANE_URL}/runner/{token}{path}"));
+        req.body = r["request"].as_str().unwrap().as_bytes().to_vec();
+        run(req);
+    }
+    let b = record()["jobs"][1].clone();
+    assert_eq!((b["state"].as_str(), b["result"].as_str()), (Some("done"), Some("failure")), "{b}");
+    assert!(b["error"].as_str().unwrap_or_default().starts_with("line 13: a `wait` step always runs; it takes no `if`"), "{b}");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("rjob:") && b["token"].as_str().is_some_and(|t| k.ends_with(t))), "nothing kept for its runner");
+    let status = json(&run(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!((status["over"].as_bool(), status["result"].as_str()), (Some(true), Some("failure")), "{status}");
 }
 
 #[test]
@@ -5057,6 +5218,29 @@ fn a_gitlab_job_whose_events_never_come_is_seen_running_and_over_by_asking_gitla
     assert_eq!(job()["ended_ms"].as_u64().unwrap() - job()["started_ms"].as_u64().unwrap(), 42_000);
 }
 
+/// A machine keeps the images its job pulled only where the region's bucket has this version's `superci-layers`:
+/// where it has not (yet), the machine is started without that step.
+#[test]
+fn a_machine_keeps_its_images_only_where_the_bucket_has_the_layers_program() {
+    for there in [true, false] {
+        let bucket = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/");
+        let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+            if r.method != "HEAD" { return None }
+            if r.url == format!("{bucket}{}", superci_core::cache::program_key("x86_64")) { return Some(Response::new(200, "application/octet-stream", "")) }
+            (r.url == format!("{bucket}{}", superci_core::cache::layers_key("x86_64"))).then(|| Response::new(if there { 200 } else { 404 }, "application/octet-stream", ""))
+        });
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/image=ubuntu26")));
+        let script = user_data_of(&launches(&clouds.0)[0]);
+        assert!(script.contains(&format!("c='{PLANE_URL}/cache/")), "{script}");
+        assert_eq!(script.contains("superci-layers keep") || script.contains("$f keep --link"), there, "{there}: {script}");
+    }
+}
+
 #[test]
 fn a_gitlab_machine_whose_jobs_event_never_came_learns_its_job_by_asking_gitlab() {
     let program = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64"));
@@ -5361,10 +5545,11 @@ fn what_a_machine_sent_to_the_internet_is_added_to_its_jobs_cost_once_cloudwatch
         run(webhook("in_progress", Some(&runner)));
         run(webhook("completed", Some(&runner)));
         let before = job(&store, 7)["cost_usd"].as_f64().unwrap();
-        // Not yet: CloudWatch counts a while after.
+        // Not yet, twelve minutes on: CloudWatch counts a while after. Asked then any time in the two days after.
+        clock.0.set(clock.0.get() + 12 * 60_000);
         block_on(plane.alarm()).unwrap();
         assert!(job(&store, 7).get("sent_gb").is_none());
-        clock.0.set(clock.0.get() + 13 * 60_000);
+        clock.0.set(clock.0.get() + 36 * 3_600_000);
         block_on(plane.alarm()).unwrap();
         let j = job(&store, 7);
         assert_eq!(j["sent_gb"].as_f64(), said, "{j}");
@@ -5697,6 +5882,83 @@ fn spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_
         if virginia_full { assert_eq!(asked[0], ("us-east-2".to_string(), "c8a.xlarge".to_string()), "{asked:?}") }
         assert_eq!(asked.iter().filter(|(r, t)| r == "us-east-2" && t == "c8a.xlarge").count(), ohio_asks, "Ohio's c8a pools asked at most once each: {asked:?}");
     }
+}
+
+/// Spot pools noted as having had no machine: not asked within a minute of it, asked after the others for a quarter
+/// of an hour, then the note dropped (to the millisecond).
+#[test]
+fn a_spot_pool_with_no_machine_lately_is_skipped_a_minute_then_asked_last_then_forgotten() {
+    let now = FixedClock.now_ms();
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| {
+        if body.contains("Action=DescribeSpotPriceHistory") {
+            let items = ["a", "b", "c"].map(|z| format!("<item><instanceType>c8a.xlarge</instanceType><availabilityZone>us-east-1{z}</availabilityZone><spotPrice>0.10</spotPrice></item>")).concat();
+            return Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
+        }
+        (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| Response::new(500, "text/xml", "<Response><Errors><Error><Code>InsufficientInstanceCapacity</Code><Message>no room</Message></Error></Errors></Response>"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    for (pool, ago) in [("c8a.xlarge:us-east-1a", 59_999), ("c8a.xlarge:us-east-1b", 60_000), ("m7i.large:us-east-1d", 900_000), ("m7i.large:us-east-1e", 899_999)] {
+        store.0.borrow_mut().insert(format!("aws:pool:us-east-1:{pool}"), (now - ago).to_string());
+    }
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-east-1".into()];
+    config.instance_types = vec!["c8a.xlarge".into()];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let zones: Vec<String> = launches(&clouds.0).iter().filter(|f| field(f, "InstanceMarketOptions.MarketType") == "spot").map(|f| field(f, "Placement.AvailabilityZone")).collect();
+    assert_eq!(zones, ["us-east-1c", "us-east-1b"], "{zones:?}");
+    let kept = store.0.borrow();
+    assert!(!kept.contains_key("aws:pool:us-east-1:m7i.large:us-east-1d") && kept.contains_key("aws:pool:us-east-1:m7i.large:us-east-1e"));
+}
+
+/// A job's machine running past the longest a job may run (an hour here), and five minutes over: ended at the sweep,
+/// saying so; one at those five minutes exactly runs on.
+#[test]
+fn a_machine_past_the_longest_time_of_a_job_is_ended_saying_so() {
+    let t = FixedClock.now_ms();
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.max_minutes = Some(60);
+    for (id, ran) in [(1u64, 65 * 60_000 + 1), (2, 65 * 60_000)] {
+        store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t - ran, "launched_ms": t - ran, "installation_id": 42,
+            "cloud": "aws", "machine_id": format!("i-{id}"), "region": "us-east-1", "seen_in_progress": true, "began": true, "label": "superci" }).to_string());
+    }
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.alarm()).unwrap();
+    let (over, on) = (job(&store, 1), job(&store, 2));
+    assert_eq!((over["state"].as_str(), over["error"].as_str()), (Some("swept"), Some("it ran past its longest time (1 hour), and its machine was ended")), "{over}");
+    assert_eq!(on["state"], "running", "{on}");
+}
+
+/// After the pools near the cheapest, each region whole goes by what is left in it: Ohio, whose cheapest left is
+/// dearer than N. Virginia's c8a was but cheaper than its r8a, is asked before N. Virginia's r8a.
+#[test]
+fn after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it() {
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+        let region = if r.url.contains("us-east-2") { "us-east-2" } else { "us-east-1" };
+        if body.contains("Action=DescribeSpotPriceHistory") {
+            let rows: &[(&str, f64)] = if region == "us-east-2" { &[("c8a.xlarge", 0.030), ("r8a.xlarge", 0.040)] } else { &[("c8a.xlarge", 0.010), ("r8a.xlarge", 0.060)] };
+            let items = rows.iter().map(|(t, p)| format!("<item><instanceType>{t}</instanceType><availabilityZone>{region}a</availabilityZone><spotPrice>{p}</spotPrice></item>")).collect::<String>();
+            return Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
+        }
+        (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| Response::new(500, "text/xml", "<Response><Errors><Error><Code>InsufficientInstanceCapacity</Code><Message>no room</Message></Error></Errors></Response>"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+    config.instance_types = ["c8a.xlarge", "r8a.xlarge"].map(String::from).to_vec();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let mut regions: Vec<&str> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances") && c.2.contains("MarketType=spot"))
+        .map(|c| if c.1.contains("us-east-2") { "us-east-2" } else { "us-east-1" }).collect();
+    regions.dedup();
+    assert_eq!(regions, ["us-east-1", "us-east-2", "us-east-1"]);
 }
 
 /// Settings with an App, GitLab, a dashboard key and a move token.
@@ -6935,6 +7197,84 @@ fn a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_a
     assert!(log["log"].as_str().is_some_and(|l| l.contains("odd time") && !l.contains(" cut")), "{log}");
 }
 
+/// A job that ended: its log is GitHub's alone, what its machine sent after GitHub's last line not read; while it
+/// runs, those lines follow GitHub's.
+#[test]
+fn an_ended_jobs_log_is_githubs_alone_and_a_running_ones_has_its_machines_newer_lines_after() {
+    let t = 1_790_000_000_000u64;
+    for (state, machine_lines) in [("done", false), ("running", true)] {
+        let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app/actions/jobs/5/logs")
+            .then(|| Response::new(200, "text/plain", "2026-10-16T21:18:46.0000000Z from github\n")));
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        store.0.borrow_mut().insert("job:5".into(), serde_json::json!({ "job_id": 5, "run_id": 3, "repo": "acme/app", "state": state, "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true, "began": true }).to_string());
+        store.0.borrow_mut().insert("glive:5:tl_x_1.log:0000000000000:000".into(), STANDARD.encode("2026-10-16T21:18:47.0000000Z from its machine\n"));
+        let log = json(&block_on(plane.handle(get("/job/log?id=5").with_header("authorization", "Bearer dashboard-session-key-1"))));
+        let text = log["log"].as_str().unwrap_or_default();
+        assert!(text.contains("from github") && text.contains("from its machine") == machine_lines, "{state}: {log}");
+        assert_eq!(log["source"], if machine_lines { "GitHub's, then what its machine sent after it" } else { "GitHub's" }, "{state}: {log}");
+    }
+}
+
+/// A GitHub job's pages are read from the newest back until about a megabyte is had: a newest page of just that much
+/// is all that is read, the one before it left out.
+#[test]
+fn a_github_jobs_log_reads_its_newest_pages_back_to_a_megabyte_and_no_further() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    store.0.borrow_mut().insert("job:8".into(), serde_json::json!({ "job_id": 8, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    let line = "2026-10-16T21:18:47.0000000Z newer\n";
+    let mut newer = line.repeat((999_999 - 100) / line.len());
+    newer.push_str(&format!("2026-10-16T21:18:48.0000000Z {}\n", "x".repeat(999_999 - newer.len() - 30)));
+    assert_eq!(newer.len(), 999_999);
+    store.0.borrow_mut().insert("glive:8:tl_x_1.log:0000000000001:000".into(), STANDARD.encode("2026-10-16T21:18:46.0000000Z older\n"));
+    store.0.borrow_mut().insert("glive:8:tl_x_1.log:0000000000002:000".into(), STANDARD.encode(&newer));
+    let log = json(&block_on(plane.handle(get("/job/log?id=8").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    let text = log["log"].as_str().unwrap_or_default();
+    assert!(text.contains(" newer") && !text.contains(" older"), "{}", &text[..text.len().min(300)]);
+}
+
+/// A run's lines are answered in parts of about a megabyte and a half: posts are taken until more than that is had (a
+/// post that brings it to just that much is not the last), the rest left for the next ask. Its event, with its inputs,
+/// is taken up to 64 KB, and refused a byte past.
+#[test]
+fn a_runs_lines_come_in_parts_and_its_event_is_taken_up_to_its_limit() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    store.0.borrow_mut().insert("run:51".into(), serde_json::json!({ "at_ms": t, "jobs": [{ "key": "a", "state": "started", "token": "tok-lines-0123456789" }] }).to_string());
+    let post = |n: usize, size: usize| {
+        let head = serde_json::json!({ "step": "s", "lines": [format!("line {n}")] }).to_string();
+        let v = serde_json::json!({ "step": "s", "lines": [format!("line {n}{}", "x".repeat(size - head.len()))] }).to_string();
+        assert_eq!(v.len(), size);
+        store.0.borrow_mut().insert(format!("rline:tok-lines-0123456789:{n:04}"), v);
+    };
+    (post(1, 1_500_000), post(2, 100), post(3, 100));
+    let status = json(&block_on(plane.handle(key(get("/runs/51")))));
+    let job = &status["jobs"][0];
+    assert_eq!((job["posts"].as_array().map(Vec::len), job["next"].as_u64()), (Some(2), Some(2)), "{}", &job.to_string()[..300]);
+    // The event: 64 KB with its inputs taken, a byte more refused, said in KB.
+    let ask = |extra: usize| {
+        let pad = "y".repeat(superci_core::plane::RUN_EVENT_BYTES - serde_json::json!({ "p": "" }).to_string().len() - "null".len() + extra);
+        block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "event": { "p": pad } }).to_string()))))
+    };
+    let over = ask(1);
+    assert!(over.status == 400 && over.body_text().contains("its event's payload is 65 KB; a run takes 64 KB at most"), "{}", over.body_text());
+    let at = ask(0);
+    assert!(!at.body_text().contains("its event's payload"), "{}", at.body_text());
+}
+
 #[test]
 fn a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine() {
     // GitLab's job: its event answered with the store's failure; the look for jobs GitLab did not tell of finds it.
@@ -7211,6 +7551,16 @@ fn a_jobs_sent_data_still_to_be_added_keeps_it_cared_for() {
     let j = |sent: Option<f64>| serde_json::from_value::<superci_core::plane::Job>(serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "installation_id": 42, "cloud": "aws", "runner": null, "runner_id": null, "machine_id": null, "machine_type": null, "error": null, "seen_in_progress": true, "state": "done", "at_ms": now - 86_400_000, "ended_ms": now - 86_400_000,
         "began": true, "region": "us-east-1", "cost_from": "2026-09-20T00:00:00Z", "sent_gb": sent })).unwrap();
     assert!(superci_core::plane::needs_care(&j(None), now) && !superci_core::plane::needs_care(&j(Some(0.5)), now));
+}
+
+/// A job that ended, with nothing else left for it: cared for half an hour from its end (a moment ago), then not.
+#[test]
+fn a_job_that_ended_a_moment_ago_is_cared_for_half_an_hour() {
+    let ended = 1_790_000_000_000u64;
+    let j = serde_json::from_value::<superci_core::plane::Job>(serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "installation_id": 42, "cloud": "aws", "runner": null, "runner_id": null, "machine_id": null, "machine_type": null, "error": null, "seen_in_progress": true, "state": "done", "at_ms": ended - 600_000, "ended_ms": ended,
+        "began": true })).unwrap();
+    assert!(superci_core::plane::needs_care(&j, ended) && superci_core::plane::needs_care(&j, ended + 30 * 60_000 - 1));
+    assert!(!superci_core::plane::needs_care(&j, ended + 30 * 60_000));
 }
 
 /// A further AWS account: connected with the role made there, its two runners under its word, a job's machine started
@@ -7574,6 +7924,7 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_provider_in_the_order_that_is_not_connected_is_said,
         bills_are_kept_as_a_computer_read_them_and_said_for_this_month,
         a_jobs_sent_data_still_to_be_added_keeps_it_cared_for,
+        a_job_that_ended_a_moment_ago_is_cared_for_half_an_hour,
         a_further_aws_account_runs_jobs_with_its_own_role_and_notes,
         several_aws_accounts_each_case_a_job_at_a_time,
         the_edges_of_further_accounts_and_of_what_a_word_or_an_image_may_be,
@@ -7584,6 +7935,12 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_control_plane_in_aws_uses_its_own_credentials_for_machines,
         machines_start_in_the_control_planes_own_network_cheapest_zone_first_else_the_default_one,
         a_region_with_no_spot_capacity_left_sends_the_machine_to_the_next,
+        after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it,
+        a_copy_read_a_minute_ago_is_taken_again_and_an_older_one_is_not_kept_as_the_copy,
+        an_ended_jobs_log_is_githubs_alone_and_a_running_ones_has_its_machines_newer_lines_after,
+        a_machine_keeps_its_images_only_where_the_bucket_has_the_layers_program,
+        a_machine_past_the_longest_time_of_a_job_is_ended_saying_so,
+        a_spot_pool_with_no_machine_lately_is_skipped_a_minute_then_asked_last_then_forgotten,
         moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_where,
         a_network_or_an_image_aws_says_is_gone_is_looked_up_anew_for_the_next_job,
         a_cloudflare_control_plane_starts_containers_itself,
@@ -7739,13 +8096,21 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         the_order_launchers_and_lists_change_by_item_and_keep_what_others_changed,
         a_settings_write_that_is_not_one_or_too_long_is_refused,
         settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back,
+        a_field_changed_by_hand_in_the_clouds_copy_is_taken_alone,
+        what_a_run_cannot_have_is_refused_as_it_is_made_and_a_run_made_before_with_it_ends_that_job,
+        keys_end_at_the_moment_they_say_and_what_only_a_reader_may_see_is_nothing_without_one,
+        a_github_jobs_log_reads_its_newest_pages_back_to_a_megabyte_and_no_further,
+        a_runs_lines_come_in_parts_and_its_event_is_taken_up_to_its_limit,
         settings_are_read_again_after_ten_seconds_and_a_record_that_is_not_one_is_said,
         a_change_is_made_only_by_a_way_through_objects_and_lists,
         an_edit_is_the_changes_of_its_fields_and_they_apply_over_others,
         a_preempted_modal_function_is_run_again_once_further_down_the_order_and_counted,
         a_lost_job_of_a_run_that_passed_without_it_is_not_run_again,
         functions_are_a_row_a_label_and_a_preemption_go_past,
-        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it
+        a_modal_launcher_in_function_mode_starts_a_function_or_says_to_update_it,
+        a_label_naming_a_region_starts_its_machine_there_alone,
+        jobs_at_once_are_twenty_unless_set_and_a_number_set_above_twenty_is_taken,
+        a_sweep_reads_the_jobs_once_however_many_wait_and_starts_only_what_there_is_room_for
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
@@ -8117,9 +8482,9 @@ fn a_settings_write_that_is_not_one_or_too_long_is_refused() {
     assert!(p.mem.0.borrow().get("settings").is_none());
 }
 
-/// An older SuperCI writes the cloud's own copy of the settings, knowing no other way: the control plane takes it,
-/// whole, as a new version. An instance that read the copy before (AWS's read it every 15 seconds) does not take
-/// that one back within the minute; a copy written again after is taken.
+/// An older SuperCI (or a hand) writes the cloud's own copy of the settings: the control plane takes what changed in
+/// it, as a new version, and keeps what was changed through it since. An instance that read the copy before (AWS's
+/// read it every 15 seconds) does not take that one back within the minute; a copy written again after is taken.
 #[test]
 fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_before_is_not_taken_back() {
     let p = Settled::new(|c| c.routing.max_cpu = Some(16));
@@ -8134,10 +8499,10 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     // As written through it, while its cloud's copy is the one it had.
     let s = read_by(&p, &p.config);
     assert_eq!((s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(90), Some(1)), "{s}");
-    // An older SuperCI wrote the copy: taken, whole.
+    // An older SuperCI wrote the copy: what it changed taken, the time written through the control plane kept.
     p.later(1_000);
     let s = read_by(&p, &instance(&p, 4));
-    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(4), None, Some(2)), "{s}");
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(4), Some(90), Some(2)), "{s}");
     // An instance that has the copy from before: not taken back, within the minute.
     p.later(10_000);
     let s = read_by(&p, &p.config);
@@ -8145,7 +8510,7 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     // Written there again, as it was before, more than a minute on: taken.
     p.later(61_000);
     let s = read_by(&p, &p.config);
-    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(3)), "{s}");
+    assert_eq!((s["routing"]["max_cpu"].as_u64(), s["routing"]["max_minutes"].as_u64(), s["settings_version"].as_u64()), (Some(16), Some(90), Some(3)), "{s}");
     // Lost to another write at the same moment: the record as that one left it.
     p.later(61_000);
     p.mem.meddling(|op, k, m| if op == "swap" && k == "settings" { let v = m["settings"].replace("\"version\":3", "\"version\":7"); m.insert("settings".into(), v); });
@@ -8156,6 +8521,81 @@ fn settings_an_older_superci_wrote_into_the_cloud_are_taken_and_a_copy_read_befo
     for n in 0..6 { p.later(61_000); read_by(&p, &instance(&p, 20 + n)); }
     let kept: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
     assert_eq!(kept["taken"].as_array().map(|t| t.len()), Some(5));
+}
+
+/// A copy taken back a minute ago, to the millisecond, is taken again (59,999 ms on, not); a record from before the copy
+/// was kept, read with an older copy than the one it took last, is left as it is (the last one is kept, not that).
+#[test]
+fn a_copy_read_a_minute_ago_is_taken_again_and_an_older_one_is_not_kept_as_the_copy() {
+    let p = Settled::new(|c| c.routing.max_cpu = Some(16));
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "max_minutes"], 90.into(), None)])).status, 200);
+    let copy_of = |c: &Config| superci_core::crypto::sha256_hex(superci_core::io::json(&(&c.routing, &c.launchers)).as_bytes());
+    let other = { let mut c = p.config.clone(); c.routing.max_cpu = Some(4); c };
+    let (mine, theirs) = (copy_of(&p.config), copy_of(&other));
+    let read_by = |config: &Config| {
+        let cache = Cache::default();
+        let plane = ControlPlane { store: &p.mem, http: &p.clouds, clock: &p.clock, timer: &p.wakes, config, cache: &cache, containers: None };
+        json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))
+    };
+    let record = |taken: serde_json::Value, copy: bool| {
+        let mut r: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+        r["taken"] = taken;
+        if copy { r["copy"] = serde_json::json!({ "routing": other.routing, "launchers": other.launchers }) } else { r.as_object_mut().unwrap().remove("copy"); }
+        p.mem.0.borrow_mut().insert("settings".into(), r.to_string());
+        r
+    };
+    let now = p.clock.0.get();
+    let put = record(serde_json::json!([[mine, now - 59_999], [theirs, now - 1_000]]), true);
+    let version = put["version"].as_u64().unwrap();
+    assert_eq!(read_by(&p.config)["settings_version"].as_u64(), Some(version));
+    record(serde_json::json!([[mine, now - 60_000], [theirs, now - 1_000]]), true);
+    assert_eq!(read_by(&p.config)["settings_version"].as_u64(), Some(version + 1));
+    let put = record(serde_json::json!([[mine, now - 1_000], [theirs, now - 500]]), false);
+    read_by(&p.config);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&p.mem.0.borrow()["settings"]).unwrap(), put);
+}
+
+/// A jobs-at-once limit set by hand in the cloud's own copy (as one did in AWS's Parameter Store) is taken alone:
+/// the limits and launchers set through the control plane since stand. A record from before the copy was kept keeps
+/// it on its next read, and is taken whole until then; a change whose provider was taken out meanwhile, whole too.
+#[test]
+fn a_field_changed_by_hand_in_the_clouds_copy_is_taken_alone() {
+    let p = Settled::new(|c| c.routing.order = vec![Pool::of("aws"), Pool::of("modal")]);
+    assert_eq!(p.write(serde_json::json!([
+        set(&["routing", "order", "modal", "max_jobs"], 5.into(), None),
+        set(&["routing", "max_cpu"], 8.into(), None),
+        set(&["launchers", "modal"], serde_json::json!({ "cloud": "modal", "url": "https://modal.example" }), None),
+    ])).status, 200);
+    let read_by = |config: &Config| {
+        let cache = Cache::default();
+        let plane = ControlPlane { store: &p.mem, http: &p.clouds, clock: &p.clock, timer: &p.wakes, config, cache: &cache, containers: None };
+        json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))))
+    };
+    let by_hand = |max: u32| { let mut c = p.config.clone(); c.routing.order[0].max_jobs = Some(max); c };
+    p.later(61_000);
+    let s = read_by(&by_hand(150));
+    let order = |s: &serde_json::Value| (s["routing"]["order"][0]["max_jobs"].as_u64(), s["routing"]["order"][1]["max_jobs"].as_u64(), s["routing"]["max_cpu"].as_u64(), s["launchers"][0]["url"].as_str().map(str::to_string));
+    assert_eq!(order(&s), (Some(150), Some(5), Some(8), Some("https://modal.example".into())), "{s}");
+    // A record from before the copy was kept: its next read keeps the one it took last, and nothing else changes.
+    let before: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+    let mut old = before.clone();
+    old.as_object_mut().unwrap().remove("copy");
+    p.mem.0.borrow_mut().insert("settings".into(), old.to_string());
+    p.later(61_000);
+    let s = read_by(&by_hand(150));
+    let after: serde_json::Value = serde_json::from_str(&p.mem.0.borrow()["settings"]).unwrap();
+    assert_eq!((&after, s["settings_version"].as_u64()), (&before, before["version"].as_u64()), "{s}");
+    // Without it, a copy changed there is taken whole (the limits set here go with it), as before it was kept.
+    p.mem.0.borrow_mut().insert("settings".into(), old.to_string());
+    p.later(61_000);
+    let s = read_by(&by_hand(20));
+    assert_eq!(order(&s), (Some(20), None, None, None), "{s}");
+    // A change to a provider the control plane's order no longer has: the copy taken whole.
+    p.later(61_000);
+    assert_eq!(p.write(serde_json::json!([set(&["routing", "order", "aws"], serde_json::Value::Null, None), set(&["routing", "max_cpu"], 4.into(), None)])).status, 200);
+    p.later(61_000);
+    let s = read_by(&by_hand(30));
+    assert_eq!((order(&s).0, s["routing"]["max_cpu"].as_u64()), (Some(30), None), "{s}");
 }
 
 /// A request within ten seconds of a read goes on with what it read (the status sees a write at once); one after reads

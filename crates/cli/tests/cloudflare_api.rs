@@ -53,7 +53,8 @@ fn a_cloudflare_control_plane_is_deployed_given_its_containers_shown_and_deleted
     assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
     assert_eq!(served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == "CONTAINERS").map(|(_, v)| v).as_deref(), Some("on"));
     let (ok, said) = run(&["runners", "list", "--plane=cfplane00001"]);
-    assert!(ok && said.contains("1. cloudflare"), "{said}");
+    // With no number set, the 20 it runs at once is said, never left out as if there were no limit.
+    assert!(ok && said.contains("1. cloudflare") && said.contains("up to 20 jobs at once"), "{said}");
     // Secrets on Cloudflare: the Worker hands its control plane those a run is given with each request, so a
     // control plane there keeps 12, about 4.8 KB each; past either, refused before anything is written.
     {
@@ -202,11 +203,30 @@ fn cloudflare_then_modal(workspace: &str) {
     // Named, with nowhere for its machines to start: said, nothing made.
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222"]);
     assert!(!ok && said.contains("Say where its machines start: `superci runners create aws --account=ID --region=us-east-1`."), "{said}");
-    // Named, the control plane not answering when asked whether it has AWS runners yet: stopped there, nothing made.
-    let cf_url = served.aws.workers.lock().unwrap().remove("superci.acme.workers.dev").unwrap();
-    let (ok, said) = run("", &["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1"]);
-    assert!(!ok && !said.contains("let aws run jobs") && !said.contains("runs jobs now"), "{said}");
-    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf_url);
+    // Named, the control plane listed a moment before but not answering when asked whether it has AWS runners yet:
+    // stopped there, nothing made. (Its health calls run beside others in no fixed order, so every call from one of
+    // them on fails: from the last ones on, the listing has answered and that question has not.)
+    let ask = ["runners", "create", "aws", "--plane=cfplane00002", "--account=222222222222", "--region=us-east-1", "--dry-run"];
+    served.aws.faults.arm(superci_testkit::Fault::None);
+    let _ = run("", &ask);
+    served.aws.faults.stop();
+    let healths: Vec<usize> = served.aws.faults.calls().iter().enumerate().filter(|(_, c)| c.contains("superci.acme.workers.dev/health")).map(|(i, _)| i + 1).collect();
+    let stopped = healths.iter().rev().find_map(|k| {
+        served.aws.faults.arm(superci_testkit::Fault::Outage(*k));
+        let (ok, said) = run("", &ask);
+        served.aws.faults.stop();
+        said.contains("The control plane did not answer whether it has AWS runners yet").then_some((*k, ok, said))
+    });
+    let (k, ok, said) = stopped.unwrap_or_else(|| panic!("one of its health calls is the control plane's answer to whether it has AWS runners: {healths:?}"));
+    assert!(!ok && said.contains("Nothing was made") && !said.contains("let aws run jobs"), "{said}");
+    // Where that answer decides nothing (no account named, or not AWS's runners), it is not asked: the same outage
+    // stops neither.
+    for (args, want) in [(&["runners", "create", "aws", "--plane=cfplane00002", "--region=us-east-1", "--dry-run"][..], "Say which AWS account"), (&["runners", "create", "cloudflare", "--plane=cfplane00002", "--dry-run"], "let cloudflare run jobs")] {
+        served.aws.faults.arm(superci_testkit::Fault::Outage(k));
+        let (_, said) = run("", args);
+        served.aws.faults.stop();
+        assert!(said.contains(want) && !said.contains("did not answer whether it has AWS runners"), "{args:?}: {said}");
+    }
     std::fs::write(&file, before.to_string()).unwrap();
     // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
     step("03-cf-containers");

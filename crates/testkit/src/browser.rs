@@ -25,7 +25,7 @@ fn pipe() -> (i32, i32) {
 
 impl Browser {
     /// A fresh Chrome (a profile of its own) with one tab, `width` × `height`.
-    pub fn open(width: u32, height: u32) -> Option<Browser> { Browser::open_among(&CHROMES, width, height) }
+    pub fn open(width: u32, height: u32) -> Option<Browser> { crate::needed(Browser::open_among(&CHROMES, width, height), "Chrome", crate::skips()) }
 
     /// The same, with the first of these that is there; `None` where none is. (One that is there and does not start
     /// is no test passed: it panics. One whose first tab does not come, as when many start at once on a busy runner, is
@@ -52,10 +52,12 @@ impl Browser {
         let (tx, from) = channel();
         std::thread::spawn(move || messages(from_chrome, tx));
         let mut b = Browser { child, to, from, id: 0, session: String::new(), _profile: profile };
+        // (Its first tab is what does not come on a busy runner: started again for that. Once it has come, Chrome
+        // answers, and what it does not answer fails the test.)
         let target = b.call("Target.createTarget", json!({ "url": "about:blank" }))?["targetId"].clone();
-        b.session = b.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true }))?["sessionId"].as_str().unwrap_or_default().to_string();
-        b.call("Page.enable", json!({}))?;
-        b.call("Runtime.enable", json!({}))?;
+        b.session = b.call("Target.attachToTarget", json!({ "targetId": target, "flatten": true })).unwrap()["sessionId"].as_str().unwrap_or_default().to_string();
+        b.call("Page.enable", json!({})).unwrap();
+        b.call("Runtime.enable", json!({})).unwrap();
         Ok(b)
     }
 

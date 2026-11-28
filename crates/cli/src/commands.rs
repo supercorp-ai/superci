@@ -38,8 +38,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci/cpu=8`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
     ("name", "  superci name retrieve\n  superci name update NAME",
         "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"AcmeCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
-    ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--disk-speed=MIBS] [--disk-iops=N] [--arch=x64|arm64]\n                         [--os=linux|windows] [--image=ubuntu26|ubuntu24|NAME] [--gpu=any|NAME] [--family=m8a+r8a] [--scratch=ramdisk|localdisk]\n                         [--provider=aws|cloudflare|modal] [--spot=true|false] [--docker-cache=true|false]",
-        "The machine `runs-on: superci` alone gets. A job's label says another with the same keys, as key=value pairs\nafter its name: `superci/cpu=8/arch=arm64`. What a label leaves out is the default machine's.\n\nEach flag is a key (see superci.dev/docs/labels). `--KEY=default` leaves one to each provider's standard again.\n\n--disk-speed  On AWS a disk's speed follows the machine's size (31.25 MiB a second for each CPU, up to 1,000; the\n              extra is in a job's price). 125 is what AWS includes at no extra price; a number sets it (125 to\n              2000).\n--spot        false: never a spot machine. --scratch: a job's files in memory or on a machine's own disk.\n--family      Only these AWS machine families. --provider: only this provider.\n--docker-cache  false: Docker as it comes, no images from the cache or kept for it; true: from the cache from a\n              job's start, even one whose last run used no images (Ubuntu 26.04 machines)."),
+    ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--disk-speed=MIBS] [--disk-iops=N] [--arch=x64|arm64]\n                         [--os=linux|windows] [--image=ubuntu26|ubuntu24|NAME] [--gpu=any|NAME] [--family=m8a+r8a] [--scratch=ramdisk|localdisk]\n                         [--provider=aws|cloudflare|modal] [--region=REGION] [--spot=true|false] [--docker-cache=true|false]",
+        "The machine `runs-on: superci` alone gets. A job's label says another with the same keys, as key=value pairs\nafter its name: `superci/cpu=8/arch=arm64`. What a label leaves out is the default machine's.\n\nEach flag is a key (see superci.dev/docs/labels). `--KEY=default` leaves one to each provider's standard again.\n\n--disk-speed  On AWS a disk's speed follows the machine's size (31.25 MiB a second for each CPU, up to 1,000; the\n              extra is in a job's price). 125 is what AWS includes at no extra price; a number sets it (125 to\n              2000).\n--spot        false: never a spot machine. --scratch: a job's files in memory or on a machine's own disk.\n--family      Only these AWS machine families. --provider: only this provider.\n--region      Only this AWS region (us-east-1): AWS's runners that start machines there, no other provider.\n--docker-cache  false: Docker as it comes, no images from the cache or kept for it; true: from the cache from a\n              job's start, even one whose last run used no images (Ubuntu 26.04 machines)."),
     ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N] [--monthly-usd=N|none] [--daily-usd=N|none]",
         "--monthly-usd The most the CI may spend on machines in a month, all providers together (no limit unless set).\n              At it no job starts until next month or a higher limit. A cloud account's own limit is\n              `superci accounts update aws --monthly-usd=N`; a provider's, `superci runners update`.\n--daily-usd   The same for a day (UTC): a day that runs away stops that day.\n--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
     ("public_repos", "  superci public_repos list\n  superci public_repos create OWNER/REPO\n  superci public_repos delete OWNER/REPO",
@@ -402,6 +402,12 @@ pub fn process_lines(t: &Value, indent: &str) -> Vec<String> {
 
 /// The tests that failed as they were marked to (`test.fail()`), each named where the list of what ran does not show
 /// them, and what that means: their runner prints no error for them, and passes one that failed for another reason.
+/// How long ago a moment was, from now (ms), in words: "just now", "5 min ago", "3 h ago", "2 days ago".
+fn ago(now: u64, ms: u64) -> String {
+    let m = now.saturating_sub(ms) / 60_000;
+    match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) }
+}
+
 pub fn expected_lines(t: &Value, indent: &str) -> Vec<String> {
     let tests = t["failed_as_expected_tests"].as_array().cloned().unwrap_or_default();
     if tests.is_empty() { return vec![] }
@@ -443,6 +449,16 @@ fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
 }
 
 fn view(d: &mut Dashboard) -> Result<PlaneView> { Ok(look(d)?.0) }
+
+/// Whether an account named goes to the CI's own AWS runners (it has none yet), from whether its control plane
+/// answered and says it has AWS runners. One that did not answer, or was not read, stops the command: never taken as
+/// having none.
+fn own_aws_first(said: Result<(bool, bool)>) -> Result<bool> {
+    match said {
+        Ok((true, aws)) => Ok(!aws),
+        _ => Err(Fail::Failed("The control plane did not answer whether it has AWS runners yet, which decides where these go. Nothing was made; try again once it answers (`superci status`).".into())),
+    }
+}
 
 /// What deletes something needs --confirm (said with what it would do); --dry-run needs none.
 fn confirmed(args: &Args, what: &str) -> Result<()> { if args.has("confirm") || args.has("dry-run") { Ok(()) } else { Err(Fail::Unconfirmed(format!("This would {what}. Add --confirm to do it, or --dry-run to check it first."))) } }
@@ -639,7 +655,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let (mut said, mut data) = (vec![], vec![]);
             // (Each run found has its jobs: a run is made of them.)
             of.iter().rev().for_each(|r| {
-                let raw: Vec<&Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).collect();
+                let raw: Vec<&Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a != 0) == r["attempt"].as_u64()).collect();
                 let mut its: Vec<Value> = raw.iter().map(|j| job_words(j)).collect();
                 said.push(run_line(r));
                 said.push(r["link"].as_str().unwrap_or_default().to_string());
@@ -701,7 +717,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let got = crate::cloudflare::plane_get(&url, &key, &match repo { Some(r) => format!("/caches?repo={}", url::form_urlencoded::byte_serialize(r.as_bytes()).collect::<String>()), None => "/caches".into() })
                 .map_err(|e| if e.contains(" 404") { "This control plane keeps no cache yet: update it (`superci planes update`).".to_string() } else { e })?;
             let now = got["now_ms"].as_u64().unwrap_or(0);
-            let ago = |ms: u64| { let m = now.saturating_sub(ms) / 60_000; match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) } };
+            let ago = |ms: u64| ago(now, ms);
             let size = |b: u64| if b >= 1_000_000_000 { format!("{:.1} GB", b as f64 / 1e9) } else { format!("{} MB", b.div_ceil(1_000_000)) };
             let mut said = vec![];
             if repo.is_none() {
@@ -732,7 +748,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let got = d.kept_secrets_said()?;
             let kept = got["secrets"].as_array().cloned().unwrap_or_default();
             let now = got["now_ms"].as_u64().unwrap_or(0);
-            let ago = |ms: u64| { let m = now.saturating_sub(ms) / 60_000; match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) } };
+            let ago = |ms: u64| ago(now, ms);
             let mut said = vec![];
             if kept.is_empty() { said.push("No secrets kept. A run from a computer gets the ones it names: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.".to_string()) }
             for s in &kept {
@@ -1247,7 +1263,10 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let accounts: Vec<String> = d.aws_accounts_signed_in().into_iter().map(|(a, _)| a).collect();
             let workspaces = d.modal_workspaces();
             // (Read only where it decides: a control plane that does not say stops the command, nothing guessed.)
-            let aws_first = if cloud == "aws" && args.has("account") && !matches!(plane, Plane::Aws { .. }) { !view(&mut d)?.aws } else { false };
+            // (One that does not answer said nothing: it is not taken as having no AWS runners.)
+            let aws_first = if cloud == "aws" && args.has("account") && !matches!(plane, Plane::Aws { .. }) {
+                own_aws_first(view(&mut d).map(|v| (v.online, v.aws)))?
+            } else { false };
             match (cloud, &plane, args.get("account")) {
                 ("aws", Plane::Aws { .. }, _) | ("modal", Plane::Modal { .. }, _) | (_, _, Some(_)) => {}
                 ("aws", _, None) if accounts.len() > 1 => return usage(format!("Say which AWS account: --account=ID. Yours: {}.", accounts.join(", "))),
@@ -1839,11 +1858,11 @@ fn runners_of(d: &mut Dashboard) -> Result<Done> {
     let view = view(d)?;
     let st = view.status.clone().unwrap_or_default();
     let pools = view.order();
-    let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "monthly_usd": p.monthly_usd,
+    let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "jobs_at_once": p.max_jobs.unwrap_or_else(|| superci_core::plane::jobs_at_once(view.records().provider_of(&p.cloud))), "monthly_usd": p.monthly_usd,
         "regions": if view.records().provider_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
         "running": st["active"][&p.cloud].as_u64().unwrap_or(0), "spent_usd": st["spend"][&p.cloud].as_f64().unwrap_or(0.0) })).collect();
     let line = |p: &Value| [p["regions"].as_array().map(|r| format!("in {}", r.iter().filter_map(|r| r.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default(),
-        p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]
+        p["jobs_at_once"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]
         .into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join("  ");
     let mut said: Vec<String> = order.iter().filter(|p| p["taken_out"] != true).enumerate().map(|(i, p)| format!("{}. {:<14} {}", i + 1, p["cloud"].as_str().unwrap_or_default(), line(p)).trim_end().to_string()).collect();
     let out: Vec<&str> = order.iter().filter(|p| p["taken_out"] == true).filter_map(|p| p["cloud"].as_str()).collect();
@@ -1894,7 +1913,28 @@ fn planes() -> Result<Done> {
 
 #[cfg(test)]
 mod tests {
+    /// How long ago, at each change of words; tests that failed as expected listed only past 30 (with 30 or fewer, each
+    /// is among those that ran, listed there).
+    #[test]
+    fn how_long_ago_and_tests_that_failed_as_expected_are_said_at_their_edges() {
+        let now = 10_000_000_000u64;
+        assert_eq!([ago(now, now - 59_999), ago(now, now - 60_000), ago(now, now - 3_599_999), ago(now, now - 3_600_000), ago(now, now - 2_879 * 60_000), ago(now, now - 2_880 * 60_000)],
+            ["just now", "1 min ago", "59 min ago", "1 h ago", "47 h ago", "2 days ago"]);
+        let with = |ran: usize| expected_lines(&serde_json::json!({ "failed_as_expected_tests": [{ "name": "flaky" }], "ran": vec![serde_json::json!({}); ran] }), "");
+        assert!(!with(30).iter().any(|l| l.contains("Failed as expected")) && with(31).iter().any(|l| l.contains("Failed as expected")));
+    }
+
     use super::*;
+
+    #[test]
+    fn an_account_named_goes_to_the_cis_own_aws_runners_only_when_its_control_plane_answered_it_has_none() {
+        assert!(own_aws_first(Ok((true, false))).unwrap());
+        assert!(!own_aws_first(Ok((true, true))).unwrap());
+        for said in [Ok((false, false)), Ok((false, true)), Err(Fail::Failed("unread".into()))] {
+            let Err(Fail::Failed(why)) = own_aws_first(said) else { panic!("not stopped") };
+            assert!(why.contains("did not answer whether it has AWS runners yet") && why.contains("Nothing was made"), "{why}");
+        }
+    }
 
     #[test]
     fn a_logs_source_and_the_age_of_its_last_line_are_said() {
