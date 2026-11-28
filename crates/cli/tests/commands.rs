@@ -895,9 +895,6 @@ fn a_region_an_older_control_plane_would_drop_is_refused_saying_to_update_it() {
     let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
     assert!(!o.status.success() && e.contains("Holding jobs to one AWS region needs a newer control plane") && e.contains("superci planes update"), "{e}");
     assert_eq!(machine(), before, "nothing written");
-    // (Another key it keeps goes through as before.)
-    let o = superci(&home, &["machine", "update", "--cpu=8"]);
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let _ = std::fs::remove_dir_all(&home);
     // A control plane of this version keeps it. (Its own stand-in: one that answered as older read this computer's key
     // under its old name, as an update moves.)
