@@ -5234,7 +5234,7 @@ fn a_machine_keeps_its_images_only_where_the_bucket_has_the_layers_program() {
         config.app = Some(app());
         (config.aws_own, config.aws_own_creds) = own_aws();
         let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-        block_on(plane.handle(webhook("queued", None)));
+        block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/image=ubuntu26")));
         let script = user_data_of(&launches(&clouds.0)[0]);
         assert!(script.contains(&format!("c='{PLANE_URL}/cache/")), "{script}");
         assert_eq!(script.contains("superci-layers keep") || script.contains("$f keep --link"), there, "{there}: {script}");
@@ -5953,6 +5953,8 @@ fn after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it() {
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
     config.instance_types = ["c8a.xlarge", "r8a.xlarge"].map(String::from).to_vec();
+    // (Each pool asked by itself: the role lately could not ask several at once.)
+    store.0.borrow_mut().insert("aws:no-fleet".into(), FixedClock.now_ms().to_string());
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(webhook("queued", None)));
     let mut regions: Vec<&str> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances") && c.2.contains("MarketType=spot"))
