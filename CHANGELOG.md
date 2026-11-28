@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.20.5
+## 0.20.5 — 2026-11-28
 - `superci keys create` on a Cloudflare control plane ends with the key taken, and `keys delete` with it gone. The Worker now hands its control plane the read keys as they are at each request: the control plane read them from what it started with, so a key written was not taken until it started again, and the command said it had not been taken. Found and fixed by Nathan Palmer (github.com/nathanpalmer).
 - `runs-on: superci/region=us-east-1`: a job's machine starts in that AWS region alone, for a job that must start where its network is (a NAT gateway or a peered network in one region). AWS's runners that start machines there take it, and no other provider; a region none of them is set up in fails the job, saying so. The same key as `superci machine update --region=REGION`, and Region in the dashboard's default machine and its machine picker, among the regions the control plane is set up in. Asked for by Hogyny (github.com/hogyny).
 - A provider with no number of jobs at once set says the 20 it runs, on its row and in its settings on the Runners page (the field said "No limit") and in `superci runners list`. Jobs past 20 waited, with nothing to say why until one read the code. Found by alen-hubora (github.com/alen-hubora).
