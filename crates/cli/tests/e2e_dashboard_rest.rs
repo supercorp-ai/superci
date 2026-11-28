@@ -246,6 +246,9 @@ fn a_change_the_control_plane_does_not_show_is_said_as_not_taken() {
         let (status, said) = sent(&link, "/routing", fields);
         assert!(status >= 400 && said.contains("did not show it within twenty seconds"), "{fields:?}: {status} {said}");
     }
+    // GitLab connected, but not shown by the control plane: said as not taken, never as connected.
+    let (status, said) = sent(&link, "/gitlab/connect", &[("url", "https://gitlab.com"), ("token", superci_testkit::gitlab::TOKEN)]);
+    assert!(status >= 400 && said.contains("did not show it within twenty seconds") && !said.contains("GitLab connected"), "{status} {said}");
     // (One from before settings were written through it, the same of a setting of where jobs run.)
     served.answer_as("0.19.21", &["settings", "settings_version"]);
     let (status, said) = sent(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
