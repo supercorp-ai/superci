@@ -5941,7 +5941,7 @@ fn after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it() {
     let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
         let region = if r.url.contains("us-east-2") { "us-east-2" } else { "us-east-1" };
         if body.contains("Action=DescribeSpotPriceHistory") {
-            let rows: &[(&str, f64)] = if region == "us-east-2" { &[("c8a.xlarge", 0.30), ("r8a.xlarge", 0.40)] } else { &[("c8a.xlarge", 0.10), ("r8a.xlarge", 0.60)] };
+            let rows: &[(&str, f64)] = if region == "us-east-2" { &[("c8a.xlarge", 0.030), ("r8a.xlarge", 0.040)] } else { &[("c8a.xlarge", 0.010), ("r8a.xlarge", 0.060)] };
             let items = rows.iter().map(|(t, p)| format!("<item><instanceType>{t}</instanceType><availabilityZone>{region}a</availabilityZone><spotPrice>{p}</spotPrice></item>")).collect::<String>();
             return Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
         }
@@ -5953,8 +5953,6 @@ fn after_the_pools_near_the_cheapest_each_region_goes_by_what_is_left_in_it() {
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
     config.instance_types = ["c8a.xlarge", "r8a.xlarge"].map(String::from).to_vec();
-    // (Each pool asked by itself: the role lately could not ask several at once.)
-    store.0.borrow_mut().insert("aws:no-fleet".into(), FixedClock.now_ms().to_string());
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(webhook("queued", None)));
     let mut regions: Vec<&str> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances") && c.2.contains("MarketType=spot"))
