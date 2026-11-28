@@ -229,14 +229,6 @@ jobs:
           SUPERCOV_MUTANTS: "1"
         # shellcheck disable=SC2086
         run: npx -y supercov@4.29.18 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
-      # (Where the measured build's time goes, and what it leaves on disk: whether keeping its build between runs would
-      # spare the parts building it.)
-      - name: What the measured build left
-        if: always() && matrix.part == 1
-        run: |
-          du -sh target .supercov/rust-target .supercov/workspaces .supercov/workspaces/workspace/superci/target .supercov/workspaces/workspace/superci/.supercov/rust-target 2>/dev/null || true
-          find .supercov -maxdepth 4 -type d -name '*target*' -exec du -sh {} + 2>/dev/null | head
-          jq '.timings' .supercov/runs/run_*/run.json 2>/dev/null | head -20
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -357,9 +349,10 @@ jobs:
         run: |
           mkdir -p mutants
           cat share/left-*.jsonl > mutants/left.jsonl 2>/dev/null || true
-          for f in share/tally-*.txt; do grep -E 'strong +score' "$f" || true; done | tee mutants/tallies.txt
+          for f in share/tally-*.txt; do grep -E '^ *Strong ' "$f" || true; done | tee mutants/tallies.txt
           jq -r '.[].id' supercov.accepted.json > accepted.txt
-          jq -c '{id: (.id // .mutantId // .mutant_id), status: (.status // .verdict)}' mutants/left.jsonl > mutants/all-left.jsonl
+          # (A mutant's verdict from running the tests is `strong.status`; `status` is what the probes saw.)
+          jq -c '{id, status: (.strong.status // .status)}' mutants/left.jsonl > mutants/all-left.jsonl
           jq -c 'select(.status != "timeout")' mutants/all-left.jsonl | grep -vFf accepted.txt > mutants/unaccepted.jsonl || true
           echo "Left alive across $(ls share/left-*.jsonl 2>/dev/null | wc -l) shares: $(wc -l < mutants/all-left.jsonl) (timeouts included, which count as caught)"
           echo "Not timed out and not accepted:"; cat mutants/unaccepted.jsonl
