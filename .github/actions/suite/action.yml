@@ -43,9 +43,11 @@ runs:
         fail-on-cache-miss: true
     # (The Cloudflare Workers' tests, measured: each Worker built again from supercov's copy of its source, with
     # worker-build, and run by the wrangler on PATH, which supercov reads it through.)
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: worker-build@0.8.7
+    # (worker-build has no build to download: cargo-binstall compiled it again each time, 2 minutes and more, though the
+    # Rust cache had kept it. `cargo install` leaves the one kept, and compiles it only where there is none.)
+    - name: worker-build
+      shell: bash
+      run: cargo install --locked worker-build@0.8.7
     - name: wrangler
       shell: bash
       run: npm install -g wrangler@4.149.0

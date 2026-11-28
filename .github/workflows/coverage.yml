@@ -229,6 +229,14 @@ jobs:
           SUPERCOV_MUTANTS: "1"
         # shellcheck disable=SC2086
         run: npx -y supercov@4.29.18 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
+      # (Where the measured build's time goes, and what it leaves on disk: whether keeping its build between runs would
+      # spare the parts building it.)
+      - name: What the measured build left
+        if: always() && matrix.part == 1
+        run: |
+          du -sh target .supercov/rust-target .supercov/workspaces .supercov/workspaces/workspace/superci/target .supercov/workspaces/workspace/superci/.supercov/rust-target 2>/dev/null || true
+          find .supercov -maxdepth 4 -type d -name '*target*' -exec du -sh {} + 2>/dev/null | head
+          jq '.timings' .supercov/runs/run_*/run.json 2>/dev/null | head -20
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -318,51 +326,47 @@ jobs:
           # no stable Cargo invocation. It runs the #[ignore]d live tests too, which fail without their sign-ins: the
           # verdicts are reached, and the command exits 2 as they cannot gate.)
           npx -y supercov@4.29.18 runs latest mutants test "$@" -- cargo test --workspace --no-fail-fast; code=$?
-          # (The run this share saved its verdicts into, for the merge.)
-          mkdir -p .supercov/shares && npx -y supercov@4.29.18 runs latest --json | jq -r '[.. | objects | (.runId? // empty) | strings] | first // empty' > .supercov/shares/${{ matrix.shard }}
-          cat .supercov/shares/${{ matrix.shard }}
+          # (This share's verdicts, as it says them: a share writes them into the measured run it was handed, the same
+          # run for every share, so the shares' run folders laid over one another kept only the last one's. Its mutants
+          # left alive, and its tally, are what the merge needs: a few kilobytes, not the measured run sent back.)
+          mkdir -p share
+          npx -y supercov@4.29.18 runs latest mutants --status survived,no-coverage,timeout,error --format jsonl --output share/left-${{ matrix.shard }}.jsonl || true
+          npx -y supercov@4.29.18 runs latest mutants > share/tally-${{ matrix.shard }}.txt 2>&1 || true
           exit $code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: mutants-${{ matrix.shard }}
-          path: .supercov/runs
-          include-hidden-files: true
+          path: share
 
   # The shares' verdicts, as one run with the coverage: the mutation score, and every mutant the tests let live.
   mutants-merge:
     needs: mutants
     if: ${{ always() && needs.mutants.result != 'skipped' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: mutants-*
-          path: .supercov/runs
+          path: share
           merge-multiple: true
-      - name: The shares merged
-        run: |
-          # (Each share's own run; where none could say its id, every run on this source that is not itself a merge.)
-          ids=$(cat .supercov/shares/* 2>/dev/null | grep -v '^$' || true)
-          echo "Shares' runs: ${ids:-none named}"
-          # shellcheck disable=SC2086
-          npx -y supercov@4.29.18 merge $ids
+      # (Every share's mutants left alive, together; those `supercov.accepted.json` gives a reason for said apart.)
       - name: The mutants
         run: |
           mkdir -p mutants
-          npx -y supercov@4.29.18 runs latest mutants | tee mutants/files.txt
-          npx -y supercov@4.29.18 runs latest mutants --status survived,no-coverage,timeout,error --format jsonl --output mutants/left.jsonl || true
-          npx -y supercov@4.29.18 runs latest mutants --diff origin/main --format markdown --output mutants/changed.md || true
-          wc -l mutants/left.jsonl || true
+          cat share/left-*.jsonl > mutants/left.jsonl 2>/dev/null || true
+          for f in share/tally-*.txt; do grep -E 'strong +score' "$f" || true; done | tee mutants/tallies.txt
+          jq -r '.[].id' supercov.accepted.json > accepted.txt
+          jq -c '{id: (.id // .mutantId // .mutant_id), status: (.status // .verdict)}' mutants/left.jsonl > mutants/all-left.jsonl
+          jq -c 'select(.status != "timeout")' mutants/all-left.jsonl | grep -vFf accepted.txt > mutants/unaccepted.jsonl || true
+          echo "Left alive across $(ls share/left-*.jsonl 2>/dev/null | wc -l) shares: $(wc -l < mutants/all-left.jsonl) (timeouts included, which count as caught)"
+          echo "Not timed out and not accepted:"; cat mutants/unaccepted.jsonl
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: mutants
           path: |
             mutants
-            .supercov/runs
-          include-hidden-files: true
+            share
