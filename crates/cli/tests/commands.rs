@@ -882,6 +882,29 @@ fn a_limit_an_older_control_plane_does_not_keep_is_refused_saying_to_update_it()
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A default machine held to one AWS region, on a control plane from before `region=` (which would drop it unsaid, and
+/// start its jobs in any region): refused before anything is written, saying to update it; once updated, kept.
+#[test]
+fn a_region_an_older_control_plane_would_drop_is_refused_saying_to_update_it() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let machine = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "MACHINE").map(|(_, v)| v);
+    let before = machine();
+    *served.aws.old_version.lock().unwrap() = Some("0.20.4".into());
+    let o = superci(&home, &["machine", "update", "--region=us-east-1"]);
+    let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success() && e.contains("Holding jobs to one AWS region needs a newer control plane") && e.contains("superci planes update"), "{e}");
+    assert_eq!(machine(), before, "nothing written");
+    // (Another key it keeps goes through as before.)
+    assert!(superci(&home, &["machine", "update", "--cpu=8"]).status.success());
+    *served.aws.old_version.lock().unwrap() = None;
+    let o = superci(&home, &["machine", "update", "--region=us-east-1"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let kept: serde_json::Value = serde_json::from_str(&machine().unwrap()).unwrap();
+    assert_eq!((kept["region"].as_str(), kept["cpu"].as_u64()), (Some("us-east-1"), Some(8)), "{kept}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A command that needs a cloud whose sign-in ended (noted by an earlier run) says so, with what to do, and changes
 /// nothing: AWS's, Cloudflare's and Modal's.
 #[test]

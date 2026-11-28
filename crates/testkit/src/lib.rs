@@ -401,10 +401,12 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
             let o = v.as_object_mut().expect("a status is an object");
             let l = o.remove("launchers").unwrap_or_default();
             o.insert("agents".into(), l);
-            // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0.)
+            // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0, a
+            // machine held to one region in 0.20.5.)
             let older = |than: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(&version) < n(than) };
             if older("0.15.0") { o.remove("account_limits"); }
             if older("0.16.0") { o.remove("daily_limits"); }
+            if older("0.20.5") { o.remove("region_label"); }
             v.to_string().into_bytes()
         }
         _ => res.body,

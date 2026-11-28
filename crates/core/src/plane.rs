@@ -2224,6 +2224,9 @@ impl<'a> ControlPlane<'a> {
             // (And images of its own, `Routing::images`; and Modal's Functions, `MODAL_FUNCTIONS`.)
             "runner_images": true,
             "function_mode": true,
+            // (And a machine held to one AWS region, `region=`: one from before drops it from the default machine
+            // unsaid, and jobs then start in any region.)
+            "region_label": true,
             "spend_today": day_spend,
             // Modal Functions preempted this month (UTC), and jobs run again for it (see `MODAL_FUNCTIONS`).
             "preempted": self.preempted(now).await,

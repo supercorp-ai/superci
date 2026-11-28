@@ -4072,6 +4072,11 @@ impl Dashboard {
                 if spec.spot == Some(true) { spec.spot = None }
                 if spec.arch.is_some() && spec.os.as_deref() == Some("windows") { return Ok(message(400, "Windows machines are x64", "Choose x64 for Windows, or Linux for arm64.")) }
                 if let Err(e) = spec.check() { return Ok(message(400, "That machine does not go together", &esc(&e))) }
+                // (A control plane from before `region=` drops it unsaid, and its jobs start in any region: refused
+                // before anything is written.)
+                if spec.region.is_some() && !status_soon(plane.url(), &self.status_key).is_some_and(|s| s["region_label"] == true) {
+                    return Ok(message(409, "Update the control plane first", "Holding jobs to one AWS region needs a newer control plane: update it on the Control plane page (or `superci planes update`), then set the region."))
+                }
                 let want = json_value(&spec);
                 self.put_secret(&plane, "MACHINE", &want.to_string())?;
                 self.shown(&plane, |s| s["machine"] == want)?;
@@ -7043,8 +7048,8 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     if let Some(r) = m.region.clone().filter(|r| !regions.contains(r)) { regions.push(r) }
     let region_names: Vec<(String, String)> = regions.iter().map(|r| (r.clone(), format!("{} ({r})", region_name(r)))).collect();
     let region_choices: Vec<(&str, &str)> = region_names.iter().map(|(r, n)| (r.as_str(), n.as_str())).collect();
-    // (None without AWS.)
-    let region = |first: &str, current: Option<&str>| if region_choices.is_empty() { String::new() } else { choice("region", "Region (AWS)", first, &region_choices, current) };
+    // (None without AWS, or with a control plane from before `region=`, which would drop it unsaid.)
+    let region = |first: &str, current: Option<&str>| if region_choices.is_empty() || !v.region_label() { String::new() } else { choice("region", "Region (AWS)", first, &region_choices, current) };
     // The default: what it is, in words, and its dialog.
     let mut parts = vec![m.cpu.map(|c| format!("{c} CPU")).unwrap_or_else(|| "Each provider's standard size".into())];
     if let Some(r) = m.ram_gb { parts.push(format!("{r} GB")) }
@@ -11494,8 +11499,12 @@ mod rest_tests {
         let card = plain(&machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "machine": { "disk_mibs": 500 } }))).0);
         assert!(card.contains("500 MiB/s disk"), "{card}");
         // Held to a region the control plane no longer says it is in: still a choice in its dialog, where it is set.
-        let card = machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "aws_regions": ["us-east-1"], "machine": { "region": "eu-west-1" } }))).0;
+        let card = machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "aws_regions": ["us-east-1"], "machine": { "region": "eu-west-1" }, "region_label": true }))).0;
         assert!(card.contains(r#"<option value="us-east-1""#) && card.contains(r#"<option value="eu-west-1" selected>"#), "{card}");
+        // A control plane from before `region=` (it would drop the region unsaid): no region to choose, in the dialog or
+        // the picker.
+        let (card, picker) = machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "aws_regions": ["us-east-1"] })));
+        assert!(!card.contains(r#"name="region""#) && !picker.contains(r#"name="region""#) && card.contains(r#"name="cpu""#), "{card}");
         let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [], "usage": { "day": { "jobs": 0 } } }));
         assert!(plain(&overview_cards(&v, &[serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": 1 })], "day")).contains("No jobs in the last 24 hours"));
         // Docker's images kept, and Cloudflare's place where its location is not said.
